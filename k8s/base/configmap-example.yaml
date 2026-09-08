@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: karnex-platform-config
+  namespace: karnex
+data:
+  ENVIRONMENT: "prod"
+  HR_DASHBOARD_TTL_S: "30"
+  OPENAI_RESPONSE_CACHE_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+---
+# Secrets (create out-of-band; never commit real values):
+# kubectl create secret generic karnex-secrets -n karnex \
+#   --from-literal=AUTH_DB_URL=postgresql://... \
+#   --from-literal=JWT_SECRET=... \
+#   --from-literal=OPENAI_API_KEY=...

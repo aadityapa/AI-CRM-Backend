@@ -1,0 +1,25 @@
+backend/certs/*.pem
+.env
+.env.*
+!.env.example
+logs/server.log
+logs/*.log
+logs/*.recovered*.txt
+logs/openai-prompts/
+__pycache__/
+*.pyc
+node_modules/
+data/hr_records.json
+data/interview_learning.jsonl
+data/hr_access_code.txt
+data/proctor_reports.json
+data/*.db
+# data/ below is a per-file denylist for historical reasons. Anything new that
+# lands in data/ is candidate PII until proven otherwise - exclude by default.
+data/crm_uploads/
+data/*.tmp
+data/question_bank/
+_to_delete/
+# Bulk archives of exported candidate data and rotated logs. Local only -
+# same PII reasoning as logs/openai-prompts/ and data/*.tmp above.
+_archive/

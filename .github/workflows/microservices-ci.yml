@@ -1,0 +1,58 @@
+name: Microservices CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "services/**"
+      - "contracts/**"
+      - "docker-compose.microservices.yml"
+      - "backend/**"
+      - ".github/workflows/microservices-ci.yml"
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  test-monolith:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest backend/tests -q --tb=short
+
+  build-gateway:
+    runs-on: ubuntu-latest
+    needs: test-monolith
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API Gateway image
+        run: docker build -f services/api-gateway/Dockerfile -t karnex/api-gateway:ci .
+
+  build-auth:
+    runs-on: ubuntu-latest
+    needs: test-monolith
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build auth-service image
+        run: docker build -f services/auth-service/Dockerfile -t karnex/auth-service:ci .
+
+  build-candidate:
+    runs-on: ubuntu-latest
+    needs: test-monolith
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build candidate-service image
+        run: docker build -f services/candidate-service/Dockerfile -t karnex/candidate-service:ci .
+
+  build-template:
+    runs-on: ubuntu-latest
+    needs: test-monolith
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build template-service image
+        run: docker build -f services/template-service/Dockerfile -t karnex/template-service:ci .

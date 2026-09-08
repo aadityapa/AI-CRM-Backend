@@ -1,0 +1,34 @@
+---
+description: Keep /docs/architecture Mermaid diagrams synchronized with the codebase automatically
+alwaysApply: true
+---
+
+# Architecture Documentation — auto-maintenance
+
+The living architecture docs live in `docs/architecture/` (Mermaid `.md`). Keep them
+in sync with the code **in the same change set**, without asking for approval.
+
+## When to update (triggers)
+
+Update the matching file whenever you change any of these:
+
+| You changed... | Update |
+|----------------|--------|
+| New/removed/renamed route or router (`backend/main.py`, `backend/routers/**`) | `04-api-flow.md` (+ `01` if a new subsystem) |
+| SQLAlchemy models / migrations (`backend/models/**`, `backend/alembic/versions/**`) | `03-database-er.md` |
+| A domain service or module (`backend/services/**`, `backend/utils/**`, `frontend/js/**`, `admin-dashboard/src/**`) | `02-module-flow.md` |
+| Auth/RBAC roles, permissions (`crm_deps.py`, `models/rbac.py`, `role_required` usage) | `04-api-flow.md`, `05-user-journeys.md` |
+| A user-facing workflow or its steps | `05-user-journeys.md`, `06-sequence-diagrams.md` |
+| External integration (OpenAI, SMTP, DB, deploy) | `01-system-architecture.md` |
+
+After finishing a module/feature, re-scan the affected area and refresh every impacted
+diagram, then bump the `_Last synced_` line in `docs/architecture/README.md`.
+
+## Rules for edits
+
+- Mermaid is the source of truth; keep diagrams renderable (valid Mermaid syntax).
+- Keep endpoint paths, table/column names, and role names **exactly** matching the code.
+- Split a diagram if it grows too large to read; one concern per diagram.
+- Do not delete diagrams for features that still exist; edit in place.
+- Never block on approval — treat doc updates as part of the change (do not commit unless asked).
+- Optional SVG/PNG export: `node docs/architecture/scripts/render.mjs`.

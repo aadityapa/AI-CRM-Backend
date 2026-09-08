@@ -1,0 +1,111 @@
+﻿profile_id,cand_zoho_id,cand_name,cand_email,opp_id,opp_title,customer,status,ta_person,reason
+270193000000515011,270193000000416147,SriLakshmi,srilakshmi.s1798@gmail.com,,,,RMG Rejected,,opportunity (blank) not found in DB
+270193000000359909,270193000000349739,Karan Singh,karanskb0007@gmail.com,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,Sales Rejected,,opportunity CP-000001 not found in DB
+270193000000485003,270193000000349739,Karan Singh,karanskb0007@gmail.com,CP-00002,Devpos CI/CD Integeration &amp; Build Engineer,Adani Motor Ahamdabad,Rejected,Neelam Singh,opportunity CP-00002 not found in DB
+270193000000310029,270193000000310023,Akshay Deshapande,akshayaad1234@gmail.com,,"Replacement for Rohit Kumar (System Engineer (Application, Android based, cluster))",,Customer Screening,,opportunity (blank) not found in DB
+270193000000310035,270193000000310023,Akshay Deshapande,akshayaad1234@gmail.com,,"Replacement for Rohit Kumar (System Engineer (Application, Android based, cluster))",,RMG Rejected,,opportunity (blank) not found in DB
+270193000000349557,270193000000319129,Anuj Singh Shekhawat,anuj.singh_shekhawat@gmail.com,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,RMG Rejected,,opportunity CP-000001 not found in DB
+270193000000359747,270193000000319129,Anuj Singh Shekhawat,anuj.singh_shekhawat@gmail.com,CP-00002,Devpos CI/CD Integeration &amp; Build Engineer,Adani Motor Ahamdabad,Customer Rejected,,opportunity CP-00002 not found in DB
+270193000000319043,270193000000319033,Manikantha D Mesta,manikanthadmesta@gmail.com,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,L1-Technical Schedhuled,,opportunity CP-000001 not found in DB
+270193000000379003,270193000000298037,bharathi basireddy,bharathii.basireddy@gmail.com,,"SW Integration Test Engineer, HLDD",,Sourcing,,opportunity (blank) not found in DB
+270193000000303019,270193000000303011,MANIKE KARGIL,manikekargil6@gmail.com,,"SW Integration Test Engineer, HLDD",,Customer Screening,,opportunity (blank) not found in DB
+270193000000367037,270193000000349920,Balaiah Lamu,balaiah.lamu@karnex.in,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,Sales Rejected,,opportunity CP-000001 not found in DB
+270193000000349585,270193000000349581,Sandeep - Kumar,Sandeep.Kumar@gmail.com,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,Customer Rejected,,opportunity CP-000001 not found in DB
+270193000000350009,270193000000350005,Kavya singh g,neelam.singh@gmail.com,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,Customer Rejected,,opportunity CP-000001 not found in DB
+270193000000485009,270193000000349989,Neelam Singh,neelam.singh@karnex.in,CP-00002,Devpos CI/CD Integeration &amp; Build Engineer,Adani Motor Ahamdabad,Rejected,Neelam Singh,opportunity CP-00002 not found in DB
+270193000000485037,270193000000485031,Kavita Khatana,MsKavita.Khatana@gmail.com,CP-000001,Minning Engineer T&amp;M,Adani Motor Ahamdabad,RMG Rejected,,opportunity CP-000001 not found in DB
+270193000000324011,270193000000324007,SIVA KIRAN BOTCHA,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,Rejected,,candidate not found in DB
+270193000000298019,270193000000298015,Tapas Kumar Pat,tapas.patra0406@gmail.com,,"SW Integration Test Engineer, HLDD",,RMG Rejected,,opportunity (blank) not found in DB
+270193000000821002,270193000000319095,Kandula Raj Kumar Reddy,kandularajkumar154@gmail.com,,,,Sourcing,,opportunity (blank) not found in DB
+270193000001277320,270193000000963034,NAVEEN.P,1712naveenkumar@gmail.com,,,,Sourcing,Mohammed Suhel,opportunity (blank) not found in DB
+270193000001283018,270193000001283014,KUSUMA,kusuma.embedded5@gmail.com,,,,Sourcing,,opportunity (blank) not found in DB
+270193000001436348,270193000001436344,Swasthik Hegde,swasthik086@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,Mohammed Suhel,candidate not found in DB
+270193000001437122,270193000001437118,Piyush Prabhakar,spiyushoct06@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,RMG Rejected,Neelam Singh,candidate not found in DB
+270193000001437131,270193000001437127,Karthik Shankara,karthikshankaran9@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Technical Interviewing,Neelam Singh,candidate not found in DB
+270193000001437140,270193000001437136,Rohit Pareekh,pareek.rohit95@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Technical Interviewing,Neelam Singh,candidate not found in DB
+270193000001436365,270193000001436361,Vadiraj Revankar,revankarvadi3979@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,Mohammed Suhel,candidate not found in DB
+270193000001436374,270193000001436370,Rahul Sunder Sharma,rahul.sharmaok71@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Self Withdrawn,Mohammed Suhel,candidate not found in DB
+270193000001436383,270193000001436379,Shashidhar,shashidhar.vshashi26@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,Mohammed Suhel,candidate not found in DB
+270193000001436396,270193000001436392,Ravi Teja Malla,ravitejamalla2318@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,Mohammed Suhel,candidate not found in DB
+270193000001438043,270193000001438039,Tamilarasan Vetrivel,tamilarasanvetri@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Self Withdrawn,Mohammed Suhel,candidate not found in DB
+270193000001446007,270193000001446003,Sandhya Rani J,sandhyajprakash123@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Technical Interviewing,Mohammed Suhel,candidate not found in DB
+270193000001446016,270193000001446012,shweta sharma,shweta.sharma6087@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Technical Interviewing,Mohammed Suhel,candidate not found in DB
+270193000001446025,270193000001446021,ISAIGOKUL U,isaigokul.droid@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Technical Interviewing,Mohammed Suhel,candidate not found in DB
+270193000001446036,270193000001446032,Rahul Parekh,rahulsmail0011@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,Mohammed Suhel,candidate not found in DB
+270193000001446045,270193000001446041,Yogesh Tanaji Shingade,yogeshtshingade@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,,candidate not found in DB
+270193000001446058,270193000001446054,Rahulraj Senapati,rahulrajsenapati24@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Technical Interviewing,Mohammed Suhel,candidate not found in DB
+270193000001446067,270193000001446063,Rahi Vasa,rahivasa12059@gmail.com,C-2026-00074,HMI - Kotlin,HARMAN - Bangalore,Sourcing,Mohammed Suhel,candidate not found in DB
+270193000000298041,,,,,"SW Integration Test Engineer, HLDD",,Sourcing,,no candidate attached in Zoho
+270193000000338197,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000376051,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000381025,,,,C-2026-00008,HIL Test Engineer (1-3),Aptiv - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000001302072,,,,C-2026-00042,Automation Test Engineer (Replacement for Lavanya),Aptiv - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000484311,,,,C-2025-00190,CAN + Python Test Automation,HARMAN - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000503087,,,,C-2025-00190,CAN + Python Test Automation,HARMAN - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000665015,,,,C-2026-00026,Sr. Engineer IOC/MCU Test,HARMAN - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000665021,,,,C-2026-00026,Sr. Engineer IOC/MCU Test,HARMAN - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000001327382,,,,C-2026-00057,SW Engineer - Projections,HARMAN - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000000947439,,,,C-2026-00043,Infotainment/Cluster SW integration Test,Visteon - Bangalore,Sourcing,,no candidate attached in Zoho
+270193000001302019,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Sourcing,,no candidate attached in Zoho
+270193000001302039,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Sourcing,,no candidate attached in Zoho
+270193000001352024,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Sourcing,,no candidate attached in Zoho
+270193000001274006,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Sourcing,,no candidate attached in Zoho
+270193000001170047,,,,C-2026-00054,Embedded SW Engineer,Aptiv - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000001321069,,,,C-2026-00054,Embedded SW Engineer,Aptiv - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000001391788,,,,C-2026-00056,Automation Test Engineer,HARMAN - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000000490009,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000326059,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,,,no candidate attached in Zoho
+270193000000330003,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,,,no candidate attached in Zoho
+270193000000330054,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000324059,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,,,no candidate attached in Zoho
+270193000000376185,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000420053,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000420061,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000326009,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000321023,,,,C-2025-00212,HIL Test Engineer (3-5),Aptiv - Bangalore,Sales Rejected,,no candidate attached in Zoho
+270193000000287264,,,,C-2025-0150,IT Analyst/Operations Support,Aptiv - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000000294069,,,,C-2025-0150,IT Analyst/Operations Support,Aptiv - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000000490015,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000420045,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000420057,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000515215,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,Rejected,,no candidate attached in Zoho
+270193000000420065,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,Sales Rejected,,no candidate attached in Zoho
+270193000000505117,,,,C-2026-00004,System Engineer - Lighting &amp; Acoustics,CREAT UNO MINDA - PUNE,RMG Rejected,,no candidate attached in Zoho
+270193000000375045,,,,C-2025-00122,WiFi,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000352015,,,,C-2025-00178,Senior Engineer / Engineer - Camera,HARMAN - Bangalore,Rejected,,no candidate attached in Zoho
+270193000000362263,,,,C-2025-00178,Senior Engineer / Engineer - Camera,HARMAN - Bangalore,Rejected,,no candidate attached in Zoho
+270193000000362323,,,,C-2025-00178,Senior Engineer / Engineer - Camera,HARMAN - Bangalore,,,no candidate attached in Zoho
+270193000000362341,,,,C-2025-00178,Senior Engineer / Engineer - Camera,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000407015,,,,C-2025-00183,Projections,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000950012,,,,C-2026-00044,Automation/ API Test Engineer,Visteon - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000950016,,,,C-2026-00044,Automation/ API Test Engineer,Visteon - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000881010,,,,C-2026-00036,Bluetooth Developer,Visteon - Chennai,RMG Rejected,,no candidate attached in Zoho
+270193000000881014,,,,C-2026-00036,Bluetooth Developer,Visteon - Chennai,RMG Rejected,,no candidate attached in Zoho
+270193000001292057,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000000310003,,,,C-2025-0141,,Visteon Pune,,,no candidate attached in Zoho
+270193000000416111,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000515007,,,,C-2026-00004,System Engineer - Lighting &amp; Acoustics,CREAT UNO MINDA - PUNE,RMG Rejected,,no candidate attached in Zoho
+270193000000483041,,,,C-2025-00213,C/C++ Test API App Developer,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000881006,,,,C-2026-00036,Bluetooth Developer,Visteon - Chennai,RMG Rejected,,no candidate attached in Zoho
+270193000001268066,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001268074,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001352015,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Technical Interviewing,,no candidate attached in Zoho
+270193000000484251,,,,C-2025-00190,CAN + Python Test Automation,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000484275,,,,C-2025-00190,CAN + Python Test Automation,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000947292,,,,C-2026-00043,Infotainment/Cluster SW integration Test,Visteon - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000420025,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,Sales Rejected,,no candidate attached in Zoho
+270193000000505057,,,,C-2026-00009,ITV Engineer,Aptiv - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000629085,,,,C-2026-00031,System Engineer,Aptiv - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000000395037,,,,C-2025-00183,Projections,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000000613387,,,,C-2026-00014,Linux Virtualization Engineer,HARMAN - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000000613499,,,,C-2026-00014,Linux Virtualization Engineer,HARMAN - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000000629367,,,,C-2026-00015,Linux Virtualization Engineer,HARMAN - Bangalore,Self Withdrawn,,no candidate attached in Zoho
+270193000001330058,,,,C-2026-00057,SW Engineer - Projections,HARMAN - Bangalore,RMG Rejected,,no candidate attached in Zoho
+270193000001292061,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001292065,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001292069,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001292073,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001292085,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000000950008,,,,C-2026-00044,Automation/ API Test Engineer,Visteon - Bangalore,Technical Interviewing,,no candidate attached in Zoho
+270193000001269055,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho
+270193000001268134,,,,C-2026-00067,Manual Integration Test Engineer,Visteon - Chennai,Self Withdrawn,,no candidate attached in Zoho

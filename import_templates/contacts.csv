@@ -1,0 +1,4 @@
+customer_name,branch_name,name,email,phone,designation,role,contact_priority,notification,is_hiring_manager
+HARMAN India,HARMAN - Bangalore,Rajesh Kumar,rajesh.kumar@harman.com,9876543210,Engineering Manager,HR,Primary,Email,Y
+HARMAN India,,Priya Sharma,priya.sharma@harman.com,9876500000,Procurement Lead,Procurement,Secondary,Both,N
+MARELLI(INDIA)PRIVATE LIMITED,MARELLI - Bangalore,Amit Verma,amit.verma@marelli.com,9812345678,Delivery Head,Operational,Primary,Email,Y

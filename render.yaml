@@ -1,0 +1,43 @@
+# Render Blueprint — backend API only (Supabase Postgres external; no Render DB).
+# Docs: docs/RENDER_DEPLOYMENT.md
+
+services:
+  - type: web
+    name: ai-interview-backend
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health/ready
+    envVars:
+      - key: KARNEX_ENV
+        value: production
+      - key: UVICORN_WORKERS
+        value: "1"
+      - key: PROMPT_LOG_ENABLED
+        value: "true"
+      - key: PROMPT_LOG_FILE_ENABLED
+        value: "false"
+      - key: SMTP_ENABLED
+        value: "false"
+      - key: ALLOW_PUBLIC_HR_REGISTRATION
+        value: "false"
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: REPORT_CODE
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY_TTS
+        sync: false
+      - key: OPENAI_API_KEY_QUESTIONS
+        sync: false
+      - key: OPENAI_API_KEY_EVALUATION
+        sync: false
+      - key: OPENAI_API_KEY_TRANSCRIBE
+        sync: false
+      - key: AUTH_DB_URL
+        sync: false
+      - key: CORS_ALLOW_ORIGINS
+        sync: false
+      - key: PUBLIC_BASE_URL
+        value: "https://ai-interview-model-frontend-v2.vercel.app"

@@ -1,0 +1,75 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: karnex-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=karnex_db
+      - POSTGRES_USER=karnex_user
+      - POSTGRES_PASSWORD=karnex_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U karnex_user -d karnex_db"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  ai-interview:
+    build: .
+    container_name: ai-interview-app
+    ports:
+      - "2020:2020"
+    env_file:
+      - .env
+    environment:
+      - PORT=2020
+# In-memory sessions require a single worker until REDIS_URL backs session state.
+      - UVICORN_WORKERS=1
+      - AUTH_DB_URL=postgresql://karnex_user:karnex_password@postgres:5432/karnex_db
+      - PG_POOL_ENABLED=true
+      - PG_POOL_MIN=1
+      - PG_POOL_MAX=10
+      - PROMPT_LOG_ENABLED=true
+      - PROMPT_LOG_FILE_ENABLED=false
+      - HR_DASHBOARD_TTL_S=30
+      - OPENAI_RESPONSE_CACHE_ENABLED=true
+      - OPENAI_RESPONSE_CACHE_TTL_S=86400
+      - GEN_VALIDATION_MAX_RETRIES=1
+      # - RATE_LIMIT_ENABLED=true   # set true to enable slowapi on hot routes
+      # - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:2020/readyz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  # Enable with: docker compose --profile cache up
+  redis:
+    image: redis:7-alpine
+    container_name: karnex-redis
+    profiles: ["cache"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

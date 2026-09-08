@@ -1,0 +1,88 @@
+# Karnex microservices stack — Phase 1 (strangler pattern)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.microservices.yml up -d
+#
+# Gateway :8080  → routes auth/candidates/templates to sidecars; rest → monolith :8010
+# Monolith :8010 → unchanged FastAPI app (source of truth until DB/code extraction)
+
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: karnex-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: karnex
+      RABBITMQ_DEFAULT_PASS: karnex_mq_dev
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: karnex-api-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - auth-service
+      - candidate-service
+      - template-service
+      - ai-interview
+    restart: unless-stopped
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    container_name: karnex-auth-service
+    environment:
+      - MONOLITH_URL=http://ai-interview:8010
+      - PORT=8001
+    depends_on:
+      ai-interview:
+        condition: service_healthy
+    restart: unless-stopped
+
+  candidate-service:
+    build:
+      context: .
+      dockerfile: services/candidate-service/Dockerfile
+    container_name: karnex-candidate-service
+    environment:
+      - MONOLITH_URL=http://ai-interview:8010
+      - PORT=8002
+    depends_on:
+      ai-interview:
+        condition: service_healthy
+    restart: unless-stopped
+
+  template-service:
+    build:
+      context: .
+      dockerfile: services/template-service/Dockerfile
+    container_name: karnex-template-service
+    environment:
+      - MONOLITH_URL=http://ai-interview:8010
+      - PORT=8003
+    depends_on:
+      ai-interview:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Phase 2+ placeholders (enable when implemented)
+  # interview-service:
+  # ai-question-service:
+  # speech-service:
+  # evaluation-service:
+  # report-service:
+  # ats-service:
+  # integrity-service:
+  # notification-service:
+  # analytics-service:
