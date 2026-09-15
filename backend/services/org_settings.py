@@ -55,7 +55,6 @@ KEYS: dict[str, tuple[str, str]] = {
     "finance.tds_rate_percent": ("TDS_RATE_PERCENT", "10"),
     # Seller (company) block on the Tax Invoice. DB row -> INVOICE_* env -> default.
     "invoice.seller_name": ("INVOICE_SELLER_NAME", "KARNEX SOFTWARE SOLUTIONS PRIVATE LIMITED"),
-    "invoice.seller_tagline": ("INVOICE_SELLER_TAGLINE", "Excellence In Motion"),
     "invoice.seller_address_line1": (
         "INVOICE_SELLER_ADDRESS_LINE1",
         "103, Pride Purple Accord, Opp- RMZ Icon, Near Nanakbawdi Flyover, Baner"),
@@ -76,8 +75,18 @@ KEYS: dict[str, tuple[str, str]] = {
     "invoice.seller_seal_url": ("INVOICE_SELLER_SEAL_URL", "/admin/assets/karnex-seal-sign.png"),
     "invoice.seller_declaration": (
         "INVOICE_SELLER_DECLARATION",
-        "We declare that this invoice shows the actual price of the "
-        "goods described and that all particulars are true and correct."),
+        "Certified that all the particulars given above are true and correct. "
+        "The amount indicated represents the price actually charged and there is "
+        "no flow of additional consideration directly or indirectly from the "
+        "Service Recipient."),
+    # Service line defaults (11 Sep 2026). SAC 998513 = contract staffing
+    # services; the old 998314 (IT design) was wrong for what Karnex bills.
+    "invoice.sac_code": ("INVOICE_SAC_CODE", "998513"),
+    "invoice.service_description": ("INVOICE_SERVICE_DESCRIPTION", "Contract Staffing Service"),
+    "invoice.signatory_line": ("INVOICE_SIGNATORY_LINE", "For Karnex Software Solutions Pvt. Ltd."),
+    # Footer strip: ONLY the website, printed as a clickable link.
+    "invoice.footer_website_url": ("INVOICE_FOOTER_WEBSITE_URL", "https://www.karnex.in"),
+    "invoice.footer_text": ("INVOICE_FOOTER_TEXT", ""),
     # Receivable bank account on the Tax Invoice.
     "invoice.bank_name": ("INVOICE_BANK_NAME", "HDFC Bank"),
     "invoice.bank_account_name": (

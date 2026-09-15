@@ -140,6 +140,8 @@ class InvoiceCreate(BaseModel):
 
 
 class InvoiceUpdate(BaseModel):
+    #: Editable since 11 Sep 2026 (user request) — must stay unique.
+    invoice_number: str | None = Field(default=None, min_length=1, max_length=64)
     invoice_date: date | None = None
     due_date: date | None = None
     # Per-invoice GST buyer state override: exactly 2 digits, or blank/null to clear.

@@ -145,8 +145,12 @@ class BillingPolicyIn(BaseModel):
     comp_off_balance_initial: float | None = None
     comp_off_max_limit: float | None = None
     comp_off_max_carry_forward: float | None = None
+    comp_off_covers_lop: bool | None = None
     # attendance rule
     normal_hours_per_day: float | None = Field(default=None, ge=0, le=24)
+    #: Karnex receivable account for this customer's invoices (0098); null =
+    #: the default company account. Only touched when present in the payload.
+    bank_account_id: int | None = None
     user_role: str | None = Field(default=None, max_length=120)
     operation: str | None = Field(default=None, max_length=120)
 

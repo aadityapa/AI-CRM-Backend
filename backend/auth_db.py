@@ -2383,49 +2383,56 @@ def list_interview_schedules(db_target: DbTarget, hr_username: str) -> list[dict
     return [dict(row) for row in rows]
 
 
-def list_interview_integrity_logs(db_target: DbTarget, hr_username: str) -> list[dict]:
-    """Single-query integrity payload for admin (avoids N+1 get_schedule_by_token)."""
-    uname = (hr_username or "hr").strip().lower()
+def list_interview_integrity_logs(db_target: DbTarget, hr_username: str | None) -> list[dict]:
+    """Single-query integrity payload for admin (avoids N+1 get_schedule_by_token).
+
+    `hr_username=None` returns EVERY schedule (15 Sep 2026): the Integrity tab
+    used to show only interviews the viewer created from the legacy HR screen,
+    which hid every CRM-scheduled interview (those are owned by "karnex-crm")."""
+    uname = (hr_username or "").strip().lower() or None
     cols = (
-        "id, invite_token, status, notes, created_at_ist, candidate_name, candidate_email, scheduled_at_local, session_status, "
-        "login_attempts, verified_at, interview_started_at, interview_completed_at, "
-        "violation_count, violations_log, active_device_id"
+        "id, invite_token, hr_username, status, notes, created_at_ist, candidate_name, candidate_email, "
+        "scheduled_at_local, session_status, login_attempts, verified_at, interview_started_at, "
+        "interview_completed_at, violation_count, violations_log, active_device_id"
     )
     if _is_postgres(db_target):
+        where = "WHERE hr_username = %s" if uname else ""
         with _connect_postgres(str(db_target)) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     f"""
                     SELECT {cols}
                     FROM interview_schedule
-                    WHERE hr_username = %s
+                    {where}
                     ORDER BY scheduled_at_local DESC NULLS LAST, created_at_ist DESC
                     """,
-                    (uname,),
+                    (uname,) if uname else (),
                 )
                 rows = cur.fetchall()
         return [dict(row) for row in rows]
+    where = "WHERE hr_username = ?" if uname else ""
+    params = (uname,) if uname else ()
     with _connect_sqlite(Path(db_target)) as conn:
         try:
             rows = conn.execute(
                 f"""
                 SELECT {cols}
                 FROM interview_schedule
-                WHERE hr_username = ?
+                {where}
                 ORDER BY scheduled_at_local DESC, created_at_ist DESC
                 """,
-                (uname,),
+                params,
             ).fetchall()
         except Exception:
             rows = conn.execute(
-                """
-                SELECT id, invite_token, status, notes, created_at_ist, candidate_name, candidate_email, scheduled_at_local, session_status,
-                       violation_count, violations_log
+                f"""
+                SELECT id, invite_token, hr_username, status, notes, created_at_ist, candidate_name, candidate_email,
+                       scheduled_at_local, session_status, violation_count, violations_log
                 FROM interview_schedule
-                WHERE hr_username = ?
+                {where}
                 ORDER BY created_at_ist DESC
                 """,
-                (uname,),
+                params,
             ).fetchall()
     return [dict(row) for row in rows]
 

@@ -171,6 +171,13 @@ def ensure_sourcing_profile(db: Session, resume: Resume, requirement: Requiremen
             if profile is not None:
                 return profile
             candidate = db.get(Candidate, resume.candidate_id)
+            # The TA who brought the candidate in owns the candidate record
+            # too (0101) — only the first profile stamps it.
+            if candidate is not None and getattr(candidate, "created_by_id", None) is None \
+                    and getattr(ta_user, "id", None):
+                candidate.created_by_id = ta_user.id
+                candidate.created_by_name = (getattr(ta_user, "full_name", None)
+                                             or getattr(ta_user, "username", None))
             profile = CandidateProfile(
                 candidate_id=resume.candidate_id,
                 opportunity_id=requirement.opportunity_id,

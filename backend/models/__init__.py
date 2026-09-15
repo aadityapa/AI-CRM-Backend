@@ -38,7 +38,8 @@ from models.timesheets import (  # noqa: F401
     TimesheetAttachment, TimesheetEntry, TimesheetStatus,
 )
 from models.finance import (  # noqa: F401
-    CreditNote, CreditNoteLine, CustomerReceipt, Invoice, InvoiceLine, InvoicePayment, PaymentStatus, POActivityLog,
+    CompanyBankAccount, CreditNote, CreditNoteLine, CustomerReceipt, Invoice, InvoiceLine, InvoicePayment, InvoiceRevision,
+    InvoiceRevisionStatus, PaymentStatus, POActivityLog,
     POProjectAllocation, POStatus, POType, PurchaseOrder, TdsPayment, TdsRecord, TdsStatus,
 )
 from models.hr import (  # noqa: F401
@@ -53,6 +54,7 @@ from models.email_outbox import EmailOutbox, EmailStatus  # noqa: F401
 from models.notify_routes import ActionPermission, NotificationRoute, UserNotifyPref  # noqa: F401
 from models.ai_links import AiInterviewLink  # noqa: F401
 from models.scheduling import CandidateOutreach, InterviewEvent, InterviewSlot, SlotBooking  # noqa: F401
+from models.support import SupportTicket, SupportTicketMessage, TicketPriority, TicketStatus, TICKET_CATEGORIES  # noqa: F401
 from models.template_requests import TemplateRequest, TemplateRequestStatus  # noqa: F401
 from models.access_templates import AccessTemplate  # noqa: F401
 from models.user_profiles import UserProfile  # noqa: F401

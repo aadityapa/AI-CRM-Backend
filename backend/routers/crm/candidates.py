@@ -4,6 +4,8 @@ Write access: TA / RMG / Sales / HR (Admin implicit). Reads: any CRM role.
 """
 from __future__ import annotations
 
+from datetime import date
+
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func, select
@@ -50,9 +52,25 @@ def list_candidates(pp: PageParams = Depends(page_params),
                     skill_id: int | None = None,
                     technical_domain: str | None = None,
                     has_cv: bool | None = None,
+                    created_by_id: str | None = None,
+                    created_from: date | None = None,
+                    created_to: date | None = None,
                     db: Session = Depends(get_crm_db),
                     user: CurrentUser = Depends(any_crm_role)):
     stmt = select(Candidate)
+    # TA + date filters (11 Sep 2026, user request). created_by_id takes one
+    # id or a CSV — the dropdown merges duplicate user accounts by name.
+    if created_by_id and str(created_by_id).strip():
+        try:
+            ids = [int(x) for x in str(created_by_id).split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="created_by_id must be an id or a comma-separated list")
+        if ids:
+            stmt = stmt.where(Candidate.created_by_id.in_(ids))
+    if created_from is not None:
+        stmt = stmt.where(sa.func.date(Candidate.created_at) >= created_from)
+    if created_to is not None:
+        stmt = stmt.where(sa.func.date(Candidate.created_at) <= created_to)
     if pp.search:
         # Full-name aware: "anand kumar" matches first_name + last_name together.
         stmt = stmt.where(candidate_search_clause(pp.search))
@@ -517,10 +535,33 @@ def create_candidate(payload: CandidateCreate,
                             detail=f"A candidate with email '{payload.email}' already exists")
     _reject_impossible_ctc(payload.model_dump())
     candidate = Candidate(**payload.model_dump())
+    candidate.created_by_id = user.id
+    candidate.created_by_name = user.full_name or user.username
     db.add(candidate)
     db.commit()
     db.refresh(candidate)
     return envelope(data=candidate_to_dict(candidate), message="Candidate created")
+
+
+@router.get("/creators")
+def candidate_creator_options(db: Session = Depends(get_crm_db),
+                              user: CurrentUser = Depends(any_crm_role)):
+    """Who has added candidates — the Candidates tab "Added by" filter.
+    Merged by NAME (one person can own two user accounts), ids as CSV."""
+    rows = db.execute(
+        select(Candidate.created_by_id, Candidate.created_by_name)
+        .where(Candidate.created_by_id.isnot(None)).distinct()
+    ).all()
+    by_name: dict[str, dict] = {}
+    for uid, name in rows:
+        label = (name or "").strip() or f"user:{uid}"
+        key = label.lower()
+        entry = by_name.setdefault(key, {"ids": [], "name": label})
+        entry["ids"].append(uid)
+    return envelope(data=sorted(
+        ({"id": ",".join(str(i) for i in sorted(e["ids"])), "name": e["name"]} for e in by_name.values()),
+        key=lambda r: r["name"].lower(),
+    ))
 
 
 @router.get("/{candidate_id}")

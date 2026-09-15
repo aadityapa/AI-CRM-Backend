@@ -20,6 +20,7 @@ from models import (
 from schemas.common import envelope
 from schemas.leave import apply_leave_expire_timing_consistency
 from schemas.projects import (
+    ProjectEmployeeCarryForwardIn,
     CommMatrixIn, ProjectCreate, ProjectEmployeeIn, ProjectEmployeeLeaveDetailUpdate,
     ProjectEmployeeRateIn, ProjectEmployeeRateUpdate, ProjectEmployeeUpdate,
     ProjectLeavePolicyCreate, ProjectLeavePolicyUpdate, ProjectUpdate,
@@ -363,6 +364,29 @@ def get_project_employee_detail(
     return envelope(data=project_employee_detail_out(db, pe))
 
 
+def backfill_pe_leave_credit_from_onboarding(db: Session, pe) -> dict:
+    """Replay the monthly leave credit for one PE from its onboarding month to
+    the current month (idempotent per `pe_credit:{pe}:{type}:{YYYY-MM}`)."""
+    from services.project_employee_leave_credit import run_pe_leave_credit, run_pe_leave_credit_backfill
+    today = date.today()
+    start = pe.onboarding_date or today
+    periods: list[str] = []
+    y, m = start.year, start.month
+    while (y, m) < (today.year, today.month):
+        periods.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+    out = {"periods": periods, "months": 0}
+    if periods:
+        res = run_pe_leave_credit_backfill(db, periods=periods, pe_id=pe.id)
+        out["months"] = len(periods)
+        out["rows_credited"] = res.get("rows_credited")
+    run_pe_leave_credit(db, today, pe_id=pe.id)
+    db.commit()
+    return out
+
+
 @router.post("/employees/{pe_id}/leave/sync")
 def sync_project_employee_leave_policies(
     pe_id: int,
@@ -376,6 +400,15 @@ def sync_project_employee_leave_policies(
     pe = get_pe_or_404(db, pe_id)
     result = sync_pe_leave_from_customer_policy(db, pe)
     db.commit()
+    # Repair (11 Sep 2026): reverse monthly credits wrongly written on Comp-Off rows.
+    from services.project_employee_leave_credit import repair_comp_off_over_credit
+    reversed_amt = repair_comp_off_over_credit(db, pe)
+    db.commit()
+    # Catch-up credit (11 Sep 2026, user report: an employee onboarded in
+    # January showed 0 leave in September). Replay every closed month from
+    # onboarding to last month for THIS employee, then the current month —
+    # idempotent per period, so re-syncing never double-credits.
+    credited = backfill_pe_leave_credit_from_onboarding(db, pe)
     detail = project_employee_detail_out(db, pe)
     added_names = [a.get("leave_type_name") or f"#{a.get('leave_type_id')}" for a in result["added"]]
     msg = (
@@ -383,6 +416,11 @@ def sync_project_employee_leave_policies(
         if result["added_count"]
         else "Leave policies already in sync — nothing to add"
     )
+    if credited.get("periods"):
+        msg += f"; credited {credited['months']} month(s) ({credited['periods'][0]} → {credited['periods'][-1]})"
+    if reversed_amt and float(reversed_amt) > 0:
+        msg += f"; reversed {float(reversed_amt):g} wrongly auto-credited Comp-Off day(s)"
+    result = {**result, "credit_backfill": credited}
     return envelope(
         data={
             **result,
@@ -555,6 +593,37 @@ def update_pe_leave_detail(
         data=leave_detail_out(row, policy=policy),
         message="Leave detail updated",
     )
+
+@router.post("/employees/{pe_id}/leave/{leave_id}/carry-forward")
+def set_pe_leave_carry_forward(
+    pe_id: int,
+    leave_id: int,
+    body: ProjectEmployeeCarryForwardIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write("project-employees", "HR", "Sales_Head")),
+):
+    """Previous-year carry-forward for one PE leave row (15 Sep 2026).
+
+    Books the figure as a Carry_Forward ledger event and moves the balance;
+    re-posting the same year replaces the earlier figure (delta only)."""
+    from services.project_employees import set_pe_carry_forward
+
+    pe = get_pe_or_404(db, pe_id)
+    row = db.get(ProjectEmployeeLeaveDetail, leave_id)
+    if not row or row.project_employee_id != pe_id:
+        raise HTTPException(status_code=404, detail="Leave detail not found")
+    if body.from_year >= date.today().year:
+        raise HTTPException(status_code=400, detail="Carry forward must come from a previous year")
+    result = set_pe_carry_forward(db, pe, row, from_year=body.from_year, days=body.days,
+                                  note=body.note, actor=getattr(user, "username", None))
+    db.commit()
+    db.refresh(row)
+    policy = (db.get(CustomerLeavePolicy, row.customer_leave_policy_id)
+              if row.customer_leave_policy_id else None)
+    msg = (f"Carry forward from {body.from_year} set to {float(body.days):g} day(s)"
+           if result["changed"] else "Carry forward unchanged")
+    return envelope(data={**leave_detail_out(row, policy=policy), "carry_forward": result}, message=msg)
+
 
 @router.get("/employees/{pe_id}/rates")
 def list_pe_rates(
@@ -979,6 +1048,12 @@ def add_project_employee(
     seed_leave_details_from_customer_policy(db, pe, project)
     add_history_entry(db, project.id, employee, body.onboarding_date)
     db.commit()
+    # A back-dated onboarding (11 Sep 2026) credits the months already gone by
+    # right away instead of waiting for the nightly repair job.
+    try:
+        backfill_pe_leave_credit_from_onboarding(db, pe)
+    except Exception:
+        db.rollback()
     db.refresh(pe)
     return envelope(data=project_employee_out(pe, employee), message="Employee assigned to project")
 

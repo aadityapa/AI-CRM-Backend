@@ -16,7 +16,7 @@ from crm_deps import (  # noqa: F401 - gated_write kept for other endpoints
     page_params, require_access,
 )
 from models import (
-    AttendanceStatus, Employee, EntryLocation, Invoice, InvoiceLine, PaymentStatus,
+    AttendanceStatus, Customer, Employee, EntryLocation, Invoice, InvoiceLine, PaymentStatus,
     POProjectAllocation, POStatus, Project,
     ProjectEmployee, PurchaseOrder, Timesheet, TimesheetActivityLog, TimesheetAttachment,
     TimesheetEntry, TimesheetStatus,
@@ -275,11 +275,19 @@ def list_timesheets(
     from services.timesheets import employee_display_name
     emp_names = {e.id: employee_display_name(e) for e in db.execute(
         select(Employee).where(Employee.id.in_(emp_ids))).scalars().all()} if emp_ids else {}
-    proj_names = dict(db.execute(
-        select(Project.id, Project.name).where(Project.id.in_(proj_ids))).all()) if proj_ids else {}
+    proj_rows = db.execute(
+        select(Project.id, Project.name, Project.customer_id, Customer.name)
+        .join(Customer, Customer.id == Project.customer_id, isouter=True)
+        .where(Project.id.in_(proj_ids))).all() if proj_ids else []
+    proj_names = {pid: name for pid, name, _, _ in proj_rows}
+    # Customer on every row (14 Sep 2026): the Projects hub groups the tab by customer.
+    proj_cust = {pid: (cid, cname) for pid, _, cid, cname in proj_rows}
     for r in rows:
         r["employee_name"] = emp_names.get(r.get("employee_id"))
         r["project_name"] = proj_names.get(r.get("project_id"))
+        cid, cname = proj_cust.get(r.get("project_id"), (None, None))
+        r["customer_id"] = cid
+        r["customer_name"] = cname
     return envelope(data=rows, meta=meta)
 
 
@@ -1063,6 +1071,53 @@ def submit_timesheet(
     return envelope(data=timesheet_out(ts), message="Timesheet submitted")
 
 
+@router.post("/{timesheet_id}/recalculate")
+def recalculate_timesheet(
+    timesheet_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write_action("timesheet.approve", "timesheets", "RMG", "Sales")),
+):
+    """Re-freeze an APPROVED, not-yet-invoiced sheet against the CURRENT policy
+    (11 Sep 2026, user request). Approval freezes the figures (0075), so fixing
+    a branch policy — e.g. unticking Weekoff Billable — did not reach sheets
+    already approved. This re-runs the same computation and freeze; comp-off
+    accrual and leave consumption are re-applied as deltas. An invoiced sheet
+    is refused: change the invoice through a change request instead."""
+    ts = get_timesheet_or_404(db, timesheet_id)
+    if ts.status != TimesheetStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="Only Approved timesheets can be recalculated")
+    linked = linked_invoice_for(db, ts)
+    if linked is not None:
+        raise HTTPException(status_code=409, detail=(
+            f"Invoice {linked.invoice_number} was generated from this sheet — request a change on the "
+            f"invoice instead (or undo the invoice first)"))
+    entries = db.execute(
+        select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
+        .order_by(TimesheetEntry.entry_date)
+    ).scalars().all()
+    before = (ts.approved_figures or {}).get("totals", {}).get("sub_total")
+    earned = accrue_comp_off(db, ts, entries)
+    consume_timesheet_leaves(db, ts, entries)
+    import json as _json
+    _snap = timesheet_invoice_preview(db, ts, entries)
+    ts.approved_figures = _json.loads(_json.dumps({
+        "frozen_at": datetime.now(timezone.utc).isoformat(),
+        "line_items": _snap["line_items"],
+        "totals": {"sub_total": _snap["totals"]["sub_total"]},
+        "summary": timesheet_summary(db, ts, entries),
+        "recalculated_by": user.id,
+    }, default=str))
+    after = _snap["totals"]["sub_total"]
+    log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_RECALCULATED",
+                 f"Figures recalculated against the current billing policy: sub-total "
+                 f"{float(before or 0):,.2f} → {float(after or 0):,.2f}"
+                 + (f"; comp-off delta {float(earned):g} day(s)" if earned and float(earned) else ""))
+    db.commit()
+    return envelope(data={"sub_total_before": before, "sub_total_after": after,
+                          "line_items": _snap["line_items"]},
+                    message=f"Recalculated — sub-total {float(before or 0):,.2f} → {float(after or 0):,.2f}")
+
+
 @router.post("/{timesheet_id}/approve")
 def approve_timesheet(
     timesheet_id: int,
@@ -1751,7 +1806,10 @@ def generate_invoice_from_timesheet(
         if m:
             credit_days = max(0, min(int(m.group(1)), 365))
     from datetime import timedelta as _td
-    invoice_number = next_sequence_number(db, Invoice, Invoice.invoice_number, "INV")
+    invoice_number = (getattr(body, "invoice_number", None) or "").strip() \
+        or next_sequence_number(db, Invoice, Invoice.invoice_number, "INV")
+    from services.finance import ensure_unique_invoice_number
+    ensure_unique_invoice_number(db, invoice_number)
     invoice = Invoice(
         invoice_number=invoice_number,
         po_id=po.id if po is not None else None,

@@ -23,3 +23,9 @@ _to_delete/
 # Bulk archives of exported candidate data and rotated logs. Local only -
 # same PII reasoning as logs/openai-prompts/ and data/*.tmp above.
 _archive/
+
+# Full data backups (Settings ▸ Backup) — PII, never commit
+backend/data/backups/
+# Camera snapshots attached to interview integrity events — candidate PII
+backend/data/integrity_evidence/
+data/integrity_evidence/

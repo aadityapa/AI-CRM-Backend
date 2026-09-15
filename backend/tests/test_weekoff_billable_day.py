@@ -48,10 +48,14 @@ def test_unworked_weekoff_bills_nothing_when_flag_off():
     assert _weekoff(_policy(comp_off_billable=True)) == (Decimal("0"), Decimal("0"))
 
 
-def test_worked_weekoff_still_bills_actual_hours():
+def test_worked_weekoff_bills_the_flat_day_unless_comp_off_billable():
+    # 11 Sep 2026: Week Off Billable covers the DAY; the extra hours are billed
+    # only when Comp Off Billable is on (else the employee earns comp-off).
     bh, bd = _weekoff(_policy(week_off_billable=True), hours=6)
-    assert float(bh) == 6.0
-    assert float(bd) == 0.5  # 6h is above the half-day, below the full-day threshold
+    assert float(bd) == 1.0 and float(bh) > 0
+    bh2, bd2 = _weekoff(_policy(week_off_billable=True, comp_off_billable=True), hours=6)
+    assert float(bh2) == 6.0
+    assert float(bd2) == 0.5  # 6h is above the half-day, below the full-day threshold
 
 
 def test_symmetry_with_unworked_holiday():

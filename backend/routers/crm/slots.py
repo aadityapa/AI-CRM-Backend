@@ -56,11 +56,7 @@ def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-try:
-    from zoneinfo import ZoneInfo
-    _DISPLAY_TZ = ZoneInfo("Asia/Kolkata")
-except Exception:  # tzdata missing on a bare Windows install
-    _DISPLAY_TZ = timezone.utc
+from services.ist import IST as _DISPLAY_TZ  # fixed +05:30 fallback, never UTC (14 Sep 2026)
 
 
 def _from_ist(dt: datetime) -> datetime:
@@ -671,7 +667,7 @@ def confirm_booking(
     # same rendering every candidate-facing "When:" uses.
     slot_local = _as_utc(slot.slot_at).astimezone(_DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
     bridge = schedule_l1_interview(db, candidate, req, profile, resume=resume, scheduled_by=None,
-                                   scheduled_at_local=slot_local)
+                                   scheduled_at_local=slot_local, request=request)
     if not bridge.get("scheduled"):
         raise HTTPException(status_code=502,
                             detail=f"AI interview scheduling failed: {bridge.get('error')}")

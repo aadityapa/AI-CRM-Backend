@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -768,7 +769,29 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
         stmt = stmt.where(Invoice.invoice_number.ilike(f"%{pp.search}%"))
     stmt = stmt.order_by(Invoice.id.desc())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
-    return envelope([serialize_invoice(inv) for inv in items], meta=meta)
+    rows = [serialize_invoice(inv) for inv in items]
+    # Customer on every LIST row (14 Sep 2026): the Projects hub groups the
+    # tab by customer. One batched query for the page — via the PO when the
+    # invoice has one (the billed party), else the project's customer.
+    proj_ids = {inv.project_id for inv in items if inv.project_id}
+    proj_cust = dict(db.execute(select(Project.id, Project.customer_id)
+                                .where(Project.id.in_(proj_ids))).all()) if proj_ids else {}
+    cust_ids = {inv.po.customer_id for inv in items if inv.po is not None and inv.po.customer_id} | set(proj_cust.values())
+    cust_names = dict(db.execute(select(Customer.id, sa.func.coalesce(Customer.legal_entity_name, Customer.name))
+                                 .where(Customer.id.in_(cust_ids))).all()) if cust_ids else {}
+    for inv, r in zip(items, rows):
+        cid = (inv.po.customer_id if inv.po is not None and inv.po.customer_id else proj_cust.get(inv.project_id))
+        r["customer_id"] = cid
+        r["customer_name"] = cust_names.get(cid)
+    return envelope(data=rows, meta=meta)
+
+
+# Literal BEFORE the parametric sibling — otherwise 'next-number' binds as invoice_id.
+@router.get("/invoices/next-number")
+def next_invoice_number(db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
+    """The number the next generated invoice would get (INV-YYYY-NNN) — shown
+    prefilled in the Generate dialog so the reviewer can keep or change it."""
+    return envelope({"invoice_number": next_sequence_number(db, Invoice, Invoice.invoice_number, "INV")})
 
 
 @router.get("/invoices/{invoice_id}")
@@ -795,6 +818,21 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
     for field in ("invoice_date", "due_date"):
         if field in data:
             setattr(invoice, field, data[field])
+    # Invoice number is editable (11 Sep 2026, user request) — the customer's
+    # numbering scheme sometimes has to win over INV-YYYY-NNN. Unique across
+    # invoices; blank keeps the current number.
+    # Header edits after generation go through the change-request workflow
+    # (routers/crm/invoice_revisions.py) — reason, approval, history,
+    # notifications. Direct PUT stays for Admin/CEO only.
+    if not user.is_admin and any(k in data for k in ("invoice_number", "invoice_date", "due_date")):
+        raise HTTPException(status_code=403, detail=(
+            "Generated invoices are changed through a change request (Edit → give a reason) so the "
+            "change is approved and kept in the invoice history"))
+    if "invoice_number" in data and data["invoice_number"] is not None:
+        new_no = str(data["invoice_number"]).strip()
+        if new_no and new_no != invoice.invoice_number:
+            ensure_unique_invoice_number(db, new_no)
+            invoice.invoice_number = new_no
     # Prefer model_fields_set so an explicit null/blank clear is never dropped.
     if "buyer_state_code" in body.model_fields_set or "buyer_state_code" in data:
         invoice.buyer_state_code = normalize_buyer_state_code_input(

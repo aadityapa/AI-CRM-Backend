@@ -99,7 +99,7 @@ def project_leave_policy_out(db: Session, p) -> dict:
         "leave_expire": p.leave_expire,
         "leave_expire_timing": getattr(p, "leave_expire_timing", None),
         "is_max_limit": bool(p.is_max_limit),
-        "maximum_carry_forward": int(p.maximum_carry_forward or 0),
+        "maximum_carry_forward": (int(p.maximum_carry_forward) if p.maximum_carry_forward is not None else None),
         "effective_date": p.effective_date.isoformat() if p.effective_date else None,
         "is_active": bool(getattr(p, "is_active", True)),
         "created_at": created.isoformat() if created else None,
@@ -169,6 +169,27 @@ def project_detail_out(db: Session, p: Project) -> dict:
     data["branch_id"] = branch.id if branch else None
     data["branch_name"] = branch.branch_name if branch else None
     data["branch_unlinked"] = bool(branch is None and foreign)
+    # Effective policy (11 Sep 2026): the Overview used to print "—" for every
+    # cap the project itself left NULL, hiding the branch/customer values the
+    # timesheet engine actually bills with.
+    from services.branch_policy import resolve_branch_project_policy
+    rp = resolve_branch_project_policy(p, branch)
+    ep = effective_billing_policy(db, p, branch=branch)
+    data["effective_policy"] = {
+        "holidays_billable": bool(ep.holidays_billable),
+        "weekoff_billable": bool(ep.week_off_billable),
+        "leave_billable": bool(ep.leave_billable),
+        "comp_off_billable": bool(ep.comp_off_billable),
+        "hours_required_half_day": _num(ep.min_hours_half_day),
+        "hours_required_full_day": _num(ep.min_hours_full_day),
+        "working_hours_per_day": _num(rp.working_hours_per_day),
+        "is_max_billable_hours_per_day": bool(rp.is_max_billable_hours_per_day),
+        "max_billable_hours_per_day": _num(rp.max_billable_hours_per_day),
+        "is_max_billable_hours_per_month": bool(rp.is_max_billable_hours_per_month),
+        "max_billable_hours_per_month": _num(rp.max_billable_hours_per_month),
+        "is_max_billable_days_per_month": bool(rp.is_max_billable_days_per_month),
+        "max_billable_days_per_month": _num(rp.max_billable_days_per_month),
+    }
     data["branch_link_message"] = (
         "Branch not linked to this customer" if data["branch_unlinked"] else None
     )

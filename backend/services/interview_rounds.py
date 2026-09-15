@@ -17,11 +17,7 @@ from sqlalchemy.orm import Session
 
 from models import Employee, InterviewEvent
 
-try:
-    from zoneinfo import ZoneInfo
-    _IST = ZoneInfo("Asia/Kolkata")
-except Exception:  # tzdata missing on a bare Windows install
-    _IST = timezone.utc
+from services.ist import IST as _IST  # fixed +05:30 fallback, never UTC (14 Sep 2026)
 
 
 def read_as_ist(dt: datetime | None) -> datetime | None:
@@ -272,7 +268,11 @@ def validate_round(db: Session, payload, *, partial: bool = False,
     if not partial or "scheduled_at" in given:
         data["scheduled_at"] = read_as_ist(payload.scheduled_at)
         # raw_when keeps the wall-clock text the TA typed (IST), for display.
-        data["raw_when"] = (payload.scheduled_at.strftime("%Y-%m-%d %H:%M")
+        # The form sends an ISO UTC instant, so convert to IST first — a bare
+        # strftime on the aware value printed the UTC clock, 5h30 early
+        # (14 Sep 2026).
+        from services.ist import ist_naive
+        data["raw_when"] = (ist_naive(payload.scheduled_at).strftime("%Y-%m-%d %H:%M")
                             if payload.scheduled_at else None)
     if not partial or "feedback" in given:
         data["feedback"] = (payload.feedback or "").strip() or None

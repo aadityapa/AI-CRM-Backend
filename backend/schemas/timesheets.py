@@ -28,6 +28,9 @@ class GenerateInvoiceIn(BaseModel):
     """
 
     po_id: int | None = None
+    #: Invoice number typed in the Generate dialog (11 Sep 2026); blank = the
+    #: next INV-YYYY-NNN. Must be unique.
+    invoice_number: str | None = Field(default=None, max_length=64)
     #: Reviewer-verified calculation (the editable preview in the Generate
     #: dialog). When set, they replace the computed qty/rate for the single
     #: line and the amount becomes qty × rate. None = computed values.

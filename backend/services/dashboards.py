@@ -831,6 +831,36 @@ def my_work(db: Session, user) -> dict:
                 CandidateProfile.pipeline_status == PipelineStatus.CUSTOMER_APPROVAL)),
             "candidates await your final sign-off", "profiles", "warning")
 
+    # RMG screening decisions (the AI L1 gate) — 14 Sep 2026 dashboard redesign.
+    if allowed("profiles", "RMG"):
+        add("rmg_screening_pending",
+            count(select(CandidateProfile.id).where(CandidateProfile.rmg_screening_status == "Pending")),
+            "applicants waiting for your Shortlist / Reject", "profiles", "warning")
+
+    # Sales: profiles the customer has held too long — chase feedback.
+    if allowed("profiles", "Sales"):
+        from services.dashboard_desk import CUSTOMER_WAIT_DAYS, _CUSTOMER_WAIT_STATUSES
+        add("customer_feedback_to_chase",
+            count(select(CandidateProfile.id).where(
+                CandidateProfile.pipeline_status.in_(_CUSTOMER_WAIT_STATUSES),
+                CandidateProfile.updated_at <= sa.func.now() - timedelta(days=CUSTOMER_WAIT_DAYS))),
+            f"profiles with the customer for more than {CUSTOMER_WAIT_DAYS} days — chase feedback",
+            "profiles")
+
+    # Finance: approved timesheets nobody has invoiced yet.
+    if allowed("invoices", "Finance"):
+        invoiced = select(Invoice.id).where(Invoice.timesheet_id == Timesheet.id).exists()
+        add("timesheets_to_invoice",
+            count(select(Timesheet.id).where(Timesheet.status == TimesheetStatus.APPROVED, ~invoiced)),
+            "approved timesheets are ready to invoice", "timesheets")
+
+    # HR: accepted offers still in pre-boarding — joining is coming.
+    if allowed("profiles", "HR"):
+        add("preboarding_open",
+            count(select(CandidateProfile.id).where(
+                CandidateProfile.pipeline_status == PipelineStatus.PREBOARDING)),
+            "candidates in pre-boarding (Emp ID, mailbox, joining date)", "profiles")
+
     # Danger first, then warning, then the rest — the eye reads top-down.
     rank = {"danger": 0, "warning": 1, "normal": 2}
     items.sort(key=lambda x: (rank.get(x["urgency"], 9), -x["count"]))

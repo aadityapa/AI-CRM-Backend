@@ -434,6 +434,11 @@ def test_weekend_work_covers_lop(db):
     from services.timesheets import timesheet_invoice_preview, timesheet_summary
 
     ts = _seed_sheet(db, onboarding=date(2026, 1, 1))  # leave_billable, credit mode
+    # OPT-IN since 11 Sep 2026 (0102): automatic cover is a customer choice.
+    from models import CustomerBillingPolicy
+    for pol in db.query(CustomerBillingPolicy).all():
+        pol.comp_off_covers_lop = True
+    db.commit()
     # One Absent working day → 1.0 raw LOP.
     mon = db.execute(
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id,
@@ -619,3 +624,28 @@ def test_customer_hours_cap_shows_on_summary_and_credits_comp_off(db):
     db.flush()
     s = timesheet_summary(db, ts, entries)
     assert s["total_billable_hours"] == 160.0 and s["comp_off_from_cap"] == 0.0
+
+
+def test_weekend_work_does_not_cover_lop_by_default(db):
+    """11 Sep 2026 (user decision): with comp_off_covers_lop OFF the LOP stays
+    visible and the weekend day credits comp-off in full — the manager applies
+    the leave they want on the LOP row instead."""
+    from decimal import Decimal as D
+
+    from models import AttendanceStatus, TimesheetEntry
+    from services.timesheets import timesheet_summary
+
+    ts = _seed_sheet(db, onboarding=date(2026, 1, 1))
+    mon = db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id,
+                                                  TimesheetEntry.entry_date == date(2026, 2, 2))).scalars().one()
+    mon.hours_worked = D("0"); mon.attendance_status = AttendanceStatus.ABSENT
+    mon.billable_hours = D("0"); mon.billable_days = D("0")
+    sat = db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id,
+                                                  TimesheetEntry.entry_date == date(2026, 2, 7))).scalars().one()
+    sat.hours_worked = D("8"); sat.attendance_status = AttendanceStatus.WEEK_OFF
+    db.commit()
+    entries = db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)).scalars().all()
+    summary = timesheet_summary(db, ts, entries)
+    assert summary["total_loss_of_pay_days"] == 1.0
+    assert summary["lop_covered_days"] == 0.0
+    assert summary["comp_off_earned"] == 1.0

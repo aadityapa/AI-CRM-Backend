@@ -260,23 +260,26 @@ def test_weekend_half_day_comp_off_when_not_billable():
     assert comp_off_billed(entries, policy) == ZERO
 
 
-def test_week_off_billable_flag_bills_worked_weekend():
-    """ISSUE-1: week_off_billable ON bills weekend work even when comp_off_billable OFF."""
+def test_week_off_billable_flag_bills_the_day_not_the_extra_work():
+    """11 Sep 2026 (CEO decision, supersedes ISSUE-1): Week Off Billable bills
+    the DAY (calendar month); worked weekend hours are extra only when Comp Off
+    Billable — otherwise the employee earns comp-off and the day bills what an
+    unworked week-off would."""
     proj = _project()
     policy = _policy(week_off_billable=True, comp_off_billable=False)
     bh, bd = compute_billables(
         is_working=False,
-        hours_worked=D("8"),
+        hours_worked=D("9.5"),
         attendance_status=AttendanceStatus.WEEK_OFF,
         leave_period=None,
         project=proj,
         policy=policy,
     )
-    assert bh == D("8") and bd == ONE
+    assert bh == D(str(policy.min_hours_full_day)) and bd == ONE
     saturday = date(2026, 6, 6)
     entries = [_entry(entry_date=saturday, hours=D("8"))]
-    assert comp_off_earned(entries, policy) == ZERO
-    assert comp_off_billed(entries, policy) == ONE
+    assert comp_off_earned(entries, policy) == ONE
+    assert comp_off_billed(entries, policy) == ZERO
 
 
 def test_holiday_work_bills_when_comp_off_billable():
@@ -389,13 +392,16 @@ def test_weekday_present_never_earns_or_bills_comp_off():
 # Legacy names kept as aliases of the new behaviour (comp_off_billable gating).
 
 
-def test_weekend_work_no_comp_off_when_week_off_billable():
-    """week_off_billable ON → billed; earned = 0 (bill XOR credit)."""
+def test_weekend_work_earns_comp_off_even_when_week_off_billable():
+    """Week Off Billable no longer suppresses the credit — only Comp Off Billable does."""
     saturday = date(2026, 6, 6)
     policy = _policy(week_off_billable=True, comp_off_billable=False)
     entries = [_entry(entry_date=saturday, hours=D("8"))]
-    assert comp_off_earned(entries, policy) == ZERO
-    assert comp_off_billed(entries, policy) == ONE
+    assert comp_off_earned(entries, policy) == ONE
+    assert comp_off_billed(entries, policy) == ZERO
+    billed = _policy(week_off_billable=True, comp_off_billable=True)
+    assert comp_off_earned(entries, billed) == ZERO
+    assert comp_off_billed(entries, billed) == ONE
 
 
 def test_weekend_work_earns_comp_off_when_week_off_not_billable():
@@ -405,8 +411,8 @@ def test_weekend_work_earns_comp_off_when_week_off_not_billable():
     assert comp_off_earned(entries, policy) == ONE
 
 
-def test_holiday_work_no_comp_off_when_holidays_billable():
-    """Holiday hours > 0 + holidays_billable → billed; no credit (even if comp_off off)."""
+def test_holiday_work_earns_comp_off_even_when_holidays_billable():
+    """Holidays Billable bills the holiday itself; worked hours credit comp-off unless Comp Off Billable."""
     policy = _policy(holidays_billable=True, comp_off_billable=False)
     entries = [_entry(
         entry_date=date(2026, 6, 15),
@@ -414,8 +420,8 @@ def test_holiday_work_no_comp_off_when_holidays_billable():
         attendance=AttendanceStatus.HOLIDAY,
         day_type=DayType.HOLIDAY,
     )]
-    assert comp_off_earned(entries, policy) == ZERO
-    assert comp_off_billed(entries, policy) == ONE
+    assert comp_off_earned(entries, policy) == ONE
+    assert comp_off_billed(entries, policy) == ZERO
 
 
 def test_holiday_work_earns_comp_off_when_holidays_not_billable():

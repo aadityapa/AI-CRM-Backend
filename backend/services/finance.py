@@ -919,13 +919,22 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
                     )
                 ).scalar_one_or_none()
                 if alloc is not None and alloc.hsn_sac:
-                    sac_code = alloc.hsn_sac
+                    from services.tax_invoice import effective_sac
+                    sac_code = effective_sac(alloc.hsn_sac)
             # PARITY with the Tax Invoice PDF: when no allocation-level HSN/SAC
             # exists, fall back to the standard service SAC the PDF prints —
             # the on-screen View Tax Invoice must never show less than the PDF.
             if not sac_code:
-                from services.tax_invoice import DEFAULT_SAC
-                sac_code = DEFAULT_SAC
+                from services.tax_invoice import default_sac
+                sac_code = default_sac()
+            # The ONE bank account for this customer (11 Sep 2026): the account
+            # Sales picked → default company account → invoice.bank_* settings.
+            from services.company_invoice_config import resolve_bank_details
+            data["bank"] = resolve_bank_details(db, customer_id)
+            # Billing breakdown (cost basis · days · leave · rate/day) from the
+            # figures frozen at approval — drives the reference column layout.
+            from services.tax_invoice import billing_breakdown_for_invoice
+            data["billing"] = billing_breakdown_for_invoice(db, invoice)
             billing_branch = resolve_billing_branch(
                 db, po=po, project=project, customer_id=customer_id,
             )
@@ -958,11 +967,18 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
             if _ts is not None:
                 ts_month = service_month_label(_ts.month, _ts.year)
         line_rows = []
-        for l in invoice.lines:
+        breakdown = data.get("billing")
+        for idx, l in enumerate(invoice.lines):
             row = serialize_invoice_line(l, sac_code=sac_code)
             emp = employee_from_line_description(l.description)
             mon = ts_month or month_from_line_description(l.description)
             row["description"] = tax_line_description(emp, mon)
+            if breakdown and idx == 0:
+                row["period_label"] = breakdown.get("period_label")
+                row["monthly_cost"] = breakdown.get("monthly_cost")
+                row["leave_days"] = breakdown.get("leave_days")
+                row["rate_per_day"] = breakdown.get("rate_per_day")
+                row["qty_days"] = breakdown.get("qty")
             line_rows.append(row)
         data["lines"] = line_rows
 

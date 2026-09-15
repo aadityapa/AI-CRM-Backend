@@ -231,7 +231,10 @@ FIELDS_BY_TAB: dict[str, dict[str, str]] = {
 # Sub-tab entries for detail pages that already have field catalogues.
 FIELDS_BY_TAB["profiles"].update({
     "tab:overview": "Sub-tab: Overview", "tab:interviews": "Sub-tab: Interviews",
-    "tab:skills": "Sub-tab: Skill Evaluation", "tab:offers": "Sub-tab: Offers",
+    "tab:skills": "Sub-tab: Skill Evaluation",
+    # "tab:offers" removed 15 Sep 2026 — the Offers tab is gone from the profile
+    # page (offer terms are captured inline in the Customer Approval move).
+    # _strip_removed_keys drops the key from any saved template on next save.
     "tab:activity": "Sub-tab: Activity Log", "tab:ai": "Sub-tab: AI Interview",
 })
 FIELDS_BY_TAB["opportunities"].update({

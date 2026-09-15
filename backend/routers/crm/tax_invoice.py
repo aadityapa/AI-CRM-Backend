@@ -109,6 +109,28 @@ def crm_tax_invoice_pdf(
     return _pdf_response(ti.render_pdf(tax_inv))
 
 
+@router.get("/api/invoices/{invoice_id}/tax-invoice.docx")
+def crm_tax_invoice_docx(
+    invoice_id: int,
+    request: Request,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(INV_READ),
+):
+    """The Tax Invoice as a Word document (11 Sep 2026) — same sections and
+    figures as the PDF, editable in Word."""
+    _ = user
+    from services.tax_invoice_docx import build_invoice_docx, docx_filename
+    invoice = get_invoice_or_404(db, invoice_id)
+    tax_inv = ti.map_crm_invoice_to_tax_invoice(
+        db, invoice, share_base_url=str(request.base_url).rstrip("/"))
+    content = build_invoice_docx(tax_inv)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{docx_filename(tax_inv)}"'},
+    )
+
+
 @router.get("/api/invoice/seller")
 def invoice_seller(user: CurrentUser = Depends(INV_READ)):
     """Fixed seller constants for the standalone generator form."""

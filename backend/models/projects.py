@@ -116,7 +116,9 @@ class ProjectLeavePolicy(Base):
     leave_credit_timing = sa.Column(sa.String(24), nullable=True)
     leave_expire_timing = sa.Column(sa.String(24), nullable=True)
     is_max_limit = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
-    maximum_carry_forward = sa.Column(sa.Integer, nullable=False, server_default="0")
+    #: Carry-forward cap at expiry (11 Sep 2026): 0 = lapse everything,
+    #: NULL = carry the whole remaining balance, N = carry up to N days.
+    maximum_carry_forward = sa.Column(sa.Integer, nullable=True, server_default="0")
     effective_date = sa.Column(sa.Date, nullable=True)
     is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)

@@ -44,6 +44,11 @@ class Candidate(Base, TimestampMixin):
     recruiter_email = sa.Column(sa.String(255), nullable=True)
     cv_original_filename = sa.Column(sa.String(255), nullable=True)
     source_created_date = sa.Column(sa.Date, nullable=True)
+    #: Who added the candidate (0101; `created_at` comes from TimestampMixin) —
+    #: the Candidates tab's TA / date filters. Stamped at creation; backfilled
+    #: from the earliest profile.
+    created_by_id = sa.Column(sa.Integer, nullable=True, index=True)
+    created_by_name = sa.Column(sa.String(255), nullable=True)
 
     education = relationship("CandidateEducation", back_populates="candidate", cascade="all, delete-orphan")
     experience = relationship("CandidateExperience", back_populates="candidate", cascade="all, delete-orphan")

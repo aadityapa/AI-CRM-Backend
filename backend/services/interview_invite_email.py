@@ -19,7 +19,6 @@ candidate can reply to the recruiter handling them rather than a shared inbox.
 from __future__ import annotations
 
 import os
-from datetime import datetime
 from html import escape
 
 # --------------------------------------------------------------- company block
@@ -108,15 +107,8 @@ def format_when(raw: str | None) -> str:
     Falls back to whatever the recruiter typed if it does not parse — a slightly
     odd date in the email beats an empty one.
     """
-    value = (raw or "").strip()
-    if not value:
-        return ""
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(value, fmt).strftime("%A, %d %B %Y at %H:%M")
-        except ValueError:
-            continue
-    return value
+    from services.ist import human_when
+    return human_when(raw)
 
 
 def _rows(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:

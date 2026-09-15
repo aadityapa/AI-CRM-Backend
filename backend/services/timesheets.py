@@ -55,6 +55,9 @@ class BillingPolicy:
     leave_billable: bool = False
     holidays_billable: bool = False
     comp_off_billable: bool = False
+    #: Weekend work automatically covers this month's LOP (customer-level,
+    #: 0102). Default OFF since 11 Sep 2026: the manager applies leave manually.
+    comp_off_covers_lop: bool = False
     min_hours_full_day: Decimal = Decimal("8.00")
     min_hours_half_day: Decimal = Decimal("4.00")
     #: Which weekdays are the week-off (0=Mon..6=Sun). Sat+Sun unless a
@@ -276,6 +279,7 @@ def effective_billing_policy(
             leave_billable=bool(row.leave_billable),
             holidays_billable=bool(row.holidays_billable),
             comp_off_billable=bool(getattr(row, "comp_off_billable", False)),
+            comp_off_covers_lop=bool(getattr(row, "comp_off_covers_lop", False)),
             min_hours_full_day=Decimal(row.min_hours_full_day),
             min_hours_half_day=Decimal(row.min_hours_half_day),
             week_off_days=parse_week_off_days(getattr(row, "week_off_days", None)) or (5, 6),
@@ -292,6 +296,7 @@ def effective_billing_policy(
             else bool(branch.holidays_billable),
             comp_off_billable=base.comp_off_billable if branch.comp_off_billable is None
             else bool(branch.comp_off_billable),
+            comp_off_covers_lop=base.comp_off_covers_lop,
             min_hours_full_day=base.min_hours_full_day if branch.hours_required_full_day is None
             else Decimal(branch.hours_required_full_day),
             min_hours_half_day=base.min_hours_half_day if branch.hours_required_half_day is None
@@ -309,6 +314,7 @@ def effective_billing_policy(
         else bool(project.holidays_billable),
         comp_off_billable=base.comp_off_billable if project.comp_off_billable is None
         else bool(project.comp_off_billable),
+        comp_off_covers_lop=base.comp_off_covers_lop,
         min_hours_full_day=base.min_hours_full_day if project.hours_required_full_day is None
         else Decimal(project.hours_required_full_day),
         min_hours_half_day=base.min_hours_half_day if project.hours_required_half_day is None
@@ -335,8 +341,23 @@ def default_hours_worked(
     from services.branch_policy import resolve_branch_project_policy
 
     resolved = resolve_branch_project_policy(project, branch)
-    if resolved.max_billable_hours_per_day is not None:
-        return Decimal(str(resolved.max_billable_hours_per_day))
+    # The customer's working day (11 Sep 2026, user report: a 9.5-hour
+    # customer's sheets pre-filled 8 h and every day read Half Day). Order:
+    # project/branch "Working Hours Per Day" → "Hours Required Full Day" →
+    # the max-hours cap → 8. Never above the cap when one is set.
+    candidates = []
+    for attr in ("working_hours_per_day", "hours_required_full_day"):
+        v = getattr(resolved, attr, None)
+        if v is not None and Decimal(str(v)) > 0:
+            candidates.append(Decimal(str(v)))
+    cap = resolved.max_billable_hours_per_day
+    if candidates:
+        hours = candidates[0]
+        if cap is not None and Decimal(str(cap)) > 0:
+            hours = min(hours, Decimal(str(cap)))
+        return hours
+    if cap is not None:
+        return Decimal(str(cap))
     return DEFAULT_WORKING_HOURS
 
 
@@ -593,6 +614,21 @@ def leave_billable_by_type_map(
     return out
 
 
+def _half_leave_billable(leave_type, policy: BillingPolicy,
+                         leave_billable_by_type: dict[str, bool] | None,
+                         paid_leave_days) -> tuple[Decimal, Decimal]:
+    """Billable (hours, days) of the LEAVE half of a half-day leave row."""
+    if is_loss_of_pay_name(leave_type):
+        return ZERO, ZERO
+    per_type = (leave_billable_by_type or {}).get((leave_type or "").strip())
+    is_leave_billable = per_type if per_type is not None else policy.leave_billable
+    if not is_leave_billable:
+        return ZERO, ZERO
+    if paid_leave_days is not None and Decimal(paid_leave_days or 0) <= ZERO:
+        return ZERO, ZERO
+    return Decimal(policy.min_hours_half_day), HALF
+
+
 def compute_billables(*, is_working: bool, hours_worked: Decimal,
                       attendance_status: AttendanceStatus,
                       leave_period: LeavePeriod | None,
@@ -607,35 +643,36 @@ def compute_billables(*, is_working: bool, hours_worked: Decimal,
     billable (excess Loss-of-Pay days contribute 0). Explicit Loss of Pay leave
     type is always non-billable.
 
-    Weekend / holiday *worked* hours (hours > 0) precedence (bill XOR credit):
-      1. ``week_off_billable`` / ``holidays_billable`` → bill as normal worked time
-      2. else ``comp_off_billable`` → bill as comp-off
-      3. else → not billed (comp-off leave credited elsewhere)
-    Pure holiday-off (0 hours) still uses ``holidays_billable`` only.
+    Weekend / holiday *worked* hours (hours > 0), since 11 Sep 2026:
+      * ``comp_off_billable`` → bill the worked hours (extra)
+      * else → the employee earns comp-off leave; the day bills only what an
+        unworked day would (a flat day when Week Off / Holidays Billable is on)
     """
     hours = Decimal(hours_worked or 0)
 
+    # DECISION (11 Sep 2026, CEO — supersedes ISSUE-1's precedence):
+    #   * Holidays / Week Off Billable answer ONE question only: does the
+    #     unworked day count in the billed month (calendar-month billing)?
+    #   * Comp Off Billable answers the OTHER: are hours WORKED on a
+    #     week-off/holiday billed (extra) — or credited as comp-off leave?
+    # A worked week-off on a "Week Off Billable" customer with Comp Off NOT
+    # billable therefore bills exactly what the unworked day would have (the
+    # flat day) and the employee earns comp-off; it is never paid twice.
     if attendance_status == AttendanceStatus.HOLIDAY:
-        # DECISION (ISSUE-1): holidays_billable > comp_off_billable > credit.
-        if hours > ZERO:
-            if policy.holidays_billable or policy.comp_off_billable:
-                bh = _capped_hours(hours, project)
-                return bh, _days_from_hours(hours, policy)
-            return ZERO, ZERO
-        # Pure holiday-off: bill a full day when Holidays Billable is ON.
+        if hours > ZERO and policy.comp_off_billable:
+            bh = _capped_hours(hours, project)
+            return bh, _days_from_hours(hours, policy)
         if policy.holidays_billable:
             return Decimal(policy.min_hours_full_day), ONE
         return ZERO, ZERO
 
     if not is_working:
-        # DECISION (ISSUE-1): week_off_billable > comp_off_billable > credit.
-        if hours > ZERO and (policy.week_off_billable or policy.comp_off_billable):
+        if hours > ZERO and policy.comp_off_billable:
             bh = _capped_hours(hours, project)
             return bh, _days_from_hours(hours, policy)
-        # Pure week-off (0 hours): Week Off Billable bills the day itself,
-        # exactly as Holidays Billable does for an unworked holiday. This is
-        # the calendar-month billing model — with both flags on, a 31-day
-        # month bills 31 days, not just the worked ones.
+        # Week Off Billable bills the day itself (worked or not) — the
+        # calendar-month model: with both flags on, a 31-day month bills 31
+        # days, not just the worked ones.
         if policy.week_off_billable:
             return Decimal(policy.min_hours_full_day), ONE
         return ZERO, ZERO
@@ -648,6 +685,18 @@ def compute_billables(*, is_working: bool, hours_worked: Decimal,
         return _capped_hours(hours, project), HALF
 
     if attendance_status == AttendanceStatus.LEAVE:
+        # HALF-DAY LEAVE ON A WORKED DAY (11 Sep 2026, user report): 4.5 h
+        # worked + a half-day leave used to bill only the leave half — the
+        # hours actually worked vanished. The worked half is billable on its
+        # own merit; the leave half follows the leave rules below.
+        half_leave = leave_period in (LeavePeriod.HALF_AM, LeavePeriod.HALF_PM,
+                                      "Half_AM", "Half_PM")
+        if half_leave and hours > ZERO:
+            worked_h = min(_capped_hours(hours, project), Decimal(policy.min_hours_half_day))
+            worked_d = min(_days_from_hours(hours, policy), HALF)
+            leave_h, leave_d = _half_leave_billable(
+                leave_type, policy, leave_billable_by_type, paid_leave_days)
+            return worked_h + leave_h, worked_d + leave_d
         # Explicit Loss of Pay is always unpaid / non-billable.
         if is_loss_of_pay_name(leave_type):
             return ZERO, ZERO
@@ -1359,6 +1408,7 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
         "leave_billable": policy.leave_billable,
         "holidays_billable": policy.holidays_billable,
         "comp_off_billable": policy.comp_off_billable,
+        "comp_off_covers_lop": bool(getattr(policy, "comp_off_covers_lop", False)),
         "min_hours_full_day": float(policy.min_hours_full_day),
         "min_hours_half_day": float(policy.min_hours_half_day),
     }
@@ -1399,7 +1449,8 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
 
 
 def _billable_rollup(project: Project | None,
-                     entries: list[TimesheetEntry]) -> dict[str, Decimal | int]:
+                     entries: list[TimesheetEntry],
+                     policy: BillingPolicy | None = None) -> dict[str, Decimal | int]:
     """Decimal rollups shared by the summary and the invoice preview.
 
     total_* are the raw sums of the stored per-entry billables; actual_* are
@@ -1410,6 +1461,11 @@ def _billable_rollup(project: Project | None,
     billable_days = ZERO
     leave_billable_days = ZERO
     working_days = 0
+    # Days the flat Monthly rate is spread over (11 Sep 2026, user report:
+    # "all days billable, why 21 days?"). Working days, PLUS week-offs when
+    # Week Off Billable, PLUS holidays when Holidays Billable — the
+    # calendar-month model bills 31 days, so one day is worth 1/31, not 1/21.
+    billed_days = 0
     for e in entries:
         billable_hours += Decimal(e.billable_hours or 0)
         billable_days += Decimal(e.billable_days or 0)
@@ -1417,6 +1473,15 @@ def _billable_rollup(project: Project | None,
             leave_billable_days += Decimal(e.billable_days or 0)
         if e.is_working:
             working_days += 1
+            billed_days += 1
+        elif policy is not None:
+            att = getattr(e.attendance_status, "value", e.attendance_status)
+            dt = getattr(e.day_type, "value", e.day_type)
+            is_holiday = att == "Holiday" or dt == "Holiday"
+            if is_holiday and policy.holidays_billable:
+                billed_days += 1
+            elif not is_holiday and policy.week_off_billable:
+                billed_days += 1
     actual_billable_hours = billable_hours
     actual_billable_days = billable_days
     if project is not None and project.max_billable_hours_month is not None:
@@ -1430,6 +1495,7 @@ def _billable_rollup(project: Project | None,
         "actual_billable_days": actual_billable_days,
         "leave_billable_days": leave_billable_days,
         "working_days": working_days,
+        "billed_days": billed_days if policy is not None else working_days,
     }
 
 
@@ -1514,9 +1580,10 @@ def _work_day_is_billed(e, policy: BillingPolicy) -> bool:
     hours = Decimal(e.hours_worked or 0)
     if hours <= ZERO or not _is_comp_off_work_day(e, policy):
         return False
-    if _is_holiday_work_day(e):
-        return bool(policy.holidays_billable or policy.comp_off_billable)
-    return bool(policy.week_off_billable or policy.comp_off_billable)
+    # 11 Sep 2026: only Comp Off Billable bills WORKED weekend/holiday hours.
+    # Holidays/Week Off Billable cover the unworked day (calendar month) and
+    # no longer suppress the comp-off credit.
+    return bool(policy.comp_off_billable)
 
 
 def _comp_off_day_fraction(hours: Decimal, policy: BillingPolicy) -> Decimal:
@@ -1616,6 +1683,21 @@ def accrue_comp_off(db: Session, ts: Timesheet, entries: list[TimesheetEntry]) -
     if ts.project_employee_id is not None:
         from services.project_employees import credit_pe_leave
         if delta > ZERO:
+            # Customer's "Comp off max limit" (11 Sep 2026): never let the
+            # balance climb past it — the excess is simply not credited.
+            try:
+                from services.project_employees import pe_leave_detail_for
+                _cust_pol = db.execute(
+                    select(CustomerBillingPolicy).join(Project, Project.customer_id == CustomerBillingPolicy.customer_id)
+                    .where(Project.id == ts.project_id)).scalar_one_or_none()
+                _limit = getattr(_cust_pol, "comp_off_max_limit", None) if _cust_pol is not None else None
+                if _limit is not None:
+                    _cur = pe_leave_detail_for(db, ts.project_employee_id, leave_type.id)
+                    _bal = Decimal(str(_cur.leave_balance or 0)) if _cur is not None else ZERO
+                    room = max(Decimal(str(_limit)) - _bal, ZERO)
+                    delta = min(delta, room)
+            except Exception:
+                pass
             pe_row = credit_pe_leave(db, ts.project_employee_id, leave_type.id, delta)
         else:
             # DECISION (ISSUE-3): reverse prior credit may go negative temporarily.
@@ -1843,7 +1925,7 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
     project, policy, _leave_map, live = live_entries_from_policy(db, ts, entries)
     # Same classification the billable recompute uses (paid vs LOP per leave day).
     classification = classify_timesheet_leave_paid_vs_lop(db, ts, entries)
-    rollup = _billable_rollup(project, live)  # type: ignore[arg-type]
+    rollup = _billable_rollup(project, live, policy)  # type: ignore[arg-type]
     total_days = len(live)
     working_days = 0
     comp_off_days = 0
@@ -1905,7 +1987,9 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
     # the remainder credits. Billed modes are untouched: comp_off_earned is
     # already zero there, so cover is zero too.
     raw_comp_off_earned = comp_off_earned(live, policy)  # type: ignore[arg-type]
-    lop_cover = min(total_lop_days, raw_comp_off_earned)
+    # Automatic cover only when the customer opts in (0102, default OFF —
+    # the manager applies Comp-Off / other leave on the LOP row instead).
+    lop_cover = min(total_lop_days, raw_comp_off_earned) if policy.comp_off_covers_lop else ZERO
     total_lop_days = total_lop_days - lop_cover
     net_comp_off_earned = raw_comp_off_earned - lop_cover
     paid_leave_days = sum(
@@ -1976,6 +2060,10 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
         # billable — NET of any fraction spent covering LOP days above.
         # Comp-off BILLED when Comp Off Billable ON (invoiced instead of credit).
         "comp_off_earned": float(net_comp_off_earned),
+        # GROSS earned (before covering LOP) and what was USED this month:
+        # comp-off leave days taken + the fraction that made up LOP.
+        "comp_off_earned_gross": float(raw_comp_off_earned + cap["comp_off_from_cap"]),
+        "comp_off_used": float(Decimal(comp_off_days) + lop_cover),
         "comp_off_billed": float(comp_off_billed(live, policy)),  # type: ignore[arg-type]
         "comp_off_billed_hours": float(comp_off_billed_hours(live, policy, project)),  # type: ignore[arg-type]
         "comp_off_credited": float(ts.comp_off_accrued or 0),
@@ -2032,7 +2120,7 @@ def timesheet_report_out(db: Session, ts: Timesheet,
             .order_by(TimesheetEntry.entry_date)
         ).scalars().all()
     project, _policy, _leave_map, live = live_entries_from_policy(db, ts, entries)
-    rollup = _billable_rollup(project, live)  # type: ignore[arg-type]
+    rollup = _billable_rollup(project, live, _policy)  # type: ignore[arg-type]
     hours_worked = sum((Decimal(e.hours_worked or 0) for e in live), ZERO)
     actual_billable_hours = rollup["actual_billable_hours"]
     actual_billable_day = display_billable_day(actual_billable_hours)
@@ -2344,7 +2432,7 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
             # amount that already excludes those days — recompute for billing.
             lop_billing = timesheet_summary(
                 db, ts, [e for e in raw_entries if e.entry_date >= nb_end])
-    rollup = _billable_rollup(project, entries)
+    rollup = _billable_rollup(project, entries, policy)
 
     rate_rows = load_rate_rows(db, assignment.id)
     unit = assignment.billing_unit
@@ -2426,7 +2514,9 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
     else:  # Monthly
         qty = ONE
         monthly_cost = current_rate
-        working_days = Decimal(rollup["working_days"])
+        # Denominator = the days the flat rate covers in this window: working
+        # days, plus billable week-offs / holidays (calendar-month model).
+        working_days = Decimal(rollup["billed_days"])
         # Week-off/holiday days the employee WORKED and the policy bills.
         # These are EXTRA effort above the standard working month the flat
         # rate covers — valued per working day and added on top (below).
@@ -2514,7 +2604,7 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
     # per-hour charge for this sheet's window. Monthly/Yearly derive per-day
     # from the window's working days — the same denominator the LOP deduction
     # uses, so "1 LOP day costs the per-day charge" reads true in the popup.
-    wd_count = Decimal(rollup["working_days"])
+    wd_count = Decimal(rollup["billed_days"])
     hours_per_day = policy.min_hours_full_day or Decimal("8")
     if unit == BillingUnit.HOURLY:
         per_hour: Decimal | None = current_rate

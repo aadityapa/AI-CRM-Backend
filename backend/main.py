@@ -748,6 +748,15 @@ def _invite_base_url(request: Request) -> str:
     return req_url
 
 
+def _remember_invite_base(request: Request) -> None:
+    """Let CRM-side link builders reuse the base this request resolved (15 Sep 2026)."""
+    try:
+        from services.invite_links import remember_base
+        remember_base(_invite_base_url(request))
+    except Exception:
+        pass
+
+
 def _session_key_from_payload(payload: dict | None) -> str:
     """Invite candidates use per-token keys; HR demo uses per-user keys."""
     if not payload:
@@ -1381,8 +1390,20 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         if not job and env_job_id:
             job = get_job_template(AUTH_DB_TARGET, env_job_id)
         if not job:
+            if jid_from_invite:
+                # The invite named a template that no longer exists. Never fall
+                # through to "whatever sorts first" — that interviews the
+                # candidate against an unrelated job (15 Sep 2026).
+                logger.error("interview.invite.template_missing",
+                             extra={"event": "interview.invite.template_missing",
+                                    "invite_token": _invite_token_tag(invite_token), "job_id": jid_from_invite})
+                return {"error": "The interview template for this invite no longer exists. Please contact HR."}
             jobs = list_job_templates(AUTH_DB_TARGET)
             job = jobs[0] if jobs else None
+            if job is not None and str(schedule.get("hr_username") or "") == "karnex-crm":
+                logger.warning("interview.invite.template_fallback",
+                               extra={"event": "interview.invite.template_fallback",
+                                      "invite_token": _invite_token_tag(invite_token)})
 
         jd_text = (job or {}).get("jdText") or (
             "Technical interview for the open role. Assess practical depth, trade-offs, and communication."
@@ -2221,7 +2242,12 @@ def _persist_fast_final_report(session: dict, reason: str, final_status: str) ->
     report_record["final_status"] = final_status
     report_record["finalization_reason"] = reason
     upsert_interview_record_snapshot(AUTH_DB_TARGET, report_record)
-    _persist_hr_record_mirror(report_record)
+    # HR mirror only — NOT the CRM (15 Sep 2026). This report is the keyword
+    # fallback; pushing it wrote a Passed/Failed verdict and notified TA
+    # before the real AI evaluation existed, and if the background upgrade
+    # never ran that wrong verdict was final. The CRM is synced from
+    # _upgrade_interview_report_background / _finalize_interview_snapshot.
+    upsert_hr_record_async(DATA_FILE, report_record)
     invalidate_hr_dashboard_cache()
 
     invite_token = str(meta.get("invite_token") or "").strip()
@@ -2286,6 +2312,17 @@ def _upgrade_interview_report_background(session_snapshot: dict, reason: str, fi
         )
     except Exception as exc:
         logger.warning("background report upgrade failed: %s", exc, exc_info=True)
+        # The AI evaluation failed for good — sync the fallback report so the
+        # CRM link does not stay Pending forever, flagged as provisional.
+        try:
+            meta = session_snapshot.get("meta", {}) or {}
+            interview_id = str(meta.get("interview_id") or "").strip()
+            existing = get_interview_record_payload(AUTH_DB_TARGET, interview_id) if interview_id else None
+            if isinstance(existing, dict) and existing.get("report"):
+                existing.setdefault("report", {})["evaluation_mode"] = "fallback_ai_failed"
+                _crm_sync_interview_async(existing)
+        except Exception:
+            logger.warning("fallback CRM sync after upgrade failure also failed", exc_info=True)
 
 
 def _parse_progress_activity(raw: str) -> datetime | None:
@@ -2305,11 +2342,16 @@ def _should_recover_progress(row: dict, now: datetime) -> bool:
     if str(row.get("report_status") or "").strip().lower() == "ready":
         return False
     status = str(row.get("status") or "").strip().lower()
-    if status in {"submitting", "completed", "terminated", "abandoned", "partially_completed", "recovered"}:
-        return True
     answers = row.get("answers") if isinstance(row.get("answers"), list) else []
     last = _parse_progress_activity(str(row.get("last_activity_at") or row.get("updated_at_ist") or row.get("created_at_ist") or ""))
     idle_seconds = (now - last).total_seconds() if last else float("inf")
+    if status in {"submitting", "completed", "terminated", "abandoned", "partially_completed", "recovered"}:
+        # A row the fast-finalize path just wrote (report "generating") is being
+        # upgraded by the submit request's background task — racing it from
+        # here produced duplicate finalizations (15 Sep 2026). Give it 10 min.
+        if str(row.get("report_status") or "").strip().lower() == "generating" and idle_seconds < 10 * 60:
+            return False
+        return True
     recovery_idle_sec = max(30 * 60, min(45 * 60, int(os.getenv("INTERVIEW_RECOVERY_IDLE_MIN", "35") or "35") * 60))
     # Active/in-progress rows with recent activity are not recoverable yet.
     if status in {"started", "in_progress"} and last and idle_seconds < recovery_idle_sec:
@@ -2447,12 +2489,18 @@ def _start_interview_recovery_worker() -> None:
         workers = 1
     redis_url = (os.getenv("REDIS_URL") or "").strip()
     if workers > 1 and not redis_url:
-        logger.warning(
-            "UVICORN_WORKERS=%s without REDIS_URL — in-memory sessions/proctor state are not shared across workers. "
-            "Use UVICORN_WORKERS=1 until Redis-backed sessions exist.",
-            workers,
-            extra={"event": "startup.multi_worker_warning", "workers": workers},
-        )
+        # Hard stop, not a log line (15 Sep 2026): the Redis session store the
+        # docstring promises does not exist, so with >1 worker a candidate's
+        # /next and /answer land on workers that never saw their session and
+        # the interview silently breaks. Set ALLOW_MULTI_WORKER_UNSAFE=1 to
+        # override for an experiment you understand.
+        msg = (f"UVICORN_WORKERS={workers} without REDIS_URL — interview sessions live in process memory and are "
+               f"not shared across workers. Run with UVICORN_WORKERS=1 (or set ALLOW_MULTI_WORKER_UNSAFE=1 to override).")
+        if str(os.getenv("ALLOW_MULTI_WORKER_UNSAFE") or "").strip().lower() in ("1", "true", "yes"):
+            logger.error(msg, extra={"event": "startup.multi_worker_warning", "workers": workers})
+        else:
+            logger.critical(msg, extra={"event": "startup.multi_worker_refused", "workers": workers})
+            raise RuntimeError(msg)
     if _RECOVERY_WORKER_STARTED:
         return
     _RECOVERY_WORKER_STARTED = True
@@ -3632,6 +3680,15 @@ def answer(
             s["completed"] = True
             _persist_interview_progress(s, status="completed")
             return {"status": "completed", "answered": len(s.get("answers") or [])}
+        # Server-side time limit (15 Sep 2026): the client's countdown is a
+        # courtesy; a timed interview closes here when the limit has passed
+        # (with a 90 s grace so the in-flight last answer is not refused).
+        from candidate.service import interview_elapsed_seconds, interview_time_limit_seconds
+        _limit = interview_time_limit_seconds(s)
+        if _limit and interview_elapsed_seconds(s) >= _limit + 90:
+            s["completed"] = True
+            _persist_interview_progress(s, status="completed")
+            return {"status": "completed", "time_expired": True, "answered": len(s.get("answers") or [])}
 
         turn_index = int(s.get("current", 0) or 0)
         answers = s.get("answers") or []
@@ -4094,7 +4151,9 @@ def submit(
         recovered = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token_from_token) if invite_token_from_token else None
         s = _session_from_progress(recovered)
         if not s:
-            return {"error": "No active session."}
+            # 404, not 200+error (15 Sep 2026): the client's retry loop used to
+            # burn every attempt on this non-retryable condition.
+            return JSONResponse({"error": "No active session."}, status_code=404)
         sessions[sk] = s
     if s.get("finalizing") and s.get("report_result"):
         existing_id = str((s.get("meta", {}) or {}).get("interview_id") or "")
@@ -6439,20 +6498,12 @@ PROCTOR_REPORT_FILE = DATA_DIR / "proctor_reports.json"
 # In-memory proctor sessions — require UVICORN_WORKERS=1 (or Redis) for multi-instance.
 _proctor_sessions: dict[str, dict] = {}
 MAX_WARNINGS = 3
-_INTEGRITY_VIOLATION_TYPES = frozenset({
-    "tab_switch",
-    "multiple_faces",
-    "proctor_tabSwitch",
-    "proctor_extraFace",
-})
-
-
-def _count_integrity_violations(events: list) -> int:
-    return sum(
-        1
-        for event in events
-        if isinstance(event, dict) and str(event.get("type") or "") in _INTEGRITY_VIOLATION_TYPES
-    )
+# One taxonomy for every integrity event (15 Sep 2026) — the strike set now
+# includes what the candidate page actually sends on a tab switch
+# (visibility_hidden / window_blur), fullscreen exits, Alt+Tab, clipboard and
+# devtools attempts. See services/interview_integrity.py.
+from services.interview_integrity import STRIKE_TYPES as _INTEGRITY_VIOLATION_TYPES  # noqa: E402
+from services.interview_integrity import count_strikes as _count_integrity_violations  # noqa: E402
 
 
 def _load_proctor_reports() -> dict:
@@ -6513,14 +6564,22 @@ def _merge_proctor_events_into_schedule(invite_token: str, sess: dict) -> None:
     if not rec:
         return
     prior = _parse_violations_log(rec.get("violations_log"))
+    # Idempotent merge (15 Sep 2026): this used to re-append the proctor
+    # session's WHOLE event list on every call, so each new violation
+    # duplicated all the earlier ones and inflated the count.
+    seen = {(str(e.get("type") or ""), str(e.get("timestamp") or "")) for e in prior if isinstance(e, dict)}
     for evt in (sess.get("events") or [])[-80:]:
         etype = str((evt or {}).get("type") or "unknown").strip() or "unknown"
         if etype not in {"tabSwitch", "extraFace"}:
             continue
+        stamp = str((evt or {}).get("at_ist") or "")
+        if (f"proctor_{etype}", stamp) in seen:
+            continue
+        seen.add((f"proctor_{etype}", stamp))
         prior.append({
             "type": f"proctor_{etype}",
             "details": str((evt or {}).get("meta") or "")[:500],
-            "timestamp": str((evt or {}).get("at_ist") or ""),
+            "timestamp": stamp,
             "ip": "",
             "user_agent": "",
         })
@@ -7288,8 +7347,42 @@ def _invite_closed_response(record: dict, invite_state: str, error_message: str)
     return JSONResponse(body, status_code=403)
 
 
+def _public_schedule_view(record: dict, session_status: str | None = None) -> dict:
+    """What the candidate page may see about its own schedule (15 Sep 2026).
+
+    Never the raw row: `access_key`, `notes`, `active_device_id` and the
+    violations log stay server-side. Adds the interview's job title, timing
+    mode, time limit and question count (from the packed invite config) so the
+    welcome card and the rules gate can state what the candidate is agreeing to.
+    """
+    cfg = _extract_invite_config_from_notes(str(record.get("notes") or ""))
+    jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
+    job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
+    timing_mode = str(cfg.get("timing_mode") or (job or {}).get("timingMode") or "count").strip().lower()
+    try:
+        time_limit = max(0, int(cfg.get("time_limit_sec") or (job or {}).get("timeLimitSec") or 0))
+    except (TypeError, ValueError):
+        time_limit = 0
+    try:
+        num_q = int(cfg.get("num_q") or (job or {}).get("numQ") or (job or {}).get("num_q") or 0)
+    except (TypeError, ValueError):
+        num_q = 0
+    return {
+        "candidate_name": record.get("candidate_name", ""),
+        "scheduled_at_local": record.get("scheduled_at_local", ""),
+        "status": record.get("status", ""),
+        "session_status": (session_status or str(record.get("session_status") or "pending")).strip().lower(),
+        "access_key": bool(record.get("access_key")),
+        "job_title": str((job or {}).get("jobTitle") or "").strip(),
+        "timing_mode": timing_mode if timing_mode in {"count", "time"} else "count",
+        "time_limit_sec": time_limit,
+        "num_q": num_q,
+    }
+
+
 @app.get("/candidate/invite/{token}")
-def candidate_invite_lookup(token: str):
+def candidate_invite_lookup(token: str, request: Request):
+    _remember_invite_base(request)
     record = get_schedule_by_token(AUTH_DB_TARGET, token)
     if not record:
         return JSONResponse({"error": "Invalid or expired interview link."}, status_code=404)
@@ -7323,13 +7416,7 @@ def candidate_invite_lookup(token: str):
     )
     if access.get("reason") == "expired":
         return JSONResponse({"error": "This interview link has expired. Please contact HR for a new link."}, status_code=403)
-    safe_schedule = {
-        "candidate_name": record.get("candidate_name", ""),
-        "scheduled_at_local": record.get("scheduled_at_local", ""),
-        "status": record.get("status", ""),
-        "session_status": session_status,
-        "access_key": bool(record.get("access_key")),
-    }
+    safe_schedule = _public_schedule_view(record, session_status)
     return {"status": "ok", "schedule": safe_schedule, "access": access, "prewarm": prewarm}
 
 
@@ -7340,10 +7427,20 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
     if not record:
         return JSONResponse({"error": "Invalid or expired interview link."}, status_code=404)
 
+    # Lockout counts FAILED attempts only, and a successful verify resets it
+    # (15 Sep 2026). It used to count every call — including page refreshes,
+    # which re-show this gate — and never reset, so ~10 reloads over the life
+    # of a link bricked it permanently.
     max_attempts = 10
-    attempts = increment_schedule_login_attempts(AUTH_DB_TARGET, token)
-    if attempts > max_attempts:
+    failed_so_far = int(record.get("login_attempts") or 0)
+    if failed_so_far >= max_attempts:
         return JSONResponse({"error": "Too many verification attempts. This interview link has been locked. Please contact HR."}, status_code=403)
+
+    def _failed(message: str, status: int = 403):
+        attempts = increment_schedule_login_attempts(AUTH_DB_TARGET, token)
+        left = max(0, max_attempts - attempts)
+        suffix = f" ({left} attempt{'s' if left != 1 else ''} left)" if left else " This link is now locked — please contact HR."
+        return JSONResponse({"error": message + suffix, "attempts_left": left}, status_code=status)
 
     access = _invite_access_state(record)
     if access.get("reason") == "expired":
@@ -7355,18 +7452,27 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
     submitted_email = (email or "").strip().lower()
     submitted_key = (access_key or "").strip().upper()
 
+    session_status = str(record.get("session_status") or "pending").strip().lower()
+    request_device = str(request.headers.get("x-device-id") or "").strip()
+    active_device = str(record.get("active_device_id") or "").strip()
+
+    # A device that already verified this link (page refresh mid-interview)
+    # is let straight through — no second factor, no attempt burned.
+    same_device = bool(request_device) and request_device == active_device
+    if same_device and session_status in {"verified", "active"} and not submitted_key:
+        return {"status": "verified", "already_verified": True,
+                "schedule": _public_schedule_view(record, session_status)}
+
     if not submitted_email or not submitted_key:
         return JSONResponse({"error": "Email and access key are required."}, status_code=400)
 
     if submitted_email != stored_email:
-        return JSONResponse({"error": "Email does not match the invited candidate."}, status_code=403)
+        return _failed("Email does not match the invited candidate.")
 
     if not stored_key:
         pass
     elif not hmac.compare_digest(submitted_key, stored_key):  # constant-time secret compare
-        return JSONResponse({"error": "Invalid access key. Please check the key shared by HR."}, status_code=403)
-
-    session_status = str(record.get("session_status") or "pending").strip().lower()
+        return _failed("Invalid access key. Please check the key shared by HR.")
     if session_status == "completed":
         return _invite_closed_response(
             record,
@@ -7380,8 +7486,6 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
             "This interview was terminated due to policy violations. The link is no longer valid.",
         )
     if session_status == "active":
-        request_device = str(request.headers.get("x-device-id") or "").strip()
-        active_device = str(record.get("active_device_id") or "").strip()
         if not request_device or request_device != active_device:
             return JSONResponse({"error": "This interview session is already active on another device."}, status_code=403)
 
@@ -7391,8 +7495,9 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
     update_schedule_field(
         AUTH_DB_TARGET, token,
         verified_at=now["ist_iso"],
-        session_status="verified",
+        session_status="verified" if session_status != "active" else "active",
         active_device_id=device_id,
+        login_attempts=0,  # success resets the failed-attempt counter
     )
 
     _maybe_prewarm_invite_session(token, record, reason="verify")
@@ -7466,7 +7571,8 @@ def candidate_invite_login(token: str, request: Request):
         )
         return {
             "status": "scheduled_wait",
-            "schedule": record,
+            # Public view only — this used to return the raw row, access key included.
+            "schedule": _public_schedule_view(record),
             "seconds_until_start": int(access.get("seconds_until_start", 0)),
             "starts_at_ist": access.get("starts_at_ist", ""),
             "prewarm": prewarm,
@@ -7525,10 +7631,7 @@ def candidate_invite_login(token: str, request: Request):
         "login_date_ist": now["ist_date"],
         "login_time_ist": now["ist_time"],
     }
-    safe_schedule = {
-        "candidate_name": record.get("candidate_name", ""),
-        "scheduled_at_local": record.get("scheduled_at_local", ""),
-    }
+    safe_schedule = _public_schedule_view(record)
     token_value, expires_at_ist = _issue_access_token(user, {"invite_token": token})
     logger.info(
         "interview.invite.login.ready",
@@ -7581,9 +7684,73 @@ def interview_time_warning_audit(request: Request, warning_key: str = Form("")):
     return {"status": "ok", "field": field, "at": now_iso}
 
 
+INTEGRITY_EVIDENCE_DIR = DATA_DIR / "integrity_evidence"
+#: A snapshot the candidate page attaches to a camera event (JPEG, small).
+INTEGRITY_EVIDENCE_MAX_BYTES = 400 * 1024
+
+
+def _store_integrity_evidence(invite_token: str, raw: bytes) -> str:
+    """Save a camera snapshot under data/integrity_evidence/<token>/ and return its name."""
+    token = re.sub(r"[^A-Za-z0-9_-]", "", invite_token or "")[:64]
+    if not token or not raw or len(raw) > INTEGRITY_EVIDENCE_MAX_BYTES:
+        return ""
+    if not raw.startswith(b"\xff\xd8"):  # JPEG magic only — the page sends image/jpeg
+        return ""
+    folder = INTEGRITY_EVIDENCE_DIR / token
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"{int(time.time() * 1000)}_{secrets.token_hex(3)}.jpg"
+    (folder / name).write_bytes(raw)
+    return name
+
+
+def _notify_ta_of_integrity(invite_token: str, *, candidate_name: str, reason: str, strikes: int) -> None:
+    """Bell + email to the TA who scheduled the interview (best-effort, CRM side)."""
+    try:
+        from sqlalchemy import select as sa_select
+        from crm_db import get_session_factory
+        from models import AiInterviewLink
+        from services.notify import notify_role, notify_user
+        factory = get_session_factory()
+    except Exception:
+        return
+    try:
+        with factory() as db:
+            link = db.execute(
+                sa_select(AiInterviewLink).where(AiInterviewLink.invite_token == invite_token)
+            ).scalars().first()
+            title = f"AI interview terminated: {candidate_name or 'candidate'}"
+            body = f"{reason}. {strikes} policy violation(s) recorded. Review the Integrity tab before deciding."
+            link_path = f"profiles/{link.profile_id}?tab=ai-interview" if link is not None else ""
+            with db.begin_nested():
+                if link is not None and link.scheduled_by:
+                    notify_user(db, link.scheduled_by, title, body, link_path,
+                                event="interview.integrity_alert", dedupe_key=f"integrity:{invite_token}",
+                                related_type="candidate", related_id=link.candidate_id)
+                else:
+                    notify_role(db, "TA", title, body, link_path, event="interview.integrity_alert",
+                                dedupe_prefix=f"integrity:{invite_token}")
+            db.commit()
+    except Exception:
+        logger.exception("integrity.notify_failed", extra={"event": "integrity.notify_failed"})
+
+
 @app.post("/interview/violation")
-def interview_violation(request: Request, violation_type: str = Form("tab_switch"), details: str = Form("")):
-    """Log an anti-cheating violation from the candidate's browser."""
+async def interview_violation(
+    request: Request,
+    violation_type: str = Form("tab_switch"),
+    details: str = Form(""),
+    current_question: str = Form(""),
+    fullscreen_status: str = Form(""),
+    browser_visibility: str = Form(""),
+    window_focus: str = Form(""),
+    evidence: UploadFile | None = File(None),
+):
+    """Log an anti-cheating violation from the candidate's browser.
+
+    The SERVER is the authority on termination (15 Sep 2026): every strike type
+    in `services.interview_integrity.STRIKE_TYPES` counts, so a client that
+    stops reporting cannot dodge the three-warning rule. Camera events may
+    attach a JPEG snapshot as evidence."""
     payload, auth_err = _require_user(request, {"candidate", "hr"})
     if auth_err:
         return auth_err
@@ -7595,30 +7762,51 @@ def interview_violation(request: Request, violation_type: str = Form("tab_switch
     meta = s.get("meta", {})
     violations = meta.get("violations", [])
     now = _now_ist_parts()
-    violations.append({
-        "type": violation_type,
+    invite_token = str(meta.get("invite_token", "")).strip()
+    event = {
+        "type": (violation_type or "tab_switch")[:40],
         "details": (details or "")[:500],
         "timestamp": now["ist_iso"],
         "ip": str(request.client.host) if request.client else "",
         "user_agent": str(request.headers.get("user-agent", ""))[:300],
-    })
+    }
+    if current_question.strip():
+        event["question"] = current_question.strip()[:16]
+    if fullscreen_status.strip():
+        event["fullscreen"] = fullscreen_status.strip()[:16]
+    if browser_visibility.strip():
+        event["visibility"] = browser_visibility.strip()[:16]
+    if window_focus.strip():
+        event["focus"] = window_focus.strip()[:8]
+    if evidence is not None:
+        try:
+            raw = await evidence.read()
+            name = _store_integrity_evidence(invite_token, raw)
+            if name:
+                event["evidence"] = name
+        except Exception:
+            logger.warning("integrity.evidence_store_failed", extra={"event": "integrity.evidence_store_failed"})
+    violations.append(event)
     meta["violations"] = violations
     violation_count = _count_integrity_violations(violations)
     meta["violation_count"] = violation_count
 
-    invite_token = str(meta.get("invite_token", "")).strip()
     auto_terminated = False
 
-    if violation_count > MAX_WARNINGS:
+    already_terminated = bool(meta.get("terminated_at"))
+    if violation_count > MAX_WARNINGS and not already_terminated:
         # Mark policy termination immediately, but leave the in-memory session
         # answerable so the frontend can auto-save the current response before
         # the normal /submit finalization path removes the session.
-        meta["termination_reason"] = "Repeated interview policy violations"
+        from services.interview_integrity import label_for as _ilabel
+        reason = "Repeated interview policy violations"
+        meta["termination_reason"] = reason
         meta["terminated_at"] = now["ist_iso"]
         violations.append({
             "type": "termination",
-            "reason": "Repeated interview policy violations",
-            "details": "Interview terminated due to repeated policy violations (tab switch / multiple faces)",
+            "reason": reason,
+            "details": f"Interview terminated after {violation_count} policy violations "
+                       f"(last: {_ilabel(event['type'])})",
             "timestamp": now["ist_iso"],
         })
         meta["violations"] = violations
@@ -7631,6 +7819,8 @@ def interview_violation(request: Request, violation_type: str = Form("tab_switch
                 violation_count=violation_count,
                 violations_log=json.dumps(violations, ensure_ascii=False),
             )
+            _notify_ta_of_integrity(invite_token, candidate_name=str(meta.get("candidate_name") or s.get("candidate_name") or ""),
+                                    reason=reason, strikes=violation_count)
     elif invite_token:
         update_schedule_field(
             AUTH_DB_TARGET,
@@ -7663,11 +7853,10 @@ def _integrity_logs_cache_ttl_s() -> int:
 
 
 def invalidate_integrity_logs_cache(hr_username: str | None = None) -> None:
+    # The list is one shared, all-users payload since 15 Sep 2026 — any change
+    # invalidates it regardless of who scheduled the interview.
     with _INTEGRITY_LOGS_CACHE_LOCK:
-        if hr_username:
-            _INTEGRITY_LOGS_CACHE.pop((hr_username or "hr").strip().lower(), None)
-        else:
-            _INTEGRITY_LOGS_CACHE.clear()
+        _INTEGRITY_LOGS_CACHE.clear()
 
 
 def _termination_reason_from_events(row: dict, events: list[dict]) -> str:
@@ -7699,8 +7888,9 @@ def _append_termination_event(row: dict, reason: str, now_iso: str) -> list[dict
     return events
 
 
-def _cleanup_expired_integrity_rows(hr_user: str) -> None:
-    """Lazy cleanup: expired pending/verified invites move from Integrity to Terminated."""
+def _cleanup_expired_integrity_rows(hr_user: str | None) -> None:
+    """Lazy cleanup: expired pending/verified invites move from Integrity to Terminated.
+    `hr_user=None` sweeps every schedule (CRM-owned ones included)."""
     now = datetime.now(IST)
     now_iso = now.isoformat()
     changed = False
@@ -7829,43 +8019,70 @@ def _cleanup_expired_integrity_rows(hr_user: str) -> None:
         invalidate_integrity_logs_cache()
 
 
-@app.get("/interview/integrity-logs")
-def interview_integrity_logs(request: Request):
-    """Return integrity/violation data for admin panel."""
-    _, auth_err = _require_user(request, {"hr"})
-    if auth_err:
-        return auth_err
-    _enforce_crm_roles(request, "TA", "HR")  # Integrity: Admin/TA/HR (RMG excluded)
-    payload = _decode_token_from_header(request)
-    hr_user = str((payload or {}).get("sub", "hr")).strip().lower() or "hr"
-    _recover_interviews_once(limit=50)
-    _cleanup_expired_integrity_rows(hr_user)
-    ttl = _integrity_logs_cache_ttl_s()
-    if ttl > 0:
-        with _INTEGRITY_LOGS_CACHE_LOCK:
-            cached = _INTEGRITY_LOGS_CACHE.get(hr_user)
-            if cached and (time.monotonic() - cached[0]) < ttl:
-                return cached[1]
-    rows = list_interview_integrity_logs(AUTH_DB_TARGET, hr_user)
-    rows = _dedupe_integrity_schedule_rows(rows)
-    logs = []
-    terminated = []
+_INTEGRITY_ALL_KEY = "__all__"
+
+
+def _crm_links_for_tokens(tokens: list[str]) -> dict[str, dict]:
+    """invite_token -> {profile_id, candidate_id, requirement_title, customer_name,
+    opportunity_title, scheduled_by_name, ai_score, ai_result} from the CRM
+    (best-effort; empty when the CRM DB is not configured)."""
+    if not tokens:
+        return {}
+    try:
+        from sqlalchemy import select as sa_select
+        from crm_db import get_session_factory
+        from models import AiInterviewLink, Customer, Opportunity, Requirement
+        from services.dashboards import _ta_names
+        factory = get_session_factory()
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        with factory() as db:
+            rows = db.execute(
+                sa_select(AiInterviewLink, Requirement.title, Opportunity.title, Customer.name)
+                .join(Requirement, Requirement.id == AiInterviewLink.requirement_id, isouter=True)
+                .join(Opportunity, Opportunity.id == AiInterviewLink.opportunity_id, isouter=True)
+                .join(Customer, Customer.id == Opportunity.customer_id, isouter=True)
+                .where(AiInterviewLink.invite_token.in_(tokens))
+            ).all()
+            names = _ta_names(db, (lk.scheduled_by for lk, *_ in rows))
+            for lk, req_title, opp_title, cust in rows:
+                out[lk.invite_token] = {
+                    "profile_id": lk.profile_id,
+                    "candidate_id": lk.candidate_id,
+                    "requirement_id": lk.requirement_id,
+                    "requirement_title": req_title or opp_title or "",
+                    "opportunity_title": opp_title or "",
+                    "customer_name": cust or "",
+                    "scheduled_by_name": names.get(lk.scheduled_by, "") if lk.scheduled_by else "",
+                    "ai_score": float(lk.overall_score_percent) if lk.overall_score_percent is not None else None,
+                    "ai_result": lk.result,
+                    "level": lk.level,
+                }
+    except Exception:
+        logger.warning("integrity.crm_enrich_failed", extra={"event": "integrity.crm_enrich_failed"})
+    return out
+
+
+def _integrity_rows() -> list[dict]:
+    """Every interview schedule, enriched: per-family counts, score, review
+    flag, CRM context, shared-device flag. Cached for the TTL like before."""
+    from services.interview_integrity import shared_device_flags, summarise
+
+    rows = _dedupe_integrity_schedule_rows(list_interview_integrity_logs(AUTH_DB_TARGET, None))
+    items: list[dict] = []
     for full in rows:
-        int(full.get("violation_count") or 0)
         events = _parse_violations_log(full.get("violations_log"))
-        policy_violation_count = _count_integrity_violations(events)
-        tab_switch_count = sum(
-            1
-            for event in events
-            if isinstance(event, dict) and str(event.get("type") or "") in {"tab_switch", "proctor_tabSwitch"}
-        )
-        extra_face_count = sum(
-            1
-            for event in events
-            if isinstance(event, dict) and str(event.get("type") or "") in {"multiple_faces", "proctor_extraFace"}
-        )
         session_status = str(full.get("session_status") or "pending").strip().lower() or "pending"
-        item = {
+        summary = summarise(events, session_status=session_status)
+        cfg = _extract_invite_config_from_notes(str(full.get("notes", "")))
+        jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
+        job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
+        title = str((job or {}).get("jobTitle") or "").strip()
+        items.append({
+            "invite_token": full.get("invite_token", ""),
+            "hr_username": full.get("hr_username", ""),
             "candidate_name": full.get("candidate_name", ""),
             "candidate_email": full.get("candidate_email", ""),
             "scheduled_at": full.get("scheduled_at_local", ""),
@@ -7874,42 +8091,165 @@ def interview_integrity_logs(request: Request):
             "verified_at": full.get("verified_at", ""),
             "interview_started_at": full.get("interview_started_at", ""),
             "interview_completed_at": full.get("interview_completed_at", ""),
-            "violation_count": policy_violation_count,
-            "tab_switch_count": tab_switch_count,
-            "extra_face_count": extra_face_count,
-            "violations_log": [
-                e
-                for e in events
-                if isinstance(e, dict)
-                and str(e.get("type") or "") in {
-                    "tab_switch",
-                    "multiple_faces",
-                    "proctor_tabSwitch",
-                    "proctor_extraFace",
-                    "termination",
-                }
-            ],
+            "terminated_at": full.get("interview_completed_at", "") if session_status == "terminated" else "",
+            "violation_count": summary["strikes"],
+            "strikes": summary["strikes"],
+            "event_count": summary["event_count"],
+            "by_family": summary["by_family"],
+            "by_type": summary["by_type"],
+            "integrity_score": summary["integrity_score"],
+            "needs_review": summary["needs_review"],
+            # Kept for older clients; the detail endpoint returns the full timeline.
+            "tab_switch_count": summary["by_family"].get("tab", 0),
+            "extra_face_count": summary["by_family"].get("face", 0),
             "active_device_id": full.get("active_device_id", ""),
-            "reason": _termination_reason_from_events(full, events),
-            "template_name": "",
-            "role": "",
-            "terminated_at": full.get("interview_completed_at", ""),
-        }
-        cfg = _extract_invite_config_from_notes(str(full.get("notes", "")))
-        jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
-        job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
-        title = str((job or {}).get("jobTitle") or "").strip()
-        item["template_name"] = title
-        item["role"] = title
-        if session_status == "terminated":
-            terminated.append(item)
-        else:
-            logs.append(item)
-    payload_out = {"logs": logs, "terminated": terminated}
+            "reason": _termination_reason_from_events(full, summary["events"]),
+            "template_name": title,
+            "role": title,
+            "has_evidence": any(isinstance(e, dict) and e.get("evidence") for e in summary["events"]),
+            "events": summary["events"],
+        })
+    # Cross-row signal: one device / IP used for several candidates.
+    shared = shared_device_flags(items)
+    crm = _crm_links_for_tokens([i["invite_token"] for i in items if i.get("invite_token")])
+    for it in items:
+        it["shared_with"] = shared.get(it["invite_token"], [])
+        if it["shared_with"]:
+            it["needs_review"] = True
+        it.update({k: v for k, v in crm.get(it["invite_token"], {}).items()})
+        it.setdefault("customer_name", "")
+        it.setdefault("requirement_title", it.get("template_name") or "")
+        it.setdefault("profile_id", None)
+        it.pop("events", None)  # the list stays light; /integrity-logs/{token} has the timeline
+    return items
+
+
+def _integrity_payload() -> dict:
+    ttl = _integrity_logs_cache_ttl_s()
     if ttl > 0:
         with _INTEGRITY_LOGS_CACHE_LOCK:
-            _INTEGRITY_LOGS_CACHE[hr_user] = (time.monotonic(), payload_out)
+            cached = _INTEGRITY_LOGS_CACHE.get(_INTEGRITY_ALL_KEY)
+            if cached and (time.monotonic() - cached[0]) < ttl:
+                return cached[1]
+    items = _integrity_rows()
+    scored = [i for i in items if i["session_status"] in {"completed", "terminated", "active"}]
+    summary = {
+        "total": len(items),
+        "active": sum(1 for i in items if i["session_status"] == "active"),
+        "pending": sum(1 for i in items if i["session_status"] in {"pending", "verified", "scheduled"}),
+        "completed": sum(1 for i in items if i["session_status"] == "completed"),
+        "terminated": sum(1 for i in items if i["session_status"] == "terminated"),
+        "needs_review": sum(1 for i in items if i.get("needs_review")),
+        "violations": sum(int(i.get("event_count") or 0) for i in items),
+        "avg_score": round(sum(i["integrity_score"] for i in scored) / len(scored)) if scored else None,
+        "shared_devices": sum(1 for i in items if i.get("shared_with")),
+    }
+    payload_out = {
+        "logs": items,
+        "terminated": [i for i in items if i["session_status"] == "terminated"],
+        "summary": summary,
+    }
+    if ttl > 0:
+        with _INTEGRITY_LOGS_CACHE_LOCK:
+            _INTEGRITY_LOGS_CACHE[_INTEGRITY_ALL_KEY] = (time.monotonic(), payload_out)
     return payload_out
+
+
+def _integrity_auth(request: Request):
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+    _enforce_crm_roles(request, "TA", "HR")  # Integrity: Admin/CEO/TA/HR (RMG excluded)
+    return None
+
+
+@app.get("/interview/integrity-logs")
+def interview_integrity_logs(request: Request):
+    """Every interview's integrity summary (15 Sep 2026: ALL schedules, not just
+    the viewer's own — CRM-scheduled interviews are owned by "karnex-crm").
+    `logs` carries every row; `terminated` is the subset; `summary` the KPIs."""
+    err = _integrity_auth(request)
+    if err:
+        return err
+    _recover_interviews_once(limit=50)
+    _cleanup_expired_integrity_rows(None)
+    return _integrity_payload()
+
+
+@app.get("/interview/integrity-logs/export")
+def interview_integrity_export(request: Request):
+    """CSV of the integrity list (declared BEFORE /{token} — keep it there)."""
+    from services.interview_integrity import rows_to_csv
+    err = _integrity_auth(request)
+    if err:
+        return err
+    body = rows_to_csv(_integrity_payload()["logs"])
+    stamp = datetime.now(IST).strftime("%Y%m%d-%H%M")
+    return Response(
+        content=body.encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="interview-integrity-{stamp}.csv"'},
+    )
+
+
+@app.get("/interview/integrity-logs/{invite_token}")
+def interview_integrity_detail(request: Request, invite_token: str):
+    """Full timeline for one interview: every event with question index, IP,
+    device, evidence snapshot names — plus the row summary."""
+    from services.interview_integrity import label_for, summarise
+    err = _integrity_auth(request)
+    if err:
+        return err
+    token = (invite_token or "").strip()
+    rec = get_schedule_by_token(AUTH_DB_TARGET, token) if token else None
+    if not rec:
+        return JSONResponse({"error": "Interview not found"}, status_code=404)
+    events = _parse_violations_log(rec.get("violations_log"))
+    status = str(rec.get("session_status") or "pending").strip().lower()
+    summary = summarise(events, session_status=status)
+    timeline = []
+    for ev in summary["events"]:
+        t = str(ev.get("type") or "")
+        timeline.append({
+            "type": t,
+            "label": label_for(t),
+            "details": ev.get("details") or ev.get("reason") or "",
+            "timestamp": ev.get("timestamp") or ev.get("at_ist") or "",
+            "question": ev.get("question") or "",
+            "ip": ev.get("ip") or "",
+            "user_agent": ev.get("user_agent") or "",
+            "evidence_url": (f"/interview/integrity-evidence/{token}/{ev['evidence']}" if ev.get("evidence") else ""),
+            "is_strike": t in _INTEGRITY_VIOLATION_TYPES,
+        })
+    row = next((i for i in _integrity_payload()["logs"] if i.get("invite_token") == token), None)
+    return {
+        "invite_token": token,
+        "candidate_name": rec.get("candidate_name", ""),
+        "candidate_email": rec.get("candidate_email", ""),
+        "session_status": status,
+        "reason": _termination_reason_from_events(rec, summary["events"]),
+        "integrity_score": summary["integrity_score"],
+        "strikes": summary["strikes"],
+        "by_family": summary["by_family"],
+        "by_type": summary["by_type"],
+        "violations_log": timeline,
+        "row": row,
+    }
+
+
+@app.get("/interview/integrity-evidence/{invite_token}/{name}")
+def interview_integrity_evidence(request: Request, invite_token: str, name: str):
+    """Serve one camera snapshot attached to an integrity event (HR only)."""
+    err = _integrity_auth(request)
+    if err:
+        return err
+    token = re.sub(r"[^A-Za-z0-9_-]", "", invite_token or "")[:64]
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", name or "")
+    path = (INTEGRITY_EVIDENCE_DIR / token / safe) if token and safe.endswith(".jpg") else None
+    if path is None or not path.is_file() or INTEGRITY_EVIDENCE_DIR.resolve() not in path.resolve().parents:
+        return JSONResponse({"error": "Evidence not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"})
 
 
 # ---------------------------------------------------------------------------

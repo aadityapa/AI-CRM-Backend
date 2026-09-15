@@ -583,6 +583,8 @@ def upsert_billing_policy(
     policy.comp_off_balance_initial = payload.comp_off_balance_initial
     policy.comp_off_max_limit = payload.comp_off_max_limit
     policy.comp_off_max_carry_forward = payload.comp_off_max_carry_forward
+    if payload.comp_off_covers_lop is not None:
+        policy.comp_off_covers_lop = bool(payload.comp_off_covers_lop)
     policy.normal_hours_per_day = payload.normal_hours_per_day
     policy.user_role = payload.user_role
     policy.operation = payload.operation
@@ -590,6 +592,15 @@ def upsert_billing_policy(
     # sent, so older callers that omit it can never wipe the value.
     if "billable_leaves_per_year" in payload.model_fields_set:
         policy.billable_leaves_per_year = payload.billable_leaves_per_year
+    # Karnex bank account for this customer's invoices (0098) — validated so a
+    # deactivated or unknown id can never leave an invoice without an account.
+    if "bank_account_id" in payload.model_fields_set:
+        if payload.bank_account_id:
+            from models import CompanyBankAccount
+            acc = db.get(CompanyBankAccount, payload.bank_account_id)
+            if acc is None or not acc.is_active:
+                raise HTTPException(status_code=400, detail="Bank account not found or inactive")
+        policy.bank_account_id = payload.bank_account_id
     db.commit()
     db.refresh(policy)
     return envelope(data=serialize_policy(policy),
@@ -824,9 +835,22 @@ def get_branch_policy_detail(branch_id: int, db: Session = Depends(get_crm_db),
     customer = db.get(Customer, branch.customer_id)
     data["customer_name"] = customer.name if customer else None
     data["holiday_years"] = branch_holiday_years(db, branch_id)
-    pols = db.execute(select(CustomerLeavePolicy).where(CustomerLeavePolicy.branch_id == branch_id)
+    pols = db.execute(select(CustomerLeavePolicy).where(CustomerLeavePolicy.branch_id == branch_id,
+                                                        CustomerLeavePolicy.is_active.is_(True))
                       .order_by(CustomerLeavePolicy.id)).scalars().all()
+    source = "branch"
+    if not pols:
+        # Inheritance (11 Sep 2026, user request): a branch with no leave rows
+        # of its own hands the CUSTOMER's default rows to the project wizard,
+        # so every new project starts from the agreed policy and only edits.
+        pols = db.execute(select(CustomerLeavePolicy)
+                          .where(CustomerLeavePolicy.customer_id == branch.customer_id,
+                                 CustomerLeavePolicy.branch_id.is_(None),
+                                 CustomerLeavePolicy.is_active.is_(True))
+                          .order_by(CustomerLeavePolicy.id)).scalars().all()
+        source = "customer" if pols else "none"
     data["leave_policies"] = [_branch_leave_policy_out(db, p) for p in pols]
+    data["leave_policies_source"] = source
     # OUTER join (fix, 27 Aug 2026): projects.opportunity_id is NULLABLE since
     # 0069, but the old INNER join silently dropped every opportunity-less
     # project from its branch page — even with project.branch_id set.

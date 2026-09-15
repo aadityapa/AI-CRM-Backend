@@ -122,8 +122,11 @@ def list_employees(is_active: bool | None = None, department_id: int | None = No
             Employee.last_name.ilike(needle),
             (Employee.first_name + " " + sa.func.coalesce(Employee.last_name, "")).ilike(needle),
             Employee.email.ilike(needle),
+            Employee.employee_code.ilike(needle),
         ))
-    stmt = stmt.order_by(Employee.id.desc())
+    # Newest joiner first (11 Sep 2026, user request): a re-hired / placed
+    # employee gets a fresh joining date and surfaces at the top.
+    stmt = stmt.order_by(sa.nulls_last(Employee.date_of_joining.desc()), Employee.id.desc())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
     return envelope([serialize_employee(e) for e in items], meta=meta)
 

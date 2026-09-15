@@ -144,6 +144,10 @@ class CustomerBillingPolicy(Base):
     comp_off_balance_initial = sa.Column(sa.Numeric(7, 2), nullable=True)
     comp_off_max_limit = sa.Column(sa.Numeric(7, 2), nullable=True)
     comp_off_max_carry_forward = sa.Column(sa.Numeric(7, 2), nullable=True)
+    #: Weekend work automatically makes up LOP days this month (0102; the
+    #: "Harman rule"). OFF = LOP stays visible and the timesheet manager
+    #: applies the leave they choose on that row.
+    comp_off_covers_lop = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
 
     #: Paid leaves per year the CUSTOMER covers (the "APTIV rule", 0078):
     #: these many leave days are billed even when leave_billable is off —
@@ -154,6 +158,10 @@ class CustomerBillingPolicy(Base):
     normal_hours_per_day = sa.Column(sa.Numeric(4, 2), nullable=True)
     user_role = sa.Column(sa.String(120), nullable=True)
     operation = sa.Column(sa.String(120), nullable=True)
+    #: Karnex bank account printed on this customer's tax invoices (0098).
+    #: NULL = the default company account.
+    bank_account_id = sa.Column(sa.Integer, sa.ForeignKey("company_bank_accounts.id",
+                                                          ondelete="SET NULL"), nullable=True)
 
     customer = relationship("Customer", back_populates="billing_policy")
 

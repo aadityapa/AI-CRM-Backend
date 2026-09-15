@@ -27,7 +27,8 @@ PROJECT_LEAVE_CREDIT_ALIASES = {
 PROJECT_LEAVE_EXPIRE_ALIASES = {
     "Days": "Monthly",
     "Annually": "Yearly",
-    "Carry Forward": "Yearly",
+    # "Carry Forward" = never expires (11 Sep 2026) — it used to alias to
+    # Yearly, which EXPIRED the balance the customer promised to carry.
 }
 # UI "Initial No Billing QTY" → stored in initial_no_billing_period
 INITIAL_NO_BILLING_UNITS = ("Hours", "Days", "Week", "Month", "Year")
@@ -211,6 +212,16 @@ class ProjectEmployeeLeaveDetailUpdate(BaseModel):
     leave_balance: Decimal | None = Field(default=None, ge=0)
 
 
+class ProjectEmployeeCarryForwardIn(BaseModel):
+    """Previous-year carry-forward entered by hand (15 Sep 2026).
+
+    `days` is the TOTAL carried in from `from_year` — posting it twice for the
+    same year replaces the earlier figure instead of stacking. Zero removes it."""
+    from_year: int = Field(ge=2000, le=2100)
+    days: Decimal = Field(ge=0, le=365)
+    note: str | None = Field(default=None, max_length=200)
+
+
 class ProjectEmployeeRateIn(BaseModel):
     effective_from: date
     rate: Decimal = Field(ge=0)
@@ -236,7 +247,8 @@ class ProjectLeavePolicyCreate(BaseModel):
     leave_expire: str
     leave_expire_timing: str | None = None  # Start_Of_Period|End_Of_Period
     is_max_limit: bool = False
-    maximum_carry_forward: int = Field(default=0, ge=0)
+    #: 0 = lapse at expiry, None = carry forward all, N = carry up to N days.
+    maximum_carry_forward: int | None = Field(default=0, ge=0)
     effective_date: date | None = None
 
     _credit = field_validator("leave_credit_type")(_project_leave_credit)

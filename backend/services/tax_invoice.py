@@ -28,14 +28,17 @@ SELLER_ADDRESS = (
 )
 SELLER_STATE_NAME = "Maharashtra"
 SELLER_STATE_CODE = "27"
+# Fallbacks ONLY — the live values come from Settings ▸ Invoice
+# (services.company_invoice_config). Corrected 11 Sep 2026 (user): the CIN
+# here was a typo'd 2019 OPC number.
 SELLER_EMAIL = "karnex.singh@karnex.in"
-SELLER_CIN = "U72900RJ2019OPC63826"
-SELLER_PAN = "AAHCK4749A"
-SELLER_GSTIN = "27AAHCK4749A1ZL"
+SELLER_CIN = "U72900RJ2018PTC638288"
+SELLER_PAN = "AAJCK2474BA"
+SELLER_GSTIN = "27AAJCK2474BA1ZL"
 BANK_NAME = "HDFC Bank, Baner"
 BANK_NAME_SHORT = "HDFC Bank"
-BANK_ACC = "50200073368143"
-BANK_IFSC = "HDFC0001794"
+BANK_ACC = "50200075368143"
+BANK_IFSC = "HDFC0001784"
 BANK_BRANCH = "Baner, Pune"
 CONTACT_WEB = "www.karnex.in"
 CONTACT_EMAIL = "info@karnex.in"
@@ -43,12 +46,157 @@ CONTACT_PHONE = "+91 20 1234 5678"
 CONTACT_LOC = "Pune, Maharashtra, India"
 
 DEFAULT_INVOICE_NO = "KRSW26-27-65-VS"
-DEFAULT_SAC = "998314"
+#: SAC 998513 = contract staffing services (11 Sep 2026, user correction; the
+#: old 998314 was IT-design). Settings key `invoice.sac_code` overrides.
+DEFAULT_SAC = "998513"
+#: Allocation-level SACs still carrying the OLD default are treated as unset.
+STALE_SAC_CODES = frozenset({"998314"})
 DEFAULT_FOOTER = (
-    "Certified that the particulars above are true and correct. "
-    "The amount charged is the actual price with no additional consideration "
-    "from the Service Recipient."
+    "Certified that all the particulars given above are true and correct. "
+    "The amount indicated represents the price actually charged and there is "
+    "no flow of additional consideration directly or indirectly from the "
+    "Service Recipient."
 )
+
+
+def default_sac() -> str:
+    """Settings-driven SAC (Settings ▸ Invoice), code default 998513."""
+    try:
+        from services.org_settings import setting
+        return (setting("invoice.sac_code") or "").strip() or DEFAULT_SAC
+    except Exception:
+        return DEFAULT_SAC
+
+
+def effective_sac(alloc_sac: str | None) -> str:
+    """The SAC to print: the PO allocation's own code unless it is blank or one
+    of the old wrong defaults, else the Settings default."""
+    code = (alloc_sac or "").strip()
+    if code and code not in STALE_SAC_CODES:
+        return code
+    return default_sac()
+
+
+def seller_from_settings() -> dict:
+    """Seller block for the server renderers (WeasyPrint / reportlab / DOCX) —
+    the SAME Settings ▸ Invoice values the on-screen sheet shows, so the
+    hardcoded constants below are only the last-resort fallback."""
+    try:
+        from services.company_invoice_config import get_seller_details
+        d = get_seller_details()
+        if d.get("name"):
+            return d
+    except Exception:
+        pass
+    return {
+        "name": SELLER_NAME, "tagline": "", "address_line1": SELLER_ADDRESS.replace("\n", ", "),
+        "address_line2": "", "city": "Pune", "state": SELLER_STATE_NAME,
+        "state_code": SELLER_STATE_CODE, "pincode": "", "country": "India", "phone": CONTACT_PHONE,
+        "email": SELLER_EMAIL, "contact_email": CONTACT_EMAIL, "website": CONTACT_WEB,
+        "gstin": SELLER_GSTIN, "pan": SELLER_PAN, "cin": SELLER_CIN, "logo_url": "", "seal_url": "",
+        "declaration": DEFAULT_FOOTER, "sac_code": DEFAULT_SAC,
+        "service_description": "Contract Staffing Service",
+        "signatory_line": "For Karnex Software Solutions Pvt. Ltd.",
+        "footer_website_url": "https://" + CONTACT_WEB, "footer_text": "",
+    }
+
+
+def bank_from_settings(db=None, customer_id: int | None = None) -> dict:
+    try:
+        from services.company_invoice_config import resolve_bank_details
+        return resolve_bank_details(db, customer_id)
+    except Exception:
+        return {"bank_name": BANK_NAME_SHORT, "account_name": SELLER_NAME, "account_number": BANK_ACC,
+                "ifsc": BANK_IFSC, "branch": BANK_BRANCH, "account_type": "Current"}
+
+
+#: Billing-unit → column wording for the service table (11 Sep 2026, user's
+#: reference invoice: Monthly Cost · Qty (Days) · Leave · Rate Per Day · Amount).
+UNIT_COLUMNS: dict[str, dict[str, str]] = {
+    "Hourly": {"cost": "Rate/Hour (INR)", "qty": "Qty (Hours)", "leave": "Leave (Days)",
+               "per_day": "Rate Per Day (Rate/Hour × Hours/Day)", "amount": "Amount (Rs.) = Qty × Rate/Hour"},
+    "Daily": {"cost": "Rate/Day (INR)", "qty": "Qty (Days)", "leave": "Leave (Days)",
+              "per_day": "Rate Per Day", "amount": "Amount (Rs.) = Qty × Rate/Day"},
+    "Monthly": {"cost": "Monthly Cost", "qty": "Qty (Days)", "leave": "Leave (Days)",
+                "per_day": "Rate Per Day (Monthly Cost / Days in Month)",
+                "amount": "Amount (Rs.) = Monthly Fixed − Leave Deduction"},
+    "Yearly": {"cost": "Monthly Cost (Yearly / 12)", "qty": "Qty (Days)", "leave": "Leave (Days)",
+               "per_day": "Rate Per Day (Monthly Cost / Days in Month)",
+               "amount": "Amount (Rs.) = Monthly Fixed − Leave Deduction"},
+}
+
+
+def billing_breakdown_for_invoice(db, invoice) -> dict | None:
+    """Per-line billing figures behind a CRM invoice (11 Sep 2026).
+
+    Source of truth = the timesheet's figures FROZEN at approval (0075);
+    falls back to a live preview for sheets approved before the freeze.
+    Returns None for invoices not raised from a timesheet (manual finance
+    invoices) — the renderers then print the plain qty × rate columns.
+    """
+    try:
+        ts = getattr(invoice, "timesheet", None)
+        if ts is None and getattr(invoice, "timesheet_id", None) and db is not None:
+            from models import Timesheet
+            ts = db.get(Timesheet, invoice.timesheet_id)
+        if ts is None:
+            return None
+        frozen = getattr(ts, "approved_figures", None) or {}
+        items = frozen.get("line_items") or []
+        line = items[0] if items else None
+        if line is None and db is not None:
+            from services.timesheets import timesheet_invoice_preview
+            prev = timesheet_invoice_preview(db, ts)
+            items = prev.get("line_items") or []
+            line = items[0] if items else None
+        if not line:
+            return None
+        unit = str(line.get("billing_unit") or "Monthly")
+        cols = UNIT_COLUMNS.get(unit, UNIT_COLUMNS["Monthly"])
+        working_days = float(line.get("working_days_in_period") or 0)
+        qty = float(line.get("total_billed_qty") or 0)
+        rate = float(line.get("rate_per_unit") or 0)
+        monthly_cost = line.get("monthly_cost")
+        cost = float(monthly_cost) if monthly_cost is not None else rate
+        per_day = line.get("per_day_charge")
+        per_day = float(per_day) if per_day is not None else None
+        leave_days = float(line.get("loss_of_pay_days") or 0)
+        amount = float(line.get("amount") or 0)
+        # Period bounds (override → PE window → calendar month) for the description.
+        period_start = period_end = None
+        try:
+            from services.timesheets import period_bounds, sheet_period_bounds
+            from models import ProjectEmployee
+            pe = db.get(ProjectEmployee, ts.project_employee_id) if (db is not None and getattr(ts, "project_employee_id", None)) else None
+            if pe is not None:
+                period_start, period_end = sheet_period_bounds(ts, pe)
+            else:
+                period_start, period_end = period_bounds(ts.year, ts.month)
+        except Exception:
+            period_start = period_end = None
+        if unit in ("Monthly", "Yearly"):
+            # Days shown = the days the flat rate covers in this window; the
+            # engine's denominator (working days) so Leave × Rate/Day reconciles.
+            qty_days = working_days if working_days else qty
+        else:
+            qty_days = qty
+        return {
+            "billing_unit": unit,
+            "columns": cols,
+            "monthly_cost": cost,
+            "qty": qty_days,
+            "leave_days": leave_days,
+            "rate_per_day": per_day,
+            "rate_per_unit": rate,
+            "working_days_in_period": working_days,
+            "amount": amount,
+            "period_start": period_start.isoformat() if period_start else None,
+            "period_end": period_end.isoformat() if period_end else None,
+            "period_label": (f"{format_date_en_in(period_start)} to {format_date_en_in(period_end)}"
+                             if period_start and period_end else ""),
+        }
+    except Exception:
+        return None
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "tax_invoice"
 LOGO_PATH = STATIC_DIR / "karnex-logo-invoice.png"
@@ -108,6 +256,16 @@ class LineItem(BaseModel):
     sac: str = DEFAULT_SAC
     billing_hours: float = 0
     rate_per_hour: float = 0
+    #: Billing breakdown (11 Sep 2026) — present for timesheet-raised
+    #: invoices: cost basis, leave days and the per-day rate so the table can
+    #: print "Monthly Cost · Qty (Days) · Leave · Rate Per Day · Amount".
+    monthly_cost: float | None = None
+    leave_days: float | None = None
+    rate_per_day: float | None = None
+    period_label: str = ""
+    #: Explicit amount from the billing engine (leave deduction applied).
+    #: None = billing_hours × rate_per_hour.
+    amount_override: float | None = None
 
 
 class Buyer(BaseModel):
@@ -137,6 +295,11 @@ class Invoice(BaseModel):
     #: seal encodes — a public, signed link to the invoice. None = no QR (the
     #: standalone generator, bulk Excel).
     share_url: str | None = None
+    #: Billing-unit column wording (UNIT_COLUMNS); None = plain qty × rate table.
+    columns: dict[str, str] | None = None
+    #: Seller / bank blocks from Settings ▸ Invoice (None = module constants).
+    seller: dict | None = None
+    bank: dict | None = None
 
 
 #: PE billing_unit -> (qty column, rate column) on the Tax Invoice.
@@ -201,6 +364,11 @@ def num(v: Any) -> float:
 
 
 def line_amount(it: LineItem | dict) -> float:
+    """qty × rate, unless the billing engine supplied the exact amount (leave
+    deduction applied) — then that figure wins so the PDF equals the invoice."""
+    ov = it.get("amount_override") if isinstance(it, dict) else getattr(it, "amount_override", None)
+    if ov is not None:
+        return num(ov)
     if isinstance(it, dict):
         hours = num(it.get("billing_hours"))
         rate = num(it.get("rate_per_hour"))
@@ -854,7 +1022,7 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
 
     billing_branch = None
     delivery_branch = None
-    sac = DEFAULT_SAC
+    sac = default_sac()
     if po is not None:
         if po.delivery_branch_id:
             delivery_branch = db.get(CustomerBranch, po.delivery_branch_id)
@@ -865,7 +1033,7 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
             )
         ).scalar_one_or_none()
         if alloc is not None and alloc.hsn_sac:
-            sac = alloc.hsn_sac
+            sac = effective_sac(alloc.hsn_sac)
     billing_branch = resolve_billing_branch(
         db, po=po, project=project, customer_id=customer_id,
     )
@@ -912,18 +1080,31 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
     # Column labels from the billing unit of the timesheet's assignment.
     qty_label, rate_label = invoice_unit_labels(db, invoice)
 
+    # Billing breakdown (11 Sep 2026): cost basis, leave, per-day rate from the
+    # figures frozen at approval — the reference invoice's column set.
+    breakdown = billing_breakdown_for_invoice(db, invoice)
+    columns = breakdown["columns"] if breakdown else None
+
     items: list[LineItem] = []
     lines = list(invoice.lines or [])
     lines.sort(key=lambda l: l.s_no or 0)
-    for line in lines:
+    for idx, line in enumerate(lines):
         desc = line.description
-        items.append(LineItem(
+        item = LineItem(
             employee_name=employee_from_line_description(desc),
             service_month=month_from_line_description(desc),
             sac=sac,
             billing_hours=num(line.qty),
             rate_per_hour=num(line.rate),
-        ))
+        )
+        if breakdown and idx == 0:
+            item.monthly_cost = breakdown["monthly_cost"]
+            item.leave_days = breakdown["leave_days"]
+            item.rate_per_day = breakdown["rate_per_day"]
+            item.period_label = breakdown["period_label"]
+            item.billing_hours = breakdown["qty"]
+            item.amount_override = num(line.amount) if line.amount is not None else breakdown["amount"]
+        items.append(item)
 
     inv_no = (invoice.invoice_number or "").strip() or DEFAULT_INVOICE_NO
     po_no = po.po_number if po else None
@@ -940,9 +1121,14 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
     except Exception:
         share_url = None
 
+    seller = seller_from_settings()
     return Invoice(
         qty_label=qty_label,
         rate_label=rate_label,
+        columns=columns,
+        seller=seller,
+        bank=bank_from_settings(db, customer_id),
+        footer_text=(seller.get("declaration") or DEFAULT_FOOTER),
         invoice_no=inv_no,
         invoice_date=format_date_en_in(invoice.invoice_date) or today_ddmmyyyy(),
         po_no=po_no,
@@ -986,28 +1172,73 @@ def render_invoice_html(inv: Invoice, totals: Totals | None = None) -> str:
     logo = _file_uri(LOGO_PATH)
     seal = _file_uri(SEAL_PATH)
 
+    seller = inv.seller or seller_from_settings()
+    bank = inv.bank or bank_from_settings()
+    cols = inv.columns
+    ncols = 8 if cols else 6
+
+    def _qty(v: float) -> str:
+        return f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
+
     rows_html = []
     items = inv.items or []
     for i, it in enumerate(items, start=1):
         amt = line_amount(it)
         desc = line_description(it.employee_name, getattr(it, "service_month", None) or None)
-        rows_html.append(
-            "<tr>"
-            f"<td class='c'>{i}</td>"
-            f"<td>{_esc(desc)}</td>"
-            f"<td class='c'>{_esc(it.sac or DEFAULT_SAC)}</td>"
-            f"<td class='r'>{_esc(format_inr(num(it.billing_hours)).replace('INR ', ''))}</td>"
-            f"<td class='r'>{_esc(format_inr(num(it.rate_per_hour)))}</td>"
-            f"<td class='r'>{_esc(format_inr(amt))}</td>"
-            "</tr>"
-        )
+        if getattr(it, "period_label", ""):
+            desc = f"{desc}<br/><span class='muted'>Billing period {_esc(it.period_label)}</span>"
+        else:
+            desc = _esc(desc)
+        if cols:
+            rows_html.append(
+                "<tr>"
+                f"<td class='c'>{i}</td>"
+                f"<td>{desc}</td>"
+                f"<td class='c'>{_esc(it.sac or default_sac())}</td>"
+                f"<td class='r'>{_esc(format_inr(num(it.monthly_cost if it.monthly_cost is not None else it.rate_per_hour)).replace('INR ', ''))}</td>"
+                f"<td class='r'>{_esc(_qty(num(it.billing_hours)))}</td>"
+                f"<td class='r'>{_esc(_qty(num(it.leave_days)))}</td>"
+                f"<td class='r'>{_esc(format_inr(num(it.rate_per_day)).replace('INR ', '') if it.rate_per_day is not None else '—')}</td>"
+                f"<td class='r'>{_esc(format_inr(amt).replace('INR ', ''))}</td>"
+                "</tr>"
+            )
+        else:
+            rows_html.append(
+                "<tr>"
+                f"<td class='c'>{i}</td>"
+                f"<td>{desc}</td>"
+                f"<td class='c'>{_esc(it.sac or default_sac())}</td>"
+                f"<td class='r'>{_esc(format_inr(num(it.billing_hours)).replace('INR ', ''))}</td>"
+                f"<td class='r'>{_esc(format_inr(num(it.rate_per_hour)))}</td>"
+                f"<td class='r'>{_esc(format_inr(amt))}</td>"
+                "</tr>"
+            )
     while len(rows_html) < 5:
-        rows_html.append(
-            "<tr class='spacer'><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td></tr>"
+        rows_html.append("<tr class='spacer'><td>&nbsp;</td>" + "<td></td>" * (ncols - 1) + "</tr>")
+
+    if cols:
+        head_html = (
+            "<th class='col-sno'>S. No.</th><th class='col-desc'>Description of Services</th>"
+            f"<th class='col-sac'>SAC Code</th><th class='col-hrs'>{_esc(cols['cost'])}</th>"
+            f"<th class='col-q'>{_esc(cols['qty'])}</th><th class='col-q'>{_esc(cols['leave'])}</th>"
+            f"<th class='col-rate'>{_esc(cols['per_day'])}</th><th class='col-amt'>{_esc(cols['amount'])}</th>"
+        )
+    else:
+        head_html = (
+            "<th class='col-sno'>S. No.</th><th class='col-desc'>Description of Services</th>"
+            f"<th class='col-sac'>SAC Code</th><th class='col-hrs'>{_esc(inv.qty_label)}</th>"
+            f"<th class='col-rate'>{_esc(inv.rate_label)}</th><th class='col-amt'>Amount (INR)</th>"
         )
 
-    seller_addr_html = "<br/>".join(_esc(line) for line in SELLER_ADDRESS.split("\n"))
+    seller_addr = ", ".join(x for x in (seller.get("address_line1"), seller.get("address_line2")) if x)
+    seller_addr_html = _esc(seller_addr)
     buyer_addr_html = "<br/>".join(_esc(line) for line in (inv.buyer.address or "").split("\n") if line)
+    website_url = (seller.get("footer_website_url") or "").strip()
+    website_label = (seller.get("website") or website_url.replace("https://", "").replace("http://", "")).strip()
+    if website_url and not website_url.lower().startswith(("http://", "https://")):
+        website_url = "https://" + website_url
+    footer_extra = (seller.get("footer_text") or "").strip()
+    bank_addr = ", ".join(x for x in (bank.get("branch"), bank.get("bank_address")) if x)
 
     # "Scan to view" QR (3 Sep 2026) beside the declaration — the public link.
     qr_html = ""
@@ -1099,8 +1330,10 @@ table.services td {{
 table.services .c {{ text-align: center; }}
 table.services .r {{ text-align: right; }}
 table.services tr.spacer td {{ height: 16px; color: transparent; }}
-.col-sno {{ width: 8%; }} .col-desc {{ width: 40%; }} .col-sac {{ width: 12%; }}
-.col-hrs {{ width: 12%; }} .col-rate {{ width: 14%; }} .col-amt {{ width: 14%; }}
+.col-sno {{ width: 6%; }} .col-desc {{ width: {"26%" if cols else "40%"}; }} .col-sac {{ width: {"9%" if cols else "12%"}; }}
+.col-hrs {{ width: 12%; }} .col-q {{ width: 9%; }} .col-rate {{ width: {"15%" if cols else "14%"}; }} .col-amt {{ width: 14%; }}
+table.services th {{ font-size: {"7pt" if cols else "8pt"}; line-height: 1.2; }}
+.contact a {{ color: #fff; text-decoration: underline; font-weight: 600; }}
 .gst-row {{ display: flex; gap: 6px; }}
 .gst-box {{ flex: 1; border: 1px solid var(--border); }}
 .gst-box table {{ width: 100%; border-collapse: collapse; font-size: 8.5pt; }}
@@ -1128,7 +1361,7 @@ table.services tr.spacer td {{ height: 16px; color: transparent; }}
 .footer2 h4 {{
   margin: 0 0 4px; color: var(--navy); font-size: 8.5pt; letter-spacing: 0.03em;
 }}
-.seal {{ height: 48px; margin-top: 4px; }}
+.seal {{ height: 40px; margin-top: 4px; }}
 .qr {{ position: absolute; right: 8px; top: 6px; text-align: center; width: 72px; }}
 .qr img {{ width: 68px; height: 68px; display: block; margin: 0 auto; }}
 .qr-cap {{ font-size: 6.5pt; color: var(--muted, #64748B); line-height: 1.2; margin-top: 2px; }}
@@ -1146,22 +1379,23 @@ table.services tr.spacer td {{ height: 16px; color: transparent; }}
   <div class="header">
     <div class="header-left">
       {"<img class='logo' src='" + logo + "' alt='Karnex'/>" if logo else "<div class='wordmark'>KARNEX</div>"}
-      <div class="seller-name">{_esc(SELLER_NAME)}</div>
+      <div class="seller-name">{_esc(seller.get("name"))}</div>
+      {"<div class='seller-meta'><i>" + _esc(seller.get("tagline")) + "</i></div>" if seller.get("tagline") else ""}
       <div class="icon-line">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
         <span>{seller_addr_html}</span>
       </div>
       <div class="icon-line">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M6 12H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/><path d="M18 9h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2"/><path d="M10 6h4"/><path d="M10 10h4"/><path d="M10 14h4"/><path d="M10 18h4"/></svg>
-        <span>State Name: {_esc(SELLER_STATE_NAME)} &nbsp; State Code: {_esc(SELLER_STATE_CODE)}</span>
+        <span>State Name: {_esc(seller.get("state"))} &nbsp; State Code: {_esc(seller.get("state_code"))}</span>
       </div>
       <div class="icon-line">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>
-        <span>Email: {_esc(SELLER_EMAIL)}</span>
+        <span>Email: {_esc(seller.get("email") or seller.get("contact_email"))}</span>
       </div>
       <div class="icon-line">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 10h2"/><path d="M16 14h2"/><path d="M6.17 15a3 3 0 0 1 5.66 0"/><circle cx="9" cy="11" r="2"/><rect x="2" y="5" width="20" height="14" rx="2"/></svg>
-        <span>CIN No.: {_esc(SELLER_CIN)}</span>
+        <span>CIN No.: {_esc(seller.get("cin"))}</span>
       </div>
     </div>
     <div class="header-right">
@@ -1172,6 +1406,8 @@ table.services tr.spacer td {{ height: 16px; color: transparent; }}
           <tr><td class="k">Invoice Date</td><td class="sep">:</td><td>{_esc(inv.invoice_date)}</td></tr>
           <tr><td class="k">P.O. No.</td><td class="sep">:</td><td>{_esc(inv.po_no or "—")}</td></tr>
           <tr><td class="k">P.O. Date</td><td class="sep">:</td><td>{_esc(inv.po_date or "—")}</td></tr>
+          <tr><td class="k">GSTIN No.</td><td class="sep">:</td><td>{_esc(seller.get("gstin") or "—")}</td></tr>
+          <tr><td class="k">PAN No.</td><td class="sep">:</td><td>{_esc(seller.get("pan") or "—")}</td></tr>
         </table>
       </div>
     </div>
@@ -1194,25 +1430,18 @@ table.services tr.spacer td {{ height: 16px; color: transparent; }}
     <div class="card">
       <div class="card-h">SUPPLIER / BANK DETAILS</div>
       <div class="card-b">
-        <span class="muted">PAN No.:</span> {_esc(SELLER_PAN)}<br/>
-        <span class="muted">GSTIN No.:</span> {_esc(SELLER_GSTIN)}<br/>
-        <span class="muted">Bank Name &amp; Address:</span> {_esc(BANK_NAME)}<br/>
-        <span class="muted">Bank Account No.:</span> {_esc(BANK_ACC)}<br/>
-        <span class="muted">IFSC Code:</span> {_esc(BANK_IFSC)}
+        <span class="muted">PAN No.:</span> {_esc(seller.get("pan"))}<br/>
+        <span class="muted">GSTIN No.:</span> {_esc(seller.get("gstin"))}<br/>
+        <span class="muted">Bank Name &amp; Address:</span> {_esc(bank.get("bank_name"))}{(", " + _esc(bank_addr)) if bank_addr else ""}<br/>
+        <span class="muted">Bank Account No.:</span> {_esc(bank.get("account_number"))}<br/>
+        <span class="muted">IFSC Code:</span> {_esc(bank.get("ifsc"))}
       </div>
     </div>
   </div>
 
   <table class="services">
     <thead>
-      <tr>
-        <th class="col-sno">S. No.</th>
-        <th class="col-desc">Description of Services</th>
-        <th class="col-sac">SAC Code</th>
-        <th class="col-hrs">{_esc(inv.qty_label)}</th>
-        <th class="col-rate">{_esc(inv.rate_label)}</th>
-        <th class="col-amt">Amount (INR)</th>
-      </tr>
+      <tr>{head_html}</tr>
     </thead>
     <tbody>
       {"".join(rows_html)}
@@ -1248,26 +1477,28 @@ table.services tr.spacer td {{ height: 16px; color: transparent; }}
   <div class="footer2">
     <div>
       <h4>BANK DETAILS</h4>
-      Bank Name: {_esc(BANK_NAME_SHORT)}<br/>
-      Account No.: {_esc(BANK_ACC)}<br/>
-      IFSC Code: {_esc(BANK_IFSC)}<br/>
-      Branch: {_esc(BANK_BRANCH)}
+      Bank Name: {_esc(bank.get("bank_name"))}<br/>
+      Account Name: {_esc(bank.get("account_name"))}<br/>
+      Account No.: {_esc(bank.get("account_number"))}<br/>
+      IFSC Code: {_esc(bank.get("ifsc"))}<br/>
+      Branch: {_esc(bank.get("branch") or "—")}<br/>
+      Account Type: {_esc(bank.get("account_type") or "—")}
+      {("<br/>SWIFT: " + _esc(bank.get("swift_code"))) if bank.get("swift_code") else ""}
+      {("<br/>UPI: " + _esc(bank.get("upi_id"))) if bank.get("upi_id") else ""}
     </div>
     <div style="position:relative">
       {qr_html}
       <h4>Declaration</h4>
       {_esc(inv.footer_text)}<br/><br/>
-      <strong>For Karnex Software Solutions Pvt. Ltd.</strong><br/>
+      <strong>{_esc(seller.get("signatory_line") or "For Karnex Software Solutions Pvt. Ltd.")}</strong><br/>
       {"<img class='seal' src='" + seal + "' alt='seal'/>" if seal else ""}
       <div>Authorized Signatory</div>
     </div>
   </div>
 
   <div class="contact">
-    <span>{_esc(CONTACT_WEB)}</span>·
-    <span>{_esc(CONTACT_EMAIL)}</span>·
-    <span>{_esc(CONTACT_PHONE)}</span>·
-    <span>{_esc(CONTACT_LOC)}</span>
+    {("<a href='" + _esc(website_url) + "'>" + _esc(website_label) + "</a>") if website_url else "<span>" + _esc(website_label) + "</span>"}
+    {("<span>" + _esc(footer_extra) + "</span>") if footer_extra else ""}
   </div>
 </div>
 </body>
@@ -1329,11 +1560,18 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     left_bits = []
     if logo_flow:
         left_bits.append(logo_flow)
-    left_bits.append(Paragraph(f"<b>{_esc(SELLER_NAME)}</b>", styles["InvHead"]))
-    left_bits.append(Paragraph(SELLER_ADDRESS.replace("\n", "<br/>"), styles["InvSmall"]))
+    seller = inv.seller or seller_from_settings()
+    bank = inv.bank or bank_from_settings()
+    cols = inv.columns
+    seller_addr = ", ".join(x for x in (seller.get("address_line1"), seller.get("address_line2")) if x)
+    left_bits.append(Paragraph(f"<b>{_esc(seller.get('name'))}</b>", styles["InvHead"]))
+    if seller.get("tagline"):
+        left_bits.append(Paragraph(f"<i>{_esc(seller.get('tagline'))}</i>", styles["InvSmall"]))
+    left_bits.append(Paragraph(_esc(seller_addr), styles["InvSmall"]))
     left_bits.append(Paragraph(
-        f"Email: {_esc(SELLER_EMAIL)}<br/>State: {_esc(SELLER_STATE_NAME)} ({_esc(SELLER_STATE_CODE)})"
-        f"<br/>CIN: {_esc(SELLER_CIN)}",
+        f"Email: {_esc(seller.get('email') or seller.get('contact_email'))}<br/>"
+        f"State: {_esc(seller.get('state'))} ({_esc(seller.get('state_code'))})"
+        f"<br/>CIN: {_esc(seller.get('cin'))}",
         styles["InvSmall"],
     ))
 
@@ -1344,8 +1582,8 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
             f"Invoice Date: {_esc(inv.invoice_date)}<br/>"
             f"P.O. No.: {_esc(inv.po_no or '—')}<br/>"
             f"P.O. Date: {_esc(inv.po_date or '—')}<br/>"
-            f"Supplier PAN No. {_esc(SELLER_PAN)}<br/>"
-            f"GSTIN No. {_esc(SELLER_GSTIN)}",
+            f"Supplier PAN No. {_esc(seller.get('pan'))}<br/>"
+            f"GSTIN No. {_esc(seller.get('gstin'))}",
             styles["InvBody"],
         ),
     ]
@@ -1371,10 +1609,11 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
         f"State Name: {_esc(inv.buyer.state_name or '—')}",
         styles["InvBody"],
     )
+    bank_addr = ", ".join(x for x in (bank.get("bank_name"), bank.get("branch"), bank.get("bank_address")) if x)
     bank_p = Paragraph(
-        f"PAN No.: {_esc(SELLER_PAN)}<br/>GSTIN No.: {_esc(SELLER_GSTIN)}<br/>"
-        f"Bank Name &amp; Address: {_esc(BANK_NAME)}<br/>"
-        f"Bank Account No.: {_esc(BANK_ACC)}<br/>IFSC Code: {_esc(BANK_IFSC)}",
+        f"PAN No.: {_esc(seller.get('pan'))}<br/>GSTIN No.: {_esc(seller.get('gstin'))}<br/>"
+        f"Bank Name &amp; Address: {_esc(bank_addr)}<br/>"
+        f"Bank Account No.: {_esc(bank.get('account_number'))}<br/>IFSC Code: {_esc(bank.get('ifsc'))}",
         styles["InvBody"],
     )
     bh = Paragraph("BUYER DETAILS", styles["InvWhite"])
@@ -1396,23 +1635,50 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     story.append(cards)
     story.append(Spacer(1, 4))
 
-    svc_data = [[
-        "S. No.", "Description of Services", "SAC Code",
-        inv.qty_label, inv.rate_label, "Amount (INR)",
-    ]]
-    for i, it in enumerate(inv.items or [], start=1):
-        svc_data.append([
-            str(i),
-            line_description(it.employee_name, getattr(it, "service_month", None) or None),
-            it.sac or DEFAULT_SAC,
-            f"{num(it.billing_hours):,.2f}",
-            format_inr(num(it.rate_per_hour)),
-            format_inr(line_amount(it)),
-        ])
-    while len(svc_data) < 6:
-        svc_data.append(["", "", "", "", "", ""])
+    styles.add(ParagraphStyle(name="InvCell", fontSize=7.5, leading=9.5, textColor=black))
+    styles.add(ParagraphStyle(name="InvTh", fontSize=6.8, leading=8.5, textColor=white, fontName="Helvetica-Bold"))
 
-    col_w = [15 * mm, 72 * mm, 22 * mm, 22 * mm, 28 * mm, 29 * mm]
+    def _p(text: str, st: str = "InvCell") -> Paragraph:
+        return Paragraph(text, styles[st])
+
+    def _qty(v: float) -> str:
+        return f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
+
+    if cols:
+        svc_data = [[_p("S. No.", "InvTh"), _p("Description of Services", "InvTh"), _p("SAC Code", "InvTh"),
+                     _p(_esc(cols["cost"]), "InvTh"), _p(_esc(cols["qty"]), "InvTh"), _p(_esc(cols["leave"]), "InvTh"),
+                     _p(_esc(cols["per_day"]), "InvTh"), _p(_esc(cols["amount"]), "InvTh")]]
+        for i, it in enumerate(inv.items or [], start=1):
+            desc = _esc(line_description(it.employee_name, getattr(it, "service_month", None) or None))
+            if getattr(it, "period_label", ""):
+                desc += f"<br/><font color='#64748B'>Billing period {_esc(it.period_label)}</font>"
+            svc_data.append([
+                str(i), _p(desc), it.sac or default_sac(),
+                format_inr(num(it.monthly_cost if it.monthly_cost is not None else it.rate_per_hour)).replace("INR ", ""),
+                _qty(num(it.billing_hours)), _qty(num(it.leave_days)),
+                (format_inr(num(it.rate_per_day)).replace("INR ", "") if it.rate_per_day is not None else "—"),
+                format_inr(line_amount(it)).replace("INR ", ""),
+            ])
+        while len(svc_data) < 6:
+            svc_data.append([""] * 8)
+        col_w = [11 * mm, 50 * mm, 16 * mm, 24 * mm, 17 * mm, 16 * mm, 27 * mm, 27 * mm]
+    else:
+        svc_data = [[
+            "S. No.", "Description of Services", "SAC Code",
+            inv.qty_label, inv.rate_label, "Amount (INR)",
+        ]]
+        for i, it in enumerate(inv.items or [], start=1):
+            svc_data.append([
+                str(i),
+                line_description(it.employee_name, getattr(it, "service_month", None) or None),
+                it.sac or default_sac(),
+                f"{num(it.billing_hours):,.2f}",
+                format_inr(num(it.rate_per_hour)),
+                format_inr(line_amount(it)),
+            ])
+        while len(svc_data) < 6:
+            svc_data.append(["", "", "", "", "", ""])
+        col_w = [15 * mm, 72 * mm, 22 * mm, 22 * mm, 28 * mm, 29 * mm]
     svc = Table(svc_data, colWidths=col_w, repeatRows=1)
     svc.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), navy),
@@ -1471,14 +1737,17 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     story.append(Spacer(1, 4))
 
     bank_f = Paragraph(
-        f"<b>BANK DETAILS</b><br/>Bank Name: {_esc(BANK_NAME_SHORT)}<br/>"
-        f"Account No.: {_esc(BANK_ACC)}<br/>IFSC Code: {_esc(BANK_IFSC)}<br/>"
-        f"Branch: {_esc(BANK_BRANCH)}",
+        f"<b>BANK DETAILS</b><br/>Bank Name: {_esc(bank.get('bank_name'))}<br/>"
+        f"Account Name: {_esc(bank.get('account_name'))}<br/>"
+        f"Account No.: {_esc(bank.get('account_number'))}<br/>IFSC Code: {_esc(bank.get('ifsc'))}<br/>"
+        f"Branch: {_esc(bank.get('branch') or '—')}<br/>Account Type: {_esc(bank.get('account_type') or '—')}"
+        + (f"<br/>SWIFT: {_esc(bank.get('swift_code'))}" if bank.get("swift_code") else "")
+        + (f"<br/>UPI: {_esc(bank.get('upi_id'))}" if bank.get("upi_id") else ""),
         styles["InvBody"],
     )
     decl_bits = [
         Paragraph(f"<b>Declaration</b><br/>{_esc(inv.footer_text)}", styles["InvBody"]),
-        Paragraph("<b>For Karnex Software Solutions Pvt. Ltd.</b>", styles["InvBody"]),
+        Paragraph(f"<b>{_esc(seller.get('signatory_line') or 'For Karnex Software Solutions Pvt. Ltd.')}</b>", styles["InvBody"]),
     ]
     if SEAL_PATH.exists():
         try:
@@ -1518,9 +1787,16 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     ]))
     story.append(foot)
     story.append(Spacer(1, 6))
-    contact = Table([[
-        f"{CONTACT_WEB}  ·  {CONTACT_EMAIL}  ·  {CONTACT_PHONE}  ·  {CONTACT_LOC}"
-    ]], colWidths=[188 * mm])
+    website_url = (seller.get("footer_website_url") or "").strip()
+    if website_url and not website_url.lower().startswith(("http://", "https://")):
+        website_url = "https://" + website_url
+    website_label = (seller.get("website") or website_url.replace("https://", "").replace("http://", "")).strip()
+    footer_extra = (seller.get("footer_text") or "").strip()
+    styles.add(ParagraphStyle(name="InvFoot", fontSize=7.5, textColor=white, alignment=1))
+    link_html = (f"<a href='{_esc(website_url)}' color='white'><u>{_esc(website_label)}</u></a>"
+                 if website_url else _esc(website_label))
+    contact = Table([[Paragraph(link_html + (f"  ·  {_esc(footer_extra)}" if footer_extra else ""), styles["InvFoot"])]],
+                    colWidths=[188 * mm])
     contact.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), navy),
         ("TEXTCOLOR", (0, 0), (-1, -1), white),
@@ -1578,6 +1854,34 @@ def build_bulk_zip(invoices: list[Invoice], day: date | None = None) -> bytes:
 
 
 def seller_public_dict() -> dict:
+    """Seller block for the standalone generator — Settings ▸ Invoice values
+    (11 Sep 2026); the module constants are the last-resort fallback."""
+    sd = seller_from_settings()
+    bk = bank_from_settings()
+    if sd.get("name") and sd.get("cin"):
+        addr = ", ".join(x for x in (sd.get("address_line1"), sd.get("address_line2")) if x)
+        return {
+            "name": sd.get("name"),
+            "address": addr,
+            "state_name": sd.get("state"),
+            "state_code": sd.get("state_code"),
+            "email": sd.get("email"),
+            "cin": sd.get("cin"),
+            "pan": sd.get("pan"),
+            "gstin": sd.get("gstin"),
+            "bank_name": ", ".join(x for x in (bk.get("bank_name"), bk.get("branch")) if x),
+            "bank_name_short": bk.get("bank_name"),
+            "bank_acc": bk.get("account_number"),
+            "ifsc": bk.get("ifsc"),
+            "branch": bk.get("branch"),
+            "contact_web": sd.get("website"),
+            "contact_email": sd.get("contact_email"),
+            "contact_phone": sd.get("phone"),
+            "contact_loc": ", ".join(x for x in (sd.get("city"), sd.get("state"), sd.get("country")) if x),
+            "sac_code": sd.get("sac_code") or DEFAULT_SAC,
+            "declaration": sd.get("declaration") or DEFAULT_FOOTER,
+            "footer_website_url": sd.get("footer_website_url"),
+        }
     return {
         "name": SELLER_NAME,
         "address": SELLER_ADDRESS,

@@ -10,9 +10,8 @@ candidate has begun, the session is an audit record and stays put.
 """
 from __future__ import annotations
 
-from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -95,13 +94,14 @@ def _schedule_row(invite_token: str) -> dict:
         return {}
 
 
-def _invite_url(invite_token: str) -> str:
-    import os
-    base = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    return f"{base}/?invite={invite_token}" if base else f"/?invite={invite_token}"
+def _invite_url(invite_token: str, request=None) -> str:
+    """Absolute invite link (15 Sep 2026): settings/env base, else the current
+    request's origin. Never a bare "/?invite=…" — see services/invite_links.py."""
+    from services.invite_links import invite_url
+    return invite_url(invite_token, request, strict=False)
 
 
-def _link_out(db: Session, link: AiInterviewLink, candidate: Candidate | None) -> dict:
+def _link_out(db: Session, link: AiInterviewLink, candidate: Candidate | None, request=None) -> dict:
     email = (candidate.email or "").lower() if candidate else ""
     data = to_dict(link)
     data["report_link"] = (
@@ -123,7 +123,7 @@ def _link_out(db: Session, link: AiInterviewLink, candidate: Candidate | None) -
     data["candidate_name"] = row.get("candidate_name")
     data["candidate_email"] = row.get("candidate_email")
     data["session_status"] = row.get("session_status") or row.get("status")
-    data["invite_url"] = _invite_url(link.invite_token)
+    data["invite_url"] = _invite_url(link.invite_token, request)
     # A session already under way must not be silently rescheduled or deleted.
     started = bool(row.get("interview_started_at") or row.get("verified_at"))
     data["started"] = started
@@ -147,15 +147,8 @@ def _role_title(db: Session, profile: CandidateProfile, requirement: Requirement
 
 def _when_text(scheduled_at_local: str | None) -> str:
     """Human date for the email body; falls back to the raw text the recruiter typed."""
-    raw = (scheduled_at_local or "").strip()
-    if not raw:
-        return ""
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(raw, fmt).strftime("%A, %d %B %Y at %H:%M")
-        except ValueError:
-            continue
-    return raw
+    from services.ist import human_when
+    return human_when(scheduled_at_local)
 
 
 def _send_invite(db: Session, profile: CandidateProfile, candidate: Candidate,
@@ -209,7 +202,7 @@ def _send_invite(db: Session, profile: CandidateProfile, candidate: Candidate,
 
 
 @router.get("/{profile_id}/ai-interviews")
-def list_ai_interviews(profile_id: int, db: Session = Depends(get_crm_db),
+def list_ai_interviews(profile_id: int, request: Request, db: Session = Depends(get_crm_db),
                        user: CurrentUser = Depends(gated_read("profiles", *VIEW_ROLES))):
     profile = _profile_or_404(db, profile_id)
     candidate = db.get(Candidate, profile.candidate_id)
@@ -218,14 +211,14 @@ def list_ai_interviews(profile_id: int, db: Session = Depends(get_crm_db),
         .order_by(AiInterviewLink.created_at.desc())
     ).scalars().all()
     return envelope(
-        data=[_link_out(db, l, candidate) for l in links],
+        data=[_link_out(db, l, candidate, request) for l in links],
         meta={"pending_count": sum(1 for l in links if l.result == "Pending"),
               "page": 1, "limit": len(links) or 1, "total": len(links), "pages": 1},
     )
 
 
 @router.post("/{profile_id}/ai-interviews")
-def trigger_ai_interview(profile_id: int, payload: AiInterviewCreate | None = None,
+def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterviewCreate | None = None,
                          db: Session = Depends(get_crm_db),
                          user: CurrentUser = Depends(gated_write("profiles", *TRIGGER_ROLES))):
     body = payload or AiInterviewCreate()
@@ -277,6 +270,7 @@ def trigger_ai_interview(profile_id: int, payload: AiInterviewCreate | None = No
         candidate_name_override=body.candidate_name,
         candidate_email_override=to_email,
         extra_notes=body.notes or "",
+        request=request,
     )
     if not bridge.get("scheduled"):
         raise HTTPException(status_code=502,
@@ -323,15 +317,19 @@ def trigger_ai_interview(profile_id: int, payload: AiInterviewCreate | None = No
             "autosend": ai_interview_autosend_enabled(),
         },
         message=(
-            f"AI interview scheduled — invite emailed to {to_email}"
+            (f"AI interview scheduled — invite queued for {to_email} (sent by the mail outbox within a minute; "
+             f"check the Emails tab if it does not arrive)"
+             if email_result.get("queued") else f"AI interview scheduled — invite emailed to {to_email}")
             if email_result.get("sent")
-            else "AI interview ready — copy the invite link to share with the candidate"
+            else ("AI interview ready — copy the invite link to share with the candidate"
+                  + (f" (email not sent: {email_result.get('error')})"
+                     if should_send and email_result.get("error") else ""))
         ),
     )
 
 
 @router.put("/{profile_id}/ai-interviews/{link_id}")
-def update_ai_interview(profile_id: int, link_id: int, payload: AiInterviewUpdate,
+def update_ai_interview(profile_id: int, link_id: int, payload: AiInterviewUpdate, request: Request,
                         db: Session = Depends(get_crm_db),
                         user: CurrentUser = Depends(gated_write("profiles", *TRIGGER_ROLES))):
     """Reschedule a pending session and/or re-send the invite email.
@@ -361,11 +359,24 @@ def update_ai_interview(profile_id: int, link_id: int, payload: AiInterviewUpdat
     if payload.candidate_email and payload.candidate_email.strip():
         updates["candidate_email"] = payload.candidate_email.strip().lower()
     if payload.notes is not None:
-        # Keep the packed karnex-cfg block intact — it drives the interview engine.
-        base = (row.get("notes") or "").split("\n--- karnex-cfg")[0].strip()
-        tail = (row.get("notes") or "")[len(base):]
-        updates["notes"] = (f"{base}\n{payload.notes.strip()}{tail}"
-                            if payload.notes.strip() else f"{base}{tail}")
+        # Keep the packed config block intact — it drives the interview engine
+        # (job, skills, timing). The marker is CFG_MARKER ("__KARNEX_CFG__:");
+        # this used to split on "--- karnex-cfg", which never matched, so the
+        # note landed AFTER the JSON, the config stopped parsing, and the
+        # candidate was interviewed against the first job template in the
+        # list (15 Sep 2026).
+        from services.ai_interview_bridge import CFG_MARKER
+        raw_notes = row.get("notes") or ""
+        if CFG_MARKER in raw_notes:
+            head, cfg_tail = raw_notes.split(CFG_MARKER, 1)
+            cfg_block = f"\n{CFG_MARKER}{cfg_tail.strip()}"
+        else:
+            head, cfg_block = raw_notes, ""
+        head = head.strip()
+        headline = head.split("\n", 1)[0] if head else ""
+        new_note = payload.notes.strip()
+        body_txt = "\n".join(x for x in (headline, new_note) if x)
+        updates["notes"] = f"{body_txt}{cfg_block}"
 
     if updates:
         try:
@@ -390,7 +401,7 @@ def update_ai_interview(profile_id: int, link_id: int, payload: AiInterviewUpdat
         notified = _send_invite(
             db, profile, candidate, _requirement_for(db, profile),
             to_email=to_email, to_name=to_name,
-            invite_url=_invite_url(link.invite_token),
+            invite_url=_invite_url(link.invite_token, request),
             access_key=fresh.get("access_key") or "",
             when_text=_when_text(fresh.get("scheduled_at_local")),
         )
@@ -403,7 +414,7 @@ def update_ai_interview(profile_id: int, link_id: int, payload: AiInterviewUpdat
     db.commit()
     db.refresh(link)
     email_result = notified.get("email") or {}
-    data = _link_out(db, link, candidate)
+    data = _link_out(db, link, candidate, request)
     data["email_sent"] = bool(email_result.get("sent"))
     data["email_error"] = email_result.get("error")
     return envelope(

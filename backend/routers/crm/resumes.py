@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+import sqlalchemy as sa
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -632,6 +633,8 @@ def _run_candidate_zip_job(job_id: str, user_id: int, user_name: str,
                             city=(parsed.get("location") or "").strip()[:120] or None,
                             preferred_locations=(parsed.get("location") or "").strip()[:255] or None,
                             cv_url=cv_url,
+                            created_by_id=user_id,
+                            created_by_name=user_name,
                         )
                         db.add(cand)
                         db.flush()
@@ -946,6 +949,8 @@ def list_resumes(
     ats_status: str | None = None,
     ai_interview_status: str | None = None,
     applied_by: str | None = None,
+    applied_from: date | None = None,
+    applied_to: date | None = None,
     dismissed: bool = False,
     stage: str | None = None,
     p: PageParams = Depends(page_params),
@@ -1003,6 +1008,12 @@ def list_resumes(
                 CandidateProfile.ta_owner_name == applied_by.strip(),
             )
         ))
+    # Applied-date window (11 Sep 2026, TA request): "what did I submit this
+    # week". The resume's upload time IS the application time here.
+    if applied_from is not None:
+        stmt = stmt.where(sa.func.date(Resume.created_at) >= applied_from)
+    if applied_to is not None:
+        stmt = stmt.where(sa.func.date(Resume.created_at) <= applied_to)
     if p.search:
         like = f"%{p.search}%"
         stmt = stmt.where(or_(Resume.candidate_name.ilike(like), Resume.email.ilike(like),
@@ -1019,6 +1030,7 @@ def list_resumes(
     extra = _profile_only_applied_rows(
         db, req, search=p.search, applied_by=applied_by,
         stages=wanted_stages, dismissed=dismissed,
+        applied_from=applied_from, applied_to=applied_to,
     )
     items, extra_page, order, meta = _paginate_merged(db, stmt, extra, p.page, p.limit)
     data = enrich_resumes_with_ai(db, items)
@@ -1120,7 +1132,9 @@ def _paginate_merged(db: Session, stmt, extra: list[dict], page: int, limit: int
 def _profile_only_applied_rows(db: Session, req, *, search: str | None,
                                applied_by: str | None,
                                stages: list | None = None,
-                               dismissed: bool = False) -> list[dict]:
+                               dismissed: bool = False,
+                               applied_from: date | None = None,
+                               applied_to: date | None = None) -> list[dict]:
     """RMG-shortlisted profiles on this opportunity that have no resume row.
 
     Filtered by the same search / applied-by / stage the caller asked for, and
@@ -1192,6 +1206,12 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
             continue
         if want_ta and (profile.ta_owner_name or "") != want_ta:
             continue
+        applied_at = profile.applied_on or profile.created_at
+        applied_day = applied_at.date() if applied_at else None
+        if applied_from and (applied_day is None or applied_day < applied_from):
+            continue
+        if applied_to and (applied_day is None or applied_day > applied_to):
+            continue
         here = getattr(profile.pipeline_status, "value", profile.pipeline_status)
         if want_stages and here not in want_stages:
             continue
@@ -1262,7 +1282,16 @@ def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]
             for c in db.execute(select(Candidate).where(Candidate.id.in_(cand_ids))).scalars().all():
                 if c.email:
                     emails[c.id] = c.email.strip().lower()
-        base = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+        from services.invite_links import resolve_invite_base
+        base = resolve_invite_base()  # settings/env, else the last request's origin
+        # Scheduled time from the legacy schedule row (see services/resumes.py).
+        from services.ist import local_stamp_to_iso
+        from auth_db import get_schedules_by_tokens
+        from services.ai_interview_bridge import _legacy_db_target
+        try:
+            scheds = get_schedules_by_tokens(_legacy_db_target(), [l.invite_token for l in latest.values() if l.invite_token])
+        except Exception:
+            scheds = {}
 
         out: dict[int, dict] = {}
         for pid in profile_ids:
@@ -1285,7 +1314,9 @@ def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]
                         f"/admin?view=candidateReport&cid={email}&iid={link.interview_record_id}"
                         if link.interview_record_id and email else None
                     ),
-                    "ai_interview_scheduled_at": link.created_at.isoformat() if link.created_at else None,
+                    "ai_interview_scheduled_at": (
+                        local_stamp_to_iso((scheds.get(link.invite_token or "") or {}).get("scheduled_at_local"))
+                        or (link.created_at.isoformat() if link.created_at else None)),
                 })
                 if token:
                     d["ai_invite_token"] = token
@@ -1636,9 +1667,31 @@ def reject_resume(
 # Candidate/profile find-or-create now lives in services/slot_booking.py — it is
 # shared with the public slot-confirmation flow (routers/crm/slots.py).
 
+class ScheduleAiInterviewIn(BaseModel):
+    """Optional interview time, IST wall clock "YYYY-MM-DD HH:MM" (or with a T).
+
+    Until 14 Sep 2026 this endpoint took no time at all and stamped "now" —
+    so the candidate's email said the moment the TA CLICKED, not the slot the
+    TA had agreed with them (11 AM agreed → "3 PM" mailed)."""
+    scheduled_at: str | None = Field(default=None, max_length=32)
+
+    def stamp(self) -> str | None:
+        raw = (self.scheduled_at or "").strip()
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(raw, fmt).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+        raise HTTPException(status_code=400, detail="scheduled_at must be YYYY-MM-DD HH:MM (IST)")
+
+
 @router.post("/api/resumes/{resume_id}/schedule-ai-interview")
 def schedule_ai_interview(
     resume_id: int,
+    request: Request,
+    body: ScheduleAiInterviewIn | None = None,
     db: Session = Depends(get_crm_db),
     # RMG added 2 Sep 2026 — RMG picks the route (AI vs manual L1) from the row.
     user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
@@ -1664,13 +1717,18 @@ def schedule_ai_interview(
     if blocked:
         raise HTTPException(status_code=400, detail=blocked)
 
-    bridge = schedule_l1_interview(db, candidate, req, profile, resume=resume, scheduled_by=user.id)
+    from services.ist import read_as_ist
+    when_stamp = body.stamp() if body is not None else None
+    bridge = schedule_l1_interview(db, candidate, req, profile, resume=resume, scheduled_by=user.id,
+                                   scheduled_at_local=when_stamp, request=request)
     if not bridge.get("scheduled"):
         raise HTTPException(status_code=502, detail=f"AI interview scheduling failed: {bridge.get('error')}")
 
     resume.candidate_id = candidate.id
     resume.ai_interview_status = AiInterviewStatus.SCHEDULED
-    resume.ai_interview_scheduled_at = _now()
+    # The SLOT the TA picked (IST → UTC), else the moment it was scheduled.
+    resume.ai_interview_scheduled_at = (
+        read_as_ist(datetime.strptime(when_stamp, "%Y-%m-%d %H:%M")) if when_stamp else _now())
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "AI_L1_SCHEDULED", f"AI_L1_SCHEDULED for {resume.candidate_name}")
 
@@ -1681,7 +1739,7 @@ def schedule_ai_interview(
         from routers.crm.slots import _when_text as _slot_when_text
         when_text = _slot_when_text(resume.ai_interview_scheduled_at)
         msg = interview_link_message(resume.candidate_name, req.title, when_text,
-                                     bridge.get("invite_url", ""), bridge.get("access_key", ""))
+                                     bridge.get("invite_url", ""), bridge.get("access_key", ""), db=db)
         notified = notify_candidate(resume.email, resume.phone, msg["subject"], msg["text"], msg["html"],
                                     db=db, event="candidate.interview_link", actor=user,
                                     to_name=resume.candidate_name,

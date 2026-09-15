@@ -199,8 +199,14 @@ def schedule_l1_interview(
     candidate_name_override: str | None = None,
     candidate_email_override: str | None = None,
     extra_notes: str = "",
+    request=None,
 ) -> dict:
     """Schedule an AI L1 interview for a CRM candidate (real session).
+
+    `request` (the scheduling HTTP request) lets the invite link resolve an
+    absolute base when no PUBLIC_BASE_URL is configured — see
+    services/invite_links.py. Without any resolvable base the call FAILS
+    (scheduled=False) instead of mailing a relative "/?invite=…" link.
 
     `scheduled_at_local` is the interview date/time as the recruiter typed it
     ("YYYY-MM-DD HH:MM"); when omitted it defaults to now, preserving the old
@@ -212,6 +218,18 @@ def schedule_l1_interview(
     The caller commits (link row is added to the given session).
     """
     from auth_db import create_interview_schedule  # deferred import — avoids cycles
+
+    # Resolve the link base BEFORE touching the DB: a schedule whose link can
+    # never be opened is worse than a clear error to the recruiter (15 Sep 2026).
+    from services.invite_links import InviteBaseUnavailable, resolve_invite_base
+    invite_base = resolve_invite_base(request)
+    if not invite_base:
+        err = InviteBaseUnavailable(
+            "Cannot build the interview link: set Settings ▸ Email ▸ Public base URL "
+            "(or PUBLIC_BASE_URL) to the address candidates open.")
+        logger.error("AI L1 scheduling refused for candidate %s: %s", getattr(candidate, "id", "?"), err)
+        return {"scheduled": False, "session_ref": None, "invite_url": "", "access_key": "",
+                "link_id": None, "job_id": "", "error": str(err)}
 
     opportunity = db.get(Opportunity, profile.opportunity_id)
     skills = _skills_for(db, requirement, profile.opportunity_id)
@@ -271,7 +289,10 @@ def schedule_l1_interview(
     candidate_name = (candidate_name_override or "").strip() or \
         f"{candidate.first_name} {candidate.last_name or ''}".strip()
     candidate_email = ((candidate_email_override or "").strip() or (candidate.email or "")).lower()
-    when = (scheduled_at_local or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
+    # IST "now", never the server clock: a UTC-hosted deploy used to stamp a
+    # time 5h30 behind the recruiter's watch (14 Sep 2026).
+    from services.ist import now_ist_stamp
+    when = (scheduled_at_local or "").strip() or now_ist_stamp()
 
     try:
         schedule = create_interview_schedule(
@@ -303,8 +324,7 @@ def schedule_l1_interview(
     db.add(link)
     db.flush()
 
-    base = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    invite_url = f"{base}/?invite={schedule['invite_token']}" if base else f"/?invite={schedule['invite_token']}"
+    invite_url = f"{invite_base}/?invite={schedule['invite_token']}"
     return {
         "scheduled": True,
         "session_ref": schedule["invite_token"],
@@ -329,7 +349,9 @@ def _score_percent(report: dict) -> Decimal | None:
             pct = None
     if pct is None:
         return None
-    return Decimal(str(round(float(pct), 2)))
+    # Clamp to 0..100: an exception-branch report once carried a 0-40 "score"
+    # that × 10 overflowed the Numeric(5,2) column (15 Sep 2026).
+    return Decimal(str(round(max(0.0, min(100.0, float(pct))), 2)))
 
 
 def _rating_from_score(score_0_10) -> int:

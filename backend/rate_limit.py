@@ -65,8 +65,9 @@ def setup_rate_limit(app) -> bool:
     return True
 
 
-def limit(spec: str) -> Callable:
+def limit(spec: str, key_func: Callable | None = None) -> Callable:
     """Decorator factory; returns slowapi limiter when active, no-op otherwise.
+    ``key_func`` overrides the per-IP key (e.g. per-login for the support bot).
 
     IMPORTANT: this reads ``_limiter`` at *decoration* time, so
     ``setup_rate_limit(app)`` must run before any decorated route is defined.
@@ -84,4 +85,4 @@ def limit(spec: str) -> Callable:
         def _noop(fn: Callable) -> Callable:
             return fn
         return _noop
-    return _limiter.limit(spec)
+    return _limiter.limit(spec, key_func=key_func) if key_func else _limiter.limit(spec)

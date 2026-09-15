@@ -190,6 +190,7 @@ def serialize_employee(emp: Employee, db: Session | None = None, detail: bool = 
         "first_name": emp.first_name,
         "last_name": emp.last_name,
         "full_name": full_name(emp),
+        "employee_code": emp.employee_code,
         "email": emp.email,
         "phone": emp.phone,
         "department_id": emp.department_id,
@@ -223,7 +224,6 @@ def serialize_employee(emp: Employee, db: Session | None = None, detail: bool = 
         data["blood_group"] = emp.blood_group
         data["current_ctc"] = _num(emp.current_ctc)
         data["cv_url"] = emp.cv_url
-        data["employee_code"] = emp.employee_code
         data["emergency_number"] = emp.emergency_number
         data["date_of_birth"] = _iso(emp.date_of_birth)
         data["present_address"] = emp.present_address

@@ -226,11 +226,14 @@ def serialize_policy(policy: CustomerBillingPolicy | None) -> dict | None:
         "comp_off_balance_initial": _bnum(getattr(policy, "comp_off_balance_initial", None)),
         "comp_off_max_limit": _bnum(getattr(policy, "comp_off_max_limit", None)),
         "comp_off_max_carry_forward": _bnum(getattr(policy, "comp_off_max_carry_forward", None)),
+        "comp_off_covers_lop": bool(getattr(policy, "comp_off_covers_lop", False)),
         "normal_hours_per_day": _bnum(getattr(policy, "normal_hours_per_day", None)),
         # Paid leaves/year billed by the customer (APTIV rule, 0078).
         "billable_leaves_per_year": _bnum(getattr(policy, "billable_leaves_per_year", None)),
         "user_role": getattr(policy, "user_role", None),
         "operation": getattr(policy, "operation", None),
+        # Karnex bank account printed on this customer's invoices (0098).
+        "bank_account_id": getattr(policy, "bank_account_id", None),
     }
 
 

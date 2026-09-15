@@ -305,3 +305,70 @@ class CreditNoteLine(Base):
     line_total = sa.Column(sa.Numeric(14, 2), nullable=False)
 
     credit_note = relationship("CreditNote", back_populates="lines")
+
+
+class CompanyBankAccount(Base):
+    """Karnex receivable bank accounts (11 Sep 2026, user request).
+
+    Admin/CEO keep the list under Settings ▸ Invoice; Sales picks ONE for a
+    customer on the Leave & Holiday Billing step, and only that account is
+    printed on the customer's tax invoices. No customer pick → the default
+    account → the legacy `invoice.bank_*` settings.
+    """
+
+    __tablename__ = "company_bank_accounts"
+    id = sa.Column(sa.Integer, primary_key=True)
+    label = sa.Column(sa.String(120), nullable=False)          # e.g. "HDFC — Baner (Current)"
+    bank_name = sa.Column(sa.String(120), nullable=False)
+    account_name = sa.Column(sa.String(255), nullable=False)
+    account_number = sa.Column(sa.String(40), nullable=False)
+    ifsc = sa.Column(sa.String(20), nullable=False)
+    branch = sa.Column(sa.String(160), nullable=True)
+    account_type = sa.Column(sa.String(40), nullable=True)     # Current / Savings / OD / CC
+    swift_code = sa.Column(sa.String(20), nullable=True)
+    micr_code = sa.Column(sa.String(20), nullable=True)
+    upi_id = sa.Column(sa.String(120), nullable=True)
+    bank_address = sa.Column(sa.String(255), nullable=True)
+    is_default = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    is_active = sa.Column(sa.Boolean, nullable=False, server_default=sa.true())
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    updated_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),
+                           onupdate=sa.func.now(), nullable=False)
+
+
+class InvoiceRevisionStatus(str, enum.Enum):
+    PENDING = "Pending"
+    APPROVED = "Approved"
+    REJECTED = "Rejected"
+
+
+class InvoiceRevision(Base):
+    """A requested change to a GENERATED invoice (11 Sep 2026, user flow).
+
+    The customer asks for a correction → Sales/Finance request the change with
+    a reason → an approver (Sales / Sales Head; Admin/CEO always) approves or
+    rejects → only then the invoice row changes. Every request, decision and
+    the before/after of each field is kept here forever: the invoice's own
+    change history. Admin/CEO + Sales Head are notified at each step.
+    """
+
+    __tablename__ = "invoice_revisions"
+    id = sa.Column(sa.Integer, primary_key=True)
+    invoice_id = sa.Column(sa.Integer, sa.ForeignKey("invoices.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    status = sa.Column(sa.String(16), nullable=False, server_default="Pending", index=True)
+    reason = sa.Column(sa.Text, nullable=False)
+    #: {"field": {"from": x, "to": y}, "lines": [{"id", "s_no", "qty": {from,to}, "rate": {...}}]}
+    changes = sa.Column(JSONB, nullable=False)
+    #: Full header + lines before the change (what the customer already had).
+    snapshot_before = sa.Column(JSONB, nullable=True)
+    snapshot_after = sa.Column(JSONB, nullable=True)
+    requested_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True, index=True)
+    requested_by_name = sa.Column(sa.String(255), nullable=True)
+    requested_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    decided_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    decided_by_name = sa.Column(sa.String(255), nullable=True)
+    decided_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    decision_note = sa.Column(sa.Text, nullable=True)
+
+    invoice = relationship("Invoice")

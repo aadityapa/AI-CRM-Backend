@@ -138,12 +138,20 @@ def _parse_sort(raw: str | None) -> list[tuple[str, bool]]:
 # CRUD
 # ---------------------------------------------------------------------------
 
+def _id_csv(raw, field: str) -> list[int]:
+    try:
+        return [int(x) for x in str(raw).split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{field} must be an id or a comma-separated list of ids")
+
+
 @router.get("")
 def list_profiles(pp: PageParams = Depends(page_params),
                   pipeline_status: str | None = None,
                   opportunity_id: str | None = None,
                   candidate_id: int | None = None,
-                  ta_owner_id: int | None = None,
+                  ta_owner_id: str | None = None,
+                  customer_id: int | None = None,
                   bucket: str | None = None,
                   source: str | None = None,
                   include_hidden: bool = False,
@@ -184,9 +192,9 @@ def list_profiles(pp: PageParams = Depends(page_params),
     if ai_max is not None:
         stmt = stmt.where(_LATEST_AI_SCORE <= ai_max)
     if applied_from is not None:
-        stmt = stmt.where(sa.func.date(CandidateProfile.applied_on) >= applied_from)
+        stmt = stmt.where(sa.func.date(sa.func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)) >= applied_from)
     if applied_to is not None:
-        stmt = stmt.where(sa.func.date(CandidateProfile.applied_on) <= applied_to)
+        stmt = stmt.where(sa.func.date(sa.func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)) <= applied_to)
     if submitted_by and submitted_by.strip():
         stmt = stmt.where(CandidateProfile.created_by_name.ilike(f"%{submitted_by.strip()}%"))
     if pipeline_status:
@@ -217,9 +225,12 @@ def list_profiles(pp: PageParams = Depends(page_params),
             stmt = stmt.where(CandidateProfile.opportunity_id.in_(opp_ids))
     if candidate_id is not None:
         stmt = stmt.where(CandidateProfile.candidate_id == candidate_id)
-    if ta_owner_id is not None:
-        # "Show only the applicants I submitted" — the Applicants tab filter.
-        stmt = stmt.where(CandidateProfile.ta_owner_id == ta_owner_id)
+    if ta_owner_id is not None and str(ta_owner_id).strip():
+        # "Show only the applicants I submitted" — one id or a CSV (merged accounts).
+        stmt = stmt.where(CandidateProfile.ta_owner_id.in_(_id_csv(ta_owner_id, "ta_owner_id")))
+    if customer_id is not None:
+        stmt = stmt.where(CandidateProfile.opportunity_id.in_(
+            select(Opportunity.id).where(Opportunity.customer_id == customer_id)))
     if source:
         # e.g. ?source=zoho_import to show only imported rows.
         stmt = stmt.where(CandidateProfile.source == source.strip())
@@ -275,6 +286,20 @@ def list_profiles(pp: PageParams = Depends(page_params),
 # NOTE (route order): these literal routes MUST stay above GET /{profile_id},
 # or FastAPI binds profile_id="ta-owners"/"export" and 404s them.
 
+@router.get("/customers")
+def profile_customer_options(db: Session = Depends(get_crm_db),
+                             user: CurrentUser = Depends(any_crm_role)):
+    """Customers that have at least one profile — the directory's Customer filter."""
+    rows = db.execute(
+        select(Customer.id, Customer.name)
+        .where(Customer.id.in_(
+            select(Opportunity.customer_id).join(
+                CandidateProfile, CandidateProfile.opportunity_id == Opportunity.id)))
+        .order_by(Customer.name)
+    ).all()
+    return envelope([{"id": r[0], "name": r[1]} for r in rows])
+
+
 @router.get("/ta-owners")
 def ta_owner_options(db: Session = Depends(get_crm_db),
                      user: CurrentUser = Depends(any_crm_role)):
@@ -288,12 +313,16 @@ def ta_owner_options(db: Session = Depends(get_crm_db),
         .where(CandidateProfile.ta_owner_id.isnot(None))
         .distinct()
     ).all()
-    best: dict[int, str] = {}
+    # Merged by NAME (11 Sep 2026, user report of duplicates): the same
+    # recruiter can own two user accounts (re-created login, import stamp),
+    # so one entry carries every id as a CSV and the filter matches all.
+    by_name: dict[str, dict] = {}
     for uid, name in rows:
-        if uid not in best or (name and not best[uid]):
-            best[uid] = (name or "").strip() or f"user:{uid}"
+        label = (name or "").strip() or f"user:{uid}"
+        entry = by_name.setdefault(label.lower(), {"ids": set(), "name": label})
+        entry["ids"].add(uid)
     return envelope(data=sorted(
-        ({"id": uid, "name": name} for uid, name in best.items()),
+        ({"id": ",".join(str(i) for i in sorted(e["ids"])), "name": e["name"]} for e in by_name.values()),
         key=lambda r: r["name"].lower(),
     ))
 
@@ -316,7 +345,8 @@ _EXPORT_FORMATS = ("csv", "tsv", "json", "xml", "html", "xlsx", "pdf")
 def export_profiles(format: str = "csv",
                     pipeline_status: str | None = None,
                     opportunity_id: str | None = None,
-                    ta_owner_id: int | None = None,
+                    ta_owner_id: str | None = None,
+                    customer_id: int | None = None,
                     bucket: str | None = None,
                     search: str | None = None,
                     ai_min: float | None = None,
@@ -363,9 +393,9 @@ def export_profiles(format: str = "csv",
     if ai_max is not None:
         stmt = stmt.where(_LATEST_AI_SCORE <= ai_max)
     if applied_from is not None:
-        stmt = stmt.where(sa.func.date(CandidateProfile.applied_on) >= applied_from)
+        stmt = stmt.where(sa.func.date(sa.func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)) >= applied_from)
     if applied_to is not None:
-        stmt = stmt.where(sa.func.date(CandidateProfile.applied_on) <= applied_to)
+        stmt = stmt.where(sa.func.date(sa.func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)) <= applied_to)
     if submitted_by and submitted_by.strip():
         stmt = stmt.where(CandidateProfile.created_by_name.ilike(f"%{submitted_by.strip()}%"))
     if pipeline_status:
@@ -380,8 +410,11 @@ def export_profiles(format: str = "csv",
             raise HTTPException(status_code=400, detail="opportunity_id must be an id or a comma-separated list of ids")
         if opp_ids:
             stmt = stmt.where(CandidateProfile.opportunity_id.in_(opp_ids))
-    if ta_owner_id is not None:
-        stmt = stmt.where(CandidateProfile.ta_owner_id == ta_owner_id)
+    if ta_owner_id is not None and str(ta_owner_id).strip():
+        stmt = stmt.where(CandidateProfile.ta_owner_id.in_(_id_csv(ta_owner_id, "ta_owner_id")))
+    if customer_id is not None:
+        stmt = stmt.where(CandidateProfile.opportunity_id.in_(
+            select(Opportunity.id).where(Opportunity.customer_id == customer_id)))
     stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
     if bucket:
         rejected_enums = [PipelineStatus(v) for v in sorted(REJECTED_BUCKET)]
@@ -966,7 +999,11 @@ def schedule_l2_face_to_face(
             status_code=400,
             detail=f"The {rl} round can be scheduled only while the profile is in "
                    f"{spec['stage'].replace('_', ' ')}")
-    when = (payload.scheduled_at or "").strip()
+    when_raw = (payload.scheduled_at or "").strip()
+    # Human, zone-labelled time for every message (14 Sep 2026): the raw
+    # datetime-local string ("2026-09-15T11:00") left the candidate — and any
+    # mail client's auto-detected event — to guess the zone. It is IST.
+    when = _fmt_slot_ist(when_raw) if when_raw else ""
     link = (payload.meeting_link or "").strip()
     note = (payload.note or "").strip()
     # WHO the candidate is meeting. Named explicitly, else derived: the RMG
@@ -984,7 +1021,7 @@ def schedule_l2_face_to_face(
             # datetime-local "YYYY-MM-DDTHH:MM" is IST — store it as such, not
             # as UTC (2 Sep 2026: rounds showed 5h30 late and missed the calendar).
             from services.interview_rounds import read_as_ist
-            event_dt = read_as_ist(_dt.fromisoformat(when))
+            event_dt = read_as_ist(_dt.fromisoformat(when_raw))
         except ValueError:
             event_dt = None
     db.add(InterviewEvent(
@@ -992,7 +1029,7 @@ def schedule_l2_face_to_face(
         candidate_id=profile.candidate_id,
         kind=spec["kind"],
         scheduled_at=event_dt,
-        raw_when=when or None,
+        raw_when=when_raw or None,
         meeting_link=link or None,
         note=note or None,
         interviewer=interviewer or None,
@@ -1316,13 +1353,19 @@ _CUSTOMER_STAGE_ROUND_KIND: dict[str, str] = {
 }
 
 
-def _fmt_slot(raw: str) -> str:
-    """'2026-09-10T14:30' → '10 Sep 2026, 02:30 PM' for notes and mails."""
+def _fmt_slot_ist(raw: str) -> str:
+    """'2026-09-15T11:00' → '15 Sep 2026, 11:00 AM IST'. The zone is spelled
+    out because the string is exactly what the TA typed in IST."""
     from datetime import datetime as _dt
     try:
-        return _dt.fromisoformat(raw).strftime("%d %b %Y, %I:%M %p")
+        return _dt.fromisoformat(raw).strftime("%d %b %Y, %I:%M %p") + " IST"
     except (ValueError, TypeError):
         return raw
+
+
+def _fmt_slot(raw: str) -> str:
+    """Alias of `_fmt_slot_ist` — every customer-slot rendering says IST too."""
+    return _fmt_slot_ist(raw)
 
 
 def _schedule_customer_round_with_move(db: Session, profile, new_status: str, sched,
@@ -2223,8 +2266,8 @@ def _email_candidate_round_invite(db: Session, profile: CandidateProfile,
         label = round_label(event.kind)
         # Show the time in IST — the zone the TA typed it in.
         try:
-            from zoneinfo import ZoneInfo
-            when_txt = event.scheduled_at.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M %p IST")
+            from services.ist import to_ist
+            when_txt = to_ist(event.scheduled_at).strftime("%d %b %Y, %I:%M %p IST")
         except Exception:
             when_txt = event.raw_when or str(event.scheduled_at)
         link = event.meeting_link.strip()
@@ -2343,7 +2386,9 @@ def _notify_round_owner_scheduled(db: Session, profile, event, user: CurrentUser
         candidate = db.get(Candidate, profile.candidate_id)
         cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
                  if candidate else f"Candidate #{profile.candidate_id}")
-        when = event.raw_when or (event.scheduled_at.isoformat() if event.scheduled_at else "")
+        from services.ist import to_ist
+        when = _fmt_slot_ist(event.raw_when) if event.raw_when else (
+            to_ist(event.scheduled_at).strftime("%d %b %Y, %I:%M %p IST") if event.scheduled_at else "")
         notify_role(
             db, owner,
             f"{round_label(event.kind)} scheduled: {cname}",

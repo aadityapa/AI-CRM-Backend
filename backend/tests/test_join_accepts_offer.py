@@ -248,3 +248,42 @@ def test_the_employee_falls_back_to_the_offer_on_older_profiles(db):
     emp = ensure_employee_for_joined_profile(db, p)
     assert emp is not None
     assert emp.date_of_joining == date(2026, 9, 21)
+
+
+def test_an_existing_employee_matched_by_emp_id_is_updated_not_duplicated(db):
+    """Internal trainee placed with a customer (11 Sep 2026): HR types the
+    trainee's Emp ID in the Workflow section; at Joined the EXISTING record is
+    promoted (designation / department / Karnex date / mailbox) — no second
+    employee row appears."""
+    from models import Designation, Employee, ProfileType
+    from services.candidate_profiles import ensure_employee_for_joined_profile
+
+    trainee_des = Designation(name="Trainee"); eng_des = Designation(name="Engineer")
+    db.add_all([trainee_des, eng_des]); db.flush()
+    existing = Employee(first_name="Omkar", last_name="Milind", email="omkar.m@karnex.in",
+                        employee_code="KRX-0042", profile_type=ProfileType.INTERNAL,
+                        designation_id=trainee_des.id, date_of_joining=date(2026, 1, 5))
+    db.add(existing); db.flush()
+
+    p = _profile(db, PS.JOINED)
+    p.employee_ref = "krx-0042"
+    p.designation_id = eng_des.id
+    p.karnex_onboarding_date = date(2026, 9, 7)
+    p.official_email = "omkar.m@karnex.in"
+    db.flush()
+
+    emp = ensure_employee_for_joined_profile(db, p)
+    assert emp is not None and emp.id == existing.id
+    assert emp.designation_id == eng_des.id
+    assert emp.date_of_joining == date(2026, 9, 7)
+    assert emp.candidate_profile_id == p.id
+    assert db.query(Employee).count() == 1
+
+
+def test_a_new_employee_gets_the_emp_id_hr_typed(db):
+    from services.candidate_profiles import ensure_employee_for_joined_profile
+    p = _profile(db, PS.JOINED)
+    p.employee_ref = "KRX-0099"
+    db.flush()
+    emp = ensure_employee_for_joined_profile(db, p)
+    assert emp is not None and emp.employee_code == "KRX-0099"

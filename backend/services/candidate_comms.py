@@ -102,9 +102,18 @@ def send_candidate_email(to: str, subject: str, text: str, html: str | None = No
 
 def build_ics_invite(summary: str, starts_at, description: str = "", location: str = "",
                      uid: str = "karnex-interview", duration_minutes: int = 60) -> str:
-    """Minimal RFC-5545 VCALENDAR for one interview event (floating local time,
-    matching how RMG typed it). Attach as ("invite.ics", bytes, "text/calendar")."""
-    from datetime import timedelta
+    """RFC-5545 VCALENDAR for one interview event, pinned to Asia/Kolkata.
+
+    The time is rendered as IST wall clock with an explicit TZID (+ a VTIMEZONE
+    block so Outlook honours it too). Until 14 Sep 2026 this wrote a FLOATING
+    time straight from `strftime`, so a UTC-aware value from the DB printed its
+    UTC wall clock and every calendar showed the round 5h30 early. A naive
+    `starts_at` is taken as IST already. Attach as
+    ("invite.ics", bytes, "text/calendar").
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from services.ist import ist_naive
 
     def _fmt(dt) -> str:
         return dt.strftime("%Y%m%dT%H%M%S")
@@ -112,17 +121,28 @@ def build_ics_invite(summary: str, starts_at, description: str = "", location: s
     def _esc(v: str) -> str:
         return (v or "").replace("\\", "\\\\").replace(";", r"\;").replace(",", r"\,").replace("\n", r"\n")
 
-    ends_at = starts_at + timedelta(minutes=duration_minutes)
+    start_ist = ist_naive(starts_at)
+    end_ist = start_ist + timedelta(minutes=duration_minutes)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//Karnex//AI HR Suite//EN",
         "METHOD:REQUEST",
+        "BEGIN:VTIMEZONE",
+        "TZID:Asia/Kolkata",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        "TZOFFSETFROM:+0530",
+        "TZOFFSETTO:+0530",
+        "TZNAME:IST",
+        "END:STANDARD",
+        "END:VTIMEZONE",
         "BEGIN:VEVENT",
         f"UID:{uid}@karnex",
-        f"DTSTAMP:{_fmt(starts_at)}",
-        f"DTSTART:{_fmt(starts_at)}",
-        f"DTEND:{_fmt(ends_at)}",
+        f"DTSTAMP:{stamp}",
+        f"DTSTART;TZID=Asia/Kolkata:{_fmt(start_ist)}",
+        f"DTEND;TZID=Asia/Kolkata:{_fmt(end_ist)}",
         f"SUMMARY:{_esc(summary)}",
     ]
     if description:

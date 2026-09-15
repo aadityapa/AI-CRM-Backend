@@ -78,8 +78,9 @@ def _leave_entry(name="Earned Leave", period=LeavePeriod.FULL, day=1):
 # ---------------------------------------------------------------- ISSUE-1
 
 
-def test_issue1_week_off_billable_bills_no_credit():
-    """week_off_billable > comp_off_billable > credit."""
+def test_week_off_billable_bills_the_day_and_credits_the_work():
+    """11 Sep 2026 (CEO): Week Off Billable = the day counts in the billed month;
+    worked hours on it earn comp-off unless Comp Off Billable is on."""
     saturday = date(2026, 6, 6)
     proj = _project()
     policy = _policy(week_off_billable=True, comp_off_billable=False)
@@ -88,10 +89,10 @@ def test_issue1_week_off_billable_bills_no_credit():
         attendance_status=AttendanceStatus.WEEK_OFF, leave_period=None,
         project=proj, policy=policy,
     )
-    assert bh == D("8") and bd == ONE
+    assert bh == D(str(policy.min_hours_full_day)) and bd == ONE
     entries = [_entry(entry_date=saturday, hours=D("8"))]
-    assert comp_off_earned(entries, policy) == ZERO
-    assert comp_off_billed(entries, policy) == ONE
+    assert comp_off_earned(entries, policy) == ONE
+    assert comp_off_billed(entries, policy) == ZERO
 
 
 def test_issue1_comp_off_billable_when_week_off_off():
@@ -123,7 +124,7 @@ def test_issue1_both_flags_off_credits_not_bills():
     assert comp_off_billed(entries, policy) == ZERO
 
 
-def test_issue1_holidays_billable_worked_holiday_no_credit():
+def test_holidays_billable_worked_holiday_credits_comp_off():
     policy = _policy(holidays_billable=True, comp_off_billable=False)
     proj = _project()
     bh, bd = compute_billables(
@@ -131,13 +132,13 @@ def test_issue1_holidays_billable_worked_holiday_no_credit():
         attendance_status=AttendanceStatus.HOLIDAY, leave_period=None,
         project=proj, policy=policy,
     )
-    assert bh == D("8") and bd == ONE
+    assert bh == D(str(policy.min_hours_full_day)) and bd == ONE
     entries = [_entry(
         entry_date=date(2026, 6, 15), hours=D("8"),
         attendance=AttendanceStatus.HOLIDAY, day_type=DayType.HOLIDAY,
     )]
-    assert comp_off_earned(entries, policy) == ZERO
-    assert comp_off_billed(entries, policy) == ONE
+    assert comp_off_earned(entries, policy) == ONE
+    assert comp_off_billed(entries, policy) == ZERO
 
 
 def test_issue1_bill_xor_credit_never_both():

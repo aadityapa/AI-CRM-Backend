@@ -43,7 +43,7 @@ resolved by `paths._resolve_frontend_dir()` (`FRONTEND_DIR` env → `<repo>/fron
 **Working tree, 8 Sep 2026:** branch `main`, head **`dd61630`**, ~90 modified + 63 untracked paths,
 none committed. `git status` is dominated by CRLF churn — review with `git diff --ignore-all-space`.
 
-**Migration head is now 0097** (`0080`…`0097` are untracked files under `alembic/versions/`).
+**Migration head is now 0103** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
 Deploying REQUIRES `alembic upgrade head` before serving traffic — the ORM maps columns from every
 one of them. Tests: **1034 pass**, 2 stale pins fail (`test_full_pipeline_flow::test_ai_l1_can_only_be_triggered_by_ta`,
 `test_pipeline_tail::test_no_other_stage_has_a_hidden_precondition`) plus the §9 known set.
@@ -66,6 +66,252 @@ hold stage (0097); opportunity list column filters; negative round verdict → r
 importer provenance keys accepted on `details` (`opportunity_form_schema._IMPORT_META`); TA/RMG
 recruiting notifications deep-link to the requirement's Applied Candidates row
 (`services.candidate_profiles.applied_candidates_link` → `p=requirements/{id}&tab=resumes&q=<email>`).
+
+**Added 11 Sep 2026 — Tax Invoice overhaul (migration 0098):** every printed value
+lives in Settings ▸ Invoice (`invoice.*` keys incl. new `sac_code` = 998513, `service_description`,
+`signatory_line`, `footer_website_url`, `footer_text`); the server renderers (`services/tax_invoice.py`
+HTML/WeasyPrint + reportlab) and the new Word export (`services/tax_invoice_docx.py`,
+`GET /api/invoices/{id}/tax-invoice.docx`) all read `seller_from_settings()` / `bank_from_settings()` —
+the module constants are fallback only. `company_bank_accounts` (`routers/crm/bank_accounts.py`, Admin
+writes, any CRM role reads) + `customer_billing_policies.bank_account_id`: the ONE account printed is
+customer pick → default → `invoice.bank_*` (`company_invoice_config.resolve_bank_details`). Service
+table follows the billing unit (`UNIT_COLUMNS`: cost basis · Qty (Days/Hours) · Leave · Rate Per Day ·
+Amount) from `billing_breakdown_for_invoice` (frozen `approved_figures`, else live preview); `LineItem.
+amount_override` makes the engine's amount win over qty × rate. `effective_sac()` treats the old default
+998314 as unset (0098 also rewrites those allocation rows). `invoice_number` is editable (`InvoiceUpdate`,
+unique) and can be typed at generation (`GenerateInvoiceIn.invoice_number`; `GET /api/invoices/next-number`
+is declared BEFORE `/invoices/{invoice_id}` — keep it there). Footer prints the website only, as a link.
+F-V2: Settings ▸ Invoice tab (+ bank accounts panel), customer form bank picker, Edit modal on the invoice
+page (list pencil → `?edit=1`), Generate dialog asks the number, "Tax Invoice (PDF)" = the on-screen
+sheet captured (html2canvas `windowWidth` fix — 794px used to trigger the mobile layout), "Tax Invoice
+(Word)" button.
+
+**Added 11 Sep 2026 — invoice change requests (migration 0099, head is now 0099):** a generated invoice
+is never edited in place. `routers/crm/invoice_revisions.py`: `POST /api/invoices/{id}/revisions` (Sales /
+Finance / Sales Head, reason ≥10 chars, header fields + line qty/rate, one pending per invoice) →
+`…/{rid}/approve` / `…/reject` (action `invoice.revision.approve`, defaults Sales + Sales_Head; Admin/CEO
+always; **requester cannot approve their own**) → `_apply()` recomputes line amounts, sub-total, GST and PO
+consumption and refuses over-consumed PO / below-paid totals. Admin/CEO requests auto-apply but are still
+recorded. `invoice_revisions` keeps reason, diff, before/after snapshots and the decision — the history the
+UI shows. Events `invoice.revision_requested/approved/rejected` notify Admin, CEO, Sales_Head (+ approvers /
+Finance / the requester). The old direct `PUT /invoices/{id}` header edit is Admin/CEO-only now (403
+otherwise). Pinned by `tests/test_invoice_revisions.py` (5 tests).
+
+**Added 11 Sep 2026 — leave carry-forward + timesheet recalc (migration 0100, head is now 0100):**
+`maximum_carry_forward` semantics are now uniform (customer, branch AND project policies; 0100 makes the
+project column nullable): **NULL = carry the whole balance, 0 = lapse, N = carry up to N** — applied by
+the Dec-31 `apply_year_end_carry` (now idempotent per year via the `pe_carry:`/`pe_expire:` sources) AND
+by the Monthly/Quarterly cycle expiry, which used to zero everything. UI: one `CarryForwardField`
+("At expiry — Lapses / Carries all / Carries up to N") in the customer, branch and project leave dialogs;
+"" in the form = NULL on the wire. `POST /api/timesheets/{id}/recalculate` re-freezes an Approved,
+uninvoiced sheet against the current policy (button "Recalculate with current policy"). The timesheet
+grid's Billable Day now follows `_days_from_hours` (≥ full-day hours = 1, ≥ half = 0.5), not hours ÷ 8.
+Branch/customer forms warn that Holidays/Weekoff Billable = calendar-month billing (weekends billed even
+unworked; Comp-Off never applies). `leave_expire = "Carry Forward"` (shown as "Never — carries forward to next year") means the balance never
+lapses: `expiry_applies()` is False, the Dec-31 job still writes the year's `Carry_Forward` ledger event, and
+the project alias no longer maps it to Yearly. Pinned by `tests/test_leave_carry_and_prorate.py` (8 tests).
+
+**11 Sep 2026 (later):** `timesheets.default_hours_worked` now pre-fills new sheets with the resolved
+policy's working day (`working_hours_per_day` → `hours_required_full_day` → cap → 8), and the grid's
+attendance rule takes the policy thresholds (`applyHoursAttendanceRule(row, {full, half})`); "Fill worked
+days with N h" button on editable sheets. `POST /api/projects/employees/{pe}/leave/sync` now also
+**backfills the monthly credit from onboarding** (`backfill_pe_leave_credit_from_onboarding`, idempotent) and
+assigning an employee with a back-dated onboarding does the same at once. Branch policy page hands the
+customer's default leave rows to the project wizard when the branch has none (`leave_policies_source`).
+
+**Comp-Off lifecycle (11 Sep 2026):** weekend/holiday work (Comp Off Billable off) credits a separate
+"Comp-Off" leave type on the PE's leave rows (`accrue_comp_off` → `credit_pe_leave`), capped by the
+customer's `comp_off_max_limit`; it shows in the Leave tab and in Apply Leave like any other type. Its
+31-Dec rule comes from the customer Comp Off section: `comp_off_max_carry_forward` NULL/0 = **lapses**,
+N = carry up to N (`comp_off_year_end_cap`, used by `apply_year_end_carry` for policy-less rows).
+**Comp-Off is NEVER credited by the monthly job** (bug fixed 11 Sep 2026: `credit_one_pe_leave_row` returns 0 for
+policy-less / Comp-Off rows — their `leave_accrual` is the running EARNED total, and the job used to re-read it as
+"N per month", turning one weekend day into a balance of 10). `POST …/leave/sync` runs
+`repair_comp_off_over_credit` first: every bogus `pe_credit:` event on a Comp-Off row gets a reversing
+`Adjustment` (source `pe_credit_reversal:<event id>`, idempotent) and the balance drops accordingly.
+
+**11 Sep 2026 (evening) — filters + Emp ID (migration 0101, head is now 0101):** `candidates.created_at /
+created_by_id / created_by_name` (backfilled from the earliest profile's TA owner + applied date, else Zoho
+`source_created_date`); stamped by `create_candidate`, the Candidates-tab ZIP job and `ensure_sourcing_profile`
+(first profile only). `GET /api/candidates` takes `created_by_id` (id or CSV), `created_from/to`;
+`GET /api/candidates/creators` (declared BEFORE `/{candidate_id}`). Profiles: `GET /api/candidate-profiles/
+customers` + `customer_id` filter; `ta_owner_id` is now id-or-CSV and `/ta-owners` **merges duplicate accounts by
+name** (ids joined with commas); `applied_from/to` fall back to `created_at` when `applied_on` is NULL.
+`GET /api/requirements/{id}/resumes` takes `applied_from/to` (resume `created_at`; profile-only rows use
+`applied_on`). Employees list is ordered `date_of_joining DESC NULLS LAST, id DESC` and search matches
+`employee_code`; the list shows an **Emp ID** column first. Profile Workflow section exposes `employee_ref` as
+"Emp ID": at Joined, `ensure_employee_for_joined_profile` looks up an EXISTING employee by that code (after the
+profile link, before the email match) and `_sync_employee_from_joined_profile` UPDATES it — designation,
+department, Karnex joining date, official mailbox, Emp ID, CTC, re-activated — instead of creating a second
+record (the internal-trainee-placed-with-a-customer scenario). New employees get `employee_code = employee_ref`.
+Project Overview prints `effective_policy` (project → branch → customer) so inherited caps/hours no longer
+show as "—".
+
+**11 Sep 2026 (night) — timesheet fixes:** (1) `compute_billables`: a HALF-day leave on a worked day bills the
+worked half (`min(hours, half-day hrs)`, ≤0.5 day) PLUS the leave half per the leave rules (`_half_leave_billable`)
+— 4.5 h + half Sick Leave used to bill only the leave. Client mirror in `Timesheets.tsx::computeBillables`; the grid
+offers "Apply half-day leave" on Half_Day rows (was Absent only). (2) `_billable_rollup(project, entries, policy)`
+adds `billed_days` = working days + week-offs when `week_off_billable` + holidays when `holidays_billable`; the
+Monthly branch of `timesheet_invoice_preview` and `per_day_charge` use it as the denominator, so an all-billable
+31-day month prints Qty 31 / rate÷31 on the Tax Invoice (was 21 working days). (3) Summary exposes
+`comp_off_earned_gross` and `comp_off_used` (= comp-off leave taken + `lop_covered_days`); the grid marks LOP rows
+paid for by weekend work as "covered by Comp-Off" (`lopCoverByRow`, budget spent in date order) instead of a bare
+LOP. Pinned by `tests/test_timesheet_half_leave_and_billed_days.py`.
+
+**11 Sep 2026 (late) — migration 0102, head is now 0102:** `customer_billing_policies.comp_off_covers_lop`
+(default FALSE). The "Harman rule" (weekend work automatically makes up the month's LOP) is now an **opt-in per
+customer** — `BillingPolicy.comp_off_covers_lop`, customer-level only (branch/project don't override); with it off,
+`lop_cover` is 0, the LOP stays on the sheet and the manager applies Comp-Off / any leave on that row. Customer form:
+Comp Off section ▸ "Loss of Pay in the same month". `test_weekend_work_covers_lop` sets the flag; new
+`test_weekend_work_does_not_cover_lop_by_default`. PE Leave tab "Leave history — credits & debits":
+`pe_credit_history` now also returns `timesheet:<id>` events of this PE's sheets (consumption + comp-off credit) and
+`pe_cycle_expire:`; comp-off reversal notes carry `PE#<id>`. Invoice tagline removed (`invoice.seller_tagline` key
+deleted; `get_seller_details()["tagline"]` is always "").
+
+**14 Sep 2026 — Full data backup (Settings ▸ Backup, Admin/CEO only):** `services/data_backup.py` +
+`routers/crm/backup.py` (`/api/admin/backup/{datasets|status|history|download/{name}}`, `POST /api/admin/backup`
+`{datasets:[…]|["all"]}`; all `role_required()`). `DATASETS` is the registry "tab → tables" (10 datasets; CRM
+tables dumped from `Base.metadata`, legacy interview tables + `registration_data` via the SQLAlchemy inspector
+with quoted identifiers). One ZIP: `karnex-backup.xlsx` (write-only workbook, sheet per table) + `<dataset>/csv|json/
+<table>` + `files/<table>/<id>_<name>/<col>__<file>` for every `/api/crm-files/…` reference (row gets
+`_files_folder`) + README. Redaction by column-name SUBSTRING (`is_redacted_column`: password/secret/token/
+api_key/access_key/device_id/salt) and `app_settings` credential values; `login_data`/`password_reset_tokens`/
+`openai_response_cache` never dumped. Background thread, ONE build at a time (409), archives in
+`data/backups/` (gitignored), last `CRM_BACKUP_KEEP`=3 kept, `.part`/`.xlsx.tmp` cleaned on failure. CSV
+neutralises formula injection. **`tests/test_data_backup.py::test_no_orm_table_is_forgotten_by_the_registry`
+fails when a new table is not assigned to a dataset — add it there.** F-V2: `pages/settings/BackupTab.tsx`
+(dataset checklist, setTimeout-chain polling, blob download via `authFetch`). Optional `date_from`/`date_to` (inclusive) window: `date_column_for(table)` picks the first of `_DATE_COLUMNS` (created_at, entry_date, invoice_date, applied_on, …); tables without one (masters, policies, settings) are always dumped whole. UI presets: All data · This FY · Last FY · This year · Last 12 months.
+
+**14 Sep 2026 — Help & Support bot + tickets (migration 0103, head is now 0103):** `models/support.py`
+(`support_tickets`, `support_ticket_messages`), `services/support.py`, `routers/crm/support.py` (`/api/support/chat`,
+`/tickets[/meta|/summary|/{id}|/{id}/messages|/{id}/rating]`, `PATCH /tickets/{id}` staff-only). Gate is bare
+`get_current_user` ON PURPOSE (legacy HR-only logins need support too); ownership enforced in `_load` (404, never
+leaks); staff = `CurrentUser.is_admin`. Bot = Ask AI's `build_messages` with the SUPPORT persona swapped in
+(`SUPPORT_SYSTEM_PROMPT`), no tools, `temperature 0.3`, `call_type="support_bot"`; the decision is the LAST line
+`ESCALATE: yes|no` (`split_escalation_marker`, after `_parse_reply` strips `NAVIGATE_TO`), offline provider →
+KB answer + escalate; `/chat` is rate-limited **per login** (`rate_limit.limit(spec, key_func=)` now accepts a key).
+Tickets: `ticket_no = T-<id>` after flush (no race); Open → In_Progress on staff reply; user reply on
+Resolved reopens, on Closed is refused (400); status/priority/assignee changes are system messages; assignee must be
+an Admin/CEO login (`_staff_name`, name resolved server-side); `add_message` bumps `updated_at` (queue order);
+rating once, owner only, once Resolved/Closed. Notifications: `support.ticket_raised` (Admin+CEO, dedupe per
+ticket), `support.ticket_replied` (dedupe per MESSAGE — the outbox persists dedupe keys), `support.ticket_status`,
+`support.ticket_assigned`; all in `email_flows.EVENTS`. F-V2: `components/support/SupportWidget.tsx` mounted in
+`App.tsx` (every page; chat · raise ticket · my tickets · thread; Esc only when focus is inside; focus returns to
+the trigger), `crm/pages/SupportTickets.tsx` — the list lives as **Settings ▸ Support Tickets** (`CrmSettingsPage` reads `?tab=`;
+no sidebar entry); routes `support-tickets` (list, Admin/CEO) and `support-tickets/:id` (detail; also renders for the
+owner from their bell link) stay for deep links. 13 tests in `tests/test_support_tickets.py`.
+`tests/test_adaptive_question_engine.py::test_followup_fallback_adapts_to_answer_strength` is FLAKY (random
+follow-up pick) — unrelated.
+
+**14 Sep 2026 — customer-wise Projects hub:** every hub tab (Projects · Project Employees · Timesheets · Invoices ·
+Customer Received Amount) now has the Purchase Orders layout — one expandable section per customer with a count and
+summary — via `crm/components/CustomerGroupedList.tsx` (`CustomerGroupedList`, `ViewToggle`, `useGroupView`; the
+"By customer / Flat list" choice is remembered in `localStorage["crm.hub.view"]`, default By customer). Grouped mode
+fetches the whole filter set (`fetchAllMaster`), flat mode keeps the server-paged `DataTable`. Backend adds
+`customer_id` / `customer_name` to `GET /api/timesheets` rows (via the project) and `GET /api/invoices` rows (via the
+PO's customer, else the project's; legal entity name), both batched per page.
+
+**14 Sep 2026 — interview times are IST end to end (`services/ist.py`):** one `IST` (Asia/Kolkata, FIXED
++05:30 fallback — `interview_rounds._IST` and `slots._DISPLAY_TZ` used to fall back to `timezone.utc` on a box
+without tzdata, a silent 5h30 shift), `now_ist_stamp()`, `to_ist()`, `ist_naive()`, `read_as_ist()`. The report was
+"TA scheduled the MANUAL L1 at 11 AM, candidate's mail said 3 PM". Closed: (1) manual L1/L2/HR rounds
+(`schedule_l2_face_to_face`) mailed the raw datetime-local string (`2026-09-15T11:00`, no zone — mail clients guess);
+every message now says `15 Sep 2026, 11:00 AM IST` (`_fmt_slot_ist`; `raw_when` keeps the typed text).
+(2) `build_ics_invite` wrote a FLOATING `DTSTART` via `strftime` on the UTC-aware `event_dt` → the calendar card
+showed 05:30; it now emits `DTSTART;TZID=Asia/Kolkata:` + a VTIMEZONE block. (3) Interview-round `raw_when`
+(`services/interview_rounds.py`) printed the UTC clock of the posted ISO instant — now `ist_naive()` first.
+(4) `POST /api/resumes/{id}/schedule-ai-interview` took NO time and the bridge stamped `datetime.now()` (server
+clock at the click); it accepts `{scheduled_at: "YYYY-MM-DD HH:MM"}` (IST; 400 otherwise), the Applied Candidates
+dialog has a picker, and the bridge's no-time default is `now_ist_stamp()`. `ScheduleAiInterviewModal` →
+`/candidate-profiles/{id}/ai-interviews` was already a verbatim string passthrough. Pinned by
+`tests/test_interview_time_ist.py` (12). Deploy: the app no longer depends on the host `TZ`; keep the DB session in
+UTC; `pip install tzdata` on Windows hosts.
+
+**14 Sep 2026 — role-based Dashboard ("every role gets its own desk"):** `services/dashboard_desk.py` +
+three routes in `routers/crm/dashboards.py`: `GET /api/dashboard/today` (any CRM role; the role's 4 KPI tiles
+`{key,label,value,detail,state ok|warn|bad,path,format int|money|percent}`, merged + de-duplicated for multi-role
+users, capped at `MAX_TILES`=8; Admin/CEO get the company tiles), `GET /api/dashboard/upcoming?days=7` (rounds,
+AI L1 slots, accepted-offer joinings, PE roll-offs, PO expiries, invoice due dates — each source only when the
+caller can open its tab), `GET /api/dashboard/team` (`role_required("Sales_Head")` = Sales Head/Admin/CEO: `stuck`
+points with the owning area, worst first, + per-person `ta` (from `ta_tracking`) and `sales` rows). All three use
+the same `allowed(tab, *roles)` precedence as `my_work` (template decides alone when present). SLA constants live at
+the top of the module (`SOURCING_SLA_DAYS` 5, `REVIEW_SLA_HOURS` 48, `CUSTOMER_WAIT_DAYS` 3, `STALLED_DAYS` 14,
+`HIRING_STUCK_DAYS` 30). `my_work` gained `rmg_screening_pending`, `customer_feedback_to_chase`,
+`timesheets_to_invoice`, `preboarding_open`. F-V2: `crm/pages/dashboard/DeskWidgets.tsx` (`TodayStrip`,
+`UpcomingPanel`, `QuickActions` (role-filtered links), `TeamPanel`); `CrmDashboard.tsx` composes greeting + role chip
+→ Today strip → My work | Coming up + Quick actions → Team (heads) → the pre-existing role sections. Admin/CEO with
+no operational role get the company stuck-points where My work would be. Tests: `tests/test_dashboard_desk.py` (6).
+
+**15 Sep 2026 — previous-year carry forward on a PE leave row:** `POST /api/projects/employees/{pe}/leave/{leave_id}/
+carry-forward` `{from_year, days, note?}` (HR / Sales Head via `gated_write("project-employees")`; `from_year` must be a
+past year). `services/project_employees.set_pe_carry_forward` books ONE `Carry_Forward` ledger event per (PE, type,
+year), source `pe_carry:{pe}:{type}:{year}:manual` — re-posting the same year books only the DELTA (never stacks),
+zero removes it; `opening_balance` and `leave_balance` move by the delta, and the event appears in the PE history
+(`pe_carry:{pe}:%`) and in "Accrued this year". The Dec-31 job's idempotency key is the exact `pe_carry:{pe}:{type}:{yr}`,
+so the two never collide. F-V2 PE Leave tab: "Carry fwd" column (opening balance, Add/Edit link) + "Carry forward"
+header button → `PeCarryForwardModal`. Pinned by `test_leave_carry_and_prorate.py::test_manual_carry_forward_*`.
+
+**15 Sep 2026 — Interview Integrity rebuilt (`services/interview_integrity.py`):** ONE event taxonomy
+(`EVENT_TYPES`: label · family · penalty · strike?) — the strike set now includes what the candidate page
+really sends on a tab change (`visibility_hidden`, `window_blur`), `fullscreen_exit`, `alt_tab`, `windows_key`,
+`multiple_faces`, plus the new `clipboard` and `devtools`; `key_escape`/`key_f11`/`no_face`/`context_menu` are
+informational. `main._count_integrity_violations` / `_INTEGRITY_VIOLATION_TYPES` are aliases of the module, so
+`POST /interview/violation` is now the **server-side authority** for the 3-strike termination (it also accepts
+`current_question`, fullscreen/visibility/focus context and an optional JPEG `evidence` upload → `data/
+integrity_evidence/<token>/`, served by `GET /interview/integrity-evidence/{token}/{name}`), and on termination
+notifies the scheduling TA (`interview.integrity_alert`, bell + email, dedupe per token). `_merge_proctor_events_
+into_schedule` is idempotent (it used to re-append the whole proctor event list on every call).
+`GET /interview/integrity-logs` returns **every** schedule (`list_interview_integrity_logs(db, None)`; CRM-scheduled
+interviews are owned by `karnex-crm` and were invisible before) with per-family counts, `integrity_score` (100 −
+weighted penalties, terminated capped at 20), `needs_review` (≤ 70, terminated, or `shared_with` — same device id /
+IP across different candidate emails), CRM context (`profile_id`, requirement, customer, scheduler, AI score) and a
+`summary`; `terminated` is the subset. `GET …/integrity-logs/export` (CSV, formula-neutralised) is declared BEFORE
+`GET …/integrity-logs/{invite_token}` (full timeline with question index + evidence URLs) — keep it there
+(`test_interview_integrity.py::test_export_route_is_declared_before_the_token_route`). F-V2: `pages/IntegrityLogs.tsx`
+rebuilt (score ring, KPIs incl. Needs review / Avg integrity, chips All · Needs review · Live · Invited · Completed ·
+Terminated, search, customer + date filters, family chips, timeline with evidence lightbox, CSV export, link to the
+profile's AI Interview tab); candidate runtime logs `clipboard` / `context_menu` / `devtools` (F12, Ctrl+Shift+I/J/C,
+Ctrl+U) and `no_face` (3 empty scans, ≤ 1 per 30 s), and attaches a 320-px JPEG to camera events
+(`face_detection.captureEvidence`); `index.html` cache-bust `app.js?v=22`. Not done: answer-timing ("reading")
+anomaly — needs the VAD timing join on `/answer`.
+
+**15 Sep 2026 — AI interview link path, end-to-end fixes (`tests/test_interview_link_flow.py`, 11):**
+(1) `services/invite_links.py` is the ONE invite-URL builder: Settings `email.public_base_url` → `PUBLIC_BASE_URL`
+→ the scheduling request's origin (X-Forwarded-*, localhost swapped for the LAN IP) → last seen base. Every CRM path
+(`ai_interview_bridge.schedule_l1_interview(..., request=)`, `ai_interviews._invite_url`, `resumes`, `slots`) uses
+it; the bridge REFUSES to schedule (`scheduled=False`) when no base resolves instead of mailing `/?invite=…`.
+`main._remember_invite_base` records the base from `/candidate/invite/{token}`. (2) `/candidate/invite/{token}/verify`
+counts FAILED attempts only, resets on success, tells the candidate how many are left, and lets the already-bound
+device (`x-device-id == active_device_id`, status verified/active) straight through with an empty POST
+(`already_verified`) — a refresh mid-interview no longer burns an attempt. (3) `_public_schedule_view` is the only
+schedule shape the candidate page sees (adds `job_title`, `timing_mode`, `time_limit_sec`, `num_q`; the
+`scheduled_wait` response used to return the raw row WITH the access key). (4) CRM PUT on an AI interview keeps the
+`__KARNEX_CFG__:` block (it split on a marker that never matched → config unparseable → candidate interviewed against
+`jobs[0]`); a missing template now errors instead of falling back when the invite named one. (5) `_persist_fast_final_
+report` no longer syncs the keyword-fallback verdict to the CRM — only `_upgrade_interview_report_background` /
+`_finalize_interview_snapshot` do (fallback synced, flagged `fallback_ai_failed`, only if the upgrade throws);
+`_score_percent` clamps 0..100. (6) `_should_recover_progress` leaves `report_status="generating"` rows younger than
+10 min alone (it raced the background upgrade). (7) `/submit` with no session → 404 (was 200+error); `/answer`
+closes a timed interview server-side at limit+90 s; `/next` already returns `time_remaining_sec` and the client now
+re-anchors its clock to it. (8) Multi-worker without `REDIS_URL` REFUSES to start (`ALLOW_MULTI_WORKER_UNSAFE=1`
+overrides). F-V2 runtime: `scene.js` (three.js from jsDelivr) is a dynamic import with a fallback — a blocked CDN
+no longer blanks the page; `maybeAutoClearCache` keeps `karnexInviteDevice*` + auth on a version change during an
+invite; `_newDeviceId()` works on plain-HTTP origins; a failed `/submit` shows a Retry card instead of redirecting to
+Thank-You (`_showFinalizeRetry`), and the finalize loop retries one timeout with 30 s; `index.html` `app.js?v=23`.
+Recruiter message now says "queued" when the outbox took the mail (SMTP happens later; check the Emails tab).
+
+**15 Sep 2026 — scheduled time on the invite panel + 12-hour clock everywhere:** the Applied Candidates
+invite card printed the AI link's `created_at` (the moment the TA clicked — "12:52 PM" for a 4 PM slot). Both
+resume enrichers (`services/resumes.py` and the profile-only branch in `routers/crm/resumes.py`) now read
+`scheduled_at_local` from the legacy schedule row (`get_schedules_by_tokens`) and emit it as an IST ISO instant via
+`services.ist.local_stamp_to_iso` ("2026-09-15T16:00:00+05:30"); `link.created_at` is the fallback only. Candidate
+emails use `services.ist.human_when` — "Tuesday, 15 September 2026 at 4:00 PM IST" (`interview_invite_email.
+format_when`, `ai_interviews._when_text`). F-V2: `lib/datetime.ts` (`fmtDateTime12`, `fmtTime12`, `fmtDateShort` —
+en-IN, 12-hour, no seconds) replaces every bare `Date.toLocaleString()` (locale-dependent, 24 h on en-GB boxes) in 15
+files; the candidate runtime's "Scheduled:" lines use `formatHrDateTimeDisplay`; `index.html` `app.js?v=24`.
+
+**CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
+edition); the September notes above exist only in the working tree — **commit them**.
 
 **Savepoint discipline:** every best-effort `try/except` around DB work wraps it in
 `db.begin_nested()` — on Postgres a swallowed statement failure otherwise poisons the transaction and

@@ -171,8 +171,14 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
             if c.email:
                 emails_by_cand[c.id] = c.email.strip().lower()
 
-    base = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    from services.invite_links import resolve_invite_base
+    base = resolve_invite_base()  # settings/env, else the last request's origin (15 Sep 2026)
     access_by_token: dict[str, str] = {}
+    # The SCHEDULED time lives on the legacy interview_schedule row, not on the
+    # link (whose created_at is the moment the TA clicked — that is what the
+    # invite panel used to print, e.g. "12:52 PM" for a 4 PM slot; 15 Sep 2026).
+    scheduled_by_token: dict[str, str | None] = {}
+    from services.ist import local_stamp_to_iso
     for link in latest.values():
         token = (link.invite_token or "").strip()
         if not token or token in access_by_token:
@@ -180,8 +186,10 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
         try:
             sched = get_schedule_by_token(_legacy_db_target(), token) or {}
             access_by_token[token] = str(sched.get("access_key") or "")
+            scheduled_by_token[token] = local_stamp_to_iso(sched.get("scheduled_at_local"))
         except Exception:
             access_by_token[token] = ""
+            scheduled_by_token[token] = None
 
     # Pipeline status of each linked profile — lets the requirement's Resumes tab
     # surface "RMG review needed" (and the RMG decision actions) per row.
@@ -277,7 +285,9 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
             d["ai_invite_token"] = token
             d["ai_invite_url"] = f"{base}/?invite={token}" if base else f"/?invite={token}"
             d["ai_access_key"] = access_by_token.get(token) or None
-        if link.created_at and not d.get("ai_interview_scheduled_at"):
+        if token and scheduled_by_token.get(token):
+            d["ai_interview_scheduled_at"] = scheduled_by_token[token]
+        elif link.created_at and not d.get("ai_interview_scheduled_at"):
             d["ai_interview_scheduled_at"] = link.created_at.isoformat()
     return data
 

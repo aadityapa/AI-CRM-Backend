@@ -136,11 +136,8 @@ def _to_local_naive(value: datetime | None) -> datetime | None:
         return None
     if value.tzinfo is None:
         return value
-    try:
-        from zoneinfo import ZoneInfo
-        return value.astimezone(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-    except Exception:
-        return value.astimezone().replace(tzinfo=None)
+    from services.ist import ist_naive
+    return ist_naive(value)
 
 
 def parse_legacy_local(value) -> datetime | None:

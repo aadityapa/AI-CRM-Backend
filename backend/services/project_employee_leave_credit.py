@@ -18,6 +18,7 @@ Idempotency: one `leave_accrual_events` row per PE/leave_type/period via
 from __future__ import annotations
 
 import calendar
+from types import SimpleNamespace
 from datetime import date
 from decimal import Decimal
 
@@ -30,6 +31,43 @@ from models import (
 from services.project_employee_billing import carry_forward, prorate_credit
 
 ZERO = Decimal("0")
+
+
+#: `leave_expire` values that mean "never expires — carry forward" (11 Sep 2026).
+NO_EXPIRY_VALUES = frozenset({"", "carry forward", "carry_forward", "never", "none"})
+
+
+def expiry_applies(policy) -> bool:
+    """False when the policy says the balance never lapses (blank or
+    "Carry Forward"); the Dec-31 job then only records a Carry_Forward event
+    (capped by maximum_carry_forward when one is set)."""
+    return str(getattr(policy, "leave_expire", "") or "").strip().lower() not in NO_EXPIRY_VALUES
+
+
+def is_comp_off_type(db: Session, leave_type_id: int | None) -> bool:
+    if not leave_type_id:
+        return False
+    from models import LeavePolicyType
+    lt = db.get(LeavePolicyType, leave_type_id)
+    name = (getattr(lt, "name", "") or "").lower().replace("-", " ").replace("_", " ")
+    return "comp" in name and "off" in name
+
+
+def comp_off_year_end_cap(db: Session, pe: ProjectEmployee, row: ProjectEmployeeLeaveDetail):
+    """Carry cap for a Comp-Off row at 31 Dec from the customer's Comp Off
+    section; None when the row is not comp-off (nothing to do)."""
+    if not is_comp_off_type(db, row.leave_type_id):
+        return None
+    try:
+        from models import CustomerBillingPolicy, Project
+        project = db.get(Project, pe.project_id)
+        pol = db.execute(select(CustomerBillingPolicy)
+                         .where(CustomerBillingPolicy.customer_id == project.customer_id)).scalar_one_or_none() \
+            if project is not None else None
+        cap = getattr(pol, "comp_off_max_carry_forward", None) if pol is not None else None
+        return Decimal(str(cap)) if cap is not None else ZERO   # default: lapses
+    except Exception:
+        return ZERO
 
 
 def _row_policy(db: Session, row: ProjectEmployeeLeaveDetail):
@@ -220,23 +258,33 @@ def _apply_cycle_expiry(
     remaining = Decimal(row.leave_balance or 0)
     if remaining <= 0:
         return ZERO
+    # Carry-forward cap (11 Sep 2026): NULL = carry everything (nothing
+    # expires), 0 = lapse everything, N = keep up to N days. Same rule the
+    # Dec-31 job applies to Yearly policies.
+    cap = getattr(policy, "maximum_carry_forward", None)
+    if cap is None:
+        return ZERO
+    carried, expired = carry_forward(remaining, cap)
+    if expired <= 0:
+        return ZERO
     src = f"pe_cycle_expire:{pe.id}:{row.leave_type_id}:{period}"
     already = db.execute(
         select(LeaveAccrualEvent.id).where(LeaveAccrualEvent.source == src).limit(1)
     ).first()
     if already is not None:
         return ZERO
-    row.leave_balance = ZERO
+    row.leave_balance = carried
     db.add(LeaveAccrualEvent(
         employee_id=pe.employee_id,
         leave_type_id=row.leave_type_id,
         event_type="Adjustment",
-        amount=-remaining,
-        balance_after=ZERO,
+        amount=-expired,
+        balance_after=carried,
         source=src,
-        note=f"{policy.leave_expire} leave expiry before {period} credit",
+        note=f"{policy.leave_expire} leave expiry before {period} credit"
+             + (f" ({carried} carried forward)" if carried > 0 else ""),
     ))
-    return remaining
+    return expired
 
 
 def credit_one_pe_leave_row(
@@ -255,6 +303,12 @@ def credit_one_pe_leave_row(
         return ZERO
 
     policy = _row_policy(db, row)
+    # Rows without a leave policy are timesheet-fed (Comp-Off): their
+    # `leave_accrual` is a running total of days EARNED, not a monthly rate.
+    # The job used to read it as "N per month" and credit it again every
+    # month (11 Sep 2026, user report: 1 weekend day became a balance of 10).
+    if policy is None or is_comp_off_type(db, row.leave_type_id):
+        return ZERO
     start = accrual_start(policy, pe)
     credit_type = (policy.leave_credit_type if policy else "Monthly") or "Monthly"
 
@@ -318,11 +372,32 @@ def apply_year_end_carry(
         return ZERO, ZERO
     policy = _row_policy(db, row)
     remaining = Decimal(row.leave_balance or 0)
-    if remaining <= 0 or policy is None:
+    if remaining <= 0:
         return ZERO, ZERO
-    expire_enabled = bool(policy.leave_expire)
+    if policy is None:
+        # Comp-Off rows have no leave policy — they are credited by timesheet
+        # weekend/holiday work. Their year-end rule (11 Sep 2026, CEO) lives
+        # in the CUSTOMER billing policy's Comp Off section:
+        # comp_off_max_carry_forward NULL/0 = lapses on 31 Dec, N = carry up to N.
+        cap = comp_off_year_end_cap(db, pe, row)
+        if cap is None:
+            return ZERO, ZERO
+        policy = SimpleNamespace(leave_expire="Yearly", maximum_carry_forward=cap)
+    expire_enabled = expiry_applies(policy)
     has_cap = policy.maximum_carry_forward is not None
-    if not expire_enabled and not has_cap:
+    explicit_carry = str(policy.leave_expire or "").strip().lower() in ("carry forward", "carry_forward")
+    # Blank policy (legacy, nothing configured) → leave the balance alone, no
+    # ledger noise. An EXPLICIT "Carry Forward" still writes the year's
+    # Carry_Forward event so the employee's record shows the rollover.
+    if not expire_enabled and not has_cap and not explicit_carry:
+        return ZERO, ZERO
+    # Idempotent per year: the scheduler may run more than once on Dec 31 and
+    # a replay must not stack a second Carry_Forward event.
+    _yr = str(as_of.year)
+    _done = db.execute(select(LeaveAccrualEvent.id).where(LeaveAccrualEvent.source.in_([
+        f"pe_carry:{pe.id}:{row.leave_type_id}:{_yr}", f"pe_expire:{pe.id}:{row.leave_type_id}:{_yr}",
+    ])).limit(1)).first()
+    if _done is not None:
         return ZERO, ZERO
     max_cf = Decimal(policy.maximum_carry_forward) if has_cap else remaining
     carried, expired = carry_forward(remaining, max_cf)
@@ -342,7 +417,7 @@ def apply_year_end_carry(
             source=f"pe_expire:{pe.id}:{row.leave_type_id}:{period}",
             note=f"PE leave expiry {period}",
         ))
-    if carried > 0 and (expire_enabled or has_cap):
+    if carried > 0 and (expire_enabled or has_cap or explicit_carry):
         db.add(LeaveAccrualEvent(
             employee_id=pe.employee_id,
             leave_type_id=row.leave_type_id,
@@ -509,3 +584,39 @@ def run_pe_leave_credit_backfill(
         "total_credited": sum(r["total_credited"] for r in runs),
         "runs": runs,
     }
+
+
+def repair_comp_off_over_credit(db: Session, pe: ProjectEmployee) -> Decimal:
+    """Undo monthly `pe_credit:` rows the job wrongly wrote on Comp-Off rows
+    (bug fixed 11 Sep 2026). Each bogus credit gets a reversing Adjustment
+    event and the balance drops accordingly — never below zero, and the
+    reversal itself is idempotent (source `pe_credit_reversal:<orig id>`)."""
+    from models import LeavePolicyType
+    reversed_total = ZERO
+    rows = db.execute(select(ProjectEmployeeLeaveDetail)
+                      .where(ProjectEmployeeLeaveDetail.project_employee_id == pe.id)).scalars().all()
+    for row in rows:
+        if not is_comp_off_type(db, row.leave_type_id):
+            continue
+        bogus = db.execute(select(LeaveAccrualEvent).where(
+            LeaveAccrualEvent.employee_id == pe.employee_id,
+            LeaveAccrualEvent.leave_type_id == row.leave_type_id,
+            LeaveAccrualEvent.source.like(f"pe_credit:{pe.id}:{row.leave_type_id}:%"),
+        )).scalars().all()
+        for ev in bogus:
+            rev_src = f"pe_credit_reversal:{ev.id}"
+            if db.execute(select(LeaveAccrualEvent.id).where(LeaveAccrualEvent.source == rev_src).limit(1)).first():
+                continue
+            amt = Decimal(str(ev.amount or 0))
+            if amt <= 0:
+                continue
+            new_balance = max(Decimal(str(row.leave_balance or 0)) - amt, ZERO)
+            row.leave_balance = new_balance
+            row.leave_accrual = max(Decimal(str(row.leave_accrual or 0)) - amt, ZERO)
+            db.add(LeaveAccrualEvent(
+                employee_id=pe.employee_id, leave_type_id=row.leave_type_id,
+                event_type="Adjustment", amount=-amt, balance_after=new_balance, source=rev_src,
+                note=f"PE#{pe.id} Reversal: Comp-Off is earned from timesheets only, not credited monthly",
+            ))
+            reversed_total += amt
+    return reversed_total

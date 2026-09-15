@@ -1296,6 +1296,51 @@ def perform_transition(db: Session, profile: CandidateProfile, new_status: str,
     return current
 
 
+def _sync_employee_from_joined_profile(db: Session, emp, profile: CandidateProfile,
+                                       candidate: Candidate, offer) -> None:
+    """Re-hire / internal placement (11 Sep 2026): copy what HR entered before
+    Joined onto the EXISTING Employees record — the trainee becomes an
+    Engineer, gets the new Karnex joining date, official mailbox, Emp ID and
+    CTC — and is re-activated. Only fields HR actually filled are touched."""
+    from models import Employee
+    if emp.candidate_profile_id is None:
+        emp.candidate_profile_id = profile.id
+    emp.is_active = True
+    des = getattr(profile, "designation_id", None)
+    if des:
+        emp.designation_id = des
+    dep = getattr(profile, "department_id", None)
+    if dep:
+        emp.department_id = dep
+    doj = getattr(profile, "karnex_onboarding_date", None)
+    if doj:
+        emp.date_of_joining = doj
+    ctc = getattr(offer, "ctc", None) if offer is not None else None
+    if ctc:
+        emp.current_ctc = ctc
+    ref = (getattr(profile, "employee_ref", None) or "").strip()
+    if ref and (emp.employee_code or "").lower() != ref.lower():
+        clash = db.execute(select(Employee.id).where(
+            func.lower(Employee.employee_code) == ref.lower(), Employee.id != emp.id)).first()
+        if not clash:
+            emp.employee_code = ref[:32]
+    official = (getattr(profile, "official_email", None) or "").strip().lower()
+    if official and (emp.email or "").lower() != official:
+        clash = db.execute(select(Employee.id).where(
+            func.lower(Employee.email) == official, Employee.id != emp.id)).first()
+        if not clash:
+            if not emp.personal_email and emp.email and emp.email.lower() != official:
+                emp.personal_email = emp.email
+            emp.email = official[:255]
+    exp = getattr(profile, "total_experience_years", None)
+    if exp is not None:
+        emp.experience_years = exp
+    if candidate.cv_url and not emp.cv_url:
+        emp.cv_url = candidate.cv_url
+    db.add(emp)
+    db.flush()
+
+
 def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
                                        user: CurrentUser | None = None):
     """A JOINED candidate becomes an Employee (31 Aug 2026, user bug report).
@@ -1319,15 +1364,30 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
     from models import Employee, OfferHistory, ProfileType
 
     try:
-        existing = db.execute(
-            select(Employee).where(Employee.candidate_profile_id == profile.id)
-        ).scalars().first()
-        if existing is not None:
-            return existing
-
         candidate = db.get(Candidate, profile.candidate_id)
         if candidate is None:
             return None
+        offer = db.execute(
+            select(OfferHistory).where(OfferHistory.profile_id == profile.id)
+            .order_by(OfferHistory.id.desc())
+        ).scalars().first()
+        emp_ref = (getattr(profile, "employee_ref", None) or "").strip()
+
+        existing = db.execute(
+            select(Employee).where(Employee.candidate_profile_id == profile.id)
+        ).scalars().first()
+        if existing is None and emp_ref:
+            # An EXISTING employee (11 Sep 2026, user scenario: an internal
+            # trainee who cleared the customer rounds) is identified by the
+            # Emp ID HR typed in the Workflow section — that record is
+            # updated (designation, department, joining date …), never
+            # duplicated.
+            existing = db.execute(
+                select(Employee).where(func.lower(Employee.employee_code) == emp_ref.lower())
+            ).scalars().first()
+        if existing is not None:
+            _sync_employee_from_joined_profile(db, existing, profile, candidate, offer)
+            return existing
         # The OFFICIAL mailbox HR issued before Joined is the employee's address
         # (0090, user decision) — the candidate's own email is their personal
         # one and is kept as such below. Older profiles with none recorded
@@ -1353,15 +1413,14 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
                 == (candidate.first_name or "").strip().lower()
             )
             if same_person:
-                if by_email.candidate_profile_id is None:
-                    by_email.candidate_profile_id = profile.id
+                _sync_employee_from_joined_profile(db, by_email, profile, candidate, offer)
                 return by_email
             email = f"candidate{profile.candidate_id}@pending.karnex.local"
 
-        offer = db.execute(
-            select(OfferHistory).where(OfferHistory.profile_id == profile.id)
-            .order_by(OfferHistory.id.desc())
-        ).scalars().first()
+        if emp_ref and db.execute(
+            select(Employee.id).where(func.lower(Employee.employee_code) == emp_ref.lower())
+        ).first():
+            emp_ref = ""   # taken by someone else — leave blank for HR to fix
 
         emp = Employee(
             first_name=(candidate.first_name or "Candidate")[:120],
@@ -1391,6 +1450,7 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
             designation_id=(getattr(profile, "designation_id", None)
                             or getattr(candidate, "designation_id", None)),
             personal_email=(candidate.email or None),
+            employee_code=(emp_ref[:32] or None),
         )
         db.add(emp)
         db.flush()

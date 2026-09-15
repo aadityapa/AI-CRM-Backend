@@ -114,3 +114,42 @@ def my_work(
     (template) are dropped, so the list never points somewhere it can't go.
     """
     return envelope(svc.my_work(db, user))
+
+
+# --------------------------------------------------- role desk (14 Sep 2026)
+
+
+@router.get("/today")
+def today_tiles(
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(any_crm_role),
+):
+    """The four-ish numbers the caller's roles are judged on — the Today strip.
+    Role- and template-aware like /my-work; multi-role users get a merged,
+    de-duplicated set capped at eight."""
+    from services import dashboard_desk
+    return envelope(dashboard_desk.today_tiles(db, user))
+
+
+@router.get("/upcoming")
+def upcoming(
+    days: int = 7,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(any_crm_role),
+):
+    """Dated items in the next `days` days: rounds, AI L1 slots, joinings,
+    roll-offs, PO expiries, invoice due dates — filtered by what the caller
+    can open."""
+    from services import dashboard_desk
+    return envelope(dashboard_desk.upcoming(db, user, days=max(1, min(days, 60))))
+
+
+@router.get("/team")
+def team_overview(
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(role_required("Sales_Head")),
+):
+    """The head's layer: where the company is stuck (with the owning team) and
+    per-person rows for TA and Sales. Sales Head, Admin, CEO."""
+    from services import dashboard_desk
+    return envelope(dashboard_desk.team_overview(db, user))

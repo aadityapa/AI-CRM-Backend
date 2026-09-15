@@ -409,3 +409,58 @@ def test_integration_crm_invoice_maps_to_same_numbers(client: TestClient):
     r = client.get(f"/api/invoices/{inv.id}/tax-invoice.pdf")
     assert r.status_code == 200
     assert len(r.content) > 100
+
+
+# ---------------------------------------------------------------------------
+# 11 Sep 2026 — settings-driven seller/bank, SAC 998513, billing-unit columns,
+# website-only footer, Word export.
+# ---------------------------------------------------------------------------
+
+
+def test_sac_default_is_contract_staffing_and_stale_codes_are_replaced():
+    assert ti.DEFAULT_SAC == "998513"
+    assert ti.effective_sac("998314") == ti.default_sac()      # old wrong default → new
+    assert ti.effective_sac("") == ti.default_sac()
+    assert ti.effective_sac("998311") == "998311"               # a real override survives
+
+
+def test_server_renderers_print_settings_seller_and_unit_columns():
+    inv = ti.Invoice(
+        invoice_no="INV-2026-001", invoice_date="10-Sep-2026",
+        buyer=ti.Buyer(name="UNO MINDA", state_code="27", state_name="Maharashtra"),
+        items=[ti.LineItem(employee_name="Aakash Malwade", service_month="Jul 2026", sac="998513",
+                           billing_hours=22, rate_per_hour=200000, monthly_cost=200000, leave_days=1,
+                           rate_per_day=9090.91, period_label="01-Jul-2026 to 31-Jul-2026",
+                           amount_override=190909.09)],
+        columns=ti.UNIT_COLUMNS["Monthly"],
+        seller={"name": "KARNEX SOFTWARE SOLUTIONS PRIVATE LIMITED", "email": "karnex.singh@karnex.in",
+                "cin": "U72900RJ2018PTC638288", "state": "Maharashtra", "state_code": "27",
+                "pan": "AAJCK2474BA", "gstin": "27AAJCK2474BA1ZL", "website": "www.karnex.in",
+                "footer_website_url": "https://www.karnex.in", "declaration": ti.DEFAULT_FOOTER,
+                "signatory_line": "For Karnex Software Solutions Pvt. Ltd."},
+        bank={"bank_name": "HDFC Bank", "account_name": "KARNEX", "account_number": "50200075368143",
+              "ifsc": "HDFC0001784", "branch": "Baner, Pune", "account_type": "Current"},
+        footer_text=ti.DEFAULT_FOOTER,
+    )
+    totals = ti.compute_totals(inv)
+    # The engine's amount (leave deducted) wins over qty × rate.
+    assert totals.subtotal == 190909.09
+    html = ti.render_invoice_html(inv, totals)
+    assert "U72900RJ2018PTC638288" in html and "karnex.singh@karnex.in" in html
+    assert "Monthly Cost" in html and "Rate Per Day" in html and "Leave (Days)" in html
+    assert "Billing period 01-Jul-2026 to 31-Jul-2026" in html
+    assert "no flow of additional consideration" in html
+    # Footer = the website as a link, nothing else.
+    assert "href='https://www.karnex.in'" in html
+    assert "info@karnex.in" not in html and "+91" not in html.split("class=\"contact\"")[-1]
+    pdf = ti._pdf_via_reportlab(inv, totals)
+    assert pdf[:4] == b"%PDF"
+    from services.tax_invoice_docx import build_invoice_docx, docx_filename
+    blob = build_invoice_docx(inv)
+    assert blob[:2] == b"PK" and docx_filename(inv).endswith(".docx")
+
+
+def test_line_amount_override_and_plain_multiplication():
+    assert ti.line_amount(ti.LineItem(billing_hours=10, rate_per_hour=5)) == 50
+    assert ti.line_amount(ti.LineItem(billing_hours=10, rate_per_hour=5, amount_override=42.5)) == 42.5
+    assert ti.line_amount({"billing_hours": 3, "rate_per_hour": 2, "amount_override": None}) == 6

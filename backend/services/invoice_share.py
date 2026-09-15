@@ -123,3 +123,24 @@ def qr_svg_data_url(text: str, size_px: int = 220) -> str | None:
     except Exception:  # pragma: no cover — a missing QR must never break the invoice
         logger.warning("QR render failed", exc_info=True)
         return None
+
+
+def qr_png_bytes(text: str, size_px: int = 240) -> bytes | None:
+    """The same QR as PNG bytes (for the Word export — python-docx cannot
+    embed SVG). reportlab's renderPM needs PIL; None when unavailable."""
+    if not text:
+        return None
+    try:
+        from reportlab.graphics import renderPM
+        from reportlab.graphics.barcode.qr import QrCodeWidget
+        from reportlab.graphics.shapes import Drawing
+
+        widget = QrCodeWidget(text, barLevel="M")
+        x0, y0, x1, y1 = widget.getBounds()
+        w, h = (x1 - x0) or 1, (y1 - y0) or 1
+        drawing = Drawing(size_px, size_px, transform=[size_px / w, 0, 0, size_px / h, 0, 0])
+        drawing.add(widget)
+        return renderPM.drawToString(drawing, fmt="PNG")
+    except Exception:  # pragma: no cover
+        logger.debug("QR PNG render unavailable", exc_info=True)
+        return None

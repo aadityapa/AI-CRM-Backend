@@ -10,6 +10,7 @@ from datetime import date
 from decimal import Decimal
 
 from fastapi import HTTPException
+import sqlalchemy as sa
 from sqlalchemy import select, or_, and_, func
 from sqlalchemy.orm import Session
 
@@ -729,6 +730,46 @@ def credit_pe_leave(db: Session, pe_id: int, leave_type_id: int, days: Decimal) 
     return row
 
 
+def set_pe_carry_forward(db: Session, pe: ProjectEmployee, row: ProjectEmployeeLeaveDetail,
+                         *, from_year: int, days: Decimal, note: str | None = None,
+                         actor: str | None = None) -> dict:
+    """Record leave carried in from a PREVIOUS year by hand (15 Sep 2026).
+
+    Customers such as Uno Minda hand over an employee's unused balance from
+    last year; the Dec-31 job only carries what THIS system saw. The figure is
+    kept as one `Carry_Forward` ledger event per (PE, type, year) with source
+    `pe_carry:{pe}:{type}:{year}:manual` — posting again for the same year
+    REPLACES it (the delta is booked), so the balance never double-counts.
+    Both `opening_balance` and `leave_balance` move by the delta, and the
+    event shows in the PE history and the "accrued this year" figure.
+    """
+    from models import LeaveAccrualEvent
+
+    source = f"pe_carry:{pe.id}:{row.leave_type_id}:{from_year}:manual"
+    previous = Decimal(db.execute(
+        select(func.coalesce(func.sum(LeaveAccrualEvent.amount), 0))
+        .where(LeaveAccrualEvent.source == source)
+    ).scalar() or 0)
+    days = Decimal(days)
+    delta = days - previous
+    if delta == 0:
+        return {"delta": 0.0, "total": float(days), "changed": False}
+    row.opening_balance = Decimal(row.opening_balance or 0) + delta
+    row.leave_balance = Decimal(row.leave_balance or 0) + delta
+    who = f" by {actor}" if actor else ""
+    db.add(LeaveAccrualEvent(
+        employee_id=pe.employee_id,
+        leave_type_id=row.leave_type_id,
+        event_type="Carry_Forward",
+        amount=delta,
+        balance_after=row.leave_balance,
+        source=source,
+        note=(f"PE#{pe.id} carry forward from {from_year} (manual{who}): {float(days):g} day(s)"
+              + (f" — {note.strip()}" if note and note.strip() else "")),
+    ))
+    return {"delta": float(delta), "total": float(days), "changed": True}
+
+
 def project_po_summary(db: Session, project_id: int, *, on_date: date | None = None) -> dict:
     """PO drawdown summary for a project (PE commercial tab + list chip)."""
     on_date = on_date or date.today()
@@ -860,6 +901,12 @@ def _holidays_for_customer_branch(
 def pe_credit_history(db: Session, pe: ProjectEmployee, *, limit: int = 50) -> list[dict]:
     """LeaveAccrualEvent rows scoped to this PE (seed / credit job / PE leave apps)."""
     pe_note = f"%PE#{pe.id}%"
+    # DEBITS too (11 Sep 2026, user request): timesheet consumption and
+    # comp-off credits are keyed `timesheet:<id>` with no PE marker, so the
+    # history used to show credits only.
+    from models import Timesheet
+    ts_sources = select(sa.func.concat("timesheet:", sa.cast(Timesheet.id, sa.String))).where(
+        Timesheet.project_employee_id == pe.id)
     rows = db.execute(
         select(LeaveAccrualEvent, LeavePolicyType.name)
         .join(LeavePolicyType, LeavePolicyType.id == LeaveAccrualEvent.leave_type_id, isouter=True)
@@ -870,6 +917,8 @@ def pe_credit_history(db: Session, pe: ProjectEmployee, *, limit: int = 50) -> l
                 LeaveAccrualEvent.source.like(f"pe_seed:{pe.id}:%"),
                 LeaveAccrualEvent.source.like(f"pe_expire:{pe.id}:%"),
                 LeaveAccrualEvent.source.like(f"pe_carry:{pe.id}:%"),
+                LeaveAccrualEvent.source.like(f"pe_cycle_expire:{pe.id}:%"),
+                LeaveAccrualEvent.source.in_(ts_sources),
                 LeaveAccrualEvent.note.like(pe_note),
             ),
         )
@@ -1115,7 +1164,7 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
         }
         for d in details_out
     ]
-    credit_history = pe_credit_history(db, pe)
+    credit_history = pe_credit_history(db, pe, limit=240)  # month groups on the Leave tab (15 Sep 2026)
     accrued_ytd = pe_accrued_this_year(db, pe)
     # Fallback when ledger is empty: opening/initial balances seeded without events
     if accrued_ytd <= 0 and details_out and not credit_history:
