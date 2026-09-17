@@ -56,6 +56,8 @@ COLUMNS: list[tuple[str, str, bool, str]] = [
     ("Present Address", "present_address", False, "Free text (one line)"),
     ("Permanent Address", "permanent_address", False, "Free text (one line)"),
     ("Active", "is_active", False, "Yes / No (default Yes)"),
+    # 16 Sep 2026: relieved staff arrive with an exit date — keep it.
+    ("Last Working Day", "last_working_day", False, "Exit date, DD/MM/YYYY — marks the employee resigned"),
 ]
 
 _HEADERS = [c[0] for c in COLUMNS]
@@ -222,6 +224,7 @@ def build_export_workbook(db: Session) -> bytes:
             e.pan, e.aadhar, e.emergency_number, e.notice_period_days,
             _addr(e.present_address), _addr(e.permanent_address),
             "Yes" if e.is_active else "No",
+            e.last_working_day,
         ])
     buf = io.BytesIO()
     wb.save(buf)
@@ -354,6 +357,7 @@ def import_workbook(db: Session, file_bytes: bytes) -> dict:
                 s = _cell_str(vals.get(key))
                 return {"line1": s} if s else None
 
+            lwd = _parse_date(vals.get("last_working_day"), "Last Working Day")
             with db.begin_nested():
                 emp = Employee(
                     first_name=first[:120],
@@ -387,6 +391,8 @@ def import_workbook(db: Session, file_bytes: bytes) -> dict:
                     present_address=_addr_dict("present_address"),
                     permanent_address=_addr_dict("permanent_address"),
                     is_active=_parse_bool(vals.get("is_active"), True, "Active"),
+                    last_working_day=lwd,
+                    is_resigned=lwd is not None,
                 )
                 db.add(emp)
                 db.flush()

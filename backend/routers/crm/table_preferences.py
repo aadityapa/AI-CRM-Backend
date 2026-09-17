@@ -67,6 +67,18 @@ TABLE_REGISTRY: dict[str, dict] = {
             "ta_owner_name", "applied_on", "created_at",
         ],
     },
+    # Requirement ▸ Applied Candidates (15 Sep 2026): the RMG asked for an
+    # Excel-style column chooser so a wide list can be trimmed to what the
+    # screening needs. The list is client-sorted, so nothing is sortable here;
+    # the Actions column is always shown (the UI pins it).
+    "requirement_resumes": {
+        "columns": [
+            "candidate_name", "source_portal", "applied_by", "rmg_screening_status",
+            "profile_pipeline_status", "received_date", "ats_score", "ats_status",
+            "ai_interview_status", "rounds", "_actions",
+        ],
+        "sortable": [],
+    },
 }
 #: How many sort levels a user may stack. Beyond this the query stops being
 #: meaningful and starts being a way to make the database work hard for nothing.

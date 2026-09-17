@@ -437,7 +437,8 @@ def _auth_db_target() -> str:
     user = (os.getenv("DB_USER") or "").strip()
     password = (os.getenv("DB_PASSWORD") or "").strip()
     if host and name and user:
-        return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+        from urllib.parse import quote as _q
+        return f"postgresql://{_q(user, safe='')}:{_q(password, safe='')}@{host}:{port}/{name}"
     return str(KARNEX_DB_FILE)
 
 
@@ -1927,6 +1928,26 @@ def _parse_scheduled_local(raw: str) -> datetime | None:
     return parsed.astimezone(IST)
 
 
+def _invite_valid_hours() -> float:
+    """How long after the scheduled slot an UNUSED link stays valid.
+
+    16 Sep 2026 policy (user decision): a link cannot be opened BEFORE its slot,
+    can be opened ANY time after it, and works exactly ONCE — completion or
+    termination closes it, not the clock. So the default is "never expires";
+    set INVITE_LINK_VALID_HOURS (e.g. 72) to bring a window back. 0/blank = never.
+    """
+    raw = (os.getenv("INVITE_LINK_VALID_HOURS") or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _invite_slot_expired(scheduled_dt: datetime, now: datetime) -> bool:
+    hours = _invite_valid_hours()
+    return bool(hours) and now > scheduled_dt + timedelta(hours=hours)
+
+
 def _invite_access_state(record: dict) -> dict:
     scheduled_dt = _parse_scheduled_local(str(record.get("scheduled_at_local", "")))
     now = datetime.now(IST)
@@ -1940,7 +1961,7 @@ def _invite_access_state(record: dict) -> dict:
             "reason": "scheduled_wait",
             "starts_at_ist": scheduled_dt.isoformat(),
         }
-    if now > (scheduled_dt + timedelta(hours=24)):
+    if _invite_slot_expired(scheduled_dt, now):
         return {
             "ok": False,
             "seconds_until_start": 0,
@@ -3288,7 +3309,33 @@ def next_question(request: Request):
         )
         meta["startup_first_next_logged"] = True
 
+    # Same rolling-pool rule on a reload/resume: never report "completed"
+    # merely because the pool ran dry while time remains.
+    if not s.get("finalizing") and int(s.get("current", 0) or 0) >= len(s.get("questions") or []):
+        _expand_time_mode_pool(s)
     return next_question_payload(s)
+
+
+_speech_log = logging.getLogger("karnex.interview.speech")
+#: `auto_advance_meta.trigger` values that mean "the client heard nothing" —
+#: the only skips the server double-checks against its own speech evidence.
+_NO_RESPONSE_TRIGGERS = frozenset({"no_response", "silent_no_response"})
+
+
+def _speech_error(status: int, code: str, message: str) -> JSONResponse:
+    """Uniform failure body for the candidate speech endpoints
+    (/candidate/transcribe, /candidate/tts): `{"error", "code"}` on a real
+    HTTP status. `code` is what the candidate runtime branches on."""
+    return JSONResponse({"error": message, "code": code}, status_code=status)
+
+
+def _openai_error_summary(exc: Exception) -> str:
+    """One line for the log: class, HTTP status when present, first 200 chars."""
+    status = getattr(exc, "status_code", None)
+    head = f"{type(exc).__name__}"
+    if status:
+        head += f" {status}"
+    return f"{head}: {str(exc)[:200]}"
 
 
 @app.post("/candidate/transcribe")
@@ -3300,15 +3347,20 @@ async def transcribe_candidate_audio(
     _, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
         return auth_err
+    # Error contract (16 Sep 2026): a failure is a real HTTP status with a
+    # machine-readable `code`, never a 200 with an "error" key. The candidate
+    # page used to swallow those 200s, so a dead transcription key looked
+    # exactly like a silent candidate and every answer was saved as "skip".
     if audio_file is None:
-        return {"error": "Audio file is required."}
+        return _speech_error(400, "no_audio", "Audio file is required.")
     raw = await audio_file.read()
     if not raw:
-        return {"error": "Audio payload is empty."}
+        return _speech_error(400, "empty_audio", "Audio payload is empty.")
     if len(raw) < 400:
-        return {"error": "Recording was too short. Speak a bit longer, then stop the mic."}
+        return _speech_error(400, "too_short",
+                             "Recording was too short. Speak a bit longer, then stop the mic.")
+    model_name = (os.getenv("OPENAI_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
     try:
-        model_name = (os.getenv("OPENAI_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
         text = await run_in_threadpool(
             transcribe_speech_bytes,
             raw,
@@ -3316,13 +3368,19 @@ async def transcribe_candidate_audio(
             audio_file.content_type or "audio/webm",
             model_name,
         )
-        if not text:
-            return {"error": "No speech detected. Please speak clearly and retry."}
-        return {"text": text}
-    except OpenAIError:
-        return {"error": "Transcription service unavailable. Please retry in a moment."}
+    except OpenAIError as exc:
+        _speech_log.warning("transcription provider error (%s, %d bytes): %s",
+                            model_name, len(raw), _openai_error_summary(exc))
+        return _speech_error(503, "stt_unavailable",
+                             "Transcription service unavailable. Please retry in a moment.")
     except Exception:
-        return {"error": "Transcription failed. Please retry."}
+        _speech_log.exception("transcription failed (%s, %d bytes)", model_name, len(raw))
+        return _speech_error(502, "stt_failed", "Transcription failed. Please retry.")
+    if not text:
+        # A real, working provider heard nothing — 200 with empty text so the
+        # client can tell "silence" from "service down".
+        return {"text": "", "code": "no_speech"}
+    return {"text": text}
 
 
 @app.post("/candidate/validate-speech")
@@ -3369,13 +3427,11 @@ async def candidate_tts(
     _, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
         return auth_err
-    payload = " ".join((text or "").split()).strip()
-    if not payload:
-        return {"error": "Text is required."}
-    if len(payload) > 3800:
-        payload = payload[:3797].rsplit(" ", 1)[0] + "…"
-    from services.tts_prewarm import get_cached, tts_voice_and_model
+    from services.tts_prewarm import get_cached, normalize_tts_text, tts_voice_and_model
 
+    payload = normalize_tts_text(text)
+    if not payload:
+        return _speech_error(400, "no_text", "Text is required.")
     tts_voice, tts_model = tts_voice_and_model()
 
     # Serve a prefetched clip instantly when this question was warmed while the
@@ -3389,14 +3445,22 @@ async def candidate_tts(
     # Stream rather than buffer. `.read()` waited for the whole MP3 before a
     # single byte reached the browser, which put a 2-3s silence in front of
     # every question. Chunks let playback start while synthesis continues.
+    # Same contract as /candidate/transcribe: failures are real statuses +
+    # a `code`, and they are logged. The client falls back to the browser's
+    # own speech synthesis on any non-audio reply, so the question is still
+    # read aloud — but the operator can now SEE that the OpenAI voice is down.
     try:
         stream = await run_in_threadpool(_open_tts_stream, payload, tts_voice, tts_model)
-    except OpenAIError:
-        return {"error": "Voice service unavailable."}
+    except OpenAIError as exc:
+        _speech_log.warning("TTS provider error (%s/%s): %s",
+                            tts_model, tts_voice, _openai_error_summary(exc))
+        return _speech_error(503, "tts_unavailable", "Voice service unavailable.")
     except Exception:
-        return {"error": "Voice synthesis failed."}
+        _speech_log.exception("TTS synthesis failed (%s/%s)", tts_model, tts_voice)
+        return _speech_error(502, "tts_failed", "Voice synthesis failed.")
     if stream is None:
-        return {"error": "Voice synthesis failed."}
+        _speech_log.warning("TTS returned no audio (%s/%s, %d chars)", tts_model, tts_voice, len(payload))
+        return _speech_error(502, "tts_empty", "Voice synthesis returned no audio.")
 
     async def _relay():
         try:
@@ -3406,7 +3470,8 @@ async def candidate_tts(
             # The audio is already partly delivered; a mid-stream failure has to
             # end the response rather than turn into a JSON error the <audio>
             # element cannot understand.
-            logging.getLogger(__name__).warning("TTS stream aborted mid-flight")
+            _speech_log.warning("TTS stream aborted mid-flight (%s/%s)", tts_model, tts_voice,
+                                exc_info=True)
             return
 
     return StreamingResponse(
@@ -3537,6 +3602,19 @@ def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: s
             meta["session_difficulty"] = nd
 
 
+def _parse_client_turn(raw: str) -> int | None:
+    """The `turn` form field of /answer: the question index the client believes
+    it is answering. Blank/garbage → None (legacy clients send nothing)."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
 def _expand_time_mode_pool(session: dict) -> None:
     meta = session.get("meta", {})
     if str(meta.get("question_source") or "") == "manual":
@@ -3652,6 +3730,7 @@ def answer(
     action: str = Form("send"),
     skip_reason: str = Form(""),
     auto_advance_meta: str = Form(""),
+    turn: str = Form(""),
 ):
     payload, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
@@ -3696,6 +3775,25 @@ def answer(
             existing_answer = answers[turn_index]
             is_skipped_existing = str(existing_answer or "").strip().lower() in {"skip", "skipped", "[skipped]"}
             return _build_answer_response(s, is_skipped_answer=is_skipped_existing)
+        # A second click on Send/Skip for a turn that has ALREADY advanced
+        # (16 Sep 2026): the client names the turn it is answering; a stale one
+        # is answered idempotently instead of consuming the next question.
+        # The old `len(answers) > turn_index` check never caught this because
+        # both grow together.
+        client_turn = _parse_client_turn(turn)
+        if client_turn is not None and client_turn < turn_index:
+            _append_answer_audit(
+                session_key=sk,
+                current_index=turn_index,
+                action=str(action or "send"),
+                answer_text=str(ans or ""),
+                is_skipped_answer=str(action or "").strip().lower() == "skip",
+                status="ignored_stale_turn",
+                reason=f"client_turn={client_turn} server_turn={turn_index}",
+            )
+            prev = answers[client_turn] if client_turn < len(answers) else ""
+            prev_skipped = str(prev or "").strip().lower() in {"skip", "skipped", "[skipped]"}
+            return _build_answer_response(s, is_skipped_answer=prev_skipped)
 
         action_clean = str(action or "send").strip().lower() or "send"
         if action_clean not in {"send", "skip"}:
@@ -3727,7 +3825,9 @@ def answer(
                 ans_clean = answer_text
         if is_skipped_answer and aa_meta:
             trigger = str(aa_meta.get("trigger") or "").strip().lower()
-            if trigger == "no_response":
+            # The client has always sent "silent_no_response" (interview_auto_advance.js);
+            # matching only "no_response" made this guard dead code (16 Sep 2026).
+            if trigger in _NO_RESPONSE_TRIGGERS:
                 allowed, block_reason = skip_allowed_by_speech_evidence(aa_meta)
                 if not allowed:
                     _append_answer_audit(
@@ -3957,7 +4057,10 @@ def answer(
                 meta["followups_added"] = meta.get("followups_added", 0) + 1
                 meta["pending_tts_invalidate"] = True
 
-        if not s.get("finalizing") and not is_skipped_answer:
+        # Time mode keeps a rolling pool; it MUST grow on skipped turns too —
+        # skipping the last generated question used to end the interview with
+        # time still on the clock (16 Sep 2026).
+        if not s.get("finalizing"):
             _expand_time_mode_pool(s)
         _persist_interview_progress(s, status="in_progress")
 
@@ -7442,17 +7545,39 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
         suffix = f" ({left} attempt{'s' if left != 1 else ''} left)" if left else " This link is now locked — please contact HR."
         return JSONResponse({"error": message + suffix, "attempts_left": left}, status_code=status)
 
+    session_status = str(record.get("session_status") or "pending").strip().lower()
+    # A closed link is closed regardless of what was typed — checking this
+    # first means a wrong key on a finished interview burns no attempt.
+    if session_status == "completed":
+        return _invite_closed_response(
+            record, "completed",
+            "This interview has already been completed. The link is no longer valid.",
+        )
+    if session_status == "terminated":
+        return _invite_closed_response(
+            record, "terminated",
+            "This interview was terminated due to policy violations. The link is no longer valid.",
+        )
+
     access = _invite_access_state(record)
     if access.get("reason") == "expired":
         return JSONResponse({"error": "This interview link has expired. Please contact HR for a new link."}, status_code=403)
+    if access.get("reason") == "scheduled_wait":
+        # Not before the slot: the candidate sees the countdown; nothing is
+        # verified, no attempt is spent.
+        return JSONResponse(
+            {"error": "This interview has not started yet. Please come back at the scheduled time.",
+             "status": "scheduled_wait",
+             "seconds_until_start": access.get("seconds_until_start", 0),
+             "starts_at_ist": access.get("starts_at_ist")},
+            status_code=425,
+        )
 
     stored_email = str(record.get("candidate_email", "")).strip().lower()
     stored_key = str(record.get("access_key", "")).strip().upper()
 
     submitted_email = (email or "").strip().lower()
     submitted_key = (access_key or "").strip().upper()
-
-    session_status = str(record.get("session_status") or "pending").strip().lower()
     request_device = str(request.headers.get("x-device-id") or "").strip()
     active_device = str(record.get("active_device_id") or "").strip()
 
@@ -7473,18 +7598,6 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
         pass
     elif not hmac.compare_digest(submitted_key, stored_key):  # constant-time secret compare
         return _failed("Invalid access key. Please check the key shared by HR.")
-    if session_status == "completed":
-        return _invite_closed_response(
-            record,
-            "completed",
-            "This interview has already been completed. The link is no longer valid.",
-        )
-    if session_status == "terminated":
-        return _invite_closed_response(
-            record,
-            "terminated",
-            "This interview was terminated due to policy violations. The link is no longer valid.",
-        )
     if session_status == "active":
         if not request_device or request_device != active_device:
             return JSONResponse({"error": "This interview session is already active on another device."}, status_code=403)
@@ -7657,7 +7770,21 @@ def candidate_invite_login(token: str, request: Request):
         "question_count": int(boot.get("question_count") or (len((sess or {}).get("questions") or []))),
         "login_latency_ms": int((time.time() - login_started) * 1000),
         "fast_bootstrap": bool(boot.get("fast_only")),
+        # Resume (16 Sep 2026): a reopened link continues from the saved turn.
+        # The client uses this to say "resuming from question N", nothing else.
+        "resume": _resume_info(sess),
     }
+
+
+def _resume_info(sess: dict | None) -> dict | None:
+    """`{"current": n, "total": m}` when the session already has answered
+    turns (the candidate closed the tab and came back); None for a fresh start."""
+    if not isinstance(sess, dict):
+        return None
+    current = int(sess.get("current", 0) or 0)
+    if current <= 0:
+        return None
+    return {"current": current, "total": len(sess.get("questions") or [])}
 
 
 @app.post("/interview/time-warning-audit")
@@ -7993,12 +8120,14 @@ def _cleanup_expired_integrity_rows(hr_user: str | None) -> None:
                     changed = True
             continue
         scheduled = _parse_scheduled_local(str(row.get("scheduled_at_local") or ""))
-        if not scheduled or now <= scheduled + timedelta(hours=24):
+        # Unused links are only swept when INVITE_LINK_VALID_HOURS is set — by
+        # default a link stays usable (once) at any time after its slot.
+        if not scheduled or not _invite_slot_expired(scheduled, now):
             continue
         started = str(row.get("interview_started_at") or "").strip()
         verified = str(row.get("verified_at") or "").strip()
         if not started:
-            reason = "Not attempted within 24 hours"
+            reason = f"Not attempted within {_invite_valid_hours():g} hours"
         elif not verified:
             reason = "Verification incomplete"
         else:

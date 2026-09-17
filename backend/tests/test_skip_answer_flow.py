@@ -56,7 +56,9 @@ def test_skip_returns_next_and_records_metadata(answer_client):
     assert len(skipped_turns) == 1
     assert skipped_turns[0]["status"] == "SKIPPED"
     assert skipped_turns[0]["question_text"] == "Q1"
-    assert state["expand_calls"] == 0
+    # 16 Sep 2026: the time-mode pool grows on skipped turns too — skipping the
+    # last generated question used to end the interview with time still left.
+    assert state["expand_calls"] == 1
 
 
 def test_mixed_skip_and_answer_sequence(answer_client):
@@ -104,3 +106,31 @@ def test_answer_after_skip_is_evaluated(answer_client):
     assert sessions["sk-test"]["answers"] == ["skip", "Practical CAN debugging example."]
     assert len(eval_calls) == 1
     assert eval_calls[0]["answer"] == "Practical CAN debugging example."
+
+
+def test_stale_turn_from_a_double_click_does_not_consume_the_next_question(answer_client):
+    """Two rapid Skip clicks: the second names turn 0 while the server is on 1."""
+    main, sessions, state, eval_calls = answer_client
+    req = SimpleNamespace()
+    first = main.answer(req, ans="", action="skip", skip_reason="Candidate skipped manually", turn="0")
+    assert first.get("next", {}).get("question") == "Q2"
+    second = main.answer(req, ans="", action="skip", skip_reason="Candidate skipped manually", turn="0")
+    assert second["status"] == "ok"
+    assert second.get("next", {}).get("question") == "Q2"          # still on Q2
+    assert sessions["sk-test"]["answers"] == ["skip"]               # nothing extra stored
+    assert sessions["sk-test"]["current"] == 1
+
+
+def test_current_turn_is_still_answered_normally(answer_client):
+    main, sessions, state, eval_calls = answer_client
+    req = SimpleNamespace()
+    out = main.answer(req, ans="A real answer about UDS", action="send", turn="0")
+    assert out["status"] == "ok" and sessions["sk-test"]["current"] == 1
+    out = main.answer(req, ans="Second answer", action="send", turn="1")
+    assert sessions["sk-test"]["current"] == 2
+
+
+def test_legacy_client_without_turn_field_still_works(answer_client):
+    main, sessions, state, eval_calls = answer_client
+    out = main.answer(SimpleNamespace(), ans="Answer", action="send")
+    assert out["status"] == "ok" and sessions["sk-test"]["current"] == 1

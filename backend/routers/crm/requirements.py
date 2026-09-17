@@ -589,6 +589,53 @@ def set_requirement_priority(
     return envelope(_one(db, req), message=f"Priority set to {payload.priority}")
 
 
+class JdSkillsIn(BaseModel):
+    """`None` = leave that part untouched; a value replaces it."""
+    rmg_jd_text: str | None = None
+    description: str | None = None
+    skills: list[RequirementSkillIn] | None = None
+
+
+@router.patch("/{requirement_id}/jd-skills")
+def set_requirement_jd_skills(
+    requirement_id: int,
+    payload: JdSkillsIn,
+    db: Session = Depends(get_crm_db),
+    # Forgotten JD / skills (15 Sep 2026): RMG, Sales, Sales Head and Admin/CEO
+    # may fill or fix them at ANY non-terminal status — unlike the full PUT,
+    # which is creator-only and Draft/Rejected-only. Deliberately narrow: no
+    # budget, positions or status fields can move through here.
+    user: CurrentUser = Depends(gated_write("requirements", "RMG", "Sales", "Sales_Head")),
+):
+    req = get_requirement_or_404(db, requirement_id)
+    if req.status in TERMINAL_STATUSES:
+        _require_status(req, tuple(s for s in RequirementStatus if s not in TERMINAL_STATUSES),
+                        "edit the JD or skills of")
+    changed: list[str] = []
+    if payload.rmg_jd_text is not None:
+        req.rmg_jd_text = payload.rmg_jd_text.strip() or None
+        changed.append("JD")
+    if payload.description is not None:
+        req.description = payload.description.strip() or None
+        changed.append("description")
+    if payload.skills is not None:
+        skills = _validated_skills(db, payload.skills)
+        db.execute(
+            RequirementSkill.__table__.delete().where(RequirementSkill.requirement_id == req.id)
+        )
+        for s in skills:
+            db.add(RequirementSkill(requirement_id=req.id, skill_id=s.skill_id,
+                                    is_mandatory=s.is_mandatory, min_rating=s.min_rating))
+        changed.append(f"skills ({len(skills)})")
+    if not changed:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
+                 "JD_SKILLS", f"{user.full_name or user.username} updated: {', '.join(changed)}")
+    db.commit()
+    db.refresh(req)
+    return envelope(_one(db, req), message="JD & skills updated")
+
+
 def _manual_terminal(db: Session, requirement_id: int, user: CurrentUser,
                      new_status: RequirementStatus, action: str, comment: str | None):
     req = get_requirement_or_404(db, requirement_id)

@@ -1585,11 +1585,11 @@ def synthesize_speech_bytes(
     content = " ".join((text or "").split()).strip()
     if not content:
         return b""
+    from services.tts_prewarm import speech_request_kwargs
+
     client = _client("tts")
     with client.audio.speech.with_streaming_response.create(
-        model=model,
-        voice=voice,
-        input=content,
+        **speech_request_kwargs(model, voice, content)
     ) as response:
         return response.read()
 
@@ -1620,11 +1620,11 @@ def stream_speech_bytes(
     content = " ".join((text or "").split()).strip()
     if not content:
         return
+    from services.tts_prewarm import speech_request_kwargs
+
     client = _client("tts")
     with client.audio.speech.with_streaming_response.create(
-        model=model,
-        voice=voice,
-        input=content,
+        **speech_request_kwargs(model, voice, content)
     ) as response:
         for chunk in response.iter_bytes(chunk_size=TTS_STREAM_CHUNK_BYTES):
             if chunk:

@@ -1697,18 +1697,21 @@ def schedule_ai_interview(
     user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
 ):
     resume = _get_resume_or_404(db, resume_id)
-    if resume.ats_status != AtsStatus.SHORTLISTED:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only Shortlisted resumes can be scheduled for AI interview "
-                   f"(current ats_status: {resume.ats_status.value})",
-        )
     req = get_requirement_or_404(db, resume.requirement_id)
     from services.requirements import ensure_not_on_hold
     ensure_not_on_hold(req)
 
     candidate = find_or_create_candidate_from_resume(db, resume)
     profile = get_or_create_profile(db, candidate, req)
+
+    # ONE gate for the interview route (15 Sep 2026, user decision): RMG's
+    # screening decision. The ATS "Shortlisted" status (TA's star on the
+    # resume) is information, not a precondition — it used to be, so RMG could
+    # shortlist a candidate and still have no AI L1 button until TA also
+    # ATS-shortlisted the file. Only a Rejected / not-yet-scanned resume is
+    # refused outright.
+    if resume.ats_status == AtsStatus.REJECTED:
+        raise HTTPException(status_code=400, detail="This resume was rejected — it cannot be scheduled for an AI interview")
 
     # RMG screening gate (25 Aug 2026): a Pending/Rejected applicant cannot be
     # sent into the AI L1 — RMG must Shortlist first. Server-side on purpose.

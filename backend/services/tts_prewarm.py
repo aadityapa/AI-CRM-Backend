@@ -37,9 +37,22 @@ TTL_SECONDS = 900
 #: that the live, on-the-critical-path request depends on.
 MAX_INFLIGHT = 4
 
-_cache: "OrderedDict[tuple[str, str, str], tuple[float, bytes]]" = OrderedDict()
+_cache: "OrderedDict[tuple[str, str, str, str], tuple[float, bytes]]" = OrderedDict()
 _lock = threading.Lock()
-_inflight: set[tuple[str, str, str]] = set()
+_inflight: set[tuple[str, str, str, str]] = set()
+
+#: How the interviewer voice should sound (16 Sep 2026, user request: read every
+#: question aloud in Indian English). `gpt-4o-mini-tts` takes free-text style
+#: instructions; the older `tts-1*` models do not, and `speech_request_kwargs`
+#: drops them there. Override with OPENAI_TTS_INSTRUCTIONS; the literal value
+#: "none" disables instructions entirely.
+DEFAULT_TTS_INSTRUCTIONS = (
+    "Speak in clear Indian English with a natural Indian accent. You are a calm, "
+    "professional technical interviewer: warm but neutral, moderate pace, crisp "
+    "pronunciation of technical terms and acronyms, a short pause after each question."
+)
+#: Models that accept the `instructions` parameter.
+_INSTRUCTION_MODELS = ("gpt-4o-mini-tts",)
 
 
 def tts_voice_and_model() -> tuple[str, str]:
@@ -48,6 +61,28 @@ def tts_voice_and_model() -> tuple[str, str]:
         (os.getenv("OPENAI_TTS_VOICE") or "nova").strip(),
         (os.getenv("OPENAI_TTS_MODEL") or "gpt-4o-mini-tts").strip(),
     )
+
+
+def tts_instructions(model: str | None = None) -> str:
+    """Style instructions for `model` ("" when the model cannot take any)."""
+    model = model or tts_voice_and_model()[1]
+    if not any(model.startswith(m) for m in _INSTRUCTION_MODELS):
+        return ""
+    raw = os.getenv("OPENAI_TTS_INSTRUCTIONS")
+    if raw is None:
+        return DEFAULT_TTS_INSTRUCTIONS
+    raw = " ".join(raw.split()).strip()
+    return "" if raw.lower() in ("", "none", "off") else raw
+
+
+def speech_request_kwargs(model: str, voice: str, text: str, instructions: str | None = None) -> dict:
+    """The exact kwargs for `client.audio.speech...create` — shared by the
+    streaming and the prewarm path so both speak with the same voice."""
+    kwargs = {"model": model, "voice": voice, "input": text}
+    instr = tts_instructions(model) if instructions is None else instructions
+    if instr:
+        kwargs["instructions"] = instr
+    return kwargs
 
 
 def normalize_tts_text(text: str) -> str:
@@ -62,8 +97,14 @@ def normalize_tts_text(text: str) -> str:
     return payload
 
 
-def _key(text: str, voice: str, model: str) -> tuple[str, str, str]:
-    return (hashlib.sha256(text.encode("utf-8")).hexdigest(), voice, model)
+def _key(text: str, voice: str, model: str) -> tuple[str, str, str, str]:
+    # Instructions are part of the key: changing the accent must not serve the
+    # old clip for the rest of the TTL.
+    instr = tts_instructions(model)
+    return (
+        hashlib.sha256(text.encode("utf-8")).hexdigest(), voice, model,
+        hashlib.sha256(instr.encode("utf-8")).hexdigest()[:16] if instr else "",
+    )
 
 
 def get_cached(text: str, voice: str, model: str) -> bytes | None:
@@ -130,7 +171,10 @@ def prewarm_tts(text: str) -> bool:
             audio = synthesize_speech_bytes(payload, voice, model)
             put_cached(payload, voice, model, audio)
         except Exception as exc:
-            logger.debug("TTS prewarm failed (harmless): %s", exc)
+            # Harmless for the candidate (the live path streams instead), but a
+            # dead key would otherwise be invisible — warn once per failure.
+            logger.warning("TTS prewarm failed (%s: %s) — the live /candidate/tts path will retry",
+                           type(exc).__name__, exc)
         finally:
             with _lock:
                 _inflight.discard(key)

@@ -310,6 +310,79 @@ format_when`, `ai_interviews._when_text`). F-V2: `lib/datetime.ts` (`fmtDateTime
 en-IN, 12-hour, no seconds) replaces every bare `Date.toLocaleString()` (locale-dependent, 24 h on en-GB boxes) in 15
 files; the candidate runtime's "Scheduled:" lines use `formatHrDateTimeDisplay`; `index.html` `app.js?v=24`.
 
+**15 Sep 2026 — RMG shortlisting desk (Applied Candidates):** (1) `POST /api/resumes/{id}/schedule-ai-interview`
+no longer requires `ats_status == Shortlisted` — only an ATS-Rejected row is refused (the RMG screening gate
+`rmg_screening_blocks_l1` still applies), so RMG sees **AI L1 and Go manual side by side** the moment the screening
+is Shortlisted (F-V2 button gates: resume rows `ats != Rejected && (ats Shortlisted || rmg Shortlisted)`, profile-only
+rows for TA **or** RMG). (2) "View resume" `FileLink` inside the RMG screening block — the CV opens inline without
+leaving the tab. (3) Excel-style column chooser: `TABLE_REGISTRY["requirement_resumes"]` in
+`routers/crm/table_preferences.py` (11 keys, nothing sortable — the list is client-sorted); F-V2 `ResumesTab` uses
+`useTableLayout("requirement_resumes", RESUME_COLUMN_KEYS)` + `TableCustomizerButton`, Actions always pinned last;
+`TableCustomizer` hides its Sort section when `sortable` is empty. (4) `PATCH /api/requirements/{id}/jd-skills`
+`{rmg_jd_text?, description?, skills?}` — `gated_write("requirements","RMG","Sales","Sales_Head")` (Admin/CEO
+implicit), **no creator restriction**, any non-terminal status (400 on Fulfilled/Closed/Cancelled), reuses
+`_validated_skills`, activity `JD_SKILLS`; the full `PUT` stays creator-only + Draft/Rejected-only. F-V2: Details tab
+shows an amber "JD / skills missing" banner + "Edit JD & skills" (`JdSkillsModal`) for those roles. Pinned by
+`tests/test_requirement_jd_skills.py` (7).
+
+**16 Sep 2026 — employee import "Last Working Day":** `services/employee_excel.COLUMNS` gained a trailing
+`Last Working Day` column (template · export · import; sets `last_working_day` + `is_resigned`). Older downloaded
+templates now fail the header check ("column count") — download a fresh one. The legacy HR sheet was converted with
+managers resolved to emails, rows ordered managers-first (the importer resolves a manager against rows already
+saved), Permanent→Full_Time / Contingent→Contract, `Designation||Role`→Designation + Role Title, self-reporting
+cleared; `employees-import-ready.xlsx` at the repo root (not committed).
+
+**16 Sep 2026 — AI interview voice + answer capture (`tests/test_candidate_speech_endpoints.py`, 11):** a live
+interview ran with NO voice and every answer saved as "skip". Root: `/candidate/tts` and `/candidate/transcribe`
+answered every provider failure with **HTTP 200 + `{"error"}`**, and the candidate page swallowed it — a dead/throttled
+OpenAI key looked exactly like a silent candidate. Now: both return real statuses with a `code` (`400 no_text/no_audio/
+too_short`, `503 tts_unavailable/stt_unavailable`, `502 tts_failed/tts_empty/stt_failed`; silence is `200 {"text":"",
+"code":"no_speech"}`) via `main._speech_error`, and log to `karnex.interview.speech` (prewarm failures now WARN, not
+DEBUG). **Indian-English voice:** `services/tts_prewarm.speech_request_kwargs()` is the ONE builder of the OpenAI
+speech call (live stream + prewarm) and adds `instructions=DEFAULT_TTS_INSTRUCTIONS` for `gpt-4o-mini-tts` (never for
+`tts-1*`); override with `OPENAI_TTS_INSTRUCTIONS` (`none` disables); the prewarm cache key includes the instructions.
+`/answer`'s speech-evidence 409 guard now matches `silent_no_response` (`_NO_RESPONSE_TRIGGERS`) — the client never sent
+"no_response", so it was dead code. F-V2 runtime: `js/question_voice.js` (server stream → server blob on a CLONED
+response — the old blob fallback read an already-consumed body → browser `speechSynthesis` with an `en-IN` voice; resolves
+on END; every fallback goes to `#candidateVoiceNotice` + console), `js/speech_transcribe.js` (one `/candidate/transcribe`
+client; `TranscribeUnavailableError` + `transcriptionRecentlyDown()` distinguish "service down" from "silence"),
+`interview_auto_advance.js` starts the browser `SpeechRecognition` (en-IN) when Silero (jsDelivr) fails to load,
+`candidate.js` refuses an AUTOMATIC skip while ≥12 KB of audio is recorded and transcription is down ("tap Send to
+retry"), reads the capture snapshot BEFORE `stopAutoAdvanceTurn()` resets it, wraps the pre-POST part of
+`submitCandidateAnswer` so a throw can no longer wedge `_answerSubmitInFlight`, and a non-`speech_blocked` 409 no longer
+dies with "body stream already read". `index.html` `app.js?v=26`. Deploy: restart the backend (the OpenAI client is
+`lru_cache`d — a fixed key needs a restart); watch the log for `TTS provider error` / `transcription provider error`;
+optional `OPENAI_TTS_VOICE` (default `nova`).
+
+**16 Sep 2026 — invite link policy (`tests/test_invite_link_policy.py`, 7):** a link is inert BEFORE its slot, usable
+ANY time after it, and works exactly ONCE — completion/termination closes it, not the clock. `main._invite_valid_hours()`
+reads `INVITE_LINK_VALID_HOURS` (blank/0 = never expire, the default; the old hard-coded 24 h is gone) and drives both
+`_invite_access_state` and the stale sweep in `_cleanup_expired_integrity_rows`. `/candidate/invite/{t}/verify` now checks
+completed/terminated BEFORE the credentials (a wrong key on a closed link no longer burns an attempt) and refuses
+`scheduled_wait` with **425** `{status:"scheduled_wait", seconds_until_start, starts_at_ist}`. `/login` returns
+`resume: {current, total}` when the session already has answered turns (`_resume_info`). F-V2: `#screenInviteNotYet`
+(countdown, re-runs the lookup at zero) on lookup `access.reason == "scheduled_wait"` and on the 425; the startup
+line says "Resuming your interview from question N of M". Device check: guided mic test (say "one", say "two", clap —
+`MIC_STEPS` in `device_test.js`, chips `[data-mic-step]`, pass = voice OR clap heard), 5-second triangle-wave chime
+instead of the 660 Hz beep; Rules + Device Check screens are full-viewport glass panels (override layer "Pre-interview
+screens v2" in `index.html`, JS hooks unchanged); `#recordingBadge` (`js/recording_badge.js`) blinks "REC · This
+interview is being recorded" on the candidate feed from STEP-8 until `submitInterview`. `index.html` `app.js?v=27`.
+
+**16 Sep 2026 — "interview closed on Skip" (`tests/test_skip_answer_flow.py`, +3):** in `timing_mode == "time"` the
+question pool grows lazily via `_expand_time_mode_pool`, and `/answer` only called it for ANSWERED turns — skipping the
+last generated question made `next_question_payload` return "Interview completed" with time still on the clock. Now it
+runs on every non-finalizing turn, and `/next` tops the pool up before deciding "completed". `/answer` also takes an
+optional `turn` form field (the question index the client is answering — `_parse_client_turn`): a stale turn
+(`client_turn < current`, i.e. a double-click after the first press already advanced) is answered idempotently and
+audited as `ignored_stale_turn` instead of skipping the NEXT question; the old `len(answers) > turn_index` check never
+caught this because both counters move together. F-V2 `candidate.js`: `_pressInFlight` locks BOTH buttons on entry
+(before the Skip pre-work that can wait seconds for a transcript; internal `_retryAfterTranscription` continuations
+pass through; every early return calls `_releasePress()`), sends `turn`, and on a `speech_blocked` 409 resumes
+listening with `autoSkip: false` for that turn (`beginAutoAdvanceTurn({autoSkip})` → `_autoSkipOffForTurn`) — the old
+handler re-armed the silence timer and looped skip→409→skip. Timer: `state.interviewClockSynced` — the countdown shows
+`--.--` until `/next` reports `time_remaining_sec`, so a resume never flashes the full limit before jumping. Note the
+clock is wall-clock from `interview_started_epoch` (time away is deducted by design). `index.html` `app.js?v=28`.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 

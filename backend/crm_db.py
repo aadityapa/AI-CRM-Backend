@@ -56,7 +56,8 @@ def _url_from_db_parts() -> str:
     user = (os.getenv("DB_USER") or "").strip()
     password = (os.getenv("DB_PASSWORD") or "").strip()
     if host and name and user:
-        return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+        from urllib.parse import quote as _q
+        return f"postgresql://{_q(user, safe='')}:{_q(password, safe='')}@{host}:{port}/{name}"
     return ""
 
 
