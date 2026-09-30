@@ -58,6 +58,28 @@ def warmup_enabled() -> bool:
     return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+WARMUP_TIME_LIMIT_ENV = "INTERVIEW_WARMUP_TIME_LIMIT_SEC"
+DEFAULT_WARMUP_TIME_LIMIT_SEC = 60
+
+
+def warmup_time_limit_sec() -> int:
+    """Seconds the candidate gets for the warm-up before the client moves on.
+
+    The warm-up is not scored, so an open-ended introduction only eats the
+    interview clock (23 Sep 2026 — user decision: 60 s, shown on screen).
+    0 disables the per-question limit. Clamped to 15..600 so a typo cannot
+    hand out a 6-second or a 10-hour introduction.
+    """
+    raw = os.getenv(WARMUP_TIME_LIMIT_ENV, str(DEFAULT_WARMUP_TIME_LIMIT_SEC))
+    try:
+        n = int(str(raw).strip() or DEFAULT_WARMUP_TIME_LIMIT_SEC)
+    except (TypeError, ValueError):
+        n = DEFAULT_WARMUP_TIME_LIMIT_SEC
+    if n <= 0:
+        return 0
+    return max(15, min(600, n))
+
+
 def inject_warmup(questions: Sequence[str]) -> Tuple[List[str], List[int]]:
     """Prepend the warmup question to a generated pool.
 

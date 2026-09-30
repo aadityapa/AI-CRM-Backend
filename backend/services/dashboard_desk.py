@@ -184,7 +184,7 @@ def today_tiles(db: Session, user) -> dict:
         review_old = _count(db, review_q.where(
             func.coalesce(Requirement.sales_head_approved_at, Requirement.created_at)
             <= now - timedelta(hours=REVIEW_SLA_HOURS)))
-        add(_tile("rmg_review_queue", "Engineering review queue", review_n,
+        add(_tile("rmg_review_queue", "RMG review queue", review_n,
                   f"{review_old} older than {REVIEW_SLA_HOURS} h" if review_old else "none overdue",
                   "bad" if review_old else _state(review_n, bad_at=None, warn_at=1), "opportunities"))
         screen_q = select(CandidateProfile.id).where(CandidateProfile.rmg_screening_status == "Pending")
@@ -315,6 +315,20 @@ def today_tiles(db: Session, user) -> dict:
 
     # ---- Admin / CEO: company desk -------------------------------------------
     if is_admin:
+        # Revenue this month (excl. GST) — the headline of the CEO Revenue
+        # report (Reports ▸ Revenue, Admin/CEO only). Same definition as
+        # services.revenue_report: sum of invoice sub_total by invoice_date.
+        # The tile carries the report's alert state (behind target, 90+ overdue,
+        # PO cover…) so a CEO sees "something needs me" before opening it.
+        from services.revenue_report import revenue_summary_for_tile
+        rev = revenue_summary_for_tile(db, today)
+        n_alerts = len(rev["alerts"])
+        detail = (f"{n_alerts} alert{'s' if n_alerts != 1 else ''} — {rev['alerts'][0]['title']}" if n_alerts
+                  else f"{rev['invoices']} invoice{'s' if rev['invoices'] != 1 else ''} raised, before GST")
+        if rev["target_pct"] is not None and not n_alerts:
+            detail = f"run-rate {rev['target_pct']:.0f}% of target · {detail}"
+        add(_tile("co_revenue_month", f"Revenue · {today.strftime('%b %Y')}", rev["billed"], detail,
+                  rev["state"], "reports?tab=revenue", fmt="money"))
         open_pos = int(db.execute(select(func.coalesce(func.sum(Requirement.no_of_positions), 0))
                                   .where(Requirement.status.in_(OPEN_SOURCING_STATUSES))).scalar() or 0)
         ageing = _count(db, select(Requirement.id).where(
@@ -501,7 +515,7 @@ def team_overview(db: Session, user) -> dict:
         CandidateProfile.rmg_screening_status == "Pending",
         func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)
         <= now - timedelta(hours=REVIEW_SLA_HOURS)))
-    add("RMG", f"RMG queue past {REVIEW_SLA_HOURS} h", f"{rev_old} engineering reviews · {scr_old} screenings",
+    add("RMG", f"RMG queue past {REVIEW_SLA_HOURS} h", f"{rev_old} RMG reviews · {scr_old} screenings",
         rev_old + scr_old, "warn", "profiles")
 
     # Cash.

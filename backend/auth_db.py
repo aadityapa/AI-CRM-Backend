@@ -369,6 +369,13 @@ def _ensure_schedule_security_columns_postgres(conn) -> None:
         "interview_completed_at": "TEXT",
         "violation_count": "INTEGER NOT NULL DEFAULT 0",
         "violations_log": "JSONB",
+        # Whole-session recording (22 Sep 2026). Only the KEY lives here — the
+        # bytes are in object storage (services/media_storage.py). Putting a
+        # ~22 MB blob in this row would bloat every backup and every dump.
+        "recording_key": "TEXT",
+        "recording_bytes": "BIGINT NOT NULL DEFAULT 0",
+        "recording_mime": "TEXT",
+        "recording_status": "TEXT NOT NULL DEFAULT ''",
     }
     with conn.cursor() as cur:
         cur.execute(
@@ -396,6 +403,11 @@ def _ensure_schedule_security_columns_sqlite(conn: sqlite3.Connection) -> None:
         "interview_completed_at": "TEXT",
         "violation_count": "INTEGER NOT NULL DEFAULT 0",
         "violations_log": "TEXT",
+        # See the Postgres twin above — key only, never the bytes.
+        "recording_key": "TEXT",
+        "recording_bytes": "INTEGER NOT NULL DEFAULT 0",
+        "recording_mime": "TEXT",
+        "recording_status": "TEXT NOT NULL DEFAULT ''",
     }
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(interview_schedule)")
@@ -2393,7 +2405,10 @@ def list_interview_integrity_logs(db_target: DbTarget, hr_username: str | None) 
     cols = (
         "id, invite_token, hr_username, status, notes, created_at_ist, candidate_name, candidate_email, "
         "scheduled_at_local, session_status, login_attempts, verified_at, interview_started_at, "
-        "interview_completed_at, violation_count, violations_log, active_device_id"
+        "interview_completed_at, violation_count, violations_log, active_device_id, "
+        # 22 Sep 2026: the Integrity list says whether a recording exists, so
+        # the reviewer sees it without opening every row.
+        "recording_key, recording_bytes, recording_status"
     )
     if _is_postgres(db_target):
         where = "WHERE hr_username = %s" if uname else ""
@@ -2439,7 +2454,10 @@ def list_interview_integrity_logs(db_target: DbTarget, hr_username: str | None) 
 
 def get_schedule_by_token(db_target: DbTarget, invite_token: str) -> dict | None:
     token = (invite_token or "").strip()
-    cols = "id, candidate_name, candidate_email, scheduled_at_local, provider, meeting_link, status, notes, access_key, session_status, active_device_id, login_attempts, verified_at, interview_started_at, interview_completed_at, violation_count, violations_log"
+    cols = ("id, candidate_name, candidate_email, scheduled_at_local, provider, meeting_link, status, notes, "
+            "access_key, session_status, active_device_id, login_attempts, verified_at, interview_started_at, "
+            "interview_completed_at, violation_count, violations_log, "
+            "recording_key, recording_bytes, recording_mime, recording_status")
     if _is_postgres(db_target):
         with _connect_postgres(str(db_target)) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:

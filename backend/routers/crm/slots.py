@@ -57,6 +57,7 @@ def _as_utc(dt: datetime) -> datetime:
 
 
 from services.ist import IST as _DISPLAY_TZ  # fixed +05:30 fallback, never UTC (14 Sep 2026)
+from services.report_links import ai_report_link
 
 
 def _from_ist(dt: datetime) -> datetime:
@@ -707,7 +708,7 @@ def confirm_booking(
     _confirm_title = f"Slot confirmed: {resume.candidate_name}"
     _confirm_body = (f"{resume.candidate_name} confirmed {when}{chosen_note} "
                      f"for '{req.title}' — AI L1 scheduled.")
-    _confirm_link = f"/admin?view=crm&p=requirements/{req.id}"
+    _confirm_link = f"/admin/?view=crm&p=requirements/{req.id}"
     owner_id = getattr(booking, "invited_by", None) or getattr(resume, "screened_by", None)
     if owner_id:
         from services.notify import notify_user
@@ -840,8 +841,7 @@ def requirement_interview_history(
         sched = sched_by_token.get((l.invite_token or "").strip()) or {}
         c = cand_by_id.get(l.candidate_id or 0)
         email = (getattr(c, "email", None) or "").strip().lower()
-        report = (f"/admin?view=candidateReport&cid={email}&iid={l.interview_record_id}"
-                  if l.interview_record_id and email else None)
+        report = ai_report_link(email, l.interview_record_id)
         _bucket(l.candidate_id, l.profile_id)["entries"].append({
             "type": f"AI {getattr(l, 'level', None) or 'L1'}",
             "scheduled_at": sched.get("scheduled_at_local") or _iso(l.created_at),

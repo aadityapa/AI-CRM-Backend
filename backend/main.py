@@ -31,6 +31,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import mimetypes
+
+# /site.webmanifest (Karnex Orbit icons) — Python's table has no entry for it on
+# every platform, and a manifest served as octet-stream is ignored by browsers.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 from openai import OpenAIError
 from pypdf import PdfReader
 from starlette.middleware.gzip import GZipMiddleware
@@ -156,6 +161,7 @@ from utils.interview_limits import (
     trim_questions_for_count_mode,
 )
 from utils.interview_mode_mapper import normalize_interview_mode, to_display_label
+from utils.mp3_duration import mp3_duration_seconds
 from utils.question_uniqueness import (
     build_question_avoid_history,
     make_question_session_seed,
@@ -183,6 +189,9 @@ from utils.warmup import (
 )
 from prompt_logger import (
     init_prompt_log_table,
+    interview_context,
+    log_audio_call,
+    set_interview_context,
 )
 import response_cache
 import password_hashing as pwh
@@ -769,6 +778,33 @@ def _session_key_from_payload(payload: dict | None) -> str:
     if sub:
         return f"hr:{sub}"
     return SESSION_ID
+
+
+def _interview_log_context(session: dict | None) -> dict:
+    """The prompt-log attribution for this session (28 Sep 2026) — who the AI
+    call is for. Every handler that has the session enters it, so each OpenAI
+    row lands on the interview and the CEO's cost page can add them up."""
+    meta = (session or {}).get("meta", {}) or {}
+    profile = meta.get("candidate_profile") or {}
+    return {
+        "interview_id": str(meta.get("interview_id") or ""),
+        "candidate_id": str(profile.get("email") or ""),
+        "candidate_name": str(profile.get("name") or ""),
+        "template_id": str(meta.get("job_id") or ""),
+        "template_name": str(meta.get("job_title") or ""),
+    }
+
+
+def _interview_log_context_from_request(request: Request) -> dict:
+    """Same, from the bearer alone — for /candidate/tts and /candidate/transcribe,
+    which never load the session. A missing session logs the call unattributed
+    rather than failing the speech path."""
+    try:
+        payload = _decode_token_from_header(request)
+        s = sessions.get(_session_key_from_payload(payload)) if payload else None
+        return _interview_log_context(s) if s else {}
+    except Exception:
+        return {}
 
 
 def _session_key_from_session(session: dict | None) -> str:
@@ -1977,6 +2013,7 @@ def _invite_access_state(record: dict) -> dict:
 
 
 def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
+    set_interview_context(**_interview_log_context(session))
     model = session.get("meta", {}).get("model", "gpt-4o-mini")
     meta = session.get("meta", {}) or {}
     jd_skills = meta.get("jd_skills", [])
@@ -2212,6 +2249,9 @@ def _finalize_interview_snapshot(session: dict, reason: str = "completed", final
             violation_count=violation_count,
             violations_log=json.dumps(merged, ensure_ascii=False),
         )
+        # Join the recorded chunks into one playable file. Best-effort and
+        # idempotent — a failure here must never affect the report.
+        _finalize_session_recording(invite_token)
         invalidate_integrity_logs_cache()
 
     try:
@@ -2286,6 +2326,7 @@ def _persist_fast_final_report(session: dict, reason: str, final_status: str) ->
             violation_count=violation_count,
             violations_log=json.dumps(merged, ensure_ascii=False),
         )
+        _finalize_session_recording(invite_token)
         invalidate_integrity_logs_cache()
 
     session["report_result"] = result
@@ -2562,6 +2603,17 @@ ensure_project_dirs()
 migrate_legacy_data_files()
 _auth_db_url_configured = bool((os.getenv("AUTH_DB_URL") or "").strip())
 AUTH_DB_TARGET = _auth_db_target()
+# Postgres is "configured" whether it came from AUTH_DB_URL or from DB_HOST/DB_NAME/DB_USER.
+# The old guard only looked at AUTH_DB_URL, so on the production box (DB_HOST) any init
+# failure -- a rotated password, a URI-hostile character, a network blip -- silently fell
+# back to an EMPTY SQLite file and every login answered "Invalid username or password"
+# (outages of 9 Sep and 17 Sep 2026). A configured Postgres that cannot be reached must
+# crash the process: systemd restarts it (Restart=on-failure) and karnex-run re-fetches the
+# live secret on every start, so the restart loop IS the recovery. SQLite is only for a box
+# with no database configured at all.
+_postgres_configured = _auth_db_url_configured or str(AUTH_DB_TARGET).startswith(
+    ("postgresql://", "postgres://")
+)
 try:
     init_auth_db(AUTH_DB_TARGET)
 except Exception as err:
@@ -2569,7 +2621,7 @@ except Exception as err:
         "auth.db.init.failed",
         extra={"event": "auth.db.init.failed", "target": str(AUTH_DB_TARGET), "error": str(err)},
     )
-    if _auth_db_url_configured:
+    if _postgres_configured:
         raise
     AUTH_DB_TARGET = KARNEX_DB_FILE
     init_auth_db(AUTH_DB_TARGET)
@@ -2577,6 +2629,18 @@ try:
     init_prompt_log_table(AUTH_DB_TARGET)
 except Exception as err:
     logger.warning("prompt_log.table.init.failed", extra={"event": "prompt_log.table.init.failed", "error": str(err)})
+else:
+    # AI Costs: attribute pre-28-Sep interview calls to their sessions and
+    # estimate the audio that was never logged (29 Sep 2026). Idempotent; in
+    # the background so a large ledger never delays startup.
+    def _repair_ai_cost_ledger() -> None:
+        try:
+            from services.ai_cost_repair import repair_ai_costs
+            repair_ai_costs(str(AUTH_DB_TARGET))
+        except Exception as err:  # noqa: BLE001 - a report repair must never stop the app
+            logger.warning("ai_cost.repair.failed", extra={"event": "ai_cost.repair.failed", "error": str(err)})
+
+    threading.Thread(target=_repair_ai_cost_ledger, name="ai-cost-repair", daemon=True).start()
 
 try:
     bulk_import_interview_records(AUTH_DB_TARGET, load_hr_records(DATA_FILE))
@@ -3278,6 +3342,7 @@ def next_question(request: Request):
         return {"error": "No active session. Run setup first."}
     if s.get("finalizing"):
         return {"message": "Interview completed"}
+    set_interview_context(**_interview_log_context(s))
     meta = s.get("meta", {}) or {}
     _persist_interview_progress(s, status=_progress_status_for_session(s))
     invite_token = str(meta.get("invite_token") or "").strip()
@@ -3343,6 +3408,9 @@ def _openai_error_summary(exc: Exception) -> str:
 async def transcribe_candidate_audio(
     request: Request,
     audio_file: UploadFile | None = File(None),
+    #: Recording length from the client (28 Sep 2026) — transcription is billed
+    #: per minute, and the browser is the only party that knows the true length.
+    duration_ms: str = Form(""),
 ):
     _, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
@@ -3360,14 +3428,21 @@ async def transcribe_candidate_audio(
         return _speech_error(400, "too_short",
                              "Recording was too short. Speak a bit longer, then stop the mic.")
     model_name = (os.getenv("OPENAI_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
+    seconds = _seconds_from_ms(duration_ms)
+    # The call is logged + priced inside `transcribe_speech_bytes` (it sees the
+    # response's audio-token usage); this frame only supplies the interview it
+    # belongs to and the recording's real length.
+    log_ctx = _interview_log_context_from_request(request)
     try:
-        text = await run_in_threadpool(
-            transcribe_speech_bytes,
-            raw,
-            audio_file.filename or "candidate-response.webm",
-            audio_file.content_type or "audio/webm",
-            model_name,
-        )
+        with interview_context(log_ctx):
+            text = await run_in_threadpool(
+                transcribe_speech_bytes,
+                raw,
+                audio_file.filename or "candidate-response.webm",
+                audio_file.content_type or "audio/webm",
+                model_name,
+                duration_s=seconds,
+            )
     except OpenAIError as exc:
         _speech_log.warning("transcription provider error (%s, %d bytes): %s",
                             model_name, len(raw), _openai_error_summary(exc))
@@ -3449,36 +3524,76 @@ async def candidate_tts(
     # a `code`, and they are logged. The client falls back to the browser's
     # own speech synthesis on any non-audio reply, so the question is still
     # read aloud — but the operator can now SEE that the OpenAI voice is down.
+    log_ctx = _interview_log_context_from_request(request)
+    started = time.perf_counter()
     try:
         stream = await run_in_threadpool(_open_tts_stream, payload, tts_voice, tts_model)
     except OpenAIError as exc:
         _speech_log.warning("TTS provider error (%s/%s): %s",
                             tts_model, tts_voice, _openai_error_summary(exc))
+        _log_speech_call("tts", tts_model, log_ctx, text=payload, started=started,
+                         status="failed", error_log=_openai_error_summary(exc), source="stream")
         return _speech_error(503, "tts_unavailable", "Voice service unavailable.")
-    except Exception:
+    except Exception as exc:
         _speech_log.exception("TTS synthesis failed (%s/%s)", tts_model, tts_voice)
+        _log_speech_call("tts", tts_model, log_ctx, text=payload, started=started,
+                         status="failed", error_log=str(exc), source="stream")
         return _speech_error(502, "tts_failed", "Voice synthesis failed.")
     if stream is None:
         _speech_log.warning("TTS returned no audio (%s/%s, %d chars)", tts_model, tts_voice, len(payload))
         return _speech_error(502, "tts_empty", "Voice synthesis returned no audio.")
 
     async def _relay():
+        # Priced AFTER the stream, from the MP3 frames actually sent (28 Sep 2026):
+        # the up-front text estimate was ±30 %, and an aborted stream is billed
+        # for what was produced, not for the whole question.
+        sent = bytearray()
+        status, error_log = "success", ""
         try:
             for chunk in stream:
+                sent.extend(chunk)
                 yield chunk
-        except Exception:
+        except Exception as exc:
             # The audio is already partly delivered; a mid-stream failure has to
             # end the response rather than turn into a JSON error the <audio>
             # element cannot understand.
+            status, error_log = "failed", f"{type(exc).__name__}: {exc}"
             _speech_log.warning("TTS stream aborted mid-flight (%s/%s)", tts_model, tts_voice,
                                 exc_info=True)
-            return
+        finally:
+            _log_speech_call("tts", tts_model, log_ctx, text=payload, started=started, source="stream",
+                             audio_seconds=mp3_duration_seconds(bytes(sent)), audio_bytes=len(sent),
+                             status=status, error_log=error_log)
 
     return StreamingResponse(
         _relay(),
         media_type="audio/mpeg",
         headers={"Cache-Control": "no-store", "X-Karnex-TTS": "stream"},
     )
+
+
+def _seconds_from_ms(raw: str) -> float:
+    try:
+        return max(0.0, min(3600.0, float(str(raw or "").strip() or 0) / 1000.0))
+    except Exception:
+        return 0.0
+
+
+def _log_speech_call(kind: str, model: str, ctx: dict, *, text: str = "", audio_seconds: float = 0.0,
+                     audio_bytes: int = 0, started: float = 0.0, status: str = "success",
+                     error_log: str = "", source: str = "") -> None:
+    """Price a TTS / transcription call against its interview. Best-effort:
+    the speech path never fails because of bookkeeping."""
+    try:
+        with interview_context(ctx):
+            log_audio_call(
+                db_target=AUTH_DB_TARGET, kind=kind, model=model, text=text,
+                audio_seconds=audio_seconds, audio_bytes=audio_bytes,
+                response_time_ms=int((time.perf_counter() - started) * 1000) if started else 0,
+                status=status, error_log=error_log, source=source,
+            )
+    except Exception:
+        _speech_log.debug("speech call logging failed", exc_info=True)
 
 
 def _open_tts_stream(payload: str, voice: str, model: str):
@@ -3570,6 +3685,7 @@ def _schedule_turn_evaluation(session: dict, previous_question: str, answer_text
 
 def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: str) -> None:
     sk = _session_key_from_session(session)
+    set_interview_context(**_interview_log_context(session))
     with session_lock(sk):
         meta = session.get("meta", {})
         if meta.get("safe_mode", True):
@@ -3753,6 +3869,7 @@ def answer(
                 )
         if not s:
             return {"error": "No active session. Run setup first."}
+        set_interview_context(**_interview_log_context(s))
         if s.get("finalizing") or s.get("completed"):
             return {"error": "Interview already completed."}
         if int(s.get("current", 0) or 0) >= len(s.get("questions") or []):
@@ -5413,13 +5530,19 @@ def _ensure_interview_strengths_weaknesses_record(rec: dict, *, force: bool = Fa
     questions = list(rec.get("questions") or [])
     answers = list(rec.get("answers") or [])
     model = str(rec.get("model") or os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip()
-    updated = attach_strengths_weaknesses_analysis(
-        report,
-        questions,
-        answers,
-        model=model,
-        force_regenerate=force,
-    )
+    # The record id IS the session's interview_id, so this on-demand analysis
+    # lands on the same interview as the calls made during it.
+    with interview_context(interview_id=str(rec.get("id") or ""),
+                           candidate_id=str(rec.get("candidate_email") or ""),
+                           candidate_name=str(rec.get("candidate_name") or ""),
+                           template_name=str(rec.get("job_title") or "")):
+        updated = attach_strengths_weaknesses_analysis(
+            report,
+            questions,
+            answers,
+            model=model,
+            force_regenerate=force,
+        )
     if updated is not report:
         rec = dict(rec)
         rec["report"] = updated
@@ -7811,25 +7934,6 @@ def interview_time_warning_audit(request: Request, warning_key: str = Form("")):
     return {"status": "ok", "field": field, "at": now_iso}
 
 
-INTEGRITY_EVIDENCE_DIR = DATA_DIR / "integrity_evidence"
-#: A snapshot the candidate page attaches to a camera event (JPEG, small).
-INTEGRITY_EVIDENCE_MAX_BYTES = 400 * 1024
-
-
-def _store_integrity_evidence(invite_token: str, raw: bytes) -> str:
-    """Save a camera snapshot under data/integrity_evidence/<token>/ and return its name."""
-    token = re.sub(r"[^A-Za-z0-9_-]", "", invite_token or "")[:64]
-    if not token or not raw or len(raw) > INTEGRITY_EVIDENCE_MAX_BYTES:
-        return ""
-    if not raw.startswith(b"\xff\xd8"):  # JPEG magic only — the page sends image/jpeg
-        return ""
-    folder = INTEGRITY_EVIDENCE_DIR / token
-    folder.mkdir(parents=True, exist_ok=True)
-    name = f"{int(time.time() * 1000)}_{secrets.token_hex(3)}.jpg"
-    (folder / name).write_bytes(raw)
-    return name
-
-
 def _notify_ta_of_integrity(invite_token: str, *, candidate_name: str, reason: str, strikes: int) -> None:
     """Bell + email to the TA who scheduled the interview (best-effort, CRM side)."""
     try:
@@ -7870,14 +7974,14 @@ async def interview_violation(
     fullscreen_status: str = Form(""),
     browser_visibility: str = Form(""),
     window_focus: str = Form(""),
-    evidence: UploadFile | None = File(None),
 ):
     """Log an anti-cheating violation from the candidate's browser.
 
     The SERVER is the authority on termination (15 Sep 2026): every strike type
     in `services.interview_integrity.STRIKE_TYPES` counts, so a client that
-    stops reporting cannot dodge the three-warning rule. Camera events may
-    attach a JPEG snapshot as evidence."""
+    stops reporting cannot dodge the three-warning rule. What the camera saw is
+    in the whole-session recording (23 Sep 2026) — the event carries the
+    timestamp to scrub to, not a snapshot."""
     payload, auth_err = _require_user(request, {"candidate", "hr"})
     if auth_err:
         return auth_err
@@ -7905,14 +8009,6 @@ async def interview_violation(
         event["visibility"] = browser_visibility.strip()[:16]
     if window_focus.strip():
         event["focus"] = window_focus.strip()[:8]
-    if evidence is not None:
-        try:
-            raw = await evidence.read()
-            name = _store_integrity_evidence(invite_token, raw)
-            if name:
-                event["evidence"] = name
-        except Exception:
-            logger.warning("integrity.evidence_store_failed", extra={"event": "integrity.evidence_store_failed"})
     violations.append(event)
     meta["violations"] = violations
     violation_count = _count_integrity_violations(violations)
@@ -8235,7 +8331,13 @@ def _integrity_rows() -> list[dict]:
             "reason": _termination_reason_from_events(full, summary["events"]),
             "template_name": title,
             "role": title,
-            "has_evidence": any(isinstance(e, dict) and e.get("evidence") for e in summary["events"]),
+            # Read straight off the schedule row (22 Sep 2026) — the list must
+            # never touch object storage, or it becomes one request per row.
+            # `recording_status`: "" · "recording" (chunks arriving — watch
+            # live) · "ready" · "missing".
+            "recording_status": str(full.get("recording_status") or ""),
+            "has_recording": str(full.get("recording_status") or "") == "ready",
+            "recording_bytes": int(full.get("recording_bytes") or 0),
             "events": summary["events"],
         })
     # Cross-row signal: one device / IP used for several candidates.
@@ -8323,8 +8425,8 @@ def interview_integrity_export(request: Request):
 
 @app.get("/interview/integrity-logs/{invite_token}")
 def interview_integrity_detail(request: Request, invite_token: str):
-    """Full timeline for one interview: every event with question index, IP,
-    device, evidence snapshot names — plus the row summary."""
+    """Full timeline for one interview: every event with question index, IP
+    and device — plus the row summary and the recording (live or final)."""
     from services.interview_integrity import label_for, summarise
     err = _integrity_auth(request)
     if err:
@@ -8347,7 +8449,6 @@ def interview_integrity_detail(request: Request, invite_token: str):
             "question": ev.get("question") or "",
             "ip": ev.get("ip") or "",
             "user_agent": ev.get("user_agent") or "",
-            "evidence_url": (f"/interview/integrity-evidence/{token}/{ev['evidence']}" if ev.get("evidence") else ""),
             "is_strike": t in _INTEGRITY_VIOLATION_TYPES,
         })
     row = next((i for i in _integrity_payload()["logs"] if i.get("invite_token") == token), None)
@@ -8362,33 +8463,295 @@ def interview_integrity_detail(request: Request, invite_token: str):
         "by_family": summary["by_family"],
         "by_type": summary["by_type"],
         "violations_log": timeline,
+        # 22 Sep 2026: the whole-session recording. `available: False` carries a
+        # reason so the tab can say WHY rather than showing an empty player;
+        # `live: True` (23 Sep 2026) tells it to stream the parts instead.
+        "recording": _recording_detail(token, status),
         "row": row,
     }
 
 
-@app.get("/interview/integrity-evidence/{invite_token}/{name}")
-def interview_integrity_evidence(request: Request, invite_token: str, name: str):
-    """Serve one camera snapshot attached to an integrity event (HR only)."""
+def _recording_detail(invite_token: str, session_status: str) -> dict:
+    """Playback info for the Integrity detail view, finalizing on demand.
+
+    An interview that ended badly is the one most worth watching, and that is
+    exactly the interview whose client never got to call `/recording/complete`.
+    So if chunks are present but unjoined, join them here — UNLESS the session
+    is still live: then the parts are the stream, and joining them would delete
+    the header chunk from under the uploading browser (see the service module).
+    """
+    from services.interview_recording import is_live_session, recording_playback
+
+    try:
+        info = recording_playback(invite_token)
+        if info.get("available"):
+            return info
+        if is_live_session(session_status):
+            return {**info, "live": True}
+        if info.get("reason") == "not_finalized":
+            _finalize_session_recording(invite_token)
+            info = recording_playback(invite_token)
+        return info
+    except Exception:
+        return {"available": False, "reason": "storage_error"}
+
+
+@app.get("/interview/recording-config")
+def interview_recording_config(request: Request):
+    """Recording + snapshot settings for the candidate runtime.
+
+    Served rather than hard-coded in the page so the size/bitrate can be tuned
+    per deployment without a frontend build. Deliberately a separate path from
+    `/interview/recording/{token}` so no literal-before-parametric ordering
+    trap is introduced.
+    """
+    _, auth_err = _require_user(request, {"candidate", "hr"})
+    if auth_err:
+        return auth_err
+    from services.interview_recording import recording_client_config
+
+    return recording_client_config()
+
+
+# ---------------------------------------------------------------------------
+# Whole-session recording (22 Sep 2026)
+# ---------------------------------------------------------------------------
+
+
+def _recording_token_for(payload: dict | None, session: dict | None) -> str:
+    """The invite token a recording belongs to.
+
+    Read from the JWT claim first (an invite session cannot lie about its own
+    token) and only then from session meta. An HR-run interview has no invite
+    token and therefore is not recorded — there is no candidate to proctor.
+    """
+    claim = str((payload or {}).get("invite_token") or "").strip()
+    if claim:
+        return claim
+    return str(((session or {}).get("meta") or {}).get("invite_token") or "").strip()
+
+
+@app.post("/interview/recording/chunk")
+async def interview_recording_chunk(
+    request: Request,
+    seq: str = Form("0"),
+    chunk: UploadFile | None = File(None),
+):
+    """Accept one ~15-second slice of the candidate's session recording.
+
+    Deliberately forgiving. This endpoint can fail for a dozen boring reasons
+    (a storage blip, an oversized chunk, a duplicated sequence) and NONE of
+    them may interrupt the interview, so every failure answers 200 with a
+    status the client simply logs. The candidate runtime never blocks on it.
+    """
+    from services.interview_recording import recording_enabled, store_chunk
+
+    payload, auth_err = _require_user(request, {"candidate", "hr"})
+    if auth_err:
+        return auth_err
+    if not recording_enabled():
+        return {"status": "disabled"}
+    sk = _session_key_from_payload(payload)
+    token = _recording_token_for(payload, sessions.get(sk))
+    if not token or chunk is None:
+        return {"status": "ignored"}
+    try:
+        index = int(str(seq or "0").strip() or 0)
+    except (TypeError, ValueError):
+        index = 0
+    try:
+        raw = await chunk.read()
+        written = store_chunk(token, index, raw)
+    except Exception as exc:
+        logger.warning(
+            "recording.chunk_store_failed: %s", exc,
+            extra={"event": "recording.chunk_store_failed", "seq": index},
+        )
+        return {"status": "error"}
+    if not written:
+        return {"status": "rejected", "seq": index}
+    if index == 0:
+        # The first chunk is what makes the interview WATCHABLE live. Stamp the
+        # schedule row so the Integrity list can say so without touching
+        # storage per row; `_finalize_session_recording` overwrites it later.
+        try:
+            update_schedule_field(AUTH_DB_TARGET, token, recording_status="recording")
+            invalidate_integrity_logs_cache()
+        except Exception:
+            pass
+    return {"status": "stored", "seq": index, "bytes": written}
+
+
+def _finalize_session_recording(invite_token: str) -> dict:
+    """Join the chunks and record the outcome on the schedule row.
+
+    Best-effort by design and safe to call more than once — both the submit
+    path and the recovery worker reach it, and a terminated interview can hit
+    submit twice.
+    """
+    from services.interview_recording import (
+        RECORDING_MIME,
+        discard_parts,
+        finalize_from_parts,
+        recording_enabled,
+    )
+
+    token = str(invite_token or "").strip()
+    if not token or not recording_enabled():
+        return {"status": "skipped"}
+    try:
+        result = finalize_from_parts(token)
+    except Exception as exc:
+        logger.warning(
+            "recording.finalize_failed: %s", exc,
+            extra={"event": "recording.finalize_failed"},
+        )
+        result = None
+    if not result:
+        try:
+            update_schedule_field(AUTH_DB_TARGET, token, recording_status="missing")
+        except Exception:
+            pass
+        return {"status": "missing"}
+    try:
+        update_schedule_field(
+            AUTH_DB_TARGET,
+            token,
+            recording_key=result.key,
+            recording_bytes=int(result.size_bytes),
+            recording_mime=RECORDING_MIME,
+            recording_status="ready",
+        )
+    except Exception as exc:
+        logger.warning(
+            "recording.schedule_update_failed: %s", exc,
+            extra={"event": "recording.schedule_update_failed"},
+        )
+    try:
+        discard_parts(token)
+    except Exception:
+        pass
+    invalidate_integrity_logs_cache()
+    return {"status": "ready", "bytes": result.size_bytes, "parts": result.parts}
+
+
+@app.post("/interview/recording/complete")
+def interview_recording_complete(request: Request):
+    """Called by the candidate page once its recorder has flushed."""
+    payload, auth_err = _require_user(request, {"candidate", "hr"})
+    if auth_err:
+        return auth_err
+    sk = _session_key_from_payload(payload)
+    token = _recording_token_for(payload, sessions.get(sk))
+    if not token:
+        return {"status": "ignored"}
+    return _finalize_session_recording(token)
+
+
+@app.get("/interview/recording/{invite_token}")
+def interview_recording_playback(request: Request, invite_token: str):
+    """Playback details for the Integrity tab (HR / dashboard only).
+
+    If the interview ended without the client's `complete` call landing — a
+    crash, a closed laptop — the chunks are still there, so finalize on demand
+    rather than telling the reviewer there is no recording.
+    """
     err = _integrity_auth(request)
     if err:
         return err
-    token = re.sub(r"[^A-Za-z0-9_-]", "", invite_token or "")[:64]
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "", name or "")
-    path = (INTEGRITY_EVIDENCE_DIR / token / safe) if token and safe.endswith(".jpg") else None
-    if path is None or not path.is_file() or INTEGRITY_EVIDENCE_DIR.resolve() not in path.resolve().parents:
-        return JSONResponse({"error": "Evidence not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/jpeg",
-                    headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"})
+    token = _recording_route_token(invite_token)
+    if not token:
+        return JSONResponse({"error": "Recording not found"}, status_code=404)
+    rec = get_schedule_by_token(AUTH_DB_TARGET, token) or {}
+    return _recording_detail(token, str(rec.get("session_status") or "pending"))
 
 
-# ---------------------------------------------------------------------------
-# AI Prompt Logs API (admin-only)
-# ---------------------------------------------------------------------------
+def _recording_route_token(invite_token: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", invite_token or "")[:64]
 
-from routers import admin as admin_router
 
-admin_router.configure(AUTH_DB_TARGET, _require_user)
-app.include_router(admin_router.router)
+@app.get("/interview/recording/{invite_token}/live")
+def interview_recording_live(request: Request, invite_token: str, after: int = -1):
+    """Live view (23 Sep 2026): the chunks uploaded since `after`.
+
+    The Integrity tab polls this every few seconds while the interview runs and
+    appends each new part to its player, so a reviewer watches the candidate
+    about one chunk (~15 s) behind real time. `finalized: true` tells the viewer
+    the session is over and the ordinary player should take over. Three
+    segments, so it can never be shadowed by the two-segment `/{invite_token}`.
+    """
+    from services.interview_recording import live_manifest
+
+    err = _integrity_auth(request)
+    if err:
+        return err
+    token = _recording_route_token(invite_token)
+    if not token:
+        return JSONResponse({"error": "Recording not found"}, status_code=404)
+    rec = get_schedule_by_token(AUTH_DB_TARGET, token) or {}
+    info = live_manifest(token, after_seq=int(after))
+    info["session_status"] = str(rec.get("session_status") or "pending")
+    return info
+
+
+@app.get("/interview/recording/{invite_token}/part/{seq}")
+def interview_recording_part(request: Request, invite_token: str, seq: int):
+    """One uploaded chunk, served through the app for BOTH drivers.
+
+    Live parts go through here rather than via presigned URLs on purpose: the
+    viewer appends them with `fetch()` + MediaSource, and a cross-origin fetch
+    from S3 would need bucket CORS for every dashboard origin. ~120 KB every
+    15 s per viewer is nothing; the final recording still streams straight from
+    S3.
+    """
+    from services.interview_recording import RECORDING_MIME, part_bytes
+
+    err = _integrity_auth(request)
+    if err:
+        return err
+    token = _recording_route_token(invite_token)
+    try:
+        raw = part_bytes(token, int(seq)) if token else None
+    except Exception:
+        raw = None
+    if not raw:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(
+        content=raw,
+        media_type=RECORDING_MIME,
+        headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/interview/media/{key:path}")
+def interview_media(request: Request, key: str):
+    """Serve a stored media object when the local driver is in force.
+
+    In production `media_storage` hands out presigned S3 URLs and this route is
+    never called; it exists so development and `start_app.bat` behave the same
+    as production without anyone configuring a bucket.
+    """
+    from services.media_storage import get_storage
+
+    err = _integrity_auth(request)
+    if err:
+        return err
+    store = get_storage()
+    if store.name != "local":
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    try:
+        if not store.exists(key):
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        raw = store.get(key)
+    except Exception:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    media_type = "video/webm" if key.endswith(".webm") else "application/octet-stream"
+    return Response(
+        content=raw,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"},
+    )
+
 
 # Question Bank API (admin dashboard) + template-wizard bank preview.
 try:
@@ -8422,6 +8785,22 @@ if FRONTEND_DIR.exists():
     if not _admin_dashboard_assets_ok():
         _try_build_admin_dashboard()
     if _admin_dashboard_assets_ok():
+
+        @app.get("/admin", include_in_schema=False)
+        def admin_dashboard_root_redirect(request: Request) -> RedirectResponse:
+            """`/admin?view=…` → `/admin/?view=…` (18 Sep 2026).
+
+            The dashboard is a StaticFiles mount at `/admin/`. Starlette's own
+            trailing-slash redirect only fires for a bare `/admin`; behind the
+            production proxy a link such as `/admin?view=candidateReport&cid=…`
+            (every CRM "View report" / "Full report" button) reached the API and
+            answered `{"detail":"Not Found"}`. Generated links now carry the
+            slash, and this route keeps every already-sent email/notification
+            link working by forwarding the whole query string.
+            """
+            query = request.url.query
+            return RedirectResponse(url=f"/admin/{'?' + query if query else ''}", status_code=307)
+
         app.mount("/admin", StaticFiles(directory=str(admin_dist), html=True), name="admin")
     else:
 

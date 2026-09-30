@@ -135,15 +135,6 @@ def _money(v: Any) -> str:
     return ti.format_inr(ti.num(v))
 
 
-def _plain(v: Any) -> str:
-    return ti.format_inr(ti.num(v)).replace("INR ", "")
-
-
-def _qty(v: Any) -> str:
-    f = ti.num(v)
-    return f"{int(f):,}" if f == int(f) else f"{f:,.2f}".rstrip("0").rstrip(".")
-
-
 def _gap(doc, pts: float = 3) -> None:
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(0)
@@ -159,7 +150,6 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
     totals = ti.compute_totals(inv)
     seller = inv.seller or ti.seller_from_settings()
     bank = inv.bank or ti.bank_from_settings()
-    cols = inv.columns
 
     doc = Document()
     sec = doc.sections[0]
@@ -203,10 +193,10 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
     right.text = ""
     pr = right.paragraphs[0]
     pr.paragraph_format.space_after = Pt(4)
-    run = pr.add_run("TAX INVOICE")
+    run = pr.add_run(inv.title)
     run.bold = True
     run.font.size = Pt(20)
-    run.font.color.rgb = NAVY_RGB
+    run.font.color.rgb = RGBColor.from_string(ti.PROFORMA_COLOR.lstrip("#")) if inv.is_proforma else NAVY_RGB
     for label, value in (("Invoice No.", inv.invoice_no), ("Invoice Date", inv.invoice_date),
                          ("P.O. No.", inv.po_no or "—"), ("P.O. Date", inv.po_date or "—"),
                          ("GSTIN No.", seller.get("gstin") or "—"), ("PAN No.", seller.get("pan") or "—")):
@@ -244,22 +234,23 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
     _gap(doc)
 
     # ---- service table ----------------------------------------------------
-    if cols:
-        heads = ["S.No", "Description of Services", "SAC Code", cols["cost"], cols["qty"],
-                 cols["leave"], cols["per_day"], cols["amount"]]
-        widths = [1.0, 5.8, 1.5, 2.2, 1.5, 1.4, 2.6, 2.8]
-    else:
-        heads = ["S.No", "Description of Services", "SAC Code", inv.qty_label, inv.rate_label, "Amount"]
-        widths = [1.2, 7.6, 2.0, 2.4, 2.6, 2.8]
+    # One column definition for every output (ti.service_columns / ti.service_cell):
+    # a column the customer switched off is absent here exactly as in the PDF.
+    columns = ti.service_columns(inv)
+    base_w = {"sno": 1.0, "sac": 1.5, "cost": 2.2, "qty": 1.5, "leave": 1.4, "per_day": 2.6,
+              "hours": 2.4, "rate": 2.6, "amount": 2.8}
+    desc_w = usable - sum(base_w[k] for k, _ in columns if k != "desc")
+    widths = [desc_w if k == "desc" else base_w[k] for k, _ in columns]
+    _ALIGN = {"c": WD_ALIGN_PARAGRAPH.CENTER, "l": None, "r": WD_ALIGN_PARAGRAPH.RIGHT}
     items = inv.items or []
     n_rows = max(len(items), 3) + 1
-    svc = doc.add_table(rows=n_rows, cols=len(heads))
+    svc = doc.add_table(rows=n_rows, cols=len(columns))
     _borders(svc)
-    for i, h in enumerate(heads):
+    for i, (key, label) in enumerate(columns):
         c = svc.rows[0].cells[i]
         _shade(c, NAVY)
-        _cell_text(c, h, bold=True, size=7, color=RGBColor(0xFF, 0xFF, 0xFF),
-                   align=WD_ALIGN_PARAGRAPH.RIGHT if i >= 3 else None)
+        _cell_text(c, label, bold=True, size=7, color=RGBColor(0xFF, 0xFF, 0xFF),
+                   align=_ALIGN[ti.SERVICE_COLUMN_ALIGN.get(key, "r")])
     for r in range(1, n_rows):
         it = items[r - 1] if r - 1 < len(items) else None
         cells = svc.rows[r].cells
@@ -267,25 +258,12 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
             for c in cells:
                 _cell_text(c, "", size=8)
             continue
-        desc = ti.line_description(it.employee_name, getattr(it, "service_month", None) or None)
-        _cell_text(cells[0], str(r), size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
-        _cell_text(cells[1], desc, size=8)
-        if getattr(it, "period_label", ""):
-            _add_line(cells[1], f"Billing period {it.period_label}", size=7.5, color=MUTED_RGB)
-        _cell_text(cells[2], it.sac or ti.default_sac(), size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
-        amt = ti.line_amount(it)
-        if cols:
-            cost = it.monthly_cost if it.monthly_cost is not None else it.rate_per_hour
-            _cell_text(cells[3], _plain(cost), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
-            _cell_text(cells[4], _qty(it.billing_hours), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
-            _cell_text(cells[5], _qty(it.leave_days), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
-            _cell_text(cells[6], _plain(it.rate_per_day) if it.rate_per_day is not None else "—",
-                       size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
-            _cell_text(cells[7], _plain(amt), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT, bold=True)
-        else:
-            _cell_text(cells[3], _qty(it.billing_hours), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
-            _cell_text(cells[4], _money(it.rate_per_hour), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
-            _cell_text(cells[5], _money(amt), size=8, align=WD_ALIGN_PARAGRAPH.RIGHT, bold=True)
+        for i, (key, _) in enumerate(columns):
+            text = ti.service_cell(it, key, r)
+            _cell_text(cells[i], text, size=8, align=_ALIGN[ti.SERVICE_COLUMN_ALIGN.get(key, "r")],
+                       bold=(key == "amount"))
+            if key == "desc" and getattr(it, "period_label", ""):
+                _add_line(cells[i], f"Billing period {it.period_label}", size=7.5, color=MUTED_RGB)
     _set_widths(svc, widths)
 
     _gap(doc)

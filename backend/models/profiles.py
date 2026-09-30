@@ -138,6 +138,14 @@ class CandidateProfile(Base, TimestampMixin):
     commercial_approval_status = sa.Column(sa.String(120), nullable=True)
     approved_ctc = sa.Column(sa.Numeric(14, 2), nullable=True)
     offer_letter_reference = sa.Column(sa.String(255), nullable=True)
+    #: The CTC HR actually OFFERS the candidate at Pre-Onboarding (0116) —
+    #: annual rupees. HR's own figure after the HR round; the Employees record
+    #: takes it as current_ctc at Joined. Read/written only through
+    #: services/hr_offer.py and shown to HR (and Admin/CEO) alone.
+    hr_offered_ctc = sa.Column(sa.Numeric(14, 2), nullable=True)
+    hr_offered_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    hr_offered_by = sa.Column(sa.Integer, nullable=True)
+    hr_offer_note = sa.Column(sa.Text, nullable=True)
 
     # --- documents ----------------------------------------------------------
     #: The resume attached to THIS application (may differ from the candidate's CV).

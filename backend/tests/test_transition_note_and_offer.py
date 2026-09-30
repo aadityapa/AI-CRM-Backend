@@ -50,9 +50,10 @@ def test_dropping_a_candidate_always_needs_a_reason(to):
 
 
 @pytest.mark.parametrize("to", [PS.L1_FEEDBACK, PS.L2_FEEDBACK])
-def test_customer_feedback_stages_need_the_feedback(to):
-    """The note IS the feedback — it becomes that round's interview record."""
-    assert comment_required_for(PS.CUSTOMER_INTERVIEW.value, to.value) is True
+def test_moving_on_to_a_customer_round_needs_no_note(to):
+    """29 Sep 2026 (user decision): the move to "Customer L1 / L2 Interview"
+    lines the round up — its feedback is recorded on the round, not the move."""
+    assert comment_required_for(PS.CUSTOMER_INTERVIEW.value, to.value) is False
 
 
 @pytest.mark.parametrize("frm,to", [

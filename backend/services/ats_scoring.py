@@ -514,7 +514,7 @@ def score_resume_against_requirement(
     if not mandatory and not optional and not jd_keywords:
         raise AtsConfigError(
             "Nothing to score against: this requirement has no skills and no RMG JD. "
-            "Ask RMG to add the JD (or Skill Evaluation Details) at engineering review."
+            "Ask RMG to add the JD (or Skill Evaluation Details) at RMG review."
         )
 
     w = resolve_weights(weights)

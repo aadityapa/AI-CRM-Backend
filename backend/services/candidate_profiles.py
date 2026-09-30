@@ -6,7 +6,7 @@ renders what GET /api/candidate-profiles/{id} returns in allowed_next_statuses.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import HTTPException
@@ -19,7 +19,12 @@ from models import (
     InterviewEvent, OfferHistory, OfferStatus, Opportunity, OpportunityCtcSlab,
     PipelineStatus, Requirement, Skill, SkillEvaluation,
 )
+from services.candidate_status import (
+    SOURCING_STAGE, STAGE_LABEL as CANDIDATE_STAGE_LABEL, TA_CLOSE_ACTIONS, TA_HOLD,
+    stage_label as candidate_stage_label, statuses_for as candidate_statuses_for,
+)
 from services.crm_common import log_activity
+from services.report_links import ai_report_link
 
 logger = logging.getLogger("karnex.crm.profiles")
 
@@ -237,10 +242,18 @@ def allowed_next_statuses(current_status) -> list[str]:
     return list(TRANSITION_MAP.get(_status_value(current_status), []))
 
 
-def user_may_transition_from(current_status, user: CurrentUser) -> bool:
+def user_may_transition_from(current_status, user: CurrentUser, db: Session | None = None) -> bool:
     if user.is_admin:
         return True
-    return bool(user.roles & STAGE_AUTHORITY.get(_status_value(current_status), set()))
+    owners = STAGE_AUTHORITY.get(_status_value(current_status), set())
+    if user.roles & owners:
+        return True
+    # A GM (custom role) holding the screening approval acts as RMG on the
+    # stages RMG owns (28 Sep 2026) — see action_permissions.screens_as_rmg.
+    if db is not None and "RMG" in owners:
+        from services.action_permissions import screens_as_rmg
+        return screens_as_rmg(db, user)
+    return False
 
 
 def may_mark_self_withdrawn(profile, user: CurrentUser) -> bool:
@@ -263,7 +276,7 @@ def may_mark_self_withdrawn(profile, user: CurrentUser) -> bool:
 
 
 def allowed_next_statuses_for_user(current_status, user: CurrentUser,
-                                   profile=None) -> list[str]:
+                                   profile=None, db: Session | None = None) -> list[str]:
     """What the transition dropdown should show for THIS user.
 
     Stage authority decides the normal moves; Self_Withdrawn has its own rule
@@ -271,7 +284,7 @@ def allowed_next_statuses_for_user(current_status, user: CurrentUser,
     they don't own the stage, and REMOVED for everyone else.
     """
     current = _status_value(current_status)
-    base = list(allowed_next_statuses(current)) if user_may_transition_from(current, user) else []
+    base = list(allowed_next_statuses(current)) if user_may_transition_from(current, user, db) else []
     sw = PS.SELF_WITHDRAWN.value
     if sw in TRANSITION_MAP.get(current, []) and profile is not None:
         if may_mark_self_withdrawn(profile, user):
@@ -406,13 +419,20 @@ _ARRIVAL_ACTION: dict[str, str] = {
                           "shortlist or reject.",
     PS.CUSTOMER_APPROVAL.value: "Offer terms are ready for your approval. Review the rate "
                                 "and onboarding date, edit if needed, then approve to hand "
-                                "this candidate to HR.",
+                                "this candidate to HR (HR Discussion) — or send the terms back.",
     PS.HR_SCREENING.value: "Approved by Sales Head. Review the candidate's details, then click "
                            "\"Request HR round\" so TA books it with the candidate. Once it is "
                            "held, record Hire / Not Recommend on the Interviews tab.",
     PS.PREBOARDING.value: "HR round done — re-check the CTCs and the customer onboarding date. "
                           "In budget: complete onboarding and mark Joined. Not in budget: flag it "
                           "to Sales from the profile.",
+}
+
+
+#: Stages decided by an APPROVAL — the arrival notice also reaches whoever
+#: `user_may` do it (a template's / custom role's Approvals), not only the role.
+_ARRIVAL_APPROVAL: dict[str, str] = {
+    PS.CUSTOMER_APPROVAL.value: "profile.sales_head_decision",
 }
 
 
@@ -441,13 +461,21 @@ def _notify_stage_owner(db: Session, profile: CandidateProfile, previous: str,
         from services.notify import notify_role
 
         name = _candidate_display_name(db, profile)
+        # Everyone who may ACT at the new stage hears it, not only the role by
+        # name (29 Sep 2026): a Sales Manager / GM whose approval comes from a
+        # template or custom role decides "Pending Sales Head Approval" too.
+        approvers: list[int] = []
+        action = _ARRIVAL_APPROVAL.get(new_status)
+        if action:
+            from services.action_permissions import user_ids_who_may
+            approvers = [uid for uid in user_ids_who_may(db, action) if uid != user.id]
         notify_role(
             db, role,
-            f"{new_status.replace('_', ' ')}: {name}",
+            f"{candidate_stage_label(new_status)}: {name}",
             f"{_ARRIVAL_ACTION.get(new_status, 'This candidate needs your attention.')} "
-            f"(moved from {previous.replace('_', ' ')} — “{comment}”)",
+            f"(moved from {candidate_stage_label(previous)} — “{comment}”)",
             (applied_candidates_link(db, profile) if role in ("RMG", "TA")
-             else f"/admin?view=crm&p=profiles/{profile.id}"),
+             else f"/admin/?view=crm&p=profiles/{profile.id}"),
             # Don't notify the person who just made the change.
             exclude_user_id=user.id,
             actor=user,
@@ -459,6 +487,7 @@ def _notify_stage_owner(db: Session, profile: CandidateProfile, previous: str,
             # route for one cannot redirect another, and an unrouted stage
             # falls back to the owner in code.
             event=stage_arrival_event(new_status),
+            user_ids=approvers or None,
         )
     except Exception:  # pragma: no cover — never break a transition
         logger.warning("Could not notify %s about profile %s", role, profile.id, exc_info=True)
@@ -519,26 +548,29 @@ _FEEDBACK_STAGE_ROUND: dict[str, str] = {
 def _record_customer_round_from_transition(db: Session, profile: CandidateProfile,
                                            previous: str, new_status: str,
                                            feedback: str, user: CurrentUser) -> None:
-    """Persist customer feedback typed on a transition as an interview round.
+    """Persist the customer's closing verdict typed on a transition.
 
-    Two shapes of the same idea:
-
-      * ARRIVING at L1/L2 Feedback — that round's verdict is in, and the text
-        is its feedback. Recorded against `stage` L1 or L2.
-      * LEAVING the customer's ladder with a decision (shortlist / approve /
-        reject) — the text is the closing verdict, applied to the most recent
-        customer round.
+    LEAVING the customer's ladder with a decision (shortlist / approve /
+    reject) — the text is the closing verdict, applied to the most recent
+    customer round. (Arriving at L1/L2 Feedback used to write a round too —
+    removed 29 Sep 2026, see below.)
 
     Without this the Interviews tab showed RMG's technical rounds and then
     stopped, while the customer's actual words lived only in the activity log.
 
     Best-effort: bookkeeping must never roll back a legitimate status change.
     """
+    # ⚠️ 29 Sep 2026 (user report): ARRIVING at L1 / L2 Feedback no longer
+    # writes a round. The UI names those stages "Customer L1 / L2 Interview",
+    # so Sales uses the move to line the round UP (with the customer's slots),
+    # not to report it — and the recorder created a "Completed" Customer L2 row
+    # with no time and no verdict, which read as "Customer L2 – Scheduled ·
+    # Time not set" and hid TA's "Schedule Customer L2" button. A round is
+    # booked by TA and its verdict recorded on the round itself; the note on
+    # the move stays in the activity log (STATUS_CHANGE). Migration 0113
+    # removes the placeholders already written.
     try:
-        arriving_round = _FEEDBACK_STAGE_ROUND.get(new_status)
-        if arriving_round:
-            _upsert_customer_round(db, profile, user, stage=arriving_round,
-                                   feedback=feedback, verdict=None)
+        if new_status in _FEEDBACK_STAGE_ROUND:
             return
 
         # Closing decision — only meaningful if the customer actually saw them.
@@ -837,7 +869,7 @@ def advance_on_hr_verdict(db: Session, profile: CandidateProfile, result: str,
         note = "HR round verdict: Drop — candidate not continuing" + (
             f" — {feedback.strip()[:160]}" if (feedback or "").strip() else "")
         return _auto_move(db, profile, PS.SELF_WITHDRAWN.value, user, note, allow_exit=True)
-    if result == "Not Recommend" and not profile.budget_status:
+    if result == "Not Recommend" and profile.budget_status in (None, TA_HOLD):
         profile.budget_status = BUDGET_CONCERN
         profile.budget_note = (feedback or "").strip() or None
     note = f"HR round verdict: {result}" + (f" — {feedback.strip()[:160]}" if (feedback or "").strip() else "")
@@ -923,11 +955,16 @@ def rmg_screening_blocks_l1(profile) -> str | None:
 
     Enforced SERVER-SIDE (the greyed buttons in the UI are a convenience, not
     a boundary): scheduling the AI interview and sending slot invites both
-    refuse while screening is Pending or Rejected.
+    refuse until RMG / GM shortlisted — not yet sent by TA (28 Sep 2026),
+    Pending, or Rejected.
     """
     if not rmg_gate_enabled():
         return None
     status = getattr(profile, "rmg_screening_status", None)
+    if status is None and _status_value(getattr(profile, "pipeline_status", None)) in TA_DECISION_STAGES:
+        return ("TA has not sent this candidate for Technical Screening yet. Press "
+                "\"Technical Screening\" on the Applied Candidates row — RMG / GM decide "
+                "whether they fit before any L1 is scheduled.")
     if status == RMG_SCREENING_PENDING:
         return ("This candidate is awaiting RMG screening. RMG must review and "
                 "mark them Shortlisted before the AI L1 interview can be scheduled.")
@@ -1009,19 +1046,40 @@ def applied_candidates_link(db: Session, profile, tab: str = "resumes") -> str:
             if not q or q.lower().endswith("@import.karnex.in"):
                 q = " ".join(x for x in (getattr(cand, "first_name", None),
                                          getattr(cand, "last_name", None)) if x).strip()
-            return (f"/admin?view=crm&p=requirements/{req_id}&tab={tab}"
+            return (f"/admin/?view=crm&p=requirements/{req_id}&tab={tab}"
                     + (f"&q={quote(q)}" if q else ""))
     except Exception:
         logger.debug("applied_candidates_link fallback for profile %s", getattr(profile, "id", "?"), exc_info=True)
-    return f"/admin?view=crm&p=profiles/{profile.id}"
+    return f"/admin/?view=crm&p=profiles/{profile.id}"
+
+
+#: The routable event behind every "applicants are waiting for screening"
+#: notice — the single apply, the bulk-ZIP summary and the SLA reminder.
+RMG_SCREENING_REQUESTED_EVENT = "profile.rmg_screening_requested"
+RMG_SCREENING_SLA_EVENT = "profile.rmg_screening_sla"
+
+
+def screening_notify_user_ids(db: Session) -> set[int]:
+    """Everyone who may actually SCREEN (`profile.rmg_screening`) — the RMG role,
+    the GM custom role, and anyone whose template's Approvals grant it.
+
+    Reported 26 Sep 2026: a TA applied a candidate and neither RMG nor the GM
+    heard. The notice was addressed to the role NAME "RMG" alone, so a GM (a
+    custom role) and an RMG whose access comes from a template never made the
+    list. The same `user_may` that gates the Shortlist button decides here, so
+    the recipients can never drift from who can act (the 25 Sep timesheet rule).
+    Never raises — a lookup failure means "nobody extra", not a failed apply."""
+    from services.action_permissions import user_ids_who_may
+    return user_ids_who_may(db, "profile.rmg_screening")
 
 
 def notify_rmg_new_applicant(db: Session, profile, actor=None) -> None:
-    """Bell + email to RMG when a TA applies a candidate to an opportunity.
+    """Bell + email to everyone who screens (RMG · GM · templated approvers)
+    when a TA applies a candidate to an opportunity.
 
-    Carries the candidate's details for THIS opportunity so RMG can screen from
-    the notification alone; the link lands on the requirement's Applied
-    Candidates tab, on the candidate's row, where the Shortlist / Reject
+    Carries the candidate's details for THIS opportunity so the screener can
+    decide from the notification alone; the link lands on the requirement's
+    Applied Candidates tab, on the candidate's row, where the Shortlist / Reject
     buttons live. Best-effort — never blocks the apply."""
     try:
         from services.notify import notify_role
@@ -1049,13 +1107,15 @@ def notify_rmg_new_applicant(db: Session, profile, actor=None) -> None:
         notify_role(
             db, "RMG",
             f"RMG screening needed: {cname}",
-            " · ".join(details) + " — review and Shortlist to enable the AI L1 interview.",
+            " · ".join(details) + " — review on the Screening Desk and Shortlist to choose "
+            "the interview route (AI L1 or manual L1).",
             applied_candidates_link(db, profile),
-            event="profile.rmg_screening_requested",
+            event=RMG_SCREENING_REQUESTED_EVENT,
             actor=actor,
             dedupe_prefix=f"rmg_screen:{profile.id}",
             related_type="candidate",
             related_id=profile.candidate_id,
+            user_ids=screening_notify_user_ids(db),
         )
     except Exception:
         logger.warning("notify_rmg_new_applicant failed for profile %s",
@@ -1075,12 +1135,13 @@ def comment_required_for(current: str, new_status: str) -> bool:
       * rejections and withdrawals — why someone was dropped is not
         recoverable from the status alone
       * backward moves — going back is an exception and needs explaining
-      * the customer's feedback stages — the note IS the feedback, and it is
-        saved as that round's interview record
+      * closing the customer's ladder — the note is the customer's verdict
+
+    Moving on to the customer's L1 / L2 round is routine progress (29 Sep 2026,
+    user decision): the round's feedback is recorded on the round, so the move
+    asks for none.
     """
     if new_status in REJECTED_BUCKET:
-        return True
-    if new_status in _FEEDBACK_STAGE_ROUND:
         return True
     if new_status in _BACKWARD.get(current, []):
         return True
@@ -1098,6 +1159,19 @@ _STAGE_DATE_STAMPS: dict[str, str] = {
     PS.SALES_SCREENING.value: "sales_submission_date",
     PS.CUSTOMER_SCREENING.value: "customer_submission_date",
 }
+
+
+def stamp_technical_submission(profile: CandidateProfile) -> None:
+    """The day the candidate reached Technical Screening (29 Sep 2026).
+
+    Since TA hands candidates over with the "Technical Screening" button, the
+    profile stays at the Sourcing STAGE while RMG / GM screen it, so the stage
+    stamp below never fired and the Hand-offs panel read "Technical screening —
+    Not yet" for a candidate already with Sales. The hand-over itself (send ·
+    a screening decision · a screener's own add · a fast-track) now stamps it.
+    Only ever fills a blank, like every workflow date."""
+    if getattr(profile, "technical_submission_date", None) is None:
+        profile.technical_submission_date = date.today()
 
 
 def _stamp_workflow_dates(db: Session, profile: CandidateProfile, new_status: str) -> None:
@@ -1123,6 +1197,20 @@ def _stamp_workflow_dates(db: Session, profile: CandidateProfile, new_status: st
         ).scalar_one_or_none()
         if joining is not None:
             profile.customer_onboarding_date = joining
+
+
+def record_stage_arrival(db: Session, profile: CandidateProfile, previous: str,
+                         new_status: str, comment: str, user: CurrentUser) -> None:
+    """The side effects of arriving at a stage WITHOUT the transition map.
+
+    For the one sanctioned jump the map does not model — an internal candidate
+    fast-tracked from TA / RMG straight to Sales (Screening Desk, 25 Sep 2026).
+    Stamps the stage's workflow date and tells the stage owner, exactly as
+    `perform_transition` would; the caller validates, sets the status, logs
+    and commits.
+    """
+    _stamp_workflow_dates(db, profile, new_status)
+    _notify_stage_owner(db, profile, previous, new_status, comment, user)
 
 
 #: Who hears that a candidate JOINED (2 Sep 2026, user request): everyone
@@ -1156,7 +1244,7 @@ def _broadcast_joined(db: Session, profile: CandidateProfile, comment: str, user
             + (f" (joining date {when.isoformat()})" if when else "")
             + ". An Employees record has been created — map them to the project to start timesheets."
             + (f" Note: {comment}" if comment else ""),
-            f"/admin?view=crm&p=profiles/{profile.id}",
+            f"/admin/?view=crm&p=profiles/{profile.id}",
             exclude_user_id=getattr(user, "id", None),
             actor=user,
             event="candidate.joined",
@@ -1233,7 +1321,7 @@ def perform_transition(db: Session, profile: CandidateProfile, new_status: str,
                 detail="Only the TA who added this candidate (or Sales / Sales Head / "
                        "Admin) can mark them Self Withdrew.",
             )
-    elif not user_may_transition_from(current, user):
+    elif not user_may_transition_from(current, user, db):
         required = sorted(STAGE_AUTHORITY.get(current, set()) | {"Admin"})
         raise HTTPException(status_code=403,
                             detail=f"Your role(s) cannot move a profile out of '{current}'. "
@@ -1247,6 +1335,10 @@ def perform_transition(db: Session, profile: CandidateProfile, new_status: str,
         profile.withdrawn_from_status = current
 
     profile.pipeline_status = PS(new_status)
+    if profile.budget_status == TA_HOLD:
+        # TA's hold only means something while TA owns the candidate; any move
+        # on (or out) ends it, so it cannot linger into the HR budget flag.
+        profile.budget_status = None
     _stamp_workflow_dates(db, profile, new_status)
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "STATUS_CHANGE", f"{current} -> {new_status}: {clean_comment}")
@@ -1296,28 +1388,77 @@ def perform_transition(db: Session, profile: CandidateProfile, new_status: str,
     return current
 
 
+#: Straight profile-field -> employee-column copies applied at Joined.
+#:
+#: Declarative on purpose (22 Sep 2026): the previous version was a wall of
+#: `if x: emp.y = x`, and every field HR added to the Workflow section needed a
+#: new four-line block — which is exactly why four of them were never copied at
+#: all and HR's work stayed stranded on the candidate profile.
+#:
+#: ONLY fields HR actually filled are touched. A blank in the Workflow section
+#: means "not captured", never "erase what the employee record already has" —
+#: this runs against a LIVE employee who may have better data than the profile.
+_PROFILE_TO_EMPLOYEE: tuple[tuple[str, str], ...] = (
+    ("designation_id", "designation_id"),
+    ("department_id", "department_id"),
+    # Karnex joining date — NOT the customer's onboarding date. This drives
+    # payroll and leave accrual, so it must never take the customer's value.
+    ("karnex_onboarding_date", "date_of_joining"),
+    ("total_experience_years", "experience_years"),
+    # Added 0105 — previously had nowhere to go.
+    ("offer_letter_reference", "offer_letter_reference"),
+    ("resignation_certificate_url", "resignation_certificate_url"),
+    ("customer_onboarding_date", "customer_onboarding_date"),
+    ("relocation_applicable", "relocation_applicable"),
+    # NB: work_location is NOT in this map — the "Customer Location" HR sees is
+    # read-only, derived from the OPPORTUNITY's `tm_work_location`, so it is
+    # resolved separately below rather than pretending to be a profile field.
+)
+
+#: Fields where a blank IS meaningful and False is a real answer, so the
+#: "only if filled" rule is `is not None` rather than truthiness. Without this
+#: an explicit "no, relocation does not apply" would be silently dropped.
+_KEEP_FALSE = frozenset({"relocation_applicable", "total_experience_years"})
+
+
 def _sync_employee_from_joined_profile(db: Session, emp, profile: CandidateProfile,
                                        candidate: Candidate, offer) -> None:
     """Re-hire / internal placement (11 Sep 2026): copy what HR entered before
     Joined onto the EXISTING Employees record — the trainee becomes an
     Engineer, gets the new Karnex joining date, official mailbox, Emp ID and
-    CTC — and is re-activated. Only fields HR actually filled are touched."""
+    CTC — and is re-activated.
+
+    Only fields HR actually filled are touched; see `_PROFILE_TO_EMPLOYEE`.
+    """
     from models import Employee
     if emp.candidate_profile_id is None:
         emp.candidate_profile_id = profile.id
     emp.is_active = True
-    des = getattr(profile, "designation_id", None)
-    if des:
-        emp.designation_id = des
-    dep = getattr(profile, "department_id", None)
-    if dep:
-        emp.department_id = dep
-    doj = getattr(profile, "karnex_onboarding_date", None)
-    if doj:
-        emp.date_of_joining = doj
-    ctc = getattr(offer, "ctc", None) if offer is not None else None
+
+    for src, dest in _PROFILE_TO_EMPLOYEE:
+        if not hasattr(emp, dest):
+            continue          # column not migrated yet — skip, never crash a join
+        value = getattr(profile, src, None)
+        blank = value is None if src in _KEEP_FALSE else not value
+        if blank:
+            continue
+        setattr(emp, dest, value)
+
+    # HR's offered CTC (0116) wins over the Sales Head-approved terms.
+    from services.hr_offer import employee_ctc
+    ctc = employee_ctc(profile, offer)
     if ctc:
         emp.current_ctc = ctc
+
+    # Where the customer wants them — the opportunity's Work Location, the same
+    # string the profile screen shows read-only. Never overwritten with a blank.
+    if hasattr(emp, "work_location"):
+        site = _opportunity_location(getattr(getattr(profile, "opportunity", None), "details", None))
+        if site:
+            emp.work_location = site[:120]
+
+    # Emp ID and official email are UNIQUE, so each needs a clash check before
+    # it is written — a collision would 500 the whole join.
     ref = (getattr(profile, "employee_ref", None) or "").strip()
     if ref and (emp.employee_code or "").lower() != ref.lower():
         clash = db.execute(select(Employee.id).where(
@@ -1329,12 +1470,14 @@ def _sync_employee_from_joined_profile(db: Session, emp, profile: CandidateProfi
         clash = db.execute(select(Employee.id).where(
             func.lower(Employee.email) == official, Employee.id != emp.id)).first()
         if not clash:
+            # The address they had becomes their personal one rather than being
+            # overwritten — it is usually the only way to reach them.
             if not emp.personal_email and emp.email and emp.email.lower() != official:
                 emp.personal_email = emp.email
             emp.email = official[:255]
-    exp = getattr(profile, "total_experience_years", None)
-    if exp is not None:
-        emp.experience_years = exp
+
+    # The CV is only filled in when the employee has none: an HR-uploaded CV on
+    # the employee record is likely newer than the one the candidate applied with.
     if candidate.cv_url and not emp.cv_url:
         emp.cv_url = candidate.cv_url
     db.add(emp)
@@ -1353,8 +1496,10 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
     Rules:
       * idempotent — an employee already linked to this profile, or one with
         the same email, is REUSED (never a second record);
-      * profile_type EXTERNAL — a joined candidate is billable/deployed staff,
-        not internal Karnex HR;
+      * profile_type INTERNAL (2 Sep 2026, user decision — this docstring said
+        EXTERNAL until 22 Sep 2026 and contradicted the code below): a joined
+        candidate is on Karnex payroll, deployed to the customer. "External"
+        means someone NOT on our payroll at all;
       * date_of_joining is the KARNEX onboarding date (0088) — payroll starts
         when they join us, not when the customer onboards them onto the
         project — falling back to the offer's joining date on older profiles;
@@ -1362,6 +1507,7 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
     Returns the Employee, or None when it could not be created.
     """
     from models import Employee, OfferHistory, ProfileType
+    from services.hr_offer import employee_ctc
 
     try:
         candidate = db.get(Candidate, profile.candidate_id)
@@ -1385,6 +1531,20 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
             existing = db.execute(
                 select(Employee).where(func.lower(Employee.employee_code) == emp_ref.lower())
             ).scalars().first()
+        if existing is None:
+            # An internal candidate applied with their OWN address, which the
+            # Employees record keeps as the personal email (29 Sep 2026: the
+            # Screening Desk already calls them internal on this key — the join
+            # must update that record, not create a second one). Same-name
+            # guard as the official-email match below.
+            own = (candidate.email or "").strip().lower()
+            if own and "@import.karnex.in" not in own and "@noemail" not in own:
+                match = db.execute(
+                    select(Employee).where(func.lower(Employee.personal_email) == own)
+                ).scalars().first()
+                if match is not None and ((match.first_name or "").strip().lower()
+                                          == (candidate.first_name or "").strip().lower()):
+                    existing = match
         if existing is not None:
             _sync_employee_from_joined_profile(db, existing, profile, candidate, offer)
             return existing
@@ -1440,7 +1600,8 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
             # profiles saved before that field existed.
             date_of_joining=(getattr(profile, "karnex_onboarding_date", None)
                              or getattr(offer, "joining_date", None)),
-            current_ctc=getattr(offer, "ctc", None) or candidate.expected_ctc,
+            # HR's offered CTC (0116), else the approved terms, else what they asked.
+            current_ctc=employee_ctc(profile, offer) or candidate.expected_ctc,
             cv_url=candidate.cv_url,
             experience_years=candidate.experience_years,
             date_of_birth=getattr(candidate, "date_of_birth", None),
@@ -1686,15 +1847,27 @@ def latest_ai_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[
             "ai_interview_completed_at": (
                 link.completed_at.isoformat() if link.completed_at else None
             ),
-            "ai_report_link": (
-                f"/admin?view=candidateReport&cid={clean_email}&iid={link.interview_record_id}"
-                if link.interview_record_id and clean_email else None
-            ),
+            "ai_report_link": ai_report_link(clean_email, link.interview_record_id),
         }
     return out
 
 
-def latest_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[int, dict]:
+def _interview_rows(db: Session, profiles: list[CandidateProfile]) -> list[InterviewEvent]:
+    """Every interview of a page of profiles, oldest first — ONE query shared by
+    the "latest round" columns and the round ladder."""
+    if not profiles:
+        return []
+    return db.execute(
+        select(InterviewEvent)
+        .where(InterviewEvent.profile_id.in_([p.id for p in profiles]))
+        .order_by(InterviewEvent.profile_id,
+                  InterviewEvent.scheduled_at.asc().nullsfirst(),
+                  InterviewEvent.id.asc())
+    ).scalars().all()
+
+
+def latest_interviews(db: Session, profiles: list[CandidateProfile],
+                      rows: list[InterviewEvent] | None = None) -> dict[int, dict]:
     """profile.id -> the most recent interview round, for the list columns.
 
     "Most recent" = latest scheduled_at, falling back to the newest row when a
@@ -1702,27 +1875,87 @@ def latest_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[int
     """
     if not profiles:
         return {}
-    ids = [p.id for p in profiles]
-    rows = db.execute(
-        select(InterviewEvent)
-        .where(InterviewEvent.profile_id.in_(ids))
-        .order_by(InterviewEvent.profile_id,
-                  InterviewEvent.scheduled_at.asc().nullsfirst(),
-                  InterviewEvent.id.asc())
-    ).scalars().all()
+    rows = _interview_rows(db, profiles) if rows is None else rows
     latest: dict[int, InterviewEvent] = {}
+    counts: dict[int, int] = {}
     for ev in rows:
         latest[ev.profile_id] = ev  # ordered ascending, so the last wins
+        counts[ev.profile_id] = counts.get(ev.profile_id, 0) + 1
     return {
         pid: {
             "interview_round": ev.kind,
             "interview_status": getattr(ev, "status", None),
             "interview_datetime": _dt(ev.scheduled_at) or getattr(ev, "raw_when", None),
             "interview_result": getattr(ev, "result", None),
-            "interview_count": sum(1 for r in rows if r.profile_id == pid),
+            "interview_count": counts.get(pid, 0),
         }
         for pid, ev in latest.items()
     }
+
+
+#: The round columns of the Candidate Profiles list (29 Sep 2026, user ask:
+#: "all rounds' feedback, the interview date and time, choose the columns").
+#: key → (label, event kinds). A customer round stored as Customer_Interview
+#: with stage "L2" is the customer's second round (the pre-Customer_L2 data).
+ROUND_COLUMNS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("tech_l1", "Technical L1", ("L1_Interview",)),
+    ("tech_l2", "Technical L2", ("L2_F2F",)),
+    ("tech_l3", "Technical L3 / L4", ("L3_Interview", "L4_Interview")),
+    ("cust_l1", "Customer L1", ("Customer_Interview",)),
+    ("cust_l2", "Customer L2", ("Customer_L2",)),
+    ("hr", "HR round", ("HR_Interview",)),
+)
+#: Feedback shown in a list cell (the full text is on the profile's Interviews tab).
+ROUND_FEEDBACK_CHARS = 220
+
+
+def round_column_key(kind: str | None, stage: str | None) -> str | None:
+    """Which list column an interview belongs to. PURE."""
+    if kind == "Customer_Interview" and (stage or "").strip().upper() == "L2":
+        return "cust_l2"
+    return next((key for key, _label, kinds in ROUND_COLUMNS if kind in kinds), None)
+
+
+def round_ladder(rows: list[InterviewEvent], now: datetime | None = None) -> dict[int, dict]:
+    """profile.id → {"rounds": {column → the latest HELD round}, "next_interview"}.
+
+    PURE over the rows `_interview_rows` returned. A round that did not happen
+    (cancelled, no-show, rescheduled) never fills a column; `next_interview` is
+    the earliest round still ahead with no verdict.
+    """
+    from services.interview_rounds import NOT_HELD_STATUSES
+
+    now = now or datetime.now(timezone.utc)
+    out: dict[int, dict] = {}
+    for ev in rows:
+        slot = out.setdefault(ev.profile_id, {"rounds": {}, "next_interview": None})
+        if (ev.status or "") in NOT_HELD_STATUSES:
+            continue
+        key = round_column_key(ev.kind, getattr(ev, "stage", None))
+        at = ev.scheduled_at
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        feedback = (ev.feedback or "").strip()
+        entry = {
+            "event_id": ev.id,
+            "when": at.isoformat() if at else ((ev.raw_when or "").strip() or None),
+            "result": (ev.result or "").strip() or None,
+            "status": ev.status,
+            "interviewer": (ev.interviewer or "").strip() or None,
+            "mode": getattr(ev, "mode", None),
+            "feedback": (feedback[:ROUND_FEEDBACK_CHARS] + "…") if len(feedback) > ROUND_FEEDBACK_CHARS else feedback or None,
+            "upcoming": bool(at and at > now and not (ev.result or "").strip()),
+        }
+        if key:
+            slot["rounds"][key] = entry        # oldest first, so the latest wins
+        if entry["upcoming"]:
+            nxt = slot["next_interview"]
+            if nxt is None or entry["when"] < nxt["when"]:
+                label = next((lab for k, lab, _ in ROUND_COLUMNS if k == key), ev.kind)
+                slot["next_interview"] = {"round": label, "round_key": key, "when": entry["when"],
+                                          "interviewer": entry["interviewer"], "event_id": ev.id,
+                                          "meeting_link": bool((ev.meeting_link or "").strip())}
+    return out
 
 
 def profile_to_dict(
@@ -1853,8 +2086,12 @@ def enrich_profiles_list(db: Session, profiles: list[CandidateProfile]) -> list[
         ).all()
     } if customer_ids else {}
     budgets = approved_ctc_budgets(db, profiles, candidates)
-    interviews = latest_interviews(db, profiles)
+    events = _interview_rows(db, profiles)
+    interviews = latest_interviews(db, profiles, events)
+    ladder = round_ladder(events)
     ai_status = latest_ai_interviews(db, profiles)
+    # The ONE status every screen shows (services/candidate_status.py).
+    statuses = candidate_statuses_for(db, profiles)
     # Fallback for candidates whose notice period only exists on their
     # application — see notice_periods_from_applications for why.
     applied_notice = notice_periods_from_applications(db, cand_ids)
@@ -1920,6 +2157,11 @@ def enrich_profiles_list(db: Session, profiles: list[CandidateProfile]) -> list[
         data["last_working_day"] = _dt(getattr(cand, "last_working_day", None)) if cand else None
         data.update(ats_by_key.get((p.candidate_id, p.opportunity_id),
                                    {"resume_id": None, "ats_score": None, "ats_status": None}))
+        data["candidate_status"] = statuses.get(p.id)
+        # Every round's verdict / time / panel / feedback, and the next one due.
+        lad = ladder.get(p.id) or {}
+        data["rounds"] = lad.get("rounds") or {}
+        data["next_interview"] = lad.get("next_interview")
         out.append(data)
     return out
 
@@ -2025,7 +2267,8 @@ def profile_detail(db: Session, profile: CandidateProfile, user: CurrentUser) ->
         data.update(manual_round_state(db, [profile.id]).get(profile.id, {}))
     except Exception:  # pragma: no cover — never break the detail page
         pass
-    data["allowed_next_statuses"] = allowed_next_statuses_for_user(profile.pipeline_status, user, profile)
+    data["candidate_status"] = candidate_statuses_for(db, [profile]).get(profile.id)
+    data["allowed_next_statuses"] = allowed_next_statuses_for_user(profile.pipeline_status, user, profile, db)
     return data
 
 
@@ -2077,3 +2320,414 @@ def interview_events_for_profile(db: Session, profile_id: int) -> list[dict]:
                             r["scheduled_at"] or "",
                             _ROUND_ORDER.get(r["kind"], 9)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# TA's calls on a fresh applicant (28 Sep 2026, user request)
+# ---------------------------------------------------------------------------
+# A TA upload lands at SOURCING, with TA. From the Applied Candidates row TA
+# then sends the candidate for Technical Screening (RMG / GM screen the CV),
+# parks them (Hold — not reachable, over budget …), rejects them, or records a
+# Self Withdraw. Screening, hold and reject are TA's while TA owns the
+# candidacy (Sourcing / Technical_Screening); a withdrawal can be recorded at
+# any live stage (perform_transition's own rule decides).
+
+TA_DECISIONS = ("screen", "hold", "release", "reject", "withdraw")
+#: Activity row written when TA hands a candidate to RMG / GM.
+SENT_FOR_SCREENING = "SENT_FOR_SCREENING"
+
+#: A send of up to this many candidates is ATS-scored inside the request; more
+#: go to a background thread after commit.
+SCREENING_SCORE_INLINE = 3
+
+
+def ta_user_ids(db: Session, profile) -> list[int]:
+    """The TAs who work this candidate: the TA owner (who applied them) AND the
+    TA who sent them for Technical Screening — often a different person
+    (28 Sep 2026 report: Gargee sent Mohammed's candidate, RMG chose the manual
+    L1, and only Mohammed heard). One query; owner first, no duplicates. Used
+    by every "tell the TA" notice and by the feedback-due reminders."""
+    ids: list[int] = [profile.ta_owner_id] if profile.ta_owner_id else []
+    sender = db.execute(
+        select(CandidateProfileActivityLog.user_id)
+        .where(CandidateProfileActivityLog.profile_id == profile.id,
+               CandidateProfileActivityLog.action_type == SENT_FOR_SCREENING,
+               CandidateProfileActivityLog.user_id.isnot(None))
+        .order_by(CandidateProfileActivityLog.id.desc()).limit(1)
+    ).scalar()
+    if sender and sender not in ids:
+        ids.append(int(sender))
+    return ids
+
+
+#: The activity row that carries the slots the customer offered, passed by Sales
+#: to TA with Customer Interviewing (29 Sep 2026) — TA books the round from them.
+CUSTOMER_SLOTS_PROPOSED = "CUSTOMER_SLOTS_PROPOSED"
+#: The customer rounds a slot offer can be for (the kind names the round TA books).
+CUSTOMER_SLOT_KINDS = ("Customer_Interview", "Customer_L2")
+_SLOT_LABEL_FMT = "%d %b %Y, %I:%M %p"
+_SLOT_HEADER = " — slots offered by the customer:"
+
+
+def fmt_slot_ist(raw: str | None) -> str:
+    """'2026-09-15T11:00' → '15 Sep 2026, 11:00 AM IST'. PURE. The zone is spelled
+    out because the string is the IST wall clock Sales typed; anything that does
+    not parse is returned as typed."""
+    try:
+        return datetime.fromisoformat(str(raw)).strftime(_SLOT_LABEL_FMT) + " IST"
+    except (ValueError, TypeError):
+        return raw or ""
+
+
+def customer_slots_text(sched) -> str:
+    """The customer's slots as the lines TA reads (numbered, IST, link, panel).
+    PURE. `parse_customer_slots` reads exactly this shape back."""
+    lines = []
+    for i, slot in enumerate(sched.all_slots(), start=1):
+        line = f"{i}. {fmt_slot_ist(slot.scheduled_at)}"
+        link = (slot.meeting_link or sched.meeting_link or "").strip()
+        if link:
+            line += f" — {link}"
+        lines.append(line)
+    extra = []
+    if sched.interviewer:
+        extra.append(f"panel {sched.interviewer.strip()[:200]}")
+    if sched.duration_minutes:
+        extra.append(f"{sched.duration_minutes} min")
+    if extra:
+        lines.append("(" + ", ".join(extra) + ")")
+    return "\n".join(lines)
+
+
+def customer_slots_comment(kind: str, sched, note: str = "") -> str:
+    """The `CUSTOMER_SLOTS_PROPOSED` activity text: header naming the round,
+    the slot lines, and Sales' note."""
+    from services.interview_rounds import round_label
+    return (f"{round_label(kind)}{_SLOT_HEADER}\n{customer_slots_text(sched)}"
+            + (f"\nNote: {note}" if note else ""))
+
+
+def parse_customer_slots(comment: str | None) -> dict | None:
+    """Read a `customer_slots_comment` back into data TA's scheduling form can
+    use. PURE — the round-trip is pinned by a test, so the two cannot drift.
+
+    → {"kind", "slots": [{"scheduled_at" ("YYYY-MM-DDTHH:MM" IST wall clock, or
+    None when Sales typed something unparseable), "label", "meeting_link"}],
+    "interviewer", "duration_minutes", "note"}; None when there is no slot."""
+    import re
+
+    from services.interview_rounds import round_label
+    lines = (comment or "").splitlines()
+    if not lines:
+        return None
+    head = lines[0].split(_SLOT_HEADER, 1)[0].strip()
+    kind = next((k for k in CUSTOMER_SLOT_KINDS if round_label(k) == head), CUSTOMER_SLOT_KINDS[0])
+    out: dict = {"kind": kind, "slots": [], "interviewer": None, "duration_minutes": None, "note": None}
+    for raw in lines[1:]:
+        line = raw.strip()
+        m = re.match(r"^\d+\.\s+(.*)$", line)
+        if m:
+            label, _, link = m.group(1).partition(" — ")
+            label = label.strip()
+            try:
+                when = datetime.strptime(label.removesuffix(" IST"), _SLOT_LABEL_FMT).strftime("%Y-%m-%dT%H:%M")
+            except ValueError:
+                when = None
+            out["slots"].append({"scheduled_at": when, "label": label,
+                                 "meeting_link": link.strip() or None})
+        elif line.startswith("(") and line.endswith(")"):
+            # "(panel <names — may hold commas>, <N> min)", either part optional
+            inner = line[1:-1].strip()
+            dur = re.search(r"(?:^|,\s*)(\d+) min$", inner)
+            if dur:
+                out["duration_minutes"] = int(dur.group(1))
+                inner = inner[:dur.start()].strip()
+            if inner.startswith("panel "):
+                out["interviewer"] = inner[6:].strip() or None
+        elif line.startswith("Note:"):
+            out["note"] = line[5:].strip() or None
+    return out if out["slots"] else None
+
+
+def latest_customer_slots(db: Session, profile_ids) -> dict[int, dict]:
+    """{profile id: the LATEST customer-slot offer, parsed} — one query for a
+    page. Each value adds `proposed_at` (ISO) and `proposed_by_id`. Used by TA's
+    scheduling form, the Applied Candidates rows and the work desk."""
+    ids = [int(i) for i in (profile_ids or ()) if i is not None]
+    if not ids:
+        return {}
+    out: dict[int, dict] = {}
+    for pid, uid, comment, ts in db.execute(
+        select(CandidateProfileActivityLog.profile_id, CandidateProfileActivityLog.user_id,
+               CandidateProfileActivityLog.comment, CandidateProfileActivityLog.timestamp)
+        .where(CandidateProfileActivityLog.profile_id.in_(ids),
+               CandidateProfileActivityLog.action_type == CUSTOMER_SLOTS_PROPOSED)
+        .order_by(CandidateProfileActivityLog.id.desc())
+    ).all():
+        if pid in out:
+            continue
+        parsed = parse_customer_slots(comment)
+        if parsed:
+            parsed["proposed_at"] = ts.isoformat() if ts else None
+            parsed["proposed_by_id"] = uid
+            out[pid] = parsed
+    return out
+
+
+TA_DECISION_STAGES = (PS.SOURCING.value, PS.TECHNICAL_SCREENING.value)
+_TA_REJECT_ACTION = next(iter(TA_CLOSE_ACTIONS))
+
+
+def budget_fit(expected_ctc, budget_max) -> dict:
+    """{"expected_ctc", "budget_ctc_max", "over_budget"} for one row. PURE.
+
+    Over budget only when BOTH figures are known — an unknown CTC is not a
+    reason to stop anyone.
+    """
+    exp = float(expected_ctc) if expected_ctc is not None else None
+    cap = float(budget_max) if budget_max else None
+    return {"expected_ctc": exp, "budget_ctc_max": cap,
+            "over_budget": exp is not None and cap is not None and exp > cap}
+
+
+def _need_reason(clean: str) -> None:
+    if len(clean) < MIN_COMMENT_LENGTH:
+        raise HTTPException(status_code=400,
+                            detail=f"Give a reason of at least {MIN_COMMENT_LENGTH} characters.")
+
+
+def ta_decision(db: Session, profile: CandidateProfile, decision: str,
+                note: str | None, user: CurrentUser) -> str:
+    """Apply TA's call; returns the message to show. Caller commits.
+
+    screen   → RMG screening Pending + everyone who may screen is told
+               (`notify_rmg_new_applicant`); a hold is lifted on the way.
+    hold     → parks the candidate (`budget_status = TA_Hold`): off the
+               Screening Desk, status "On Hold". Reason optional.
+    release  → back to where they were.
+    reject   → Rejected through `perform_transition` (same checks, log and
+               notifications as any rejection) + a `TA_REJECTED` row, so the
+               status reads "Rejected by TA". Reason required.
+    withdraw → Self_Withdrawn through `perform_transition`. Reason required.
+    """
+    if decision not in TA_DECISIONS:
+        raise HTTPException(status_code=400,
+                            detail=f"Decision must be one of: {', '.join(TA_DECISIONS)}")
+    clean = (note or "").strip()
+    uid = getattr(user, "id", None)
+    actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "TA"
+    if decision == "withdraw":
+        _need_reason(clean)
+        perform_transition(db, profile, PS.SELF_WITHDRAWN.value, f"Self withdrew: {clean}", user)
+        notify_screeners_of_ta_close(db, profile, "withdrew", clean, user)
+        return "Recorded — the candidate withdrew"
+    # Technical Screening, Hold and Reject belong to the SOURCING phase
+    # (28 Sep 2026, user rule): once the candidate is with RMG / GM or has an
+    # interview asked for, only Self Withdraw is TA's to record.
+    stage = _ta_stage(db, [profile]).get(profile.id)
+    if stage != SOURCING_STAGE:
+        raise HTTPException(status_code=409, detail=_not_at_sourcing(stage))
+    if decision == "screen":
+        sent, refused = send_for_screening(db, [profile], user, clean)
+        if refused:
+            raise HTTPException(status_code=409, detail=refused[0]["reason"])
+        return "Sent for Technical Screening — RMG / GM notified"
+    if decision == "hold":
+        profile.budget_status = TA_HOLD
+        profile.budget_note = clean or None
+        profile.budget_flagged_by = uid
+        profile.budget_flagged_at = datetime.now(timezone.utc)
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid, "TA_HOLD",
+                     f"{actor} put the candidate on hold" + (f": {clean}" if clean else ""))
+        return "Candidate on hold — nobody screens them until you release the hold"
+    if decision == "release":
+        if profile.budget_status != TA_HOLD:
+            raise HTTPException(status_code=400, detail="This candidate is not on hold.")
+        profile.budget_status = None
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid,
+                     "TA_HOLD_RELEASED", f"{actor} released the hold" + (f": {clean}" if clean else ""))
+        return "Hold released — the candidate is back in the flow"
+    _need_reason(clean)
+    perform_transition(db, profile, PS.REJECTED.value, f"Rejected by TA: {clean}", user)  # ends any hold
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid,
+                 _TA_REJECT_ACTION, f"Rejected by TA: {clean}")
+    notify_screeners_of_ta_close(db, profile, "rejected", clean, user)
+    return "Candidate rejected — RMG / GM notified"
+
+
+#: Event for "TA closed a candidacy" (in `email_flows.EVENTS`, RMG + GM).
+TA_CLOSED_EVENT = "profile.ta_closed"
+
+
+def notify_screeners_of_ta_close(db: Session, profile: CandidateProfile, how: str, reason: str,
+                                 user: CurrentUser) -> None:
+    """Tell everyone who may SCREEN that TA closed a candidacy (29 Sep 2026, user
+    report: "once TA rejects a candidate, RMG / GM get no email"). Same
+    recipients as the screening notices (`screening_notify_user_ids`), so a GM
+    or a template-granted RMG hears it too; the actor is never told. Bell +
+    email, deduped per profile and outcome. Best-effort, savepointed."""
+    try:
+        from services.notify import notify_roles
+        with db.begin_nested():
+            uid = getattr(user, "id", None)
+            actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "TA"
+            name = _candidate_display_name(db, profile)
+            opp = db.get(Opportunity, profile.opportunity_id) if profile.opportunity_id else None
+            where = " — ".join(x for x in (getattr(opp, "opp_id", None), getattr(opp, "title", None)) if x)
+            title = f"Rejected by TA: {name}" if how == "rejected" else f"Candidate withdrew: {name}"
+            message = (f"{actor} recorded that {name}"
+                       + (f" ({where})" if where else "")
+                       + (" was rejected" if how == "rejected" else " withdrew")
+                       + f". Reason: {reason}")
+            notify_roles(db, ["RMG", "GM"], title, message,
+                         f"/admin/?view=crm&p=profiles/{profile.id}",
+                         exclude_user_id=uid, actor=user, event=TA_CLOSED_EVENT,
+                         dedupe_prefix=f"ta_closed:{profile.id}:{how}",
+                         related_type="candidate", related_id=profile.candidate_id,
+                         user_ids=[i for i in screening_notify_user_ids(db) if i != uid] or None)
+    except Exception:  # pragma: no cover — a notice never undoes the decision
+        logger.warning("Could not notify screeners of TA close for profile %s", profile.id, exc_info=True)
+
+
+def _ta_stage(db: Session, profiles: list[CandidateProfile]) -> dict[int, str]:
+    """profile id → the derived phase key (`candidate_status.STAGES`), batched."""
+    return {pid: (st.get("stage") or {}).get("key")
+            for pid, st in candidate_statuses_for(db, profiles).items()}
+
+
+def _not_at_sourcing(stage: str | None) -> str:
+    return ("Technical Screening, Hold and Reject are TA's calls while the candidate is at "
+            f"Sourcing — this one is at {CANDIDATE_STAGE_LABEL.get(stage or '', 'a later stage')}.")
+
+
+def _screening_refusal(profile, stage: str | None) -> str | None:
+    """Why this profile cannot be sent for Technical Screening, or None."""
+    if stage != SOURCING_STAGE:
+        return _not_at_sourcing(stage)
+    status = profile.rmg_screening_status
+    if status in (RMG_SCREENING_PENDING, RMG_SCREENING_SHORTLISTED):
+        return "This candidate is already with RMG / GM for screening."
+    if status == RMG_SCREENING_REJECTED:
+        return "RMG / GM already rejected this candidate at screening."
+    return None
+
+
+def send_for_screening(db: Session, profiles: list[CandidateProfile], user,
+                       note: str | None = None) -> tuple[list[CandidateProfile], list[dict]]:
+    """TA hands candidates to RMG / GM (the "Technical Screening" button).
+
+    Stamps screening Pending (the Screening Desk's queue), lifts a TA hold and
+    logs `SENT_FOR_SCREENING`. Everyone who may screen hears ONCE: one notice
+    per candidate for a single send, one summary for a batch — fifty bell rows
+    for one bulk upload would be noise. Returns (sent, refused[{profile_id,
+    reason}]); the caller commits.
+    """
+    uid = getattr(user, "id", None)
+    actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "TA"
+    clean = (note or "").strip()
+    sent: list[CandidateProfile] = []
+    refused: list[dict] = []
+    stages = _ta_stage(db, profiles)
+    for profile in profiles:
+        reason = _screening_refusal(profile, stages.get(profile.id))
+        if reason:
+            refused.append({"profile_id": profile.id, "reason": reason})
+            continue
+        if profile.budget_status == TA_HOLD:
+            profile.budget_status = None
+        profile.rmg_screening_status = RMG_SCREENING_PENDING
+        profile.rmg_screening_note = None
+        stamp_technical_submission(profile)
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid,
+                     SENT_FOR_SCREENING,
+                     f"{actor} sent the candidate for Technical Screening"
+                     + (f": {clean}" if clean else ""))
+        sent.append(profile)
+    # ATS the moment a candidate reaches the Screening Desk (30 Sep 2026, user
+    # ask) — RMG / GM open the row to a score, not "Not scored". A small send
+    # is scored inline (each scan savepointed, never fails the send); a larger
+    # batch is scored after commit by the caller (`score_profiles_in_background`).
+    if 0 < len(sent) <= SCREENING_SCORE_INLINE:
+        from services.resumes import auto_score_profile
+
+        for profile in sent:
+            auto_score_profile(db, profile, uid)
+    if len(sent) == 1:
+        notify_rmg_new_applicant(db, sent[0], actor=user)
+    elif sent:
+        _notify_screening_batch(db, sent, user, actor)
+    return sent, refused
+
+
+def _notify_screening_batch(db: Session, profiles: list[CandidateProfile], user, actor: str) -> None:
+    """ONE "N candidates await screening" notice to everyone who may screen."""
+    try:
+        from services.notify import notify_role
+
+        ids = [p.candidate_id for p in profiles]
+        rows = db.execute(select(Candidate.first_name, Candidate.last_name)
+                          .where(Candidate.id.in_(ids)).limit(5)).all()
+        names = ", ".join(" ".join(x for x in r if x) for r in rows)
+        more = f" and {len(profiles) - len(rows)} more" if len(profiles) > len(rows) else ""
+        notify_role(
+            db, "RMG",
+            f"{len(profiles)} candidates await Technical Screening",
+            f"{names}{more} — sent for screening by {actor}. Review them on the Screening "
+            "Desk: Shortlist or Reject, then choose the AI or manual L1.",
+            "/admin/?view=crm&p=screening-desk",
+            event=RMG_SCREENING_REQUESTED_EVENT, actor=user,
+            dedupe_prefix="screen_batch:" + ",".join(str(p.id) for p in profiles[:20]),
+            user_ids=screening_notify_user_ids(db),
+        )
+    except Exception:
+        logger.warning("screening batch notice failed", exc_info=True)
+
+
+def l1_verdict_recorded(db: Session, profile_id: int) -> bool:
+    """Has the L1 — manual or AI — got a verdict? An L2 is asked for after it.
+
+    Manual: an `L1_Interview` event with a result. AI: a completed link (the
+    report exists, whatever it said — RMG / GM may still take an L2 to be sure).
+    """
+    from models import AiInterviewLink
+
+    manual = db.execute(
+        select(InterviewEvent.id).where(
+            InterviewEvent.profile_id == profile_id, InterviewEvent.kind == "L1_Interview",
+            func.coalesce(InterviewEvent.result, "") != "").limit(1)
+    ).first()
+    if manual is not None:
+        return True
+    return db.execute(
+        select(AiInterviewLink.id).where(
+            AiInterviewLink.profile_id == profile_id,
+            AiInterviewLink.completed_at.isnot(None)).limit(1)
+    ).first() is not None
+
+
+def set_applied_archive(db: Session, profile: CandidateProfile, archived: bool, user) -> bool:
+    """RMG / GM move a CLOSED candidacy to the Applied Candidates Archive tab,
+    or bring it back (30 Sep 2026, user rule: nothing is archived on its own).
+
+    Archiving a live candidacy is refused (409) — it has to be rejected /
+    withdrawn first. Idempotent: the same state again writes nothing and
+    returns False. Logged as APPLIED_ARCHIVED / APPLIED_RESTORED (the latest
+    wins). The caller commits.
+    """
+    from services.candidate_status import (
+        ARCHIVED_ACTION, RESTORED_ACTION, archived_profile_ids,
+    )
+
+    stage = profile.pipeline_status.value if hasattr(profile.pipeline_status, "value") \
+        else str(profile.pipeline_status or "")
+    if archived and stage not in REJECTED_BUCKET:
+        raise HTTPException(status_code=409,
+                            detail="Only a rejected or withdrawn candidate can be archived.")
+    now = profile.id in archived_profile_ids(db, [profile.id])
+    if now == archived:
+        return False
+    actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "RMG"
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, getattr(user, "id", None),
+                 ARCHIVED_ACTION if archived else RESTORED_ACTION,
+                 f"{actor} {'moved the candidate to Archive' if archived else 'restored the candidate to Applied Candidates'}")
+    return True

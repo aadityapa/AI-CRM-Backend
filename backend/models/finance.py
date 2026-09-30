@@ -40,6 +40,19 @@ class TdsStatus(str, enum.Enum):
     PAID = "Paid"
 
 
+class InvoiceKind(str, enum.Enum):
+    """Proforma → Tax lifecycle (23 Sep 2026). A plain String column, not a
+    pg_enum, so a new kind never needs an ALTER TYPE.
+
+    PROFORMA — raised by the GM from an approved timesheet for Finance to
+    review. Consumes NO PO balance, takes no payments, no TDS; printed as
+    "PROFORMA INVOICE". Finance converts it (→ TAX) or returns it to the GM.
+    TAX — the original tax invoice: the only kind that draws down a PO.
+    """
+    PROFORMA = "Proforma"
+    TAX = "Tax"
+
+
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
     id = sa.Column(sa.Integer, primary_key=True)
@@ -143,7 +156,24 @@ class Invoice(Base):
     paid_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     balance_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     invoice_pdf_url = sa.Column(sa.String(1024), nullable=True)
+    # ---- Proforma → Tax lifecycle (0107, 23 Sep 2026) ---------------------
+    kind = sa.Column(sa.String(16), nullable=False, server_default=InvoiceKind.TAX.value, index=True)
+    #: The PI-… number the document carried while it was a Proforma; kept after
+    #: conversion so the customer's reference still resolves.
+    proforma_number = sa.Column(sa.String(64), nullable=True)
+    #: Customer-specific column choice frozen on THIS document
+    #: (`services/invoice_format.py`): {"sac": bool, "leave": bool, "per_day": bool}.
+    #: NULL = every column. Copied from the Proforma onto the Tax invoice.
+    invoice_format = sa.Column(JSONB, nullable=True)
+    #: Finance sent the Proforma back to the GM: why, when, who. Cleared on reissue.
+    returned_reason = sa.Column(sa.Text, nullable=True)
+    returned_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    returned_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
     __table_args__ = (sa.UniqueConstraint("timesheet_id", name="uq_invoice_timesheet"),)
+
+    @property
+    def is_proforma(self) -> bool:
+        return (self.kind or InvoiceKind.TAX.value) == InvoiceKind.PROFORMA.value
 
     po = relationship("PurchaseOrder", back_populates="invoices")
     project = relationship("Project")

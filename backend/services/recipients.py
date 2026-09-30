@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from models import Employee, Role
+from models import Employee
 
 logger = logging.getLogger("karnex.crm.recipients")
 
@@ -110,17 +110,47 @@ def user_recipient(db: Session, user_id: int | None) -> Recipient | None:
     return found[0] if found else None
 
 
+_CUSTOM_ROLE_SELECT = sa.text(
+    """
+    SELECT DISTINCT r.id, r.full_name, r.email
+    FROM user_custom_roles ucr
+    JOIN custom_roles cr ON cr.id = ucr.custom_role_id
+    JOIN registration_data r ON r.id = ucr.user_id
+    WHERE LOWER(cr.name) = LOWER(:role_name) AND cr.is_active AND COALESCE(r.is_active, TRUE)
+    ORDER BY r.id
+    """
+)
+
+
 def role_recipients(db: Session, role_name: str, exclude_user_id: int | None = None) -> list[Recipient]:
-    """Everyone holding a CRM role. `exclude_user_id` mirrors `notify_role` so
-    the person who performed the action is not mailed about their own action."""
+    """Everyone holding a CRM role — built-in OR custom (23 Sep 2026: the GM and
+    Sales Manager are custom roles). `exclude_user_id` mirrors `notify_role` so
+    the person who performed the action is not mailed about their own action.
+
+    The name picks the query: `roles.name` is a Postgres enum, and comparing it
+    with a custom name raises (and would poison the transaction), so a custom
+    name never reaches that statement."""
     if not (role_name or "").strip():
         return []
+    from models.rbac import RoleName
+    stmt = _ROLE_SELECT if role_name in {r.value for r in RoleName} else _CUSTOM_ROLE_SELECT
     try:
-        rows = db.execute(_ROLE_SELECT, {"role_name": role_name}).all()
+        with db.begin_nested():
+            rows = db.execute(stmt, {"role_name": role_name}).all()
     except Exception as exc:
         logger.warning("recipient lookup failed for role=%s: %s", role_name, exc)
         return []
     found = _clean(rows)
+    if stmt is _ROLE_SELECT:
+        # …and the custom roles that carry this built-in one (29 Sep 2026: the
+        # Sales Manager hears what the Sales Head hears — services/role_implications).
+        from services.role_implications import custom_roles_implying
+        seen = {r.email.lower() for r in found}
+        for custom in custom_roles_implying(role_name):
+            for rec in role_recipients(db, custom):
+                if rec.email.lower() not in seen:
+                    seen.add(rec.email.lower())
+                    found.append(rec)
     if exclude_user_id is not None:
         found = [r for r in found if r.user_id != exclude_user_id]
     return found
@@ -135,10 +165,6 @@ def roles_recipients(db: Session, role_names, exclude_user_id: int | None = None
         for rec in role_recipients(db, name, exclude_user_id=exclude_user_id):
             merged.setdefault(rec.email.lower(), rec)
     return list(merged.values())
-
-
-def role_exists(db: Session, role_name: str) -> bool:
-    return bool(db.execute(sa.select(Role.id).where(Role.name == role_name)).first())
 
 
 # ------------------------------------------------------------------- employees

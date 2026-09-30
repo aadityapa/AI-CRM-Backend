@@ -15,8 +15,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params,
-    role_required, gated_write,
+    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, gated_write,
 )
 from models import (
     AiInterviewStatus, AtsStatus, Candidate, CandidateProfile,
@@ -27,16 +26,24 @@ from models import (
 logger = logging.getLogger("karnex.crm.resumes")
 from pydantic import BaseModel, Field
 
-from routers.crm.apply import _base_url
 from schemas.common import envelope
 from schemas.resumes import AI_INTERVIEW_STATUS_VALUES, ATS_STATUS_VALUES, ResumeScanResult
 from services.ai_interview_bridge import ai_interview_autosend_enabled, schedule_l1_interview
 from services.candidate_comms import interview_link_message, notify_candidate
+from services.candidate_profiles import budget_fit
+from services.candidate_status import (
+    ARCHIVE_BUCKET, LIVE_BUCKET, applied_buckets, parse_phases, parse_status_keys,
+    profile_ids_in_phase, profile_ids_with_status, status_counts,
+)
 from services.crm_common import log_activity, paginate, save_upload_hashed
 from services.requirements import get_requirement_or_404
-from services.resumes import enrich_resumes_with_ai, run_ats_scan, serialize_resume
+from services.resumes import (
+    enrich_resumes_with_ai, ensure_resume_for_profile, run_ats_scan, serialize_resume,
+)
+from services.report_links import ai_report_link
 from services.slot_booking import (
-    auto_pipeline_after_scan, find_or_create_candidate_from_resume, get_or_create_profile,
+    record_upload_note,
+    find_or_create_candidate_from_resume, get_or_create_profile,
 )
 
 router = APIRouter(tags=["CRM: Resumes"])
@@ -79,6 +86,11 @@ def upload_resume(
     current_ctc: str = Form("", max_length=40),
     expected_ctc: str = Form("", max_length=40),
     preferred_location: str = Form("", max_length=120),
+    # 29 Sep 2026 upload-form redesign: where the candidate lives today (fills
+    # the candidate's city when empty) and TA's note for RMG / GM (kept on the
+    # resume row AND logged on the profile's Activity Log).
+    current_location: str = Form("", max_length=120),
+    note: str = Form("", max_length=1000),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA")),
 ):
@@ -127,6 +139,8 @@ def upload_resume(
         "current_ctc": (current_ctc or "").strip() or None,
         "expected_ctc": (expected_ctc or "").strip() or None,
         "preferred_location": (preferred_location or "").strip() or None,
+        "current_location": (current_location or "").strip() or None,
+        "note": (note or "").strip() or None,
     }
     details = {k: v for k, v in details.items() if v}
     resume = Resume(
@@ -150,14 +164,21 @@ def upload_resume(
     # interview was scheduled, so the Applicants tab silently missed everyone
     # who came in through Resumes.
     try:
-        from services.slot_booking import ensure_sourcing_profile, find_or_create_candidate_from_resume
+        # `find_or_create_candidate_from_resume` is the MODULE import — re-importing
+        # it here made it a function-local and the duplicate-upload branch above
+        # raised UnboundLocalError (found by the 23 Sep 2026 shadow scan).
+        from services.slot_booking import ensure_sourcing_profile
         # Savepoint: this block is best-effort, and on Postgres a failed
         # statement without a savepoint rollback poisons the transaction —
         # the log_activity/commit below would then 500 the whole upload.
         with db.begin_nested():
             cand = find_or_create_candidate_from_resume(db, resume)
             resume.candidate_id = cand.id
-        ensure_sourcing_profile(db, resume, req, ta_user=user)
+        profile = ensure_sourcing_profile(db, resume, req, ta_user=user)
+        record_upload_note(db, profile, (note or "").strip(), user.id)
+        # Locations blank after the form's "Current location" → tell the TA (29 Sep 2026).
+        from services.slot_booking import remind_missing_location
+        remind_missing_location(db, profile, user.id)
     except Exception:
         logger.warning("candidate bootstrap failed for resume %s", resume.id, exc_info=True)
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
@@ -387,8 +408,7 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
                             pass
                         cand = find_or_create_candidate_from_resume(db, resume)
                         resume.candidate_id = cand.id
-                        profile = ensure_sourcing_profile(db, resume, req, ta_user=ta_user,
-                                                          notify_rmg=False)
+                        profile = ensure_sourcing_profile(db, resume, req, ta_user=ta_user)
                         if name_note and name_note.get("candidate_id") == cand.id:
                             name_note = None  # matched by name and REUSED — not a second record
                         applied.append({"file": short, "resume_id": resume.id,
@@ -404,24 +424,9 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
              "RESUME_UPLOADED",
              f"Bulk ZIP: {len(applied)} applied, {len(held)} held as possible "
              f"duplicates, {len(skipped)} skipped, {len(failed)} failed")
-        # ONE summary notification to RMG for the whole batch — fifty separate
-        # bell rows and emails for one zip would be noise, not signal.
-        if applied:
-            try:
-                from services.notify import notify_role
-                names = ", ".join(a["name"] for a in applied[:5])
-                more = f" and {len(applied) - 5} more" if len(applied) > 5 else ""
-                notify_role(
-                    db, "RMG",
-                    f"{len(applied)} new applicant(s) awaiting RMG screening",
-                    f"{names}{more} — applied to '{req.title}' via bulk upload by "
-                    f"{user_name}. Review and Shortlist to enable AI L1 interviews.",
-                    f"/admin?view=crm&p=requirements/{req.id}&tab=resumes",
-                    event="profile.rmg_screening_requested",
-                    dedupe_prefix=f"rmg_screen_bulk:{job_id}",
-                )
-            except Exception:
-                pass
+        # No screening notice here (28 Sep 2026): the batch lands at Sourcing,
+        # with TA, who sends the ones worth screening from Applied Candidates
+        # (one summary per send — `candidate_profiles.send_for_screening`).
         if req.status == RequirementStatus.POSTED_ON_PORTALS and applied:
             req.status = RequirementStatus.IN_PROGRESS
             _log(db, RequirementActivityLog, "requirement_id", req.id, user_id,
@@ -952,12 +957,21 @@ def list_resumes(
     applied_from: date | None = None,
     applied_to: date | None = None,
     dismissed: bool = False,
-    stage: str | None = None,
+    #: The stage the candidate sits in (services/candidate_status.STAGES keys), CSV.
+    phase: str | None = None,
+    #: The derived status (services/candidate_status.STATUS_DEFS keys), CSV —
+    #: the chip strip above the list (30 Sep 2026).
+    status_key: str | None = None,
+    #: `live` (default) = candidacies still in the pipeline; `archive` = the
+    #: rejected / withdrawn ones, which leave the live list (30 Sep 2026).
+    bucket: str = LIVE_BUCKET,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG", "Sales_Head")),
 ):
     req = get_requirement_or_404(db, requirement_id)
+    if bucket not in (LIVE_BUCKET, ARCHIVE_BUCKET):
+        raise HTTPException(status_code=400, detail=f"bucket must be {LIVE_BUCKET} or {ARCHIVE_BUCKET}")
     stmt = select(Resume).where(Resume.requirement_id == req.id)
     # Dismissed duplicates are hidden by default (0087); ?dismissed=1 lists
     # ONLY them, so the decision stays reviewable and reversible by re-upload.
@@ -966,27 +980,39 @@ def list_resumes(
     else:
         stmt = stmt.where(or_(Resume.duplicate_dismissed.is_(None),
                               Resume.duplicate_dismissed.is_(False)))
-    # Stage pills (28 Aug 2026, user request): filter by the candidate's LIVE
-    # pipeline stage on this opportunity. CSV so one pill can cover several
-    # statuses ("Customer Interviewing" = interview + feedback + shortlist).
-    # Server-side — the list is paginated, a client filter would miss pages.
-    wanted_stages: list[PipelineStatus] = []
-    if stage:
-        for s in stage.split(","):
-            s = s.strip()
-            if not s:
-                continue
-            try:
-                wanted_stages.append(PipelineStatus(s))
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid stage '{s}'")
-        if wanted_stages:
-            stmt = (
-                stmt.join(CandidateProfile,
-                          (CandidateProfile.candidate_id == Resume.candidate_id)
-                          & (CandidateProfile.opportunity_id == req.opportunity_id))
-                .where(CandidateProfile.pipeline_status.in_(wanted_stages))
-            )
+    pstmt = select(CandidateProfile).where(CandidateProfile.opportunity_id == req.opportunity_id)
+    # Live / Archive (30 Sep 2026): a rejected or withdrawn candidacy leaves
+    # Applied Candidates for the Archive tab. Resolved on the opportunity's
+    # profiles once; resume rows follow their candidate. A resume with no
+    # profile at all (legacy) stays on the live list — it was never closed.
+    live_ids, archived_ids = applied_buckets(db, pstmt)
+    wanted_profile_ids: set[int] = set(archived_ids if bucket == ARCHIVE_BUCKET else live_ids)
+    archived_cids = select(CandidateProfile.candidate_id).where(
+        CandidateProfile.id.in_(archived_ids or [-1]))
+    if bucket == ARCHIVE_BUCKET:
+        stmt = stmt.where(Resume.candidate_id.in_(archived_cids))
+    else:
+        stmt = stmt.where(or_(Resume.candidate_id.is_(None), ~Resume.candidate_id.in_(archived_cids)))
+    # Status chips (30 Sep 2026) — the derived status, so "Technical L1
+    # Interview · Yet to Schedule" is a click, not a stage guess.
+    if status_key and status_key.strip():
+        try:
+            keys = parse_status_keys(status_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        wanted_profile_ids &= set(profile_ids_with_status(db, pstmt, keys))
+        stmt = _narrow_to_profiles(stmt, wanted_profile_ids)
+    # Stage pills (28 Sep 2026): Sourcing / Technical Screening / Technical
+    # Interview … are DERIVED stages — one stored stage (Sourcing) holds the
+    # first three. Resolve the matching profiles of THIS opportunity once,
+    # then narrow both kinds of row to them.
+    if phase and phase.strip():
+        try:
+            phases = parse_phases(phase)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        wanted_profile_ids &= set(profile_ids_in_phase(db, pstmt, phases))
+        stmt = _narrow_to_profiles(stmt, wanted_profile_ids)
     if ats_status:
         if ats_status not in ATS_STATUS_VALUES:
             raise HTTPException(status_code=400, detail=f"Invalid ats_status filter '{ats_status}'")
@@ -1029,10 +1055,23 @@ def list_resumes(
     # "4 resumes" over a table showing 6 rows.
     extra = _profile_only_applied_rows(
         db, req, search=p.search, applied_by=applied_by,
-        stages=wanted_stages, dismissed=dismissed,
+        dismissed=dismissed,
         applied_from=applied_from, applied_to=applied_to,
+        profile_ids=wanted_profile_ids,
     )
-    items, extra_page, order, meta = _paginate_merged(db, stmt, extra, p.page, p.limit)
+    activity = _last_activity_by_candidate(db, req.opportunity_id)
+    items, extra_page, order, meta = _paginate_merged(db, stmt, extra, p.page, p.limit, activity)
+    # Counts for the status chips (30 Sep 2026): the opportunity's applicants
+    # per derived status, live and archived apart — the same derivation the
+    # Status column prints — so each chip (and the Archive tab) says what
+    # clicking it lists. "Applied by" narrows them too.
+    counts_stmt = select(CandidateProfile).where(
+        CandidateProfile.opportunity_id == req.opportunity_id,
+        or_(CandidateProfile.is_hidden.is_(None), CandidateProfile.is_hidden.is_(False)))
+    if applied_by:
+        counts_stmt = counts_stmt.where(CandidateProfile.ta_owner_name == applied_by.strip())
+    meta["status_counts"] = status_counts(db, counts_stmt)
+    meta["bucket"] = bucket
     data = enrich_resumes_with_ai(db, items)
     # Attach the linked profile's attribution + RMG screening state — batched,
     # one query for the whole page. Powers the Applied-by column and the RMG
@@ -1040,15 +1079,19 @@ def list_resumes(
     cand_ids = [r.candidate_id for r in items if r.candidate_id]
     prof: dict[int, tuple] = {}
     if cand_ids:
-        for cid, owner, pid, screening, stage, budget in db.execute(
+        for cid, owner, pid, screening, stage, budget, expected, cand_expected in db.execute(
             select(CandidateProfile.candidate_id, CandidateProfile.ta_owner_name,
                    CandidateProfile.id, CandidateProfile.rmg_screening_status,
-                   CandidateProfile.pipeline_status, CandidateProfile.budget_status).where(
+                   CandidateProfile.pipeline_status, CandidateProfile.budget_status,
+                   CandidateProfile.expected_ctc, Candidate.expected_ctc)
+            .join(Candidate, Candidate.id == CandidateProfile.candidate_id)
+            .where(
                 CandidateProfile.opportunity_id == req.opportunity_id,
                 CandidateProfile.candidate_id.in_(cand_ids),
             )
         ).all():
-            prof[cid] = (owner, pid, screening, getattr(stage, "value", stage), budget)
+            prof[cid] = (owner, pid, screening, getattr(stage, "value", stage), budget,
+                         _first_set(expected, cand_expected))
     # Manual L1 / L2 round state for EVERY row that has a profile — not only
     # the ones with an AI link (1 Sep 2026). A candidate RMG took down the
     # manual route never has a link, and keying this off one left their row
@@ -1056,9 +1099,9 @@ def list_resumes(
     from services.resumes import manual_round_state
     rounds = manual_round_state(db, [p[1] for p in prof.values() if p[1]])
     for row, item in zip(data, items):
-        owner, pid, screening, stage, budget = (
-            prof.get(item.candidate_id, (None, None, None, None, None))
-            if item.candidate_id else (None, None, None, None, None))
+        owner, pid, screening, stage, budget, expected = (
+            prof.get(item.candidate_id, (None,) * 6)
+            if item.candidate_id else (None,) * 6)
         row["applied_by"] = owner
         row["rmg_screening_status"] = screening
         # profile_id may already be set by the AI-link enrichment; the applied
@@ -1067,7 +1110,8 @@ def list_resumes(
             row["profile_id"] = pid
         if row.get("profile_pipeline_status") is None:
             row["profile_pipeline_status"] = stage
-        row["budget_status"] = budget   # the Pre-Onboarding budget hold (3 Sep 2026)
+        row["budget_status"] = budget   # Pre-Onboarding hold (3 Sep) / TA hold (28 Sep)
+        row.update(budget_fit(expected, req.budget_ctc_max))
         if pid:
             row.update(rounds.get(pid, {}))
 
@@ -1077,7 +1121,56 @@ def list_resumes(
     by_resume = {item.id: row for item, row in zip(items, data)}
     by_profile = {row["id"]: row for row in extra_page}
     merged = [(by_resume if kind == "r" else by_profile).get(key) for kind, key in order]
-    return envelope([row for row in merged if row is not None], meta=meta)
+    page_rows = [row for row in merged if row is not None]
+    # The candidate status every screen shows (services/candidate_status.py).
+    from services.candidate_status import attach_to_rows
+    attach_to_rows(db, page_rows)
+    # How long the candidate has been waiting on whoever holds them (30 Sep
+    # 2026): days since the last thing that happened to the candidacy — the
+    # same activity clock that orders the list — else since they applied.
+    # Manual Archive (30 Sep 2026): a closed candidacy offers RMG / GM an
+    # Archive button (`archivable`); an archived one offers Restore.
+    from services.candidate_profiles import REJECTED_BUCKET as _CLOSED
+    archived_set = set(archived_ids)
+    for row in page_rows:
+        row.update(waiting_since(activity.get(row.get("candidate_id")),
+                                 row.get("received_date") or row.get("created_at")))
+        pid = row.get("profile_id")
+        stage = row.get("profile_pipeline_status")
+        row["archived"] = bool(pid and pid in archived_set)
+        row["archivable"] = bool(pid and stage in _CLOSED and not row["archived"])
+    return envelope(page_rows, meta=meta)
+
+
+def _narrow_to_profiles(stmt, profile_ids: set[int]):
+    """Resume rows whose candidate holds one of these profiles on the deal."""
+    return stmt.where(Resume.candidate_id.in_(
+        select(CandidateProfile.candidate_id).where(
+            CandidateProfile.id.in_(sorted(profile_ids) or [-1]))))
+
+
+def waiting_since(last_activity: datetime | None, fallback) -> dict:
+    """`{"waiting_since": ISO, "waiting_days": int}` — PURE.
+
+    `fallback` is the apply / upload time (an ISO string or datetime) used
+    when the candidacy has no activity yet. Never negative.
+    """
+    at = last_activity
+    if at is None and fallback:
+        try:
+            at = fallback if isinstance(fallback, datetime) else datetime.fromisoformat(str(fallback))
+        except ValueError:
+            at = None
+    if at is None:
+        return {"waiting_since": None, "waiting_days": None}
+    now = datetime.now(timezone.utc) if at.tzinfo else datetime.utcnow()
+    days = max(0, (now - at).days)
+    return {"waiting_since": at.isoformat(), "waiting_days": days}
+
+
+def _first_set(*values):
+    """The first value that is not None (0 is a real CTC)."""
+    return next((v for v in values if v is not None), None)
 
 
 def _naive_utc(dt: datetime | None) -> datetime:
@@ -1087,26 +1180,54 @@ def _naive_utc(dt: datetime | None) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
-def _paginate_merged(db: Session, stmt, extra: list[dict], page: int, limit: int):
-    """Page over resumes + profile-only rows as ONE newest-first list.
+def _last_activity_by_candidate(db: Session, opportunity_id: int) -> dict[int, datetime]:
+    """{candidate id: the latest activity on their profile for this opportunity}
+    — ONE grouped query. Anything that happened to a candidate (RMG shortlisted,
+    chose the manual L1, recorded a verdict) moves their row to the top of
+    Applied Candidates, so TA's next move is the first thing on the list
+    (28 Sep 2026, user ask). Best-effort: no activity = the upload time."""
+    try:
+        rows = db.execute(
+            select(CandidateProfile.candidate_id, sa.func.max(CandidateProfileActivityLog.timestamp))
+            .join(CandidateProfileActivityLog, CandidateProfileActivityLog.profile_id == CandidateProfile.id)
+            .where(CandidateProfile.opportunity_id == opportunity_id)
+            .group_by(CandidateProfile.candidate_id)
+        ).all()
+    except Exception:  # pragma: no cover — ordering must never break the list
+        logger.warning("activity ordering failed for opportunity %s", opportunity_id, exc_info=True)
+        return {}
+    return {cid: ts for cid, ts in rows if cid and ts}
+
+
+def _paginate_merged(db: Session, stmt, extra: list[dict], page: int, limit: int,
+                     activity: dict[int, datetime] | None = None):
+    """Page over resumes + profile-only rows as ONE list, most recently
+    ACTIVE first — a row's key is the later of its upload / apply time and the
+    last activity on its candidate's profile (`_last_activity_by_candidate`).
 
     Returns (resume objects on this page, profile-only rows on this page, the
     page's ("r"|"p", key) order, meta) — the order comes back with the data
     rather than living in module state, so concurrent requests can't cross.
 
-    Only the id + timestamp of every matching resume is read to build the
+    Only the id + timestamps of every matching resume are read to build the
     ordering; the full rows (and their AI enrichment) are loaded for the page
     alone, so the extra query stays cheap on a requirement with many CVs.
     """
-    if not extra:
+    activity = activity or {}
+    if not extra and not activity:
         items, meta = paginate(db, stmt, page, limit)
         return items, [], [("r", r.id) for r in items], meta
 
+    def key(at, candidate_id):
+        return max(_naive_utc(at), _naive_utc(activity.get(candidate_id)))
+
     keys = db.execute(
-        stmt.with_only_columns(Resume.id, Resume.created_at, maintain_column_froms=True)
+        stmt.with_only_columns(Resume.id, Resume.created_at, Resume.candidate_id,
+                               maintain_column_froms=True)
     ).all()
-    ordered = [("r", rid, _naive_utc(created)) for rid, created in keys]
-    ordered += [("p", row["id"], _naive_utc(row.pop("_sort_at", None))) for row in extra]
+    ordered = [("r", rid, key(created, cid)) for rid, created, cid in keys]
+    ordered += [("p", row["id"], key(row.pop("_sort_at", None), row.get("candidate_id")))
+                for row in extra]
     # id descending as the tiebreaker, so rows created in the same second (a
     # bulk ZIP) keep a stable, newest-first order instead of shuffling per page.
     ordered.sort(key=lambda t: (t[2], abs(t[1])), reverse=True)
@@ -1131,26 +1252,28 @@ def _paginate_merged(db: Session, stmt, extra: list[dict], page: int, limit: int
 
 def _profile_only_applied_rows(db: Session, req, *, search: str | None,
                                applied_by: str | None,
-                               stages: list | None = None,
                                dismissed: bool = False,
                                applied_from: date | None = None,
-                               applied_to: date | None = None) -> list[dict]:
-    """RMG-shortlisted profiles on this opportunity that have no resume row.
+                               applied_to: date | None = None,
+                               profile_ids: set[int] | None = None) -> list[dict]:
+    """Every applied profile on this opportunity that has no resume row.
 
-    Filtered by the same search / applied-by / stage the caller asked for, and
-    empty when the caller wants dismissed CVs only (a profile-only row is not
-    a CV and can never have been dismissed).
+    EVERY one, whatever the screening state (28 Sep 2026, user request: "all
+    applied candidates come into Applied Candidates" — the TA's separate
+    Applicants tab is gone). It used to be RMG-shortlisted ones only. Hidden
+    profiles stay out, as they do on every list. Filtered by the same search /
+    applied-by / stage the caller asked for, and empty when the caller wants
+    dismissed CVs only (a profile-only row is not a CV).
     """
     if dismissed:
         return []
-    from services.candidate_profiles import RMG_SCREENING_SHORTLISTED
     try:
         rows = db.execute(
             select(CandidateProfile, Candidate)
             .join(Candidate, Candidate.id == CandidateProfile.candidate_id)
             .where(
                 CandidateProfile.opportunity_id == req.opportunity_id,
-                CandidateProfile.rmg_screening_status == RMG_SCREENING_SHORTLISTED,
+                CandidateProfile.is_hidden.is_(False),
                 ~CandidateProfile.candidate_id.in_(
                     select(Resume.candidate_id).where(
                         Resume.requirement_id == req.id,
@@ -1194,10 +1317,6 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
 
     needle = (search or "").strip().lower()
     want_ta = (applied_by or "").strip()
-    # Stage pills apply here too — filtered in Python, and AFTER the heal above,
-    # so a candidate the heal just moved to RMG Review answers the pill the
-    # recruiter is actually looking at.
-    want_stages = {getattr(s, "value", s) for s in (stages or [])}
     out: list[dict] = []
     for profile, cand in rows:
         name = " ".join(p for p in [cand.first_name, cand.last_name] if p) or f"Candidate #{cand.id}"
@@ -1212,8 +1331,8 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
             continue
         if applied_to and (applied_day is None or applied_day > applied_to):
             continue
-        here = getattr(profile.pipeline_status, "value", profile.pipeline_status)
-        if want_stages and here not in want_stages:
+        # The stage pill (`phase`) was resolved by the caller into profile ids.
+        if profile_ids is not None and profile.id not in profile_ids:
             continue
         out.append({
             # Sort key for the merged page — popped before the row is returned.
@@ -1239,6 +1358,7 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
             "rmg_screening_status": profile.rmg_screening_status,
             "profile_pipeline_status": getattr(profile.pipeline_status, "value", profile.pipeline_status),
             "budget_status": getattr(profile, "budget_status", None),
+            **budget_fit(_first_set(profile.expected_ctc, cand.expected_ctc), req.budget_ctc_max),
             "received_date": profile.applied_on.isoformat() if profile.applied_on else None,
             "created_at": profile.created_at.isoformat() if profile.created_at else None,
             **ai_by_profile.get(profile.id, {}),
@@ -1258,8 +1378,7 @@ def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]
     if not profile_ids:
         return {}
     try:
-        import os
-        from models import AiInterviewLink, CandidateProfileActivityLog, InterviewEvent
+        from models import AiInterviewLink
         from models.ai_links import hr_decision_label
 
         latest: dict[int, AiInterviewLink] = {}
@@ -1310,10 +1429,7 @@ def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]
                     "ai_effective_result": link.effective_result,
                     "ai_is_overridden": bool(link.hr_decision) and link.effective_result != link.result,
                     "ai_interview_record_id": link.interview_record_id,
-                    "ai_report_link": (
-                        f"/admin?view=candidateReport&cid={email}&iid={link.interview_record_id}"
-                        if link.interview_record_id and email else None
-                    ),
+                    "ai_report_link": ai_report_link(email, link.interview_record_id),
                     "ai_interview_scheduled_at": (
                         local_stamp_to_iso((scheds.get(link.invite_token or "") or {}).get("scheduled_at_local"))
                         or (link.created_at.isoformat() if link.created_at else None)),
@@ -1344,6 +1460,9 @@ class ResumeUpdateIn(BaseModel):
     current_ctc: str | None = Field(default=None, max_length=40)
     expected_ctc: str | None = Field(default=None, max_length=40)
     preferred_location: str | None = Field(default=None, max_length=120)
+    #: Where the candidate lives today (30 Sep 2026, the redesigned Edit
+    #: applicant dialog) — the same detail key the upload form writes.
+    current_location: str | None = Field(default=None, max_length=120)
     current_company: str | None = Field(default=None, max_length=160)
     designation: str | None = Field(default=None, max_length=160)
     linkedin_url: str | None = Field(default=None, max_length=255)
@@ -1351,7 +1470,7 @@ class ResumeUpdateIn(BaseModel):
     summary: str | None = Field(default=None, max_length=500)
 
 _DETAIL_KEYS = ("education", "technical_domain", "skills", "notice_period",
-                "current_ctc", "expected_ctc", "preferred_location",
+                "current_ctc", "expected_ctc", "preferred_location", "current_location",
                 "current_company", "designation", "linkedin_url",
                 "certifications", "summary")
 
@@ -1429,7 +1548,6 @@ def delete_resume(
 @router.post("/api/resumes/{resume_id}/ats-scan")
 def ats_scan(
     resume_id: int,
-    request: Request,
     db: Session = Depends(get_crm_db),
     # RMG runs the same deterministic scan while screening (25 Aug 2026): the
     # score is shared — what differs between the roles is the decision.
@@ -1438,63 +1556,9 @@ def ats_scan(
     resume = _get_resume_or_404(db, resume_id)
     req = get_requirement_or_404(db, resume.requirement_id)
     result = run_ats_scan(db, resume, req, user.id)
-    # Auto-threshold pipeline (auto-shortlist + slot invite) — never raises.
-    auto = auto_pipeline_after_scan(db, resume, req, user.id, _base_url(request))
     db.commit()
     db.refresh(resume)
-    data = serialize_resume(resume)
-    data["auto_shortlisted"] = bool(auto.get("auto_shortlisted"))
-    data["slot_invite_sent"] = bool(auto.get("slot_invite_sent"))
-    data["auto_action"] = auto
-    return envelope(data, message=f"ATS scan complete: {result['ats_score']}/100")
-
-
-def ensure_resume_for_profile(db: Session, profile: CandidateProfile, req) -> Resume:
-    """The Resume row a profile-only applicant needs before anything CV-shaped
-    can happen to them — built from the CV on the candidate's own record.
-
-    A candidate applied from the Candidates page (or "Apply to Opportunity")
-    has a profile but no `resumes` row, so ATS, slot invites and the AI L1
-    all had nothing to work on (user report, 2 Sep 2026). Once this row
-    exists the applicant is an ordinary resume row everywhere. Idempotent:
-    an existing (requirement, candidate) row is reused, never duplicated.
-    """
-    existing = db.execute(
-        select(Resume).where(Resume.requirement_id == req.id,
-                             Resume.candidate_id == profile.candidate_id)
-        .order_by(Resume.id.desc())
-    ).scalars().first()
-    if existing is not None:
-        return existing
-    cand = db.get(Candidate, profile.candidate_id)
-    if cand is None:
-        raise HTTPException(status_code=404, detail="Candidate not found")
-    if not (cand.cv_url or "").strip():
-        raise HTTPException(
-            status_code=422,
-            detail="No CV on file for this candidate — upload one on their record "
-                   "(Candidates → their profile → CV), then run the ATS scan.")
-    resume = Resume(
-        requirement_id=req.id,
-        candidate_id=cand.id,
-        candidate_name=(" ".join(p for p in (cand.first_name, cand.last_name) if p)
-                        or f"Candidate #{cand.id}")[:255],
-        email=cand.email,
-        phone=cand.phone,
-        source_portal=(profile.source or "app")[:64],
-        applicant_experience=(str(cand.experience_years)
-                              if cand.experience_years is not None else None),
-        resume_file_url=cand.cv_url,
-    )
-    # Stamp the application date the profile carries, not today — the row is
-    # catching up with an application that already happened. Left unset (so
-    # the column's server default applies) when the profile has no date.
-    applied = profile.applied_on or profile.created_at
-    if applied is not None:
-        resume.received_date = applied.date()
-    db.add(resume)
-    db.flush()
-    return resume
+    return envelope(serialize_resume(resume), message=f"ATS scan complete: {result['ats_score']}/100")
 
 
 def _requirement_for_profile(db: Session, profile, requirement_id: int | None):
@@ -1520,7 +1584,6 @@ def _requirement_for_profile(db: Session, profile, requirement_id: int | None):
 @router.post("/api/candidate-profiles/{profile_id}/ats-scan")
 def ats_scan_profile(
     profile_id: int,
-    request: Request,
     requirement_id: int | None = None,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
@@ -1528,8 +1591,8 @@ def ats_scan_profile(
     """ATS-scan a profile-only applicant against a requirement (TA or RMG).
 
     Materialises the resume row from the candidate's CV first, then runs the
-    same scan as `POST /api/resumes/{id}/ats-scan` — same score, same
-    auto-threshold pipeline. The row comes back as a normal resume row, so the
+    same scan as `POST /api/resumes/{id}/ats-scan` — the score only; nothing is
+    sent to the candidate (29 Sep 2026: candidate mail is TA's call). The row comes back as a normal resume row, so the
     Applied Candidates tab shows every standard action from the next load.
     """
     from services.candidate_profiles import get_profile_or_404
@@ -1537,25 +1600,18 @@ def ats_scan_profile(
     req = _requirement_for_profile(db, profile, requirement_id)
     resume = ensure_resume_for_profile(db, profile, req)
     result = run_ats_scan(db, resume, req, user.id)
-    auto = auto_pipeline_after_scan(db, resume, req, user.id, _base_url(request))
     db.commit()
     db.refresh(resume)
-    data = serialize_resume(resume)
-    data["auto_shortlisted"] = bool(auto.get("auto_shortlisted"))
-    data["slot_invite_sent"] = bool(auto.get("slot_invite_sent"))
-    data["auto_action"] = auto
-    return envelope(data, message=f"ATS scan complete: {result['ats_score']}/100")
+    return envelope(serialize_resume(resume), message=f"ATS scan complete: {result['ats_score']}/100")
 
 
 @router.post("/api/requirements/{requirement_id}/resumes/scan-all")
 def scan_all_resumes(
     requirement_id: int,
-    request: Request,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
 ):
     req = get_requirement_or_404(db, requirement_id)
-    base_url = _base_url(request)
     pending = db.execute(
         select(Resume)
         .where(Resume.requirement_id == req.id, Resume.ats_status == AtsStatus.PENDING_SCAN)
@@ -1566,14 +1622,10 @@ def scan_all_resumes(
     for resume in pending:
         try:
             outcome = run_ats_scan(db, resume, req, user.id)
-            # Auto-threshold pipeline (auto-shortlist + slot invite) — never raises.
-            auto = auto_pipeline_after_scan(db, resume, req, user.id, base_url)
             scored += 1
             results.append(ResumeScanResult(
                 resume_id=resume.id, candidate_name=resume.candidate_name,
                 status="Scored", ats_score=outcome["ats_score"],
-                auto_shortlisted=bool(auto.get("auto_shortlisted")),
-                slot_invite_sent=bool(auto.get("slot_invite_sent")),
             ).model_dump())
         except HTTPException as exc:
             failed += 1

@@ -85,11 +85,11 @@ class CustomerSlotIn(BaseModel):
 class CustomerRoundScheduleIn(BaseModel):
     """The customer's slot(s), entered by Sales while moving the stage (2 Sep
     2026): the customer tells Sales the time(s) and sends the meeting link;
-    Sales records them here and TA is told, so the same round shows for both
-    without a second form. Simplified 7 Sep 2026 (user request): the form asks
-    only for slots + links — panel and duration are optional extras. The FIRST
-    slot is the primary one on the round; the rest are recorded as alternatives
-    in the round's note and in the candidate's invite."""
+    Sales records them here and TA is told. Simplified 7 Sep 2026 (user
+    request): the form asks only for slots + links — panel and duration are
+    optional extras. Since 29 Sep 2026 NOTHING is booked from them: TA gets the
+    slots, confirms the candidate's availability and schedules the round
+    (routers/crm/candidate_profiles._propose_customer_slots)."""
     scheduled_at: str | None = Field(default=None, max_length=64)   # legacy single-slot shape
     interviewer: str | None = Field(default=None, max_length=200)
     meeting_link: str | None = Field(default=None, max_length=1024)

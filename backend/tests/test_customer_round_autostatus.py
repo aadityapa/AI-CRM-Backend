@@ -148,26 +148,58 @@ def test_transition_recorder_reuses_the_form_row(db):
                           created_by=1, kind="Customer_L2", interview_category="External",
                           status="Completed", result="Strong Hire", feedback="Final selected"))
     db.flush()
-    # Then the profile moves to L2 Feedback with a closing note.
+    # Then Sales closes the ladder from L2 Feedback with the customer's verdict.
     _record_customer_round_from_transition(
-        db, profile, PS.L1_FEEDBACK.value, PS.L2_FEEDBACK.value, "Customer confirmed", USER)
+        db, profile, PS.L2_FEEDBACK.value, PS.SHORTLISTED.value, "Customer confirmed", USER)
     rows = _rounds(db, profile)
     assert len(rows) == 1, "the transition must update the existing round, not add a second"
     assert "Final selected" in (rows[0].feedback or "")
     assert "Customer confirmed" in (rows[0].feedback or "")
 
 
-def test_transition_creates_the_round_with_its_own_kind(db):
-    """No form row yet → the recorder creates ONE row under the round's kind,
-    so the next form save finds it instead of adding a twin."""
+def test_moving_on_to_a_customer_round_writes_no_round(db):
+    """29 Sep 2026 (user report): the move to "Customer L2 Interview" wrote a
+    Completed Customer L2 row with no time and no verdict — it read as
+    "Scheduled · Time not set" and hid TA's Schedule button. The move lines
+    the round UP; TA books it and the verdict is recorded on the round."""
+    from services.candidate_profiles import comment_required_for
     profile = _profile(db, PS.CUSTOMER_INTERVIEW)
-    _record_customer_round_from_transition(
-        db, profile, PS.CUSTOMER_INTERVIEW.value, PS.L2_FEEDBACK.value, "Customer said yes", USER)
-    rows = _rounds(db, profile)
-    assert len(rows) == 1
-    assert rows[0].kind == "Customer_L2"
-    assert rows[0].stage == "L2"
+    for prev, new in ((PS.CUSTOMER_INTERVIEW.value, PS.L1_FEEDBACK.value),
+                      (PS.L1_FEEDBACK.value, PS.L2_FEEDBACK.value)):
+        _record_customer_round_from_transition(db, profile, prev, new, "move to L2", USER)
+        assert comment_required_for(prev, new) is False
+    assert _rounds(db, profile) == []
+    # Closing the ladder still needs the customer's verdict.
+    assert comment_required_for(PS.L2_FEEDBACK.value, PS.SHORTLISTED.value) is True
 
+
+
+def test_migration_0113_removes_only_the_placeholders(db):
+    """0113 deletes the rows the move used to write (no time, link, panel or
+    verdict) and keeps their text on the activity log; real rounds stay."""
+    import importlib.util
+    import pathlib
+    from models import CandidateProfileActivityLog
+    path = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions" / \
+        "0113_remove_placeholder_customer_rounds.py"
+    spec = importlib.util.spec_from_file_location("m0113", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    profile = _profile(db, PS.L2_FEEDBACK)
+    common = dict(profile_id=profile.id, candidate_id=profile.candidate_id, created_by=1,
+                  interview_category="External", user_role="Customer")
+    db.add(InterviewEvent(kind="Customer_L2", status="Completed", feedback="move to L2", **common))
+    db.add(InterviewEvent(kind="Customer_Interview", status="Completed", result="Hire", **common))
+    db.add(InterviewEvent(kind="Customer_L2", status="Completed", raw_when="tomorrow 3pm", **common))
+    db.flush()
+    mod.op = SimpleNamespace(get_bind=lambda: db.connection())
+    mod.upgrade()
+    rows = _rounds(db, profile)
+    assert len(rows) == 2 and all(r.result or r.raw_when for r in rows)
+    notes = db.execute(select(CandidateProfileActivityLog.comment).where(
+        CandidateProfileActivityLog.profile_id == profile.id,
+        CandidateProfileActivityLog.action_type == "CUSTOMER_NOTE")).scalars().all()
+    assert notes == ["Note on the move to the Customer L2 round: move to L2"]
 
 # --------------------------------------------------------------------------
 # AI L1 is OPTIONAL: RMG can take a candidate straight to review (28 Aug 2026)

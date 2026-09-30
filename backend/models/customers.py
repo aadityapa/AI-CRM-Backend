@@ -4,6 +4,7 @@ from __future__ import annotations
 import enum
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from models.base import Base, TimestampMixin, pg_enum
@@ -162,6 +163,12 @@ class CustomerBillingPolicy(Base):
     #: NULL = the default company account.
     bank_account_id = sa.Column(sa.Integer, sa.ForeignKey("company_bank_accounts.id",
                                                           ondelete="SET NULL"), nullable=True)
+    #: Client-specific invoice format (0107, 23 Sep 2026): which optional
+    #: service-table columns this customer's invoices print —
+    #: {"sac": bool, "leave": bool, "per_day": bool}. NULL = all columns.
+    #: The GM confirms it on every Proforma; the confirmed choice is saved here
+    #: so next month is pre-filled. See services/invoice_format.py.
+    invoice_format = sa.Column(JSONB, nullable=True)
 
     customer = relationship("Customer", back_populates="billing_policy")
 

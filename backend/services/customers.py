@@ -13,6 +13,7 @@ from models import (
     CustomerDocument,
     DocumentType,
 )
+from services.invoice_format import normalize_invoice_format
 
 
 def _ev(value):
@@ -234,6 +235,8 @@ def serialize_policy(policy: CustomerBillingPolicy | None) -> dict | None:
         "operation": getattr(policy, "operation", None),
         # Karnex bank account printed on this customer's invoices (0098).
         "bank_account_id": getattr(policy, "bank_account_id", None),
+        # Client-specific invoice columns (0107) — what the GM's Proforma dialog pre-fills.
+        "invoice_format": normalize_invoice_format(getattr(policy, "invoice_format", None)),
     }
 
 

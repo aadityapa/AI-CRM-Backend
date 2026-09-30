@@ -47,9 +47,13 @@ from schemas.opportunities import (
     StageTransitionIn,
 )
 from services.crm_common import log_activity, next_sequence_number, paginate
-from services.notify import notify_role, notify_user
+from services.notify import notify_role, notify_roles, notify_user
 from services.opportunity_ctc import derive_ctc_row, normalize_tm_billing_details
+from services.requirements import positions_by_opportunity
 from services.opportunities import (
+    STAGE_HOLDS_REQUIREMENT,
+    STAGE_RESUMES_REQUIREMENT,
+    cascade_stage_to_requirements,
     fetch_activity_log,
     get_opportunity_or_404,
     replace_skills,
@@ -131,10 +135,10 @@ def _spawn_requirement_from_opportunity(db: Session, opp: Opportunity, approver:
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, approver.id,
                  "CREATED",
                  f"Requirement for {opp.opp_id} auto-created from the approved opportunity; "
-                 f"pending engineering review")
+                 f"pending RMG review")
     notify_role(db, "RMG",
-                f"Requirement {opp.opp_id} pending engineering review",
-                f"'{req.title}' (from opportunity {opp.opp_id}) needs engineering review.",
+                f"Requirement {opp.opp_id} pending RMG review",
+                f"'{req.title}' (from opportunity {opp.opp_id}) needs RMG review.",
                 f"/requirements/{req.id}", exclude_user_id=approver.id,
                 event="opportunity.approved", actor=approver)
     return req
@@ -160,6 +164,10 @@ def list_opportunities(
     rfi_max: float | None = None,
     created_from: date | None = None,
     created_to: date | None = None,
+    #: Only deals open for applications (29 Sep 2026): a live stage AND a
+    #: requirement in sourcing. The Apply-to-Opportunity picker sends it; a
+    #: recruiter-only TA is ALWAYS given this list there — see create_profile.
+    sourcing: bool = False,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(read_opportunities),
@@ -167,6 +175,9 @@ def list_opportunities(
     # Outer join so an opportunity without a customer row still lists; the
     # join exists for sorting/filtering by customer name.
     stmt = select(Opportunity).outerjoin(Customer, Customer.id == Opportunity.customer_id)
+    if sourcing:
+        from services.requirements import sourcing_opportunity_clause
+        stmt = stmt.where(sourcing_opportunity_clause())
     if opp_id:
         stmt = stmt.where(Opportunity.opp_id.ilike(f"%{opp_id.strip()}%"))
     if title:
@@ -221,8 +232,15 @@ def list_opportunities(
     order_col = _SORTABLE.get(p.sort_by or "", Opportunity.id)
     stmt = stmt.order_by(order_col.asc() if p.sort_dir == "asc" else order_col.desc())
     items, meta = paginate(db, stmt, p.page, p.limit)
-    return envelope(data=[serialize_opportunity(db, o) for o in items],
-                    message="Opportunities fetched", meta=meta)
+    rows = [serialize_opportunity(db, o) for o in items]
+    # Positions (21 Sep 2026): how many heads this deal is hiring and how many
+    # are still open. Resolved for the WHOLE page in three queries — never one
+    # per row (see the N+1 note in CLAUDE.md §10 · 8.4). An opportunity with no
+    # requirement yet is simply absent, and the UI shows "—".
+    positions = positions_by_opportunity(db, [o.id for o in items])
+    for row in rows:
+        row.update(positions.get(row.get("id"), {}))
+    return envelope(data=rows, message="Opportunities fetched", meta=meta)
 
 
 def _opp_type_value(opp_type) -> str:
@@ -465,18 +483,23 @@ def suggested_candidates(
 ):
     """Database scan: who already fits this position?
 
-    Deterministic scoring over skills / experience band / pipeline history /
+    Deterministic scoring against the RMG JD + skills of the latest requirement
+    (else the opportunity's skills), the experience band, pipeline history and
     contactability — see services/candidate_match.py for the exact weights.
     Candidates already applied here are excluded; ones currently
     Joined/Preboarding elsewhere come back flagged ``engaged``.
     """
-    from services.candidate_match import suggest_candidates
+    from services.candidate_match import suggest_candidates, suggestion_basis
 
     opp = db.get(Opportunity, opportunity_id)
     if opp is None:
         raise HTTPException(status_code=404, detail="Opportunity not found")
-    return envelope(data=suggest_candidates(db, opp),
-                    message="Suggested candidates")
+    basis = suggestion_basis(db, opp)
+    rows = suggest_candidates(db, opp, basis)
+    # `meta.basis` tells the page WHAT it scored against (the RMG JD of REQ-x,
+    # its skills, the band) — the internal skill map is not part of the contract.
+    public_basis = {k: v for k, v in basis.items() if not k.startswith("_")}
+    return envelope(data=rows, message="Suggested candidates", meta={"basis": public_basis})
 
 
 class EmailCandidatesIn(BaseModel):
@@ -709,7 +732,11 @@ def get_opportunity(
     user: CurrentUser = Depends(read_opportunities),
 ):
     opp = get_opportunity_or_404(db, opportunity_id)
-    return envelope(data=serialize_opportunity(db, opp, detail=True), message="Opportunity fetched")
+    data = serialize_opportunity(db, opp, detail=True)
+    # Headcount of the spawned requirement (21 Sep 2026) — Sales works on THIS
+    # page, so the positions panel and its RMG approval live here too.
+    data.update(positions_by_opportunity(db, [opp.id]).get(opp.id, {}))
+    return envelope(data=data, message="Opportunity fetched")
 
 
 @router.put("/{opportunity_id}")
@@ -889,7 +916,9 @@ def approve_opportunity(
     opportunity_id: int,
     payload: CommentIn | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("opportunities", "Sales_Head")),
+    # An approval button: Opportunities: Edit (every Sales user has it) never
+    # implied the Sales Head decision. Access Template ▸ Approvals decides.
+    user: CurrentUser = Depends(gated_write_action("opportunity.approve", "opportunities")),
 ):
     opp = get_opportunity_or_404(db, opportunity_id)
     _require_approval_status(opp, (OpportunityApprovalStatus.PENDING_SALES_HEAD_APPROVAL,), "approve")
@@ -918,7 +947,7 @@ def approve_opportunity(
     if opp.created_by != user.id:
         notify_user(db, opp.created_by,
                     f"Opportunity {opp.opp_id} approved",
-                    "Approved by Sales Head; sent to engineering review."
+                    "Approved by Sales Head; sent to RMG review."
                     if spawned else "Approved by Sales Head.",
                     f"/opportunities/{opp.id}", actor=user)
     db.commit()
@@ -931,7 +960,7 @@ def reject_opportunity(
     opportunity_id: int,
     payload: RejectIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("opportunities", "Sales_Head")),
+    user: CurrentUser = Depends(gated_write_action("opportunity.approve", "opportunities")),
 ):
     try:
         reason = payload.validated_reason()
@@ -1000,6 +1029,63 @@ def _set_profiles_hidden(db: Session, opportunity_id: int, hidden: bool) -> int:
     return len(rows)
 
 
+#: What each stage change is called in a subject line, and which event routes
+#: it. Three events rather than one so an admin can mute "reactivated" without
+#: losing "closed" (routers/crm/email_flows.py owns the wording).
+_STAGE_EVENTS = {
+    "closed": ("opportunity.stage_closed", "closed"),
+    "held": ("opportunity.stage_held", "put on hold"),
+    "reactivated": ("opportunity.stage_reactivated", "reactivated"),
+}
+
+
+def _stage_event_kind(new_stage: str) -> str | None:
+    """Which of the three notifiable things just happened, or None."""
+    if new_stage in _CLOSED_STAGES:
+        return "closed"
+    if new_stage in STAGE_HOLDS_REQUIREMENT:
+        return "held"
+    if new_stage == STAGE_RESUMES_REQUIREMENT:
+        return "reactivated"
+    return None
+
+
+def _notify_stage_change(db: Session, opp, old_stage: str, new_stage: str,
+                         moved: list[dict], user: CurrentUser, reason: str) -> None:
+    """Tell everyone downstream that the deal moved.
+
+    TA and RMG are the ones who would otherwise keep sourcing a dead
+    requirement; Sales_Head, Admin and CEO get it for oversight (user decision,
+    22 Sep 2026). The actor is excluded — nobody needs a mail about their own
+    click. Dedupe is per (opportunity, stage) so a double-submit cannot double-
+    mail, while a genuine later move to a DIFFERENT stage still sends.
+    """
+    kind = _stage_event_kind(new_stage)
+    if not kind:
+        return
+    event, verb = _STAGE_EVENTS[kind]
+    label = opp.opp_id or f"#{opp.id}"
+    stage_text = new_stage.replace("_", " ")
+    body = (f"'{opp.title}' ({label}) was {verb} by "
+            f"{user.full_name or user.username} — {old_stage.replace('_', ' ')} → {stage_text}.")
+    if reason:
+        body += f" Reason: {reason}"
+    if moved:
+        listing = "; ".join(f"{m['title']} → {m['to'].replace('_', ' ')}" for m in moved)
+        if kind == "reactivated":
+            body += f"\n\nSourcing is live again: {listing}."
+        else:
+            body += (f"\n\nSourcing has been updated: {listing}. "
+                     "Please stop work on these unless the deal is reactivated.")
+    notify_roles(db, ["TA", "RMG", "Sales_Head", "Admin", "CEO"],
+                 f"Opportunity {verb}: {opp.title} ({label})",
+                 body,
+                 f"/admin/?view=crm&p=opportunities/{opp.id}",
+                 event=event, actor=user, exclude_user_id=user.id,
+                 dedupe_prefix=f"opp_stage:{opp.id}:{new_stage}",
+                 related_type="opportunity", related_id=opp.id)
+
+
 @router.post("/{opportunity_id}/stage-transition")
 def stage_transition(
     opportunity_id: int,
@@ -1025,12 +1111,23 @@ def stage_transition(
     hidden = _set_profiles_hidden(db, opp.id, new_stage in _CLOSED_STAGES)
     if hidden:
         comment += f" | {hidden} candidate profile(s) {'hidden' if new_stage in _CLOSED_STAGES else 'restored'}"
+    # The requirement is what TA actually works from, so it has to follow the
+    # stage (22 Sep 2026). Hiding the profiles alone left a closed deal sitting
+    # live in TA's queue — see services/opportunities.py for the mapping.
+    moved = cascade_stage_to_requirements(db, opp, new_stage, user.id,
+                                          (payload.comment or "").strip())
+    for m in moved:
+        comment += f" | sourcing {m['from'].replace('_', ' ')} → {m['to'].replace('_', ' ')}"
     log_activity(db, OpportunityActivityLog, "opportunity_id", opp.id, user.id,
                  "Stage_Transition", comment)
+    _notify_stage_change(db, opp, old_stage, new_stage, moved, user,
+                         (payload.comment or "").strip())
     db.commit()
     db.refresh(opp)
-    return envelope(data=serialize_opportunity(db, opp, detail=True),
-                    message=f"Opportunity moved to {new_stage}")
+    note = f"Opportunity moved to {new_stage.replace('_', ' ')}"
+    if moved:
+        note += f" — {len(moved)} requirement(s) updated, TA and RMG notified"
+    return envelope(data=serialize_opportunity(db, opp, detail=True), message=note)
 
 
 # ---------------------------------------------------------------------------

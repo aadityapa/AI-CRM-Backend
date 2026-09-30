@@ -45,8 +45,14 @@ TABLE_REGISTRY: dict[str, dict] = {
     "candidate_profiles": {
         "columns": [
             "candidate_name", "email", "phone", "experience_years", "notice_period",
-            "technical_domain", "opportunity", "customer", "pipeline_status", "stage",
-            "ai_interview",
+            # "stage" (the Zoho import's RMG/Sales/HR text) was removed on
+            # 25 Sep 2026: the Status column now says where the candidate is.
+            "technical_domain", "opportunity", "customer", "phase", "pipeline_status",
+            "next_interview", "ai_interview", "ats_score",
+            # One column per round (29 Sep 2026): verdict · date & time · panel ·
+            # feedback — services/candidate_profiles.ROUND_COLUMNS.
+            "round_tech_l1", "round_tech_l2", "round_tech_l3", "round_cust_l1", "round_cust_l2",
+            "round_hr",
             "current_ctc", "expected_ctc", "hike_percent", "approved_ctc_budget",
             "interview_round", "interview_status",
             "interview_datetime", "resume_url", "resignation_certificate_url",
@@ -59,13 +65,26 @@ TABLE_REGISTRY: dict[str, dict] = {
             # The directory sorts by AI score by default — see _LATEST_AI_SCORE
             # in routers/crm/candidate_profiles.py for how a per-session score
             # becomes a sortable per-profile value.
-            "ai_interview",
+            "ai_interview", "ats_score",
+            # Latest change first (29 Sep 2026) — the directory's default order.
+            "last_activity",
             "opportunity", "customer",
             "pipeline_status", "current_ctc", "expected_ctc", "hike_percent",
             "customer_submission_date", "customer_onboarding_date",
             "karnex_onboarding_date",
             "ta_owner_name", "applied_on", "created_at",
         ],
+        # Columns every user must SEE, even with a layout saved before they
+        # existed: column -> the key it is placed after. Everything else new
+        # arrives hidden at the end (see _clean). ATS Score (25 Sep 2026, user
+        # request: "an ATS Score field where everyone can see").
+        "announce": {"ats_score": "ai_interview",
+                     # The redesigned directory (29 Sep 2026): the stage, the
+                     # next interview and the round ladder arrive visible.
+                     "phase": "customer", "next_interview": "pipeline_status",
+                     "round_tech_l1": "ats_score", "round_tech_l2": "round_tech_l1",
+                     "round_cust_l1": "round_tech_l2", "round_cust_l2": "round_cust_l1",
+                     "round_hr": "round_cust_l2"},
     },
     # Requirement ▸ Applied Candidates (15 Sep 2026): the RMG asked for an
     # Excel-style column chooser so a wide list can be trimmed to what the
@@ -73,11 +92,17 @@ TABLE_REGISTRY: dict[str, dict] = {
     # the Actions column is always shown (the UI pins it).
     "requirement_resumes": {
         "columns": [
-            "candidate_name", "source_portal", "applied_by", "rmg_screening_status",
-            "profile_pipeline_status", "received_date", "ats_score", "ats_status",
+            "candidate_name", "applied_by",
+            "profile_stage", "profile_pipeline_status", "received_date", "ats_score",
             "ai_interview_status", "rounds", "_actions",
         ],
         "sortable": [],
+        # The separate "ATS Status" column was removed 28 Sep 2026 (user ask) —
+        # the score ring carries the scan state, and saved layouts drop it
+        # (`_clean`). "RMG Screening" and "Source" went the same way on 30 Sep
+        # 2026. Stage stays beside Status (user decision, 30 Sep 2026) and is
+        # announced so every saved layout shows it.
+        "announce": {"profile_stage": "applied_by"},
     },
 }
 #: How many sort levels a user may stack. Beyond this the query stops being
@@ -110,8 +135,16 @@ def _clean(config: dict, reg: dict) -> dict:
         if key in allowed and key not in seen:
             seen.add(key)
             columns.append({"key": key, "visible": bool(item.get("visible", True))})
-    # Anything the saved layout has not seen yet goes to the end, hidden, so a
-    # newly added column never rearranges a layout someone already tuned.
+    # An ANNOUNCED column the saved layout has never seen goes in visible,
+    # right after its anchor — the product decided everyone sees it. Once the
+    # user saves again it is part of their layout and theirs to hide.
+    for key, after in (reg.get("announce") or {}).items():
+        if key in allowed and key not in seen:
+            seen.add(key)
+            at = next((i + 1 for i, c in enumerate(columns) if c["key"] == after), len(columns))
+            columns.insert(at, {"key": key, "visible": True})
+    # Anything else the saved layout has not seen yet goes to the end, hidden,
+    # so a newly added column never rearranges a layout someone already tuned.
     for key in allowed:
         if key not in seen:
             columns.append({"key": key, "visible": False})

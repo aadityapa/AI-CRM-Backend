@@ -180,7 +180,9 @@ def test_resolve_entry_fields_derives_attendance_from_hours():
     _, is_working, hours, att, _, _ = resolve_entry_fields(
         d=hol, item=item, holiday_dates={hol},
     )
-    assert is_working is False and att == AttendanceStatus.HOLIDAY and hours == Decimal("0")
+    # 25 Sep 2026: hours WORKED on a holiday are kept (the day stays a Holiday);
+    # the billing ladder bills or credits them as comp-off.
+    assert is_working is False and att == AttendanceStatus.HOLIDAY and hours == Decimal("9")
 
 
 def test_upsert_entries_derives_attendance_from_hours(client):

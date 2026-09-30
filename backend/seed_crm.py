@@ -78,8 +78,6 @@ TDS_DEFAULT_RATE = os.getenv("TDS_RATE_PERCENT", "10")
 
 SETTINGS = [
     ("ai_interview_pass_threshold", "60", "AI L1 interview pass threshold (%) — Admin editable"),
-    ("ats_auto_threshold", "50", "Auto-shortlist + slot-invite when ATS score ≥ this % (Admin editable)"),
-    ("ats_auto_invite", "true", "Enable automatic slot-booking invite at the ATS threshold"),
 ]
 
 

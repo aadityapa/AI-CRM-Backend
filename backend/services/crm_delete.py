@@ -27,9 +27,7 @@ from models import (
     Invoice,
     LeaveApplication,
     OpportunityAttachment,
-    POProjectAllocation,
     ProjectEmployeeLeaveDetail,
-    PurchaseOrder,
     Requirement,
     SlotBooking,
     TemplateRequest,
@@ -37,7 +35,6 @@ from models import (
     TimesheetActivityLog,
     TimesheetStatus,
 )
-from services import tax
 
 
 def _ev(v) -> str:
@@ -80,21 +77,9 @@ def assert_invoice_cascade_ok(db: Session, invoice: Invoice) -> None:
 def cascade_delete_invoice(db: Session, invoice: Invoice) -> None:
     """Delete invoice + owned unpaid TDS; reverse PO consumption. No commit."""
     assert_invoice_cascade_ok(db, invoice)
-    if invoice.po_id is not None:
-        po = db.get(PurchaseOrder, invoice.po_id)
-        if po is not None:
-            tax.apply_po_consumption(po, -Decimal(str(invoice.grand_total)))
-            alloc = db.execute(
-                select(POProjectAllocation).where(
-                    POProjectAllocation.po_id == po.id,
-                    POProjectAllocation.project_id == invoice.project_id,
-                )
-            ).scalar_one_or_none()
-            if alloc is not None:
-                alloc.consumed_amount = max(
-                    Decimal(str(alloc.consumed_amount)) - Decimal(str(invoice.grand_total)),
-                    Decimal("0"),
-                )
+    # A Proforma never drew on its PO (0107) — there is nothing to give back.
+    from services.finance import release_invoice_from_po
+    release_invoice_from_po(db, invoice)
     # ORM cascade deletes owned unpaid TDS (payments already blocked above).
     db.delete(invoice)
 
@@ -131,21 +116,8 @@ def undo_invoice_admin(db: Session, invoice: Invoice) -> dict:
         "payments_amount": float(paid_total),
         "tds_paid_reversed": float(tds_paid),
     }
-    if invoice.po_id is not None:
-        po = db.get(PurchaseOrder, invoice.po_id)
-        if po is not None:
-            tax.apply_po_consumption(po, -Decimal(str(invoice.grand_total)))
-            alloc = db.execute(
-                select(POProjectAllocation).where(
-                    POProjectAllocation.po_id == po.id,
-                    POProjectAllocation.project_id == invoice.project_id,
-                )
-            ).scalar_one_or_none()
-            if alloc is not None:
-                alloc.consumed_amount = max(
-                    Decimal(str(alloc.consumed_amount)) - Decimal(str(invoice.grand_total)),
-                    Decimal("0"),
-                )
+    from services.finance import release_invoice_from_po
+    release_invoice_from_po(db, invoice)
     db.delete(invoice)  # lines, payments, TDS record + TDS payments cascade
     return summary
 

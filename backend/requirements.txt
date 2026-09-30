@@ -22,3 +22,8 @@ weasyprint
 #   https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#windows
 # Without GTK the Tax Invoice PDF falls back to ReportLab (same API contract).
 slowapi>=0.1.9
+
+# Session recordings + integrity snapshots in S3 (22 Sep 2026).
+# services/media_storage.py imports this lazily and falls back to local disk
+# when it is absent, so an existing deployment keeps working without it.
+boto3>=1.34.0

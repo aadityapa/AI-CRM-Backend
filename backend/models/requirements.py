@@ -142,3 +142,39 @@ class RequirementActivityLog(Base):
     timestamp = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 
     requirement = relationship("Requirement", back_populates="activity_log")
+
+
+class RequirementPositionRequest(Base):
+    """A requested change to a requirement's headcount (21 Sep 2026, user flow).
+
+    Positions are the sourcing target: `requirements.no_of_positions` is what
+    TA sources against and what `check_and_mark_fulfilled` measures Joined
+    candidates against. Sales does not get to move that number silently — RMG
+    owns delivery capacity, so a change is a REQUEST that RMG (or Admin/CEO)
+    approves, and every request, decision and before/after is kept here as the
+    headcount's audit trail. Mirrors `InvoiceRevision`'s shape deliberately.
+    """
+
+    __tablename__ = "requirement_position_requests"
+    id = sa.Column(sa.Integer, primary_key=True)
+    requirement_id = sa.Column(sa.Integer, sa.ForeignKey("requirements.id", ondelete="CASCADE"),
+                               nullable=False, index=True)
+    status = sa.Column(sa.String(16), nullable=False, server_default="Pending", index=True)
+    from_positions = sa.Column(sa.Integer, nullable=False)
+    to_positions = sa.Column(sa.Integer, nullable=False)
+    reason = sa.Column(sa.Text, nullable=False)
+    #: Status the requirement sat in when the change applied, and what it became
+    #: (an increase can reopen a Fulfilled requirement; a decrease can fulfil it).
+    status_before = sa.Column(sa.String(60), nullable=True)
+    status_after = sa.Column(sa.String(60), nullable=True)
+    #: Joined candidates at decision time — the floor a decrease may not cross.
+    joined_at_decision = sa.Column(sa.Integer, nullable=True)
+    requested_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True, index=True)
+    requested_by_name = sa.Column(sa.String(255), nullable=True)
+    requested_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    decided_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    decided_by_name = sa.Column(sa.String(255), nullable=True)
+    decided_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    decision_note = sa.Column(sa.Text, nullable=True)
+
+    requirement = relationship("Requirement")

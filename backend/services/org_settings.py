@@ -51,8 +51,16 @@ KEYS: dict[str, tuple[str, str]] = {
     "scheduler.recurring_invoices": ("", "true"),
     "scheduler.pe_leave_credit": ("", "true"),
     "scheduler.pe_leave_credit_lookback": ("", "12"),
+    # Closed projects: team moves to the bench after the last working day (25 Sep 2026).
+    "scheduler.project_closures": ("", "true"),
+    "scheduler.prompt_log_retention": ("", "true"),
+    "scheduler.interview_feedback_due": ("", "true"),
+    # CEO revenue close mail on the 1st (catches up until the 7th) — 18 Sep 2026.
+    "scheduler.revenue_month_close": ("", "true"),
     # Finance — an office move or a bank change must not be a code deploy.
     "finance.tds_rate_percent": ("TDS_RATE_PERCENT", "10"),
+    # AI spend (28 Sep 2026): OpenAI bills in USD; the CEO page prints rupees too.
+    "ai.usd_inr_rate": ("USD_INR_RATE", "84"),
     # Seller (company) block on the Tax Invoice. DB row -> INVOICE_* env -> default.
     "invoice.seller_name": ("INVOICE_SELLER_NAME", "KARNEX SOFTWARE SOLUTIONS PRIVATE LIMITED"),
     "invoice.seller_address_line1": (

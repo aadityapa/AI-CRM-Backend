@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+from config import APP_NAME
 from services.crm_common import CRM_UPLOAD_DIR
 
 
@@ -172,7 +173,7 @@ def generate_invoice_pdf(data: dict) -> str:
     story.append(Paragraph(str(data.get("payment_terms") or "As per agreement."), normal))
     story.append(Spacer(1, 18))
     story.append(Paragraph(
-        "This is a system-generated invoice from Karnex CRM.", small))
+        f"This is a system-generated invoice from {APP_NAME}.", small))
 
     doc.build(story)
     return f"/api/crm-files/invoices/{filename}"

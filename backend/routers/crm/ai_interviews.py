@@ -29,6 +29,7 @@ from services.ai_interview_bridge import (
 )
 from services.candidate_comms import interview_link_message, notify_candidate
 from services.crm_common import log_activity, to_dict
+from services.report_links import ai_report_link
 
 router = APIRouter(prefix="/api/candidate-profiles", tags=["CRM: AI Interviews"])
 
@@ -104,10 +105,7 @@ def _invite_url(invite_token: str, request=None) -> str:
 def _link_out(db: Session, link: AiInterviewLink, candidate: Candidate | None, request=None) -> dict:
     email = (candidate.email or "").lower() if candidate else ""
     data = to_dict(link)
-    data["report_link"] = (
-        f"/admin?view=candidateReport&cid={email}&iid={link.interview_record_id}"
-        if link.interview_record_id and email else None
-    )
+    data["report_link"] = ai_report_link(email, link.interview_record_id)
     data["pending"] = link.result == "Pending"
     # The recruiter's override, when they disagreed with the AI. `result` stays
     # the AI's own verdict so the UI can show both — "Selected (HR override)"
@@ -215,6 +213,44 @@ def list_ai_interviews(profile_id: int, request: Request, db: Session = Depends(
         meta={"pending_count": sum(1 for l in links if l.result == "Pending"),
               "page": 1, "limit": len(links) or 1, "total": len(links), "pages": 1},
     )
+
+
+def _interview_record(interview_record_id: str | None) -> dict | None:
+    """The legacy `interview_records` payload behind a link. Never raises."""
+    rid = str(interview_record_id or "").strip()
+    if not rid:
+        return None
+    try:
+        from auth_db import get_interview_record_payload
+        return get_interview_record_payload(_legacy_target(), rid) or None
+    except Exception:
+        return None
+
+
+@router.get("/{profile_id}/ai-interviews/{link_id}/summary")
+def ai_interview_summary(profile_id: int, link_id: int, db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(gated_read("profiles", *VIEW_ROLES))):
+    """Compact overview for the Interviews tab (23 Sep 2026).
+
+    Same gate as the list — anyone who can see the profile can read the
+    verdict without leaving it. ONE legacy read per call; the card fetches it
+    lazily, so a profile page never pays for reports it does not show.
+    """
+    from services.ai_interview_summary import summarize_interview_record
+
+    profile = _profile_or_404(db, profile_id)
+    link = _link_or_404(db, profile.id, link_id)
+    record = _interview_record(link.interview_record_id)
+    data = summarize_interview_record(record)
+    # The link row is the CRM's own truth for the headline; the record can lag
+    # it by a few seconds while the background upgrade runs.
+    if data.get("overall_score_percent") is None and link.overall_score_percent is not None:
+        data["overall_score_percent"] = float(link.overall_score_percent)
+    data["result"] = link.result
+    data["effective_result"] = link.effective_result
+    data["hr_decision_label"] = hr_decision_label(link.hr_decision)
+    data["level"] = link.level
+    return envelope(data=data)
 
 
 @router.post("/{profile_id}/ai-interviews")

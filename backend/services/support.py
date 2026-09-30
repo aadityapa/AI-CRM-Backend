@@ -24,6 +24,7 @@ import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from config import APP_NAME
 from models import SupportTicket, SupportTicketMessage, TicketPriority, TicketStatus, TICKET_CATEGORIES
 
 logger = logging.getLogger("karnex.support")
@@ -32,8 +33,8 @@ ADMIN_ROLES = ("Admin", "CEO")
 ESCALATE_MARK = "ESCALATE: yes"
 
 SUPPORT_SYSTEM_PROMPT = (
-    "You are the Karnex Help & Support assistant — the first line of support inside the "
-    "Karnex AI HR Suite (CRM + AI hiring). A colleague is describing a problem or asking how "
+    f"You are the {APP_NAME} Help & Support assistant — the first line of support inside "
+    f"{APP_NAME} (staffing CRM + AI hiring). A colleague is describing a problem or asking how "
     "to do something.\n"
     "1. Answer their SPECIFIC question directly, in plain language, in a few short sentences "
     "or a short numbered list of clicks. Ground every fact in the HELP CONTEXT; never invent "
@@ -158,7 +159,7 @@ def serialize_ticket(t: SupportTicket, *, with_thread: bool = False) -> dict:
 
 
 def _link(t: SupportTicket) -> str:
-    return f"/admin?view=crm&p=support-tickets/{t.id}"
+    return f"/admin/?view=crm&p=support-tickets/{t.id}"
 
 
 def _notify(db: Session, *, roles=(), user_ids=(), title: str, message: str, link: str,

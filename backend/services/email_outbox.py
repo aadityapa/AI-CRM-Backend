@@ -25,6 +25,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from models import EmailOutbox, EmailStatus
+from config import APP_NAME
 from services.recipients import Recipient, is_real_email
 
 logger = logging.getLogger("karnex.crm.email_outbox")
@@ -34,7 +35,9 @@ MAX_ATTEMPTS = 5
 #: Backoff per attempt, minutes: 1, 5, 15, 60, 240.
 _BACKOFF_MINUTES = (1, 5, 15, 60, 240)
 
-_DEFAULT_FROM_LABEL = "Karnex"
+#: The From display name: "Pavan Sanap (Karnex Orbit)" — the product, so a
+#: recipient knows which system mailed them (26 Sep 2026).
+_DEFAULT_FROM_LABEL = APP_NAME
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -193,6 +196,38 @@ def _apply_event_template(db: Session, event: str, *, subject: str,
         return subject, body_text
 
 
+#: The same message to the same address within this window is a repeat, not
+#: news (29 Sep 2026, user report: one candidate's "AI interview completed" and
+#: "AI L1 passed — review" each arrived twice, because the interview report is
+#: saved more than once and every save re-notified). Judged on the FINAL subject
+#: (after any admin template), so it catches every call site in the system.
+REPEAT_WINDOW_MINUTES = 30
+#: Messages that may legitimately repeat inside the window: a second password
+#: reset, a re-sent invite or interview link, successive ticket replies (they
+#: share a subject), direct messages to candidates, a test mail.
+NEVER_COLLAPSE_EVENTS = frozenset({
+    "auth.password_reset", "user.invited", "settings.test_email",
+    "support.ticket_replied", "candidate.direct_message", "candidate.ai_invite",
+    "candidate.slot_invite", "candidate.round_invite", "candidate.interview_link",
+    "candidate.hiring_interest", "candidate.round_scheduled",
+})
+
+
+def is_recent_repeat(db: Session, *, to_email: str, subject: str, event: str = "") -> bool:
+    """True when this exact subject went to this address within the window.
+    Never raises (a lookup failure means "not a repeat" — never lose mail)."""
+    if (event or "") in NEVER_COLLAPSE_EVENTS:
+        return False
+    since = _now() - timedelta(minutes=REPEAT_WINDOW_MINUTES)
+    found = _safe_scalar(
+        db,
+        "SELECT id FROM email_outbox WHERE lower(to_email) = :e AND subject = :s "
+        "AND created_at >= :since",
+        {"e": (to_email or "").strip().lower(), "s": (subject or "")[:500], "since": since},
+    )
+    return found is not None
+
+
 def queue_email(
     db: Session,
     *,
@@ -260,6 +295,9 @@ def queue_email(
             db, event, subject=subject, body_text=body_text, to_name=to_name,
             context=template_context,
         )
+        if is_recent_repeat(db, to_email=to_email, subject=subject or "", event=event):
+            logger.info("email_outbox: skipped a repeat of %r to %s (%s)", subject, to_email, event)
+            return None
 
         row = EmailOutbox(
             event=(event or "generic")[:64],
@@ -402,7 +440,7 @@ def app_url(path: str = "") -> str:
     if path.startswith("http"):
         return path
     stripped = path.lstrip("/")
-    # Already a full in-app link ("/admin?view=crm&p=profiles/5&tab=ai") — pass
+    # Already a full in-app link ("/admin/?view=crm&p=profiles/5&tab=ai") — pass
     # it through. Wrapping it again produced p=admin?view=crm&p=… and every
     # "Open in Karnex" button 404'd on "Page not found: admin" (seen live
     # 25 Aug 2026). Notification links arrive in BOTH forms, so the consumer

@@ -34,7 +34,9 @@ def _upload(data: bytes) -> UploadFile:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Python 3.12+ no longer creates a loop on `get_event_loop()` outside a
+    # running loop (RuntimeError on 3.14); `asyncio.run` owns its own.
+    return asyncio.run(coro)
 
 
 # ------------------------------------------------------------ transcribe

@@ -146,6 +146,16 @@ class InvoiceUpdate(BaseModel):
     due_date: date | None = None
     # Per-invoice GST buyer state override: exactly 2 digits, or blank/null to clear.
     buyer_state_code: str | None = None
+    #: Column choice on a PROFORMA only (Finance may correct it before converting).
+    invoice_format: dict[str, bool] | None = None
+
+
+class ConvertProformaIn(BaseModel):
+    """Body for POST /invoices/{id}/convert — Finance generates the original."""
+    #: Blank = the next INV-YYYY-NNN. Must be unique.
+    invoice_number: str | None = Field(default=None, max_length=64)
+    #: Blank = keep the Proforma's date.
+    invoice_date: date | None = None
 
 
 class PaymentIn(BaseModel):

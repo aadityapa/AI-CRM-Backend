@@ -4,9 +4,10 @@ from __future__ import annotations
 import enum
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
-from models.base import Base, WorkMode, pg_enum
+from models.base import USERS_FK, Base, WorkMode, pg_enum
 
 
 class BillingFrequency(str, enum.Enum):
@@ -85,6 +86,17 @@ class Project(Base):
     initial_no_billing_period = sa.Column(sa.String(40), nullable=True)
     status = sa.Column(pg_enum(ProjectStatus, "project_status"), nullable=False,
                        server_default=ProjectStatus.ACTIVE.value, index=True)
+    # --- Closure (0109, 25 Sep 2026) — see services/project_closure.py -------
+    #: Last working day. A future date = a SCHEDULED close; the team keeps
+    #: billing until then and the daily job exits them the day after.
+    end_date = sa.Column(sa.Date, nullable=True, index=True)
+    #: {pe_id: previous exit ISO date | None} — what the close overwrote, so a
+    #: cancelled close restores every assignment's own plan exactly.
+    closure_capped_exits = sa.Column(JSONB, nullable=True)
+    closed_reason = sa.Column(sa.Text, nullable=True)
+    #: NULL while the close is only scheduled; stamped when the team is exited.
+    closed_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    closed_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 
     employees = relationship("ProjectEmployee", back_populates="project", cascade="all, delete-orphan")

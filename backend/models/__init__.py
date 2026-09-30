@@ -18,7 +18,7 @@ from models.opportunities import (  # noqa: F401
 )
 from models.requirements import (  # noqa: F401
     JobPostingStatus, Priority, Requirement, RequirementActivityLog, RequirementAttachment,
-    RequirementJobPosting, RequirementSkill, RequirementStatus,
+    RequirementJobPosting, RequirementPositionRequest, RequirementSkill, RequirementStatus,
 )
 from models.candidates import (  # noqa: F401
     Candidate, CandidateEducation, CandidateExperience, CandidateSkill,
@@ -58,3 +58,4 @@ from models.support import SupportTicket, SupportTicketMessage, TicketPriority, 
 from models.template_requests import TemplateRequest, TemplateRequestStatus  # noqa: F401
 from models.access_templates import AccessTemplate  # noqa: F401
 from models.user_profiles import UserProfile  # noqa: F401
+from models.custom_roles import CustomRole, UserCustomRole  # noqa: F401

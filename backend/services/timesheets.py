@@ -8,8 +8,9 @@ is field-by-field — a branch with only some fields set inherits the rest.
 from __future__ import annotations
 
 import calendar
+import json
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from types import SimpleNamespace
 
@@ -21,8 +22,8 @@ from models import (
     USERS_TABLE, AttendanceStatus, BillingUnit, Customer, CustomerBillingPolicy,
     CustomerBranch, DayType, Employee, EmployeeLeaveBalance, EntryLocation, Holiday, Invoice,
     LeaveAccrualEvent, LeavePeriod, LeavePolicyType, Opportunity, Project,
-    ProjectEmployee, ProjectEmployeeLeaveDetail, Timesheet, TimesheetAttachment,
-    TimesheetEntry, TimesheetStatus,
+    ProjectEmployee, ProjectEmployeeLeaveDetail, Timesheet, TimesheetActivityLog,
+    TimesheetAttachment, TimesheetEntry, TimesheetStatus,
 )
 from services.employees import (
     ensure_loss_of_pay_type,
@@ -493,6 +494,15 @@ def build_generated_entry(*, timesheet_id: int, d: date, holiday_dates: set[date
     )
 
 
+def _holiday_hours(raw) -> Decimal:
+    """Hours worked on a holiday, clamped to a real day (0–24)."""
+    try:
+        h = Decimal(raw or 0)
+    except Exception:
+        return ZERO
+    return min(max(h, ZERO), Decimal("24"))
+
+
 def resolve_entry_fields(
     *,
     d: date,
@@ -500,9 +510,17 @@ def resolve_entry_fields(
     holiday_dates: set[date],
     policy: BillingPolicy | None = None,
 ) -> tuple[DayType, bool, Decimal, AttendanceStatus, str | None, LeavePeriod | None]:
-    """Normalize client payload into stored day fields (calendar holidays stay locked)."""
+    """Normalize client payload into stored day fields.
+
+    A calendar holiday stays a HOLIDAY (the day type is locked to the client
+    calendar) but its HOURS WORKED are kept (25 Sep 2026): some employees work
+    on a holiday, and the billing ladder already knows what to do with that —
+    billed when Comp Off Billable is on, credited as Comp-Off leave otherwise
+    (`compute_billables` / `accrue_comp_off`). The old code zeroed them, so
+    holiday work could never be recorded at all."""
     if d in holiday_dates:
-        return DayType.HOLIDAY, False, ZERO, AttendanceStatus.HOLIDAY, None, None
+        return (DayType.HOLIDAY, False, _holiday_hours(item.hours_worked),
+                AttendanceStatus.HOLIDAY, None, None)
 
     day_type = item.day_type
     attendance = item.attendance_status
@@ -537,7 +555,7 @@ def resolve_entry_fields(
         attendance = AttendanceStatus.HOLIDAY
         leave_type = None
         leave_period = None
-        hours = ZERO
+        hours = _holiday_hours(hours)
     else:
         is_working = True
         if attendance in (AttendanceStatus.WEEK_OFF, AttendanceStatus.HOLIDAY):
@@ -1435,12 +1453,8 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
     # can no longer be rejected (3 Sep 2026: the button was offered, the
     # server 409'd, and the message never reached the screen).
     invoice = linked_invoice_for(db, ts)
-    data["invoice"] = {
-        "id": invoice.id,
-        "invoice_number": invoice.invoice_number,
-        "payment_status": getattr(invoice.payment_status, "value", invoice.payment_status),
-    } if invoice else None
-    data["can_generate_invoice"] = ts.status == TimesheetStatus.APPROVED and invoice is None
+    data["invoice"] = invoice_ref(invoice)
+    data["can_generate_invoice"] = can_generate_invoice(ts, invoice)
     data["can_reject"] = (
         ts.status == TimesheetStatus.SUBMITTED
         or (ts.status == TimesheetStatus.APPROVED and invoice is None)
@@ -2021,7 +2035,11 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
         "billable_days": float(rollup["billable_days"]),
         "leave_days": float(leave_days),
         "holidays": holidays,
-        "present_days": present_days,
+        # A HALF DAY is half a day present (29 Sep 2026, user rule: "a half day
+        # must read the same in Present Days as in Billable Days" — 21 full days
+        # + one half day is 21.5 present, not 21). `half_days` still counts the
+        # rows, so payroll can see how many there were.
+        "present_days": float(Decimal(present_days) + HALF * half_days),
         "absent_days": absent_days,
         "half_days": half_days,
         # --- Tab 9 additions (existing keys above are kept untouched) ---
@@ -2149,14 +2167,8 @@ def timesheet_report_out(db: Session, ts: Timesheet,
     })
     if invoice is None:
         invoice = linked_invoice_for(db, ts)
-    data["invoice"] = {
-        "id": invoice.id,
-        "invoice_number": invoice.invoice_number,
-        "payment_status": getattr(invoice.payment_status, "value", invoice.payment_status),
-    } if invoice else None
-    data["can_generate_invoice"] = (
-        ts.status == TimesheetStatus.APPROVED and invoice is None
-    )
+    data["invoice"] = invoice_ref(invoice)
+    data["can_generate_invoice"] = can_generate_invoice(ts, invoice)
     return data
 
 
@@ -2337,6 +2349,84 @@ def linked_invoice_for(db: Session, ts: Timesheet) -> Invoice | None:
     ).scalars().first()
 
 
+def freeze_invoice_figures(db: Session, ts: Timesheet, entries: list[TimesheetEntry],
+                           **extra) -> dict:
+    """Snapshot the invoice figures onto an approved sheet (0075) and return the
+    preview they came from. ONE builder for approve, Recalculate and the re-freeze
+    after a Commercial Details unit fix, so the three can never store different
+    shapes. `default=str`: a stray Decimal/date becomes a string instead of
+    aborting the freeze."""
+    snap = timesheet_invoice_preview(db, ts, entries)
+    ts.approved_figures = json.loads(json.dumps({
+        "frozen_at": datetime.now(timezone.utc).isoformat(),
+        "line_items": snap["line_items"],
+        "totals": {"sub_total": snap["totals"]["sub_total"]},
+        "summary": timesheet_summary(db, ts, entries),
+        **extra,
+    }, default=str))
+    return snap
+
+
+def refreeze_uninvoiced_sheets(db: Session, pe: ProjectEmployee, user_id: int | None,
+                               reason: str) -> list[dict]:
+    """Re-freeze every APPROVED sheet of this assignment that has no live invoice
+    yet (none, or a Proforma Finance returned) after its rate basis changed.
+
+    Without this a unit correction reached only NEW approvals: the sheet already
+    approved at "₹1,414.77 / Month" kept billing one month until someone found
+    the Recalculate button. Issued invoices are never touched — a correction
+    there is a change request. Returns what moved, for the caller's message."""
+    from services.crm_common import log_activity
+
+    sheets = db.execute(
+        select(Timesheet).where(
+            Timesheet.project_id == pe.project_id,
+            Timesheet.employee_id == pe.employee_id,
+            Timesheet.status == TimesheetStatus.APPROVED,
+        ).order_by(Timesheet.year, Timesheet.month)
+    ).scalars().all()
+    moved: list[dict] = []
+    for ts in sheets:
+        if not can_generate_invoice(ts, linked_invoice_for(db, ts)):
+            continue
+        entries = db.execute(
+            select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
+            .order_by(TimesheetEntry.entry_date)
+        ).scalars().all()
+        before = float(((ts.approved_figures or {}).get("totals") or {}).get("sub_total") or 0)
+        snap = freeze_invoice_figures(db, ts, entries, recalculated_by=user_id, reason=reason)
+        after = float(snap["totals"]["sub_total"] or 0)
+        log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user_id, "TS_RECALCULATED",
+                     f"{reason}: sub-total {before:,.2f} → {after:,.2f}")
+        moved.append({"timesheet_id": ts.id, "month": f"{ts.year}-{ts.month:02d}",
+                      "sub_total_before": before, "sub_total_after": after})
+    return moved
+
+
+def invoice_ref(invoice: Invoice | None) -> dict | None:
+    """The sheet's invoice as every timesheet payload prints it (list row,
+    detail, summary, preview) — ONE shape, so the UI reads `kind` and the
+    Proforma's returned state the same way everywhere (0107)."""
+    if invoice is None:
+        return None
+    return {
+        "id": invoice.id,
+        "invoice_number": invoice.invoice_number,
+        "payment_status": getattr(invoice.payment_status, "value", invoice.payment_status),
+        "kind": invoice.kind or "Tax",
+        "returned_at": invoice.returned_at.isoformat() if invoice.returned_at else None,
+        "returned_reason": invoice.returned_reason,
+    }
+
+
+def can_generate_invoice(ts: Timesheet, invoice: Invoice | None) -> bool:
+    """An Approved sheet with no document — or whose Proforma Finance RETURNED,
+    which the GM raises again (the returned one is replaced)."""
+    if ts.status != TimesheetStatus.APPROVED:
+        return False
+    return invoice is None or (invoice.is_proforma and invoice.returned_at is not None)
+
+
 def initial_no_billing_end(db: Session, project: Project | None, pe) -> date | None:
     """EXCLUSIVE end date of the employee's initial no-billing window, or None.
 
@@ -2397,7 +2487,8 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         use billable_days / working_days against the (split) monthly rates.
     """
     from services.project_employee_billing import (
-        RateRow, invoice_amount_split, invoice_amount_uniform, rate_for_date, split_period_by_rate,
+        RateRow, invoice_amount_split, invoice_amount_uniform, rate_for_date, rate_unit_warning,
+        split_period_by_rate,
     )
     from services.project_employees import load_rate_rows
 
@@ -2630,6 +2721,8 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         "total_billed_qty": float(qty),
         "rate_per_unit": float(rate),
         "billing_unit": getattr(unit, "value", str(unit)),
+        # Where the rate and its unit live — the UI links a warning straight there.
+        "project_employee_id": assignment.id,
         "working_days_in_period": float(wd_count),
         "hours_per_full_day": float(hours_per_day),
         "per_day_charge": _money(per_day),
@@ -2651,15 +2744,18 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         "no_billing_until": nb_end.isoformat() if nb_end is not None and nb_days_excluded else None,
         "amount": float(amount),
         "rate_split": rate_changed,
+        # A rate typed against the wrong unit (25 Sep 2026: ₹1,414.77 saved
+        # "per Month" for an hourly contractor billed a 168-hour month at
+        # ₹1,414.77). Shown before anyone commits the money; never blocks.
+        # Yearly rates are already ÷12 here, so they are judged as a month.
+        "rate_unit_warning": rate_unit_warning(
+            "Monthly" if unit == BillingUnit.YEARLY else getattr(unit, "value", str(unit)),
+            current_rate, per_hour),
     }
     linked = linked_invoice_for(db, ts)
     return {
         "line_items": [line],
         "totals": {"sub_total": float(amount)},
-        "linked_invoice": {
-            "id": linked.id,
-            "invoice_number": linked.invoice_number,
-            "payment_status": getattr(linked.payment_status, "value", linked.payment_status),
-        } if linked else None,
-        "can_generate": ts.status == TimesheetStatus.APPROVED and linked is None,
+        "linked_invoice": invoice_ref(linked),
+        "can_generate": can_generate_invoice(ts, linked),
     }

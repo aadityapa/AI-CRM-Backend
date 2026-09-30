@@ -13,6 +13,8 @@ class UserCreateIn(BaseModel):
     legacy_role: str = "hr"
     # CRM role names to assign (Admin, Sales, Sales_Head, RMG, TA, HR, Finance).
     roles: list[str] = []
+    # Custom role ids (Access Control ▸ Roles) — GM, Sales Manager, …
+    custom_roles: list[int] = []
 
     @field_validator("full_name", "email", "username", "password")
     @classmethod
@@ -33,6 +35,9 @@ class UserCreateIn(BaseModel):
 
 class RolesIn(BaseModel):
     roles: list[str]
+    # Custom role ids (Access Control ▸ Roles). None = leave the custom set as
+    # it is; a list REPLACES it, like `roles` replaces the built-in set.
+    custom_roles: list[int] | None = None
 
 
 class TabAccessIn(BaseModel):
@@ -52,3 +57,13 @@ class UserOut(BaseModel):
     legacy_role: str
     is_active: bool
     roles: list[str] = []
+
+
+class PasswordResetIn(BaseModel):
+    # Blank/None → the server generates a temporary password and returns it once.
+    new_password: str | None = None
+
+
+class AccessSourceIn(BaseModel):
+    kind: str = "default"          # default | template | role
+    id: int | None = None

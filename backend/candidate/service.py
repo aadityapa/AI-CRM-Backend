@@ -11,6 +11,7 @@ from utils.warmup import (
     WARMUP_NOTE,
     is_warmup_index,
     question_type_for_index,
+    warmup_time_limit_sec,
 )
 
 def _evaluated_total(session: dict) -> int:
@@ -220,6 +221,9 @@ def next_question_payload(session: dict) -> dict:
     if is_warm:
         out["warmup_label"] = WARMUP_LABEL
         out["warmup_note"] = WARMUP_NOTE
+        # The client counts this down on the question and moves on at zero
+        # (whatever was said is sent; the turn is never scored either way).
+        out["warmup_time_limit_sec"] = warmup_time_limit_sec()
     if meta.get("last_turn_score") is not None:
         out["last_turn_score"] = meta.get("last_turn_score")
         out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]

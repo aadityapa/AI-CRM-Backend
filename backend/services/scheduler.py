@@ -61,6 +61,14 @@ DEFAULTS = {
     #: that has been off longer than this should be backfilled deliberately
     #: (`run_pe_leave_credit.py --from`), not quietly by a daily job.
     "scheduler.pe_leave_credit_lookback": "12",
+    #: Move a closed project's team to the bench the day after its last
+    #: working day (services/project_closure.py). 25 Sep 2026.
+    "scheduler.project_closures": "true",
+    #: Drop the heavy prompt/response text from AI call logs past the retention
+    #: window and purge the expired response cache. Tokens, audio minutes, cost
+    #: and interview attribution are KEPT — the cost report needs them for
+    #: years (prompt_logger.prune_prompt_log_text). 28 Sep 2026.
+    "scheduler.prompt_log_retention": "true",
 }
 
 LAST_RUN_PREFIX = "scheduler.last_run."
@@ -283,11 +291,10 @@ def run_recurring_invoices(db, *, today: date | None = None) -> dict:
     from models import Invoice, InvoiceLine, PaymentStatus, Project, PurchaseOrder, Timesheet, TimesheetStatus
     from services.crm_common import next_sequence_number
     from services.finance import (
-        assert_po_allows_new_drawdown, karnex_gst_tax_and_grand,
-        log_invoice_created_on_po, resolve_or_create_po_allocation_for_project,
+        assert_po_allows_new_drawdown, consume_po_for_invoice, karnex_gst_tax_and_grand,
+        po_draw_amount, resolve_or_create_po_allocation_for_project,
     )
     from services.notify import notify_roles
-    from services import tax
     from services.timesheets import linked_invoice_for, timesheet_invoice_preview
 
     today = today or date.today()
@@ -336,7 +343,7 @@ def run_recurring_invoices(db, *, today: date | None = None) -> dict:
             tax_amount, grand_total, _gst = karnex_gst_tax_and_grand(
                 db, po=po, project_id=ts.project_id, lines=lines, sub_total=sub_total,
             )
-            if po is not None and Decimal(str(po.balance_value)) < grand_total:
+            if po is not None and Decimal(str(po.balance_value)) < po_draw_amount(sub_total):
                 skipped.append((ts, "PO balance insufficient"))
                 continue
 
@@ -363,11 +370,8 @@ def run_recurring_invoices(db, *, today: date | None = None) -> dict:
                 lines=lines,
             )
             db.add(invoice)
-            if po is not None:
-                tax.apply_po_consumption(po, grand_total)
-                alloc.consumed_amount = Decimal(str(alloc.consumed_amount)) + grand_total
             db.flush()
-            log_invoice_created_on_po(db, po, invoice, None)
+            consume_po_for_invoice(db, invoice, po, None)   # base value (sub-total) only
             notify_roles(
                 db, ["Finance"],
                 f"Invoice {number} auto-generated for {ts.year}-{ts.month:02d}",
@@ -491,8 +495,11 @@ def run_rmg_screening_sla(db, *, today: date | None = None) -> dict:
 
     from sqlalchemy import func
 
-    from models import Candidate, CandidateProfile, Opportunity
-    from services.candidate_profiles import RMG_SCREENING_PENDING, applied_candidates_link, rmg_gate_enabled
+    from models import Candidate, CandidateProfile, CandidateProfileActivityLog, Opportunity
+    from services.candidate_profiles import (
+        RMG_SCREENING_PENDING, RMG_SCREENING_SLA_EVENT, SENT_FOR_SCREENING, applied_candidates_link, rmg_gate_enabled,
+        screening_notify_user_ids,
+    )
     from services.notify import notify_role
     from services.org_settings import setting
 
@@ -503,15 +510,23 @@ def run_rmg_screening_sla(db, *, today: date | None = None) -> dict:
     except ValueError:
         hours = 48
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    # Waiting since TA pressed "Technical Screening" (28 Sep 2026) — an upload
+    # now sits at Sourcing until then, so the apply date would overstate it.
+    sent = (select(CandidateProfileActivityLog.profile_id,
+                   func.max(CandidateProfileActivityLog.timestamp).label("at"))
+            .where(CandidateProfileActivityLog.action_type == SENT_FOR_SCREENING)
+            .group_by(CandidateProfileActivityLog.profile_id).subquery())
+    since = func.coalesce(sent.c.at, CandidateProfile.applied_on, CandidateProfile.created_at)
     rows = db.execute(
         select(CandidateProfile, Candidate, Opportunity)
         .join(Candidate, Candidate.id == CandidateProfile.candidate_id)
         .join(Opportunity, Opportunity.id == CandidateProfile.opportunity_id)
+        .outerjoin(sent, sent.c.profile_id == CandidateProfile.id)
         .where(
             CandidateProfile.rmg_screening_status == RMG_SCREENING_PENDING,
-            func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at) < cutoff,
+            since < cutoff,
         )
-        .order_by(func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at))
+        .order_by(since)
         .limit(50)
     ).all()
     if not rows:
@@ -527,20 +542,117 @@ def run_rmg_screening_sla(db, *, today: date | None = None) -> dict:
         f"{len(rows)} applicant(s) waiting on RMG screening > {hours}h",
         "; ".join(lines) + more + " — review and Shortlist/Reject so TAs can proceed.",
         applied_candidates_link(db, rows[0][0]),
-        event="profile.rmg_screening_sla",
+        event=RMG_SCREENING_SLA_EVENT,
         dedupe_prefix=f"rmg_sla:{(today or date.today()).isoformat()}",
+        user_ids=screening_notify_user_ids(db),
     )
     db.commit()
     return {"sent": 1, "overdue": len(rows)}
 
 
+def run_revenue_month_close(db, *, today: date | None = None) -> dict:
+    """On the first days of a month, mail Admin/CEO the previous month's revenue
+    close (headline numbers + alerts + link to Reports ▸ Revenue). Dedupe key is
+    the closed month, so the daily runner sends it exactly once."""
+    from services.notify import notify_roles
+    from services.revenue_report import Month, revenue_report
+
+    today = today or date.today()
+    if today.day > 7:   # missed window (server down on the 1st) still catches up within a week
+        return {"sent": 0, "reason": "not in the month-close window"}
+    closed = Month(today.year, today.month).shift(-1)
+    r = revenue_report(db, closed.key, today=today)
+    h, t, m, a = r["headline"], r["targets"], r["margin"], r["ageing"]
+
+    def money(v):
+        return f"₹{(v or 0):,.0f}"
+
+    rows = [
+        ("Revenue billed (excl. GST)", money(h["billed"])),
+        ("vs last month", f"{h['billed_mom_pct']:+.1f}%" if h["billed_mom_pct"] is not None else "n/a"),
+        ("vs last year", f"{h['billed_yoy_pct']:+.1f}%" if h["billed_yoy_pct"] is not None else "n/a"),
+        ("Cash collected", money(h["collected"])),
+        ("Outstanding", f"{money(h['outstanding'])} ({money(a['overdue_total'])} overdue)"),
+        ("Gross margin", f"{money(m['gross_margin'])} ({m['gross_margin_pct']:.1f}%)" if m["gross_margin_pct"] is not None else money(m["gross_margin"])),
+    ]
+    if t["month_target"]:
+        rows.append(("Target attainment", f"{t['month_attainment_pct']:.0f}% of {money(t['month_target'])}"))
+    if t["fy_target"]:
+        rows.append((f"{t['fy_label']} projection", f"{money(t['fy_projection'])} ({t['fy_projection_pct']:.0f}% of target)"))
+    for alert in r["alerts"][:5]:
+        rows.append((f"⚠ {alert['title']}", alert["detail"]))
+    top = r["by_customer"]["rows"][:3]
+    if top:
+        rows.append(("Top customers", ", ".join(f"{x['customer']} {money(x['billed'])}" for x in top)))
+
+    notify_roles(
+        db, ["Admin", "CEO"],
+        f"Revenue close — {closed.label}",
+        f"{closed.label}: billed {money(h['billed'])}, collected {money(h['collected'])}, "
+        f"{len(r['alerts'])} alert(s). Open Reports ▸ Revenue for the full picture and the Excel pack.",
+        f"/admin/?view=crm&p=reports&tab=revenue&month={closed.key}",
+        event="reports.revenue_month_close",
+        subject=f"Karnex revenue close — {closed.label}",
+        rows=rows,
+        dedupe_prefix=f"revenue_close:{closed.key}",
+    )
+    db.commit()
+    return {"sent": 1, "month": closed.key}
+
+
+def run_project_closures_job(db, today: date | None = None) -> dict:
+    """Close every project whose last working day has passed (team → bench)."""
+    from services.project_closure import run_project_closures
+    return run_project_closures(db, today or date.today())
+
+
+def run_feedback_due_job(db=None) -> dict:
+    """Interviews that are over with no verdict → remind their owner
+    (`services/interview_followups`). Runs on EVERY pass — a reminder a day
+    late defeats the point; the service repeats each round once a day at most."""
+    from services.interview_followups import run_feedback_due_reminders
+    return run_feedback_due_reminders(db)
+
+
+def run_prompt_log_retention(db=None, today: date | None = None) -> dict:
+    """Retention for the AI call log (28 Sep 2026): file logs older than the
+    window are removed, DB rows keep their figures but lose their text, and the
+    expired response cache is purged. Money is never deleted — the CEO's cost
+    page reports years of it. Takes no CRM session; the log lives in the legacy
+    store (`ai._db_target()`)."""
+    import response_cache
+    from ai import _db_target
+    from prompt_logger import cleanup_old_file_logs, prune_prompt_log_text
+
+    target = _db_target()
+    out = {"file_days_removed": cleanup_old_file_logs(), "rows_pruned": 0, "cache_purged": 0}
+    if target:
+        out["rows_pruned"] = prune_prompt_log_text(target)
+        # Attribute stray interview calls + estimate pre-28-Sep audio (idempotent).
+        from services.ai_cost_repair import repair_ai_costs
+        out["cost_repair"] = repair_ai_costs(target)
+        try:
+            out["cache_purged"] = response_cache.purge_expired(target)
+        except Exception as exc:  # the cache is a convenience; retention must still report
+            logger.warning("response cache purge failed: %s", exc)
+    return out
+
+
 JOBS = {
     "timesheet_reminders": ("scheduler.timesheet_reminders", run_timesheet_reminders),
+    "revenue_month_close": ("scheduler.revenue_month_close", run_revenue_month_close),
     "rmg_screening_sla": ("scheduler.rmg_screening_sla", run_rmg_screening_sla),
     "po_expiry": ("scheduler.po_expiry", run_po_expiry_notices),
     "recurring_invoices": ("scheduler.recurring_invoices", run_recurring_invoices),
     "pe_leave_credit": ("scheduler.pe_leave_credit", run_pe_leave_credit_job),
+    "project_closures": ("scheduler.project_closures", run_project_closures_job),
+    "prompt_log_retention": ("scheduler.prompt_log_retention", run_prompt_log_retention),
+    "interview_feedback_due": ("scheduler.interview_feedback_due", run_feedback_due_job),
 }
+
+#: Jobs that run on every scheduler pass (≈15 min) rather than once a day after
+#: the run hour — each keeps its own "already told" record.
+EVERY_PASS_JOBS = frozenset({"interview_feedback_due"})
 
 
 def run_due_jobs(*, force: bool = False, only: str | None = None) -> dict:
@@ -570,9 +682,8 @@ def run_due_jobs(*, force: bool = False, only: str | None = None) -> dict:
             if not force:
                 if not _flag(flag_key):
                     continue
-                if now.hour < run_hour:
-                    continue
-                if _last_run_date(session, job) == now.date():
+                if job not in EVERY_PASS_JOBS and (
+                        now.hour < run_hour or _last_run_date(session, job) == now.date()):
                     continue
             try:
                 summary = fn(session)

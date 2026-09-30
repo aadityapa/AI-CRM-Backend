@@ -583,9 +583,14 @@ def upcoming_interview_events(db: Session, days: int = 30) -> list[dict]:
 # --------------------------------------------------------- bench / roll-offs
 
 def bench_rolloffs(db: Session, days: int = 60) -> list[dict]:
-    """Active project employees whose project's PO coverage ends within `days`
-    (or already ended) — the redeployment radar. Coverage = the LATEST end_date
-    across the project's POs, so renewed projects don't false-alarm."""
+    """Active project employees whose cover ends within `days` (or already
+    ended) — the redeployment radar.
+
+    Cover ends at the EARLIER of the project's last working day (a scheduled
+    close, 25 Sep 2026) and the latest end_date across the project's POs, so
+    renewed projects don't false-alarm and a closing project always does.
+    `ends_by` says which one it was.
+    """
     from datetime import timedelta
 
     from models import POProjectAllocation, ProjectEmployee
@@ -603,22 +608,26 @@ def bench_rolloffs(db: Session, days: int = 60) -> list[dict]:
         .group_by(POProjectAllocation.project_id)
         .subquery()
     )
+    project_first = sa.and_(Project.end_date.isnot(None),
+                            sa.or_(po_end.c.last_end.is_(None), Project.end_date <= po_end.c.last_end))
+    cover_end = sa.case((project_first, Project.end_date), else_=po_end.c.last_end)
     rows = db.execute(
-        select(ProjectEmployee, Employee, Project, Customer.name, po_end.c.last_end)
+        select(ProjectEmployee, Employee, Project, Customer.name, cover_end, project_first)
         .join(Employee, Employee.id == ProjectEmployee.employee_id)
         .join(Project, Project.id == ProjectEmployee.project_id)
         .join(Customer, Customer.id == Project.customer_id, isouter=True)
-        .join(po_end, po_end.c.project_id == ProjectEmployee.project_id)
+        .join(po_end, po_end.c.project_id == ProjectEmployee.project_id, isouter=True)
         .where(
             ProjectEmployee.is_active.is_(True),
             ProjectEmployee.is_exit.is_(False),
-            po_end.c.last_end <= horizon,
+            cover_end.isnot(None),
+            cover_end <= horizon,
         )
-        .order_by(po_end.c.last_end.asc())
+        .order_by(cover_end.asc())
         .limit(100)
     ).all()
     out: list[dict] = []
-    for pe, emp, project, customer_name, last_end in rows:
+    for pe, emp, project, customer_name, last_end, by_project in rows:
         days_left = (last_end - today).days if last_end else None
         out.append({
             "project_employee_id": pe.id,
@@ -628,7 +637,9 @@ def bench_rolloffs(db: Session, days: int = 60) -> list[dict]:
             "project_id": project.id,
             "project_name": project.name,
             "customer_name": customer_name,
+            # Kept as `po_end_date` for the existing UI; it is the cover end.
             "po_end_date": last_end.isoformat() if last_end else None,
+            "ends_by": "project_close" if by_project else "po_expiry",
             "days_left": days_left,
             "candidate_profile_id": emp.candidate_profile_id,
         })
@@ -853,6 +864,16 @@ def my_work(db: Session, user) -> dict:
         add("timesheets_to_invoice",
             count(select(Timesheet.id).where(Timesheet.status == TimesheetStatus.APPROVED, ~invoiced)),
             "approved timesheets are ready to invoice", "timesheets")
+
+    # Finance: Proformas the GM raised, waiting to become the original invoice
+    # (28 Sep 2026 — the work desk's queue for Finance). A returned one is
+    # back with the GM, not Finance's move.
+    if allowed("invoices", "Finance"):
+        from models.finance import InvoiceKind
+        add("proformas_to_convert",
+            count(select(Invoice.id).where(Invoice.kind == InvoiceKind.PROFORMA.value,
+                                           Invoice.returned_at.is_(None))),
+            "Proformas waiting to become the original invoice", "invoices?tab=Proforma", "warning")
 
     # HR: accepted offers still in pre-boarding — joining is coming.
     if allowed("profiles", "HR"):

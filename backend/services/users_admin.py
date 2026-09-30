@@ -65,6 +65,12 @@ def _auto_assign_role_template(db: Session, user_id: int, members: list[RoleName
         ).scalars().first()
         if profile is not None and (profile.access_template_id or profile.tab_access):
             return  # explicitly configured — never override
+        from services.custom_roles import user_role_ids
+        if user_role_ids(db, user_id):
+            # A custom role IS the explicit configuration (23 Sep 2026): this
+            # is how "Default — Sales" kept re-attaching itself to a Sales
+            # Manager on every Edit Roles save and silently outranking the role.
+            return
         for member in members:
             t = db.execute(
                 select(AccessTemplate).where(
@@ -81,6 +87,57 @@ def _auto_assign_role_template(db: Session, user_id: int, members: list[RoleName
             return
     except Exception:  # noqa: BLE001 — auto-default must never break user admin
         return
+
+
+def _display_name(db: Session, user_id: int) -> str:
+    row = _require_user_row(db, user_id)
+    return row.get("full_name") or row.get("username") or f"User #{user_id}"
+
+
+#: What a template or custom role CANNOT do on its own (25 Sep 2026, reported
+#: with a "No CRM role is assigned" screen after a template was assigned): open
+#: the CRM. Entry needs a ROLE — built-in, or an active custom role — and the
+#: template then decides the tabs. One-source-of-access removes custom roles
+#: when a template is chosen, so a user whose ONLY role was custom was silently
+#: locked out by the very click meant to give them access.
+_ENTRY_MESSAGE = (
+    "{name} has no built-in role, so {what} would leave them with no role at all and the CRM would "
+    "refuse them (\"No CRM role is assigned\"). Give them a built-in role in Edit Roles first{hint}."
+)
+
+
+def ensure_role_for_template(db: Session, user_id: int, template) -> str | None:
+    """Make sure a user keeps a ROLE when `template` becomes their access source.
+
+    A user with any built-in role is fine as-is. One without: if the template is
+    TAGGED with a built-in role (the "Default — Sales" pattern — the admin built
+    it for Sales people), that role is given to them, because that is what the
+    assignment meant; returns the role added. If they hold only CUSTOM roles —
+    which the template is about to remove — and the tag gives no built-in role,
+    the assignment is refused with a message that says exactly what to do (that
+    removal is the lockout this guards). A user with no role at all and an
+    untagged template loses nothing, so it proceeds; the Users row flags them.
+    Does not commit."""
+    if _roles_map(db, [user_id]).get(user_id):
+        return None
+    tag = str(getattr(template, "role", "") or "").strip()
+    member = next((m for m in RoleName if m.value == tag and m.value not in ("Admin", "CEO")), None)
+    if member is None:
+        from services.custom_roles import user_role_ids
+        if not user_role_ids(db, user_id):
+            return None
+        hint = (f", or tag the template \"{template.name}\" with the built-in role it is for"
+                if not tag else f" (the tag \"{tag}\" is not a built-in role)")
+        raise HTTPException(status_code=400, detail=_ENTRY_MESSAGE.format(
+            name=_display_name(db, user_id), what=f"assigning the template \"{template.name}\"", hint=hint))
+    db.add(UserRole(user_id=user_id, role_id=_get_or_create_role(db, member).id))
+    db.flush()
+    return member.value
+
+
+def _refuse_roleless(db: Session, user_id: int, what: str) -> None:
+    raise HTTPException(status_code=400, detail=_ENTRY_MESSAGE.format(
+        name=_display_name(db, user_id), what=what, hint=""))
 
 
 def _get_or_create_role(db: Session, member: RoleName) -> Role:
@@ -123,8 +180,11 @@ def _require_user_row(db: Session, user_id: int) -> dict:
 
 
 def _user_out(row: dict, roles: list[str], tab_access: list[str] | None = None,
-              access_template_id: int | None = None) -> dict:
+              access_template_id: int | None = None, custom_roles: list[str] | None = None) -> dict:
     return {
+        # Admin/CEO-defined roles (Access Control ▸ Roles), kept apart from the
+        # built-in `roles` so the UI can chip them differently.
+        "custom_roles": list(custom_roles or []),
         "id": row["id"],
         "full_name": row["full_name"] or "",
         "email": row["email"] or "",
@@ -251,7 +311,10 @@ def list_users(db: Session, p: PageParams) -> tuple[list[dict], dict]:
     roles = _roles_map(db, ids)
     tabs = _tab_access_map(db, ids)
     templates = _template_map(db, ids)
-    users = [_user_out(dict(r), roles.get(r["id"], []), tabs.get(r["id"]), templates.get(r["id"]))
+    from services.custom_roles import custom_roles_by_user
+    customs = custom_roles_by_user(db, ids)
+    users = [_user_out(dict(r), roles.get(r["id"], []), tabs.get(r["id"]), templates.get(r["id"]),
+                       custom_roles=customs.get(r["id"], []))
              for r in rows]
     pages = (total + p.limit - 1) // p.limit if p.limit else 1
     meta = {"page": p.page, "limit": p.limit, "total": total, "pages": pages}
@@ -259,10 +322,17 @@ def list_users(db: Session, p: PageParams) -> tuple[list[dict], dict]:
 
 
 def create_user(db: Session, full_name: str, email: str, username: str,
-                password: str, legacy_role: str, role_names: list[str]) -> dict:
+                password: str, legacy_role: str, role_names: list[str],
+                custom_role_ids: list[int] | None = None) -> dict:
+    """Create a login with built-in roles and/or custom roles (25 Sep 2026: a
+    GM or Sales Manager can be created directly — a custom role alone is
+    enough to reach the CRM)."""
+    from services.custom_roles import set_user_roles, validate_role_ids
+
     # Validate CRM roles BEFORE touching the legacy table.
     members = [_role_member(n) for n in dict.fromkeys(role_names or [])]
-    if not members:
+    custom_ids = validate_role_ids(db, custom_role_ids)
+    if not members and not custom_ids:
         raise HTTPException(
             status_code=400,
             detail="Assign at least one CRM role so the user can access the application.",
@@ -279,22 +349,42 @@ def create_user(db: Session, full_name: str, email: str, username: str,
     for member in members:
         role = _get_or_create_role(db, member)
         db.add(UserRole(user_id=user_id, role_id=role.id))
-    _auto_assign_role_template(db, user_id, members)
+    customs = set_user_roles(db, user_id, custom_ids) if custom_ids else []
+    _auto_assign_role_template(db, user_id, members)   # skips users holding a custom role
     db.commit()
     row = _require_user_row(db, user_id)
-    return _user_out(row, sorted(m.value for m in members))
+    return _user_out(row, sorted(m.value for m in members), custom_roles=customs)
 
 
-def replace_roles(db: Session, user_id: int, role_names: list[str]) -> dict:
+def replace_roles(db: Session, user_id: int, role_names: list[str],
+                  custom_role_ids: list[int] | None = None) -> dict:
+    """Replace the built-in roles and — when `custom_role_ids` is given — the
+    custom roles too, in ONE save (the Edit Roles dialog lists both). `None`
+    leaves the custom set untouched so older callers keep their behaviour."""
+    from services.custom_roles import custom_roles_by_user, set_user_roles
+
     row = _require_user_row(db, user_id)
     members = [_role_member(n) for n in dict.fromkeys(role_names or [])]
     db.execute(delete(UserRole).where(UserRole.user_id == user_id))
     for member in members:
         role = _get_or_create_role(db, member)
         db.add(UserRole(user_id=user_id, role_id=role.id))
-    _auto_assign_role_template(db, user_id, members)
+    if custom_role_ids is not None:
+        customs = set_user_roles(db, user_id, custom_role_ids)   # validates; clears a template when any chosen
+    else:
+        customs = custom_roles_by_user(db, [user_id]).get(user_id, [])
+    if not members and not customs:
+        # Clearing every role locks the account out of the CRM (no role = 403
+        # everywhere, whatever the template says). Deactivate it instead.
+        raise HTTPException(
+            status_code=400,
+            detail="Keep at least one role — with none the user cannot open the CRM. "
+                   "To remove their access, deactivate the account instead.")
+    _auto_assign_role_template(db, user_id, members)             # skips users holding a custom role
     db.commit()
-    return _user_out(row, sorted(m.value for m in members))
+    return _user_out(row, sorted(m.value for m in members),
+                     access_template_id=_template_map(db, [user_id]).get(user_id),
+                     custom_roles=customs)
 
 
 def set_user_active(db: Session, user_id: int, active: bool) -> dict:
@@ -409,4 +499,95 @@ def toggle_portal_access(db: Session, user_id: int) -> dict:
         "user_id": user_id,
         "employee_id": employee.id,
         "portal_access": bool(employee.portal_access),
+    }
+
+
+# ------------------------------------------------------------ password reset
+
+TEMP_PASSWORD_LENGTH = 12
+
+
+def generate_temporary_password() -> str:
+    """A policy-passing temporary password: letters, digits and a symbol."""
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits
+    body = "".join(secrets.choice(alphabet) for _ in range(TEMP_PASSWORD_LENGTH - 3))
+    # Guarantee one of each class the policy may ask for, then shuffle.
+    chars = list(body + secrets.choice(string.ascii_uppercase) + secrets.choice(string.digits) + secrets.choice("!@#$%"))
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def reset_password(db: Session, user_id: int, new_password: str | None, actor_id: int) -> dict:
+    """Admin/CEO sets a user's password (23 Sep 2026).
+
+    Blank → a temporary password is generated and RETURNED ONCE so the admin
+    can hand it over; it is never stored in clear or logged. The same policy
+    the self-service reset enforces applies (`password_hashing.validate_password`),
+    and the user cannot reset their own account here — that is the ordinary
+    change-password flow, which asks for the current one.
+    """
+    import password_hashing as pwh
+    from auth_db import update_user_password
+
+    if int(user_id) == int(actor_id):
+        raise HTTPException(status_code=400, detail="Use Change password for your own account")
+    row = _require_user_row(db, user_id)
+    generated = not (new_password or "").strip()
+    password = generate_temporary_password() if generated else str(new_password)
+    try:
+        pwh.validate_password(password)
+    except pwh.PasswordPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    update_user_password(_legacy_db_target(), int(row["id"]), pwh.hash_password(password))
+    return {
+        "id": int(row["id"]),
+        "username": row["username"] or "",
+        "email": row["email"] or "",
+        "generated": generated,
+        "temporary_password": password if generated else None,
+    }
+
+
+# ------------------------------------------------------------ access source
+
+def set_access_source(db: Session, user_id: int, kind: str, ref_id: int | None) -> dict:
+    """The Users-tab "Access" dropdown (23 Sep 2026): exactly ONE of
+    role default · an Access Template · a custom role. Picking any one clears
+    the others, so what the admin sees is what decides the user's tabs."""
+    from services.access_templates import assign_template
+    from services.custom_roles import get_or_404 as _role_or_404, list_members, remove_user_from_all_roles, set_members
+
+    _require_user_row(db, user_id)
+    kind = (kind or "default").strip().lower()
+    if kind == "template":
+        if ref_id is None:
+            raise HTTPException(status_code=400, detail="template id required")
+        assign_template(db, user_id, int(ref_id))          # also drops custom roles
+    elif kind == "role":
+        if ref_id is None:
+            raise HTTPException(status_code=400, detail="role id required")
+        role = _role_or_404(db, int(ref_id))
+        remove_user_from_all_roles(db, user_id)             # one role from this control
+        current = [m["id"] for m in list_members(db, role.id)]
+        set_members(db, role.id, current + [user_id])       # also drops the template
+    elif kind == "default":
+        if not _roles_map(db, [user_id]).get(user_id):
+            # "Role default" means "the rules of their built-in role" — a user
+            # with none would be left with nothing (their custom role removed).
+            _refuse_roleless(db, user_id, "switching to \"Role default\"")
+        remove_user_from_all_roles(db, user_id)
+        assign_template(db, user_id, None)
+    else:
+        raise HTTPException(status_code=400, detail="kind must be default, template or role")
+    db.commit()
+    from services.custom_roles import custom_roles_by_user
+    return {
+        "user_id": user_id,
+        "access_template_id": _template_map(db, [user_id]).get(user_id),
+        "custom_roles": custom_roles_by_user(db, [user_id]).get(user_id, []),
+        # A template can ADD the built-in role it is tagged with (see
+        # ensure_role_for_template), so the row's role chips are returned too.
+        "roles": _roles_map(db, [user_id]).get(user_id, []),
     }

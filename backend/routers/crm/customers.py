@@ -585,6 +585,9 @@ def upsert_billing_policy(
     policy.comp_off_max_carry_forward = payload.comp_off_max_carry_forward
     if payload.comp_off_covers_lop is not None:
         policy.comp_off_covers_lop = bool(payload.comp_off_covers_lop)
+    if payload.invoice_format is not None:   # only when sent — the GM's dialog also writes this
+        from services.invoice_format import normalize_invoice_format
+        policy.invoice_format = normalize_invoice_format(payload.invoice_format)
     policy.normal_hours_per_day = payload.normal_hours_per_day
     policy.user_role = payload.user_role
     policy.operation = payload.operation

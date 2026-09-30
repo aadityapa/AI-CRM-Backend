@@ -24,6 +24,7 @@ from crm_deps import CurrentUser, any_crm_role, get_crm_db, role_required
 from models import NotificationRoute, RoleName, UserNotifyPref
 from schemas.common import envelope
 from services import users_admin as users_svc
+from services.custom_roles import all_role_names
 from services.email_outbox import app_url, queue_email, render_html, render_text
 from services.notify import paused_user_ids
 
@@ -37,8 +38,10 @@ admin_only = role_required()
 EVENTS: list[dict] = [
     {"event": "timesheet.submitted",
      "label": "Timesheet submitted for approval",
-     "description": "Sent when an employee submits a monthly timesheet.",
-     "default_roles": ["HR", "RMG", "Sales", "CEO"]},
+     "description": "Sent when Sales / an employee submits a monthly timesheet — the GM verifies it. "
+                    "Everyone allowed to approve timesheets (by role, template or custom role) always "
+                    "receives it too; the roles here add more people.",
+     "default_roles": ["GM", "CEO"]},
     {"event": "leave.submitted",
      "label": "Leave application submitted",
      "description": "Sent when an employee applies for leave.",
@@ -55,6 +58,36 @@ EVENTS: list[dict] = [
                     "repeated policy violations (tab switches, extra faces, dev tools…) — with the "
                     "strike count and a link to the candidate's AI Interview tab.",
      "default_roles": ["TA"]},
+    {"event": "project.close_scheduled",
+     "label": "Project close scheduled",
+     "description": "Sent when someone sets a project's last working day: who rolls off, on which "
+                    "day, and the reason — so RMG can line up the next assignment before the bench.",
+     "default_roles": ["RMG", "HR", "Sales_Head", "Admin"]},
+    {"event": "project.closed",
+     "label": "Project closed — team on the bench",
+     "description": "Sent the day a project's team is moved to the bench (after its last working "
+                    "day, or at once for a back-dated close), listing everyone who needs redeploying.",
+     "default_roles": ["RMG", "HR", "Sales_Head", "Admin"]},
+    {"event": "reports.revenue_month_close",
+     "label": "Monthly revenue close (CEO)",
+     "description": "Sent on the 1st of each month to Admin/CEO: last month's billing, collections, "
+                    "margin, target attainment and the alert list, with a link to Reports ▸ Revenue.",
+     "default_roles": ["Admin", "CEO"]},
+    {"event": "requirement.positions_requested",
+     "label": "Position change requested",
+     "description": "Sent to RMG (and Sales Head) when Sales asks to increase or reduce the number of "
+                    "positions on a requirement — with the old and new count, the reason and how many "
+                    "candidates have already joined.",
+     "default_roles": ["RMG", "Sales_Head"]},
+    {"event": "requirement.positions_approved",
+     "label": "Position change approved",
+     "description": "Sent to TA and Sales Head (and the requester) when a headcount change is approved — "
+                    "TA sources against the new target, so they are told the moment it moves.",
+     "default_roles": ["TA", "Sales_Head"]},
+    {"event": "requirement.positions_rejected",
+     "label": "Position change rejected",
+     "description": "Sent to the requester (and Sales Head) when RMG rejects a headcount change, with the note.",
+     "default_roles": ["Sales_Head"]},
     {"event": "support.ticket_raised",
      "label": "Support ticket raised",
      "description": "Sent when someone raises a ticket from the Help & Support bot (bottom-right) — "
@@ -87,30 +120,73 @@ EVENTS: list[dict] = [
      "label": "Invoice change rejected",
      "description": "Sent to the requester, Admin, CEO and Sales Head when a change request is rejected.",
      "default_roles": ["Admin", "CEO", "Sales_Head"]},
-    {"event": "invoice.generated",
-     "label": "Invoice generated from a timesheet",
-     "description": "Sent when a reviewer generates the invoice for an approved timesheet.",
+    {"event": "invoice.proforma_ready",
+     "label": "Proforma invoice ready for Finance review",
+     "description": "Sent when the GM raises a Proforma invoice from an approved timesheet.",
      "default_roles": ["Finance"]},
+    {"event": "invoice.proforma_returned",
+     "label": "Proforma invoice returned to the GM",
+     "description": "Sent when Finance sends a Proforma back with a reason, for the GM to fix and reissue.",
+     "default_roles": ["GM"]},
+    {"event": "invoice.generated",
+     "label": "Original invoice generated",
+     "description": "Sent when Finance generates the original (tax) invoice from a Proforma — "
+                    "the Sales Manager takes it from here.",
+     "default_roles": ["Sales Manager"]},
     {"event": "opportunity.submitted",
      "label": "Opportunity awaiting approval",
      "description": "Sent when an opportunity is created or resubmitted for Sales Head approval.",
      "default_roles": ["Sales_Head"]},
     {"event": "opportunity.approved",
-     "label": "Opportunity approved — engineering review",
-     "description": "Sent when an approved opportunity auto-creates a requirement that needs engineering review.",
+     "label": "Opportunity approved — RMG review",
+     "description": "Sent when an approved opportunity auto-creates a requirement that needs RMG review.",
      "default_roles": ["RMG"]},
+    {"event": "opportunity.stage_closed",
+     "label": "Opportunity closed (Won / Lost / Partial / Rejected)",
+     "description": "Sent when Sales closes a deal. Its requirement stops sourcing, so TA and RMG "
+                    "must know or they keep working it.",
+     "default_roles": ["TA", "RMG", "Sales_Head", "Admin", "CEO"]},
+    {"event": "opportunity.stage_held",
+     "label": "Opportunity put on hold (Customer Hold / Sales Hold)",
+     "description": "Sent when a deal is parked. Sourcing pauses and resumes to the same status.",
+     "default_roles": ["TA", "RMG", "Sales_Head", "Admin", "CEO"]},
+    {"event": "opportunity.stage_reactivated",
+     "label": "Opportunity reactivated",
+     "description": "Sent when a closed or held deal goes back to Active and sourcing resumes.",
+     "default_roles": ["TA", "RMG", "Sales_Head", "Admin", "CEO"]},
     {"event": "requirement.submitted",
      "label": "Requirement submitted for approval",
      "description": "Sent when a requirement is submitted for Sales Head approval.",
      "default_roles": ["Sales_Head"]},
     {"event": "requirement.sales_approved",
      "label": "Requirement approved by Sales Head",
-     "description": "Sent when Sales Head approves a requirement and it needs engineering review.",
+     "description": "Sent when Sales Head approves a requirement and it needs RMG review.",
      "default_roles": ["RMG"]},
     {"event": "requirement.engineering_approved",
      "label": "Requirement open for sourcing",
      "description": "Sent when engineering approves a requirement and sourcing can start.",
      "default_roles": ["TA"]},
+    # Screening (26 Sep 2026): these two used to fire outside this list, so
+    # nobody could see or re-route them. Whatever the route says, everyone who
+    # may Shortlist (RMG role · GM custom role · a template's Approvals) is
+    # ALWAYS added — `candidate_profiles.screening_notify_user_ids`.
+    {"event": "profile.ta_closed",
+     "label": "TA rejected / recorded a withdrawal",
+     "description": "Sent when a TA rejects a candidate at Sourcing or records that the candidate withdrew. "
+                    "Everyone who may screen — RMG and GM — is always included.",
+     "default_roles": ["RMG", "GM"]},
+    {"event": "profile.rmg_screening_requested",
+     "label": "New applicant awaiting RMG screening",
+     "description": "Sent when a TA applies a candidate to an opportunity (one per candidate; one "
+                    "summary per bulk upload). Everyone who may screen — RMG and GM — is always "
+                    "included; add roles here to copy others.",
+     "default_roles": ["RMG", "GM"]},
+    {"event": "profile.rmg_screening_sla",
+     "label": "Applicants waiting on RMG screening too long",
+     "description": "Daily reminder listing applicants past the screening SLA "
+                    "(Settings ▸ scheduler.rmg_screening_sla_hours). Everyone who may screen is always "
+                    "included.",
+     "default_roles": ["RMG", "GM"]},
     # Candidate stage arrivals — ONE ROW PER STAGE (2 Sep 2026). A single
     # "candidate.stage_arrival" row used to cover every stage, so customising
     # it for one team redirected every other team's hand-off too: HR stopped
@@ -122,6 +198,42 @@ EVENTS: list[dict] = [
      "description": "Sent when HR marks a candidate Joined — to every team that carried them "
                     "through the pipeline, and to leadership.",
      "default_roles": ["TA", "RMG", "Sales", "Sales_Head", "Admin", "CEO"]},
+    # TA's side of the screening flow (28 Sep 2026): these fired outside the
+    # list, so nobody could see or re-word them.
+    {"event": "profile.rmg_screening_decided",
+     "label": "Technical Screening decided",
+     "description": "Sent to the TA who applied a candidate when RMG / GM shortlist or reject them at "
+                    "Technical Screening.",
+     "default_roles": ["TA"]},
+    {"event": "profile.location_missing",
+     "label": "Candidate location missing",
+     "description": "Sent to the TA who added a profile when the candidate's Location or Preferred "
+                    "Location is blank — Sales and HR need both.",
+     "default_roles": ["TA"]},
+    {"event": "profile.ai_l1_requested",
+     "label": "Schedule the AI L1",
+     "description": "Sent to the TA owner when RMG / GM choose the AI L1 route after a shortlist — TA "
+                    "then gets the Schedule AI L1 button.",
+     "default_roles": ["TA"]},
+    {"event": "candidate.l1_requested",
+     "label": "Schedule the manual L1",
+     "description": "Sent to the TA owner when RMG / GM choose a manual L1 instead of the AI interview.",
+     "default_roles": ["TA"]},
+    {"event": "candidate.l2_requested",
+     "label": "Schedule the L2",
+     "description": "Sent to the TA owner when RMG / GM ask for an L2 after recording the L1 verdict.",
+     "default_roles": ["TA"]},
+    {"event": "profile.ai_l1_skipped",
+     "label": "AI L1 skipped",
+     "description": "Sent to the TA owner when RMG / GM skip the AI interview and review the CV alone.",
+     "default_roles": ["TA"]},
+    {"event": "profile.fast_tracked",
+     "label": "Internal candidate sent straight to Sales",
+     "description": "Sent to the TA who applied a candidate when RMG / GM fast-track them to Sales "
+                    "for customer screening from the Screening Desk (an existing Karnex employee — "
+                    "L1 and L2 skipped), so no interview gets booked. Sales hears through the "
+                    "Sales Screening hand-off.",
+     "default_roles": ["TA"]},
     {"event": "candidate.notice_period_requested",
      "label": "Collect the candidate's notice period",
      "description": "Sent to the TA owner when RMG submits a candidate to Sales and ticks "
@@ -135,7 +247,7 @@ EVENTS: list[dict] = [
     {"event": "candidate.hr_screening",
      "label": "Approved — HR round next",
      "description": "Sent to TA, RMG and HR when Sales Head approves the terms: the candidate is in "
-                    "HR Screening and TA schedules the HR round.",
+                    "HR Discussion and TA schedules the HR round.",
      "default_roles": ["TA", "RMG", "HR"]},
     {"event": "candidate.round_scheduled",
      "label": "Interview round scheduled — panel notified",
@@ -143,9 +255,15 @@ EVENTS: list[dict] = [
                     "the customer's) when TA books a round from the Applied Candidates tab or the "
                     "Interviews tab. Roles here are the DEFAULT; the round decides the recipient.",
      "default_roles": []},
+    {"event": "candidate.customer_slots_proposed",
+     "label": "Customer slots offered — TA schedules",
+     "description": "Sent to the candidate's TAs (who applied them and who sent them for screening) when "
+                    "Sales moves a candidate to Customer Interviewing with the slots the customer "
+                    "offered: TA confirms the candidate's availability and schedules the round.",
+     "default_roles": ["TA"]},
     {"event": "candidate.hr_requested",
      "label": "HR round requested",
-     "description": "Sent to the TA owner when HR (at HR Screening) asks for the HR round to be booked.",
+     "description": "Sent to the TA owner when HR (at HR Discussion) asks for the HR round to be booked.",
      "default_roles": ["TA"]},
     {"event": "candidate.round_rejected",
      "label": "Rejected at an interview round",
@@ -154,9 +272,9 @@ EVENTS: list[dict] = [
      "default_roles": ["TA", "Sales"]},
     {"event": "candidate.out_of_budget",
      "label": "Out of budget — HR flag at Pre-Onboarding",
-     "description": "Sent to Sales Head and the Sales person who submitted the terms when HR finds the "
-                    "candidate's CTC / joining date does not fit at Pre-Onboarding.",
-     "default_roles": ["Sales_Head", "Sales"]},
+     "description": "Sent to Sales Head, the Sales Manager and the Sales person who submitted the terms "
+                    "when HR finds the candidate's CTC / joining date does not fit at Pre-Onboarding.",
+     "default_roles": ["Sales_Head", "Sales Manager", "Sales"]},
     {"event": "candidate.budget_resolved",
      "label": "Budget reply from Sales",
      "description": "Sent to HR when Sales / Sales Head reply to the out-of-budget flag after talking to "
@@ -193,6 +311,25 @@ EVENTS: list[dict] = [
      "label": "AI L1 passed — needs review",
      "description": "Sent when a candidate passes the AI L1 threshold and the report needs a decision.",
      "default_roles": ["RMG"]},
+    {"event": "ai_interview.failed_review",
+     "label": "AI L1 not cleared — needs a decision",
+     "description": "Sent to everyone who screens (RMG · GM) when a candidate scores below the AI L1 "
+                    "threshold: reject them, or take a manual L1 when the AI read looks wrong.",
+     "default_roles": ["RMG", "GM"]},
+    {"event": "interview.result_recorded",
+     "label": "Interview done — result to review",
+     "description": "Sent to everyone who screens (RMG · GM) when someone else records an interview "
+                    "verdict (a customer round, a panel interviewer). It links to the Screening Desk's "
+                    "\"Results to review\" list, where the result stays highlighted until marked reviewed.",
+     "default_roles": ["RMG", "GM"]},
+    {"event": "interview.feedback_due",
+     "label": "Interview over — feedback due",
+     "description": "Sent when an interview's time has passed and no verdict is recorded, to whoever "
+                    "owns the round: RMG / GM for L1–L4, HR for the HR round, Sales · Sales Head · Sales "
+                    "Manager and the candidate's TAs for the customer's rounds — then once a day until it "
+                    "is recorded (Settings ▸ Operations). Roles here are the DEFAULT; the round decides "
+                    "the recipient.",
+     "default_roles": []},
     {"event": "slot.confirmed",
      "label": "Interview slot confirmed",
      "description": "Sent when a candidate confirms an interview slot and AI L1 is scheduled.",
@@ -299,6 +436,9 @@ def _stage_arrival_events() -> list[dict]:
 
 EVENTS.extend(_stage_arrival_events())
 
+#: Built-in roles only — kept for callers that need a static list. Pickers and
+#: validation use `all_role_names(db)` so custom roles (GM, Sales Manager)
+#: are routable too.
 ALL_ROLES = [m.value for m in RoleName]
 
 
@@ -343,6 +483,7 @@ class InviteIn(BaseModel):
     email: str
     full_name: str = ""
     roles: list[str] = Field(default_factory=list)
+    custom_roles: list[int] = Field(default_factory=list)   # GM, Sales Manager, …
 
     @field_validator("email")
     @classmethod
@@ -450,7 +591,7 @@ def list_email_flows(db: Session = Depends(get_crm_db),
             flows.append(_custom_flow(row))
     return envelope(data={
         "flows": flows,
-        "all_roles": ALL_ROLES,
+        "all_roles": all_role_names(db),
         "paused_user_ids": sorted(paused_user_ids(db)),
         "custom_tokens": list(CUSTOM_DRAFT_TOKENS),
     })
@@ -519,7 +660,7 @@ def save_email_flow(event: str, body: FlowIn,
     is_custom = spec is None and event.startswith(CUSTOM_DRAFT_PREFIX)
     if spec is None and not is_custom:
         raise HTTPException(status_code=404, detail="Unknown email flow")
-    bad = [r for r in body.roles if r not in ALL_ROLES]
+    bad = [r for r in body.roles if r not in all_role_names(db)]
     if bad:
         raise HTTPException(status_code=400, detail=f"Unknown role(s): {', '.join(bad)}")
     if (spec is not None and spec.get("kind", "internal") != "candidate"
@@ -624,7 +765,9 @@ def scheduler_status(db: Session = Depends(get_crm_db),
     labels = {"timesheet_reminders": "Timesheet due reminders",
               "po_expiry": "Purchase order expiry notices",
               "recurring_invoices": "Recurring invoice drafts",
-              "pe_leave_credit": "Monthly leave credit"}
+              "pe_leave_credit": "Monthly leave credit",
+              "project_closures": "Close projects after their last working day",
+              "prompt_log_retention": "AI call log retention (keeps cost figures)"}
     runs = last_runs()
 
     def _stale(entry: dict) -> bool:
@@ -734,7 +877,7 @@ def list_action_permissions(db: Session = Depends(get_crm_db),
     always pass regardless — an empty role list means admins only."""
     from services.action_permissions import effective as ap_effective
 
-    return envelope(data={"actions": ap_effective(db), "all_roles": ALL_ROLES})
+    return envelope(data={"actions": ap_effective(db), "all_roles": all_role_names(db)})
 
 
 @router.put("/action-permissions/{action}")
@@ -746,7 +889,7 @@ def save_action_permission(action: str, body: ActionPermissionIn,
 
     if action not in ACTIONS:
         raise HTTPException(status_code=404, detail="Unknown action")
-    bad = [r for r in body.roles if r not in ALL_ROLES]
+    bad = [r for r in body.roles if r not in all_role_names(db)]
     if bad:
         raise HTTPException(status_code=400, detail=f"Unknown role(s): {', '.join(bad)}")
     row = db.execute(
@@ -759,7 +902,7 @@ def save_action_permission(action: str, body: ActionPermissionIn,
     row.updated_by = user.id
     db.commit()
     ap_invalidate()
-    label = ACTIONS[action][0]
+    label = ACTIONS[action].label
     who = ", ".join(row.roles) if row.roles else "Admin/CEO only"
     return envelope(data={"action": action, "roles": row.roles},
                     message=f"'{label}' can now be done by: {who}")
@@ -915,6 +1058,7 @@ def invite_user(body: InviteIn,
         password=secrets.token_urlsafe(24),  # unusable until they set their own
         legacy_role="hr",
         role_names=body.roles,
+        custom_role_ids=body.custom_roles,
     )
     uid = int(created["id"])
 
@@ -927,7 +1071,7 @@ def invite_user(body: InviteIn,
 
     base = app_url("") or ""
     link = f"{base}/?reset_token={token}" if base else f"/?reset_token={token}"
-    roles_txt = ", ".join(created["roles"]) or "none"
+    roles_txt = ", ".join([*created["roles"], *created.get("custom_roles", [])]).replace("_", " ") or "none"
     title = "You're invited to Karnex"
     message = (
         f"{user.full_name or user.username} invited you to the Karnex application "

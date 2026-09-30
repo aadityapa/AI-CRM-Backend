@@ -30,12 +30,15 @@ from models import (
     TdsPayment,
     TdsRecord,
     TdsStatus,
+    TimesheetActivityLog,
 )
-from schemas.common import envelope
+from models.finance import InvoiceKind
+from schemas.common import RejectIn, envelope
 from schemas.finance import (
     AddressSnapshotIn,
     AllocationHsnUpdate,
     AllocationIn,
+    ConvertProformaIn,
     InvoiceCreate,
     InvoiceUpdate,
     PaymentIn,
@@ -47,12 +50,16 @@ from schemas.finance import (
     TdsPaymentIn,
 )
 from services import tax
-from services.crm_common import next_sequence_number, paginate, save_upload
+from services.crm_common import log_activity, next_sequence_number, paginate, save_upload
+from services.invoice_format import format_summary, normalize_invoice_format
+from services.proforma import convert_to_tax_invoice, return_to_gm
 from services.finance import (
     apply_gst_split,
     apply_invoice_gst_totals,
     assert_po_allows_new_drawdown,
     compute_karnex_gst,
+    consume_po_for_invoice,
+    ensure_po_covers,
     ensure_unique_invoice_number,
     ensure_unique_po_number,
     fetch_po_activity_log,
@@ -60,12 +67,13 @@ from services.finance import (
     get_po_or_404,
     get_project_or_404,
     karnex_gst_tax_and_grand,
-    log_invoice_created_on_po,
     log_po_activity,
     normalize_buyer_state_code_input,
+    po_draw_amount,
     po_invoice_rows,
     primary_branch,
     primary_contact,
+    require_tax_invoice,
     resolve_billing_branch,
     serialize_allocation,
     serialize_invoice,
@@ -711,8 +719,7 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
         db, po=po, project_id=body.project_id, lines=line_rows, sub_total=sub_total,
     )
 
-    if po is not None and Decimal(str(po.balance_value)) < grand_total:
-        raise HTTPException(status_code=400, detail="PO balance insufficient")
+    ensure_po_covers(po, po_draw_amount(sub_total))   # base value, not incl. GST
 
     invoice = Invoice(
         invoice_number=invoice_number,
@@ -729,20 +736,8 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
         lines=line_rows,
     )
     db.add(invoice)
-
-    if po is not None:
-        tax.apply_po_consumption(po, grand_total)
-        alloc = db.execute(
-            select(POProjectAllocation).where(
-                POProjectAllocation.po_id == po.id,
-                POProjectAllocation.project_id == body.project_id,
-            )
-        ).scalar_one_or_none()
-        if alloc is not None:
-            alloc.consumed_amount = Decimal(str(alloc.consumed_amount)) + grand_total
-
     db.flush()
-    log_invoice_created_on_po(db, po, invoice, user.id)
+    consume_po_for_invoice(db, invoice, po, user.id)
     db.commit()
     db.refresh(invoice)
     return envelope(serialize_invoice(invoice, detail=True, db=db), "Invoice created")
@@ -751,9 +746,13 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
 @router.get("/invoices")
 def list_invoices(payment_status: str | None = None, project_id: int | None = None,
                   po_id: int | None = None, customer_id: int | None = None,
+                  kind: str | None = None,
                   pp: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
     stmt = select(Invoice)
+    if kind:
+        # "Proforma" = Finance's review queue; "Tax" = issued invoices. Blank = both.
+        stmt = stmt.where(Invoice.kind == _enum_or_400(InvoiceKind, kind, "kind").value)
     if payment_status:
         stmt = stmt.where(
             Invoice.payment_status == _enum_or_400(PaymentStatus, payment_status, "payment_status"))
@@ -815,6 +814,23 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
         "invoice_date": "invoice_date", "due_date": "due_date", "sub_total": "sub_total",
         "payment_status": "payment_status"})
 
+    # A PROFORMA is Finance's to correct directly (23 Sep 2026): it is a
+    # document under review, not yet issued, so the change-request workflow
+    # (which exists to keep an ISSUED invoice's history) does not apply. Its
+    # PI number is not editable — the tax number is chosen at conversion.
+    if invoice.is_proforma:
+        if "invoice_number" in data and (data["invoice_number"] or "").strip() not in ("", invoice.invoice_number):
+            raise HTTPException(status_code=400, detail=(
+                "A Proforma keeps its PI number — type the invoice number when generating the original invoice"))
+        data.pop("invoice_number", None)
+        if "invoice_format" in data:
+            invoice.invoice_format = normalize_invoice_format(data["invoice_format"])
+            log_timesheet_activity(db, invoice, user.id, "PROFORMA_FORMAT_CHANGED",
+                                   f"Finance set the invoice format: {format_summary(invoice.invoice_format)}")
+    elif "invoice_format" in data:
+        raise HTTPException(status_code=400,
+                            detail="The column format is fixed once the original invoice is generated")
+
     for field in ("invoice_date", "due_date"):
         if field in data:
             setattr(invoice, field, data[field])
@@ -824,7 +840,8 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
     # Header edits after generation go through the change-request workflow
     # (routers/crm/invoice_revisions.py) — reason, approval, history,
     # notifications. Direct PUT stays for Admin/CEO only.
-    if not user.is_admin and any(k in data for k in ("invoice_number", "invoice_date", "due_date")):
+    if (not user.is_admin and not invoice.is_proforma
+            and any(k in data for k in ("invoice_number", "invoice_date", "due_date"))):
         raise HTTPException(status_code=403, detail=(
             "Generated invoices are changed through a change request (Edit → give a reason) so the "
             "change is approved and kept in the invoice history"))
@@ -853,6 +870,57 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
     db.commit()
     db.refresh(invoice)
     return envelope(serialize_invoice(invoice, detail=True, db=db), "Invoice updated")
+
+
+# ------------------------------------------------ Proforma → Tax (23 Sep 2026)
+
+def log_timesheet_activity(db: Session, invoice: Invoice, user_id: int, action: str, note: str) -> None:
+    """Invoice events are logged on the SOURCE TIMESHEET's activity log — that
+    is where Sales / GM / Finance already read the sheet's history, and a
+    manual invoice (no timesheet) has nothing to log against."""
+    if invoice.timesheet_id:
+        log_activity(db, TimesheetActivityLog, "timesheet_id", invoice.timesheet_id, user_id, action, note)
+
+
+CONVERT_PROFORMA = gated_write_action("invoice.convert_proforma", "invoices", "Finance")
+
+
+@router.post("/invoices/{invoice_id}/convert")
+def convert_proforma(invoice_id: int, body: ConvertProformaIn | None = None,
+                     db: Session = Depends(get_crm_db), user: CurrentUser = Depends(CONVERT_PROFORMA)):
+    """Finance generates the ORIGINAL (tax) invoice from a reviewed Proforma.
+    Same row, real number, PO drawn down now; the Sales Manager is notified."""
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice = convert_to_tax_invoice(
+        db, invoice, user,
+        invoice_number=body.invoice_number if body else None,
+        invoice_date=body.invoice_date if body else None,
+    )
+    log_timesheet_activity(db, invoice, user.id, "INVOICE_GENERATED",
+                           f"Original invoice {invoice.invoice_number} generated from proforma "
+                           f"{invoice.proforma_number} for {float(invoice.grand_total or 0):,.2f}")
+    db.commit()
+    db.refresh(invoice)
+    return envelope(serialize_invoice(invoice, detail=True, db=db),
+                    f"Original invoice {invoice.invoice_number} generated — Sales Manager notified")
+
+
+@router.post("/invoices/{invoice_id}/return")
+def return_proforma(invoice_id: int, body: RejectIn,
+                    db: Session = Depends(get_crm_db), user: CurrentUser = Depends(CONVERT_PROFORMA)):
+    """Finance sends the Proforma back to the GM with a reason (≥10 chars)."""
+    invoice = get_invoice_or_404(db, invoice_id)
+    try:
+        reason = body.validated_reason()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    invoice = return_to_gm(db, invoice, user, reason)
+    log_timesheet_activity(db, invoice, user.id, "PROFORMA_RETURNED",
+                           f"Finance returned proforma {invoice.invoice_number}: {reason}")
+    db.commit()
+    db.refresh(invoice)
+    return envelope(serialize_invoice(invoice, detail=True, db=db),
+                    f"Proforma {invoice.invoice_number} returned to the GM")
 
 
 @router.delete("/invoices/{invoice_id}")
@@ -926,6 +994,7 @@ def generate_invoice_pdf_endpoint(invoice_id: int, db: Session = Depends(get_crm
 def record_payment(invoice_id: int, body: PaymentIn, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(INV_WRITE)):
     invoice = get_invoice_or_404(db, invoice_id)
+    require_tax_invoice(invoice, "recording a payment")
     if body.amount <= 0 or body.amount > Decimal(str(invoice.balance_amount)):
         raise HTTPException(status_code=400,
                             detail="Payment amount must be positive and not exceed the balance amount")
@@ -967,6 +1036,7 @@ def upload_payment_proof(invoice_id: int, file: UploadFile = File(...),
 def record_tds(invoice_id: int, body: TdsCreateIn, db: Session = Depends(get_crm_db),
                user: CurrentUser = Depends(gated_write("tds", "Finance"))):
     invoice = get_invoice_or_404(db, invoice_id)
+    require_tax_invoice(invoice, "recording TDS")
     if invoice.tds_record is not None:
         raise HTTPException(status_code=409, detail="TDS record already exists for this invoice")
     tds_amount = body.tds_amount if body.tds_amount is not None else tax.tds_amount(invoice.sub_total)

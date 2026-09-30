@@ -17,7 +17,8 @@ from crm_deps import CurrentUser, PageParams, any_crm_role, gated_create, get_cr
 from routers.crm.candidates import _reject_impossible_ctc
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Customer,
-    InterviewEvent, OfferHistory, OfferStatus, Opportunity, PipelineStatus,
+    InterviewEvent, OfferHistory, OfferStatus, Opportunity, PipelineStatus, Requirement,
+    Resume,
 )
 from pydantic import BaseModel, Field
 
@@ -26,17 +27,25 @@ from schemas.candidate_profiles import (
     SkillEvaluationItem,
 )
 from schemas.common import envelope
+from services.action_permissions import screens_as_rmg
 from services.candidate_profiles import (
     applied_candidates_link,
     REJECTED_BUCKET, user_may_transition_from, backfill_profile_commercials, compute_hike_percent, enrich_profiles_list,
     get_profile_or_404, interview_event_to_dict, interview_events_for_profile,
-    offer_to_dict, perform_transition, profile_detail, profile_to_dict, upsert_skill_evaluations,
-    visible_statuses_for,
+    offer_to_dict, perform_transition, profile_detail, profile_to_dict,
+    ta_decision as apply_ta_decision, send_for_screening, l1_verdict_recorded,
+    upsert_skill_evaluations, visible_statuses_for,
+    customer_slots_text, fmt_slot_ist, latest_customer_slots, stamp_technical_submission,
+)
+from services.candidate_status import (
+    GROUPS, catalogue as candidate_status_catalogue, parse_phases, parse_status_keys,
+    phase_counts, profile_ids_in_phase, profile_ids_with_status,
 )
 from services.candidates import candidate_search_clause
 from services.crm_common import log_activity, paginate
+from services import hr_offer
 from services.interview_rounds import (
-    WRITE_ROLES as INTERVIEW_ROUND_WRITE_ROLES, ensure_may_write_round, get_round_or_404,
+    NOT_HELD_STATUSES, WRITE_ROLES as INTERVIEW_ROUND_WRITE_ROLES, ensure_may_write_round, get_round_or_404,
     options as interview_round_options_data, round_label, validate_round,
 )
 
@@ -50,9 +59,44 @@ evaluation_roles = gated_write("profiles", "RMG", "TA", "Sales")
 #: change that requires one.
 OFFER_WRITE_ROLES = ("Sales", "Sales_Head", "HR")
 offer_roles = gated_write("profiles", *OFFER_WRITE_ROLES)
-rmg_roles = gated_write_action("profile.rmg_screening", "profiles", "RMG")
+rmg_roles = gated_write_action("profile.rmg_screening", "profiles")
+#: Internal candidate → Sales, skipping L1 / L2 (Screening Desk, 25 Sep 2026).
+fast_track_gate = gated_write_action("profile.fast_track_internal", "profiles")
 #: Interview feedback is recorded by RMG (Admin/CEO are implicit in role_required).
 interview_round_roles = gated_write("profiles", *INTERVIEW_ROUND_WRITE_ROLES)
+
+
+def _ta_recipients(db: Session, profile) -> list[int]:
+    """The TAs who work this candidate (`services.candidate_profiles.ta_user_ids`)."""
+    from services.candidate_profiles import ta_user_ids
+    return ta_user_ids(db, profile)
+
+
+def _notify_ta(db: Session, profile, title: str, message: str, event: str, user) -> None:
+    """Tell the TAs who work this candidate (`_ta_recipients`; else every TA).
+    Best-effort — a notification must never cost the action that triggered it."""
+    from services.notify import notify_role, notify_user
+    link = applied_candidates_link(db, profile)
+    try:
+        with db.begin_nested():
+            recipients = [uid for uid in _ta_recipients(db, profile) if uid != getattr(user, "id", None)]
+            if recipients:
+                for uid in recipients:
+                    notify_user(db, uid, title, message, link, event=event, actor=user,
+                                related_type="candidate", related_id=profile.candidate_id)
+            elif not profile.ta_owner_id:
+                notify_role(db, "TA", title, message, link, exclude_user_id=getattr(user, "id", None),
+                            event=event, actor=user,
+                            related_type="candidate", related_id=profile.candidate_id)
+    except Exception:
+        logger.warning("TA notification %s failed for profile %s", event, profile.id, exc_info=True)
+
+
+def _candidate_name(db: Session, profile) -> str:
+    candidate = db.get(Candidate, profile.candidate_id)
+    return (" ".join(x for x in (getattr(candidate, "first_name", None),
+                                  getattr(candidate, "last_name", None)) if x)
+            or f"Candidate #{profile.candidate_id}")
 
 
 def _status_val(status) -> str:
@@ -86,12 +130,41 @@ _LATEST_AI_SCORE = (
     .scalar_subquery()
 )
 
+#: The ATS score the list shows — the latest resume on any of the profile's
+#: opportunity's requirements (same rule as enrich_profiles_list), as a
+#: correlated scalar so it can sort and filter server-side (25 Sep 2026).
+_LATEST_ATS_SCORE = (
+    select(Resume.ats_score)
+    .join(Requirement, Requirement.id == Resume.requirement_id)
+    .where(Requirement.opportunity_id == CandidateProfile.opportunity_id,
+           Resume.candidate_id == CandidateProfile.candidate_id)
+    .order_by(Resume.id.desc())
+    .limit(1)
+    .correlate(CandidateProfile)
+    .scalar_subquery()
+)
+
+#: The moment anything last happened to the candidacy (29 Sep 2026, user ask:
+#: "latest change first on top"). Every stage move, screening call, round
+#: verdict and note writes an activity row, so its newest timestamp IS the
+#: latest change; a profile with no row yet falls back to its own updated_at.
+_LAST_ACTIVITY = sa.func.coalesce(
+    select(sa.func.max(CandidateProfileActivityLog.timestamp))
+    .where(CandidateProfileActivityLog.profile_id == CandidateProfile.id)
+    .correlate(CandidateProfile)
+    .scalar_subquery(),
+    CandidateProfile.updated_at,
+    CandidateProfile.created_at,
+)
+
 _SORTABLE = {
+    "last_activity": (_LAST_ACTIVITY,),
     "candidate_name": (Candidate.first_name, Candidate.last_name),
     "email": (Candidate.email,),
     "experience_years": (Candidate.experience_years,),
     "notice_period": (Candidate.notice_period,),
     "ai_interview": (_LATEST_AI_SCORE,),
+    "ats_score": (_LATEST_ATS_SCORE,),
     "opportunity": (Opportunity.title,),
     "customer": (Customer.name,),
     "pipeline_status": (CandidateProfile.pipeline_status,),
@@ -145,9 +218,36 @@ def _id_csv(raw, field: str) -> list[int]:
         raise HTTPException(status_code=400, detail=f"{field} must be an id or a comma-separated list of ids")
 
 
+def _narrow_by_status(db: Session, stmt, status_key: str | None, phase: str | None = None):
+    """Apply the `?status_key=` (derived candidate status) and `?phase=` (the
+    stage it sits in — Sourcing … Onboarding, Closed) filters, both CSV.
+
+    Runs AFTER every other filter and the visibility scope, and BEFORE
+    ordering/pagination, so the page, the count and the sort stay exact.
+    """
+    try:
+        keys = parse_status_keys(status_key) if (status_key or "").strip() else []
+        phases = parse_phases(phase)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if keys:
+        ids = profile_ids_with_status(db, stmt, keys)
+        stmt = stmt.where(CandidateProfile.id.in_(ids)) if ids else stmt.where(sa.false())
+    if phases:
+        ids = profile_ids_in_phase(db, stmt, phases)
+        stmt = stmt.where(CandidateProfile.id.in_(ids)) if ids else stmt.where(sa.false())
+    return stmt
+
+
 @router.get("")
 def list_profiles(pp: PageParams = Depends(page_params),
                   pipeline_status: str | None = None,
+                  #: The derived candidate status (services/candidate_status.py), CSV.
+                  status_key: str | None = None,
+                  #: The stage it sits in (services/candidate_status.STAGES keys), CSV.
+                  phase: str | None = None,
+                  #: Adds `meta.phase_counts` — the Candidate Profiles stage strip.
+                  with_phase_counts: bool = False,
                   opportunity_id: str | None = None,
                   candidate_id: int | None = None,
                   ta_owner_id: str | None = None,
@@ -160,6 +260,8 @@ def list_profiles(pp: PageParams = Depends(page_params),
                   # SERVER query, so they cover the whole dataset, not the page.
                   ai_min: float | None = None,
                   ai_max: float | None = None,
+                  ats_min: float | None = None,
+                  ats_max: float | None = None,
                   exp_min: float | None = None,
                   exp_max: float | None = None,
                   notice: str | None = None,
@@ -191,6 +293,10 @@ def list_profiles(pp: PageParams = Depends(page_params),
         stmt = stmt.where(_LATEST_AI_SCORE >= ai_min)
     if ai_max is not None:
         stmt = stmt.where(_LATEST_AI_SCORE <= ai_max)
+    if ats_min is not None:
+        stmt = stmt.where(_LATEST_ATS_SCORE >= ats_min)
+    if ats_max is not None:
+        stmt = stmt.where(_LATEST_ATS_SCORE <= ats_max)
     if applied_from is not None:
         stmt = stmt.where(sa.func.date(sa.func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)) >= applied_from)
     if applied_to is not None:
@@ -238,6 +344,8 @@ def list_profiles(pp: PageParams = Depends(page_params),
         # is_hidden is NOT NULL with a false default, so this never drops rows
         # that predate the column.
         stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
+    # The stage strip counts every stage, Closed included, whatever the bucket.
+    pre_bucket = stmt
     if bucket:
         bucket = bucket.strip().lower()
         rejected_enums = [PipelineStatus(v) for v in sorted(REJECTED_BUCKET)]
@@ -257,6 +365,16 @@ def list_profiles(pp: PageParams = Depends(page_params),
         stmt = stmt.where(
             CandidateProfile.pipeline_status.in_([PipelineStatus(v) for v in sorted(visible)])
         )
+    # The stage strip's counts (29 Sep 2026): every other filter applies, the
+    # stage itself does not — each chip says what clicking it would list.
+    counts = None
+    if with_phase_counts:
+        cstmt = pre_bucket
+        if visible is not None:
+            cstmt = cstmt.where(
+                CandidateProfile.pipeline_status.in_([PipelineStatus(v) for v in sorted(visible)]))
+        counts = phase_counts(db, _narrow_by_status(db, cstmt, status_key, None))
+    stmt = _narrow_by_status(db, stmt, status_key, phase)
     # ---- ordering -------------------------------------------------------
     levels = _parse_sort(sort)
     if levels:
@@ -280,11 +398,20 @@ def list_profiles(pp: PageParams = Depends(page_params),
             CandidateProfile.id.asc() if pp.sort_dir == "asc" else CandidateProfile.id.desc()
         )
     items, meta = paginate(db, stmt, pp.page, pp.limit)
+    if counts is not None:
+        meta = {**meta, "phase_counts": counts}
     return envelope(data=enrich_profiles_list(db, items), meta=meta)
 
 
 # NOTE (route order): these literal routes MUST stay above GET /{profile_id},
-# or FastAPI binds profile_id="ta-owners"/"export" and 404s them.
+# or FastAPI binds profile_id="ta-owners"/"export"/"status-options" and 404s them.
+
+@router.get("/status-options")
+def candidate_status_options(user: CurrentUser = Depends(any_crm_role)):
+    """The candidate-status catalogue (groups + statuses in flow order) — the
+    ONE vocabulary behind every Status column, badge, filter and export."""
+    return envelope(candidate_status_catalogue())
+
 
 @router.get("/customers")
 def profile_customer_options(db: Session = Depends(get_crm_db),
@@ -330,9 +457,9 @@ def ta_owner_options(db: Session = Depends(get_crm_db),
 _EXPORT_COLUMNS: list[tuple[str, str]] = [
     ("candidate_name", "Candidate"), ("email", "Email"), ("phone", "Phone"),
     ("opportunity_opp_id", "Opportunity"), ("opportunity_title", "Role"),
-    ("customer_name", "Customer"), ("pipeline_status", "Status"),
-    ("withdrawn_from_status", "Withdrew From"),
-    ("ai_overall_score_percent", "AI Score %"), ("ai_result", "AI Result"),
+    # The derived candidate status — the same words the Status column shows.
+    ("stage_label", "Stage"), ("status_label", "Status"), ("status_group", "Status Group"),
+    ("ai_overall_score_percent", "AI Score %"), ("ai_result", "AI Result"), ("ats_score", "ATS Score"),
     ("experience_years", "Exp (yrs)"), ("notice_period", "Notice"),
     ("current_ctc", "Current CTC"), ("expected_ctc", "Expected CTC"),
     ("approved_ctc", "Approved CTC"), ("ta_owner_name", "TA Owner"),
@@ -344,6 +471,8 @@ _EXPORT_FORMATS = ("csv", "tsv", "json", "xml", "html", "xlsx", "pdf")
 @router.get("/export")
 def export_profiles(format: str = "csv",
                     pipeline_status: str | None = None,
+                    status_key: str | None = None,
+                    phase: str | None = None,
                     opportunity_id: str | None = None,
                     ta_owner_id: str | None = None,
                     customer_id: int | None = None,
@@ -351,6 +480,8 @@ def export_profiles(format: str = "csv",
                     search: str | None = None,
                     ai_min: float | None = None,
                     ai_max: float | None = None,
+                    ats_min: float | None = None,
+                    ats_max: float | None = None,
                     exp_min: float | None = None,
                     exp_max: float | None = None,
                     notice: str | None = None,
@@ -392,6 +523,10 @@ def export_profiles(format: str = "csv",
         stmt = stmt.where(_LATEST_AI_SCORE >= ai_min)
     if ai_max is not None:
         stmt = stmt.where(_LATEST_AI_SCORE <= ai_max)
+    if ats_min is not None:
+        stmt = stmt.where(_LATEST_ATS_SCORE >= ats_min)
+    if ats_max is not None:
+        stmt = stmt.where(_LATEST_ATS_SCORE <= ats_max)
     if applied_from is not None:
         stmt = stmt.where(sa.func.date(sa.func.coalesce(CandidateProfile.applied_on, CandidateProfile.created_at)) >= applied_from)
     if applied_to is not None:
@@ -426,10 +561,17 @@ def export_profiles(format: str = "csv",
     if visible is not None:
         stmt = stmt.where(
             CandidateProfile.pipeline_status.in_([PipelineStatus(v) for v in sorted(visible)]))
+    stmt = _narrow_by_status(db, stmt, status_key, phase)
     stmt = stmt.order_by(CandidateProfile.id.desc()).limit(5000)
 
     items = db.execute(stmt).scalars().all()
     data = enrich_profiles_list(db, items)
+    group_labels = dict(GROUPS)
+    for row in data:
+        status = row.get("candidate_status") or {}
+        row["stage_label"] = (status.get("stage") or {}).get("label")
+        row["status_label"] = status.get("label")
+        row["status_group"] = group_labels.get(status.get("group") or "")
     rows = [[("" if r.get(k) is None else r.get(k)) for k, _ in _EXPORT_COLUMNS] for r in data]
     headers = [label for _, label in _EXPORT_COLUMNS]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
@@ -537,6 +679,17 @@ def create_profile(payload: ProfileCreate,
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not db.get(Opportunity, payload.opportunity_id):
         raise HTTPException(status_code=404, detail="Opportunity not found")
+    # A recruiter-only TA puts candidates forward on SOURCING deals only
+    # (29 Sep 2026, user report): a deal still waiting for the Sales Head or
+    # RMG, parked or closed has nothing to apply to yet.
+    from services.requirements import recruiter_only, sourcing_opportunity_clause
+    if recruiter_only(user) and not db.execute(
+            select(Opportunity.id).where(Opportunity.id == payload.opportunity_id,
+                                         sourcing_opportunity_clause())).first():
+        raise HTTPException(
+            status_code=400,
+            detail="This opportunity is not open for sourcing yet — it is waiting for "
+                   "Sales Head / RMG approval, on hold or closed. Apply once it is in sourcing.")
     duplicate = db.execute(
         select(CandidateProfile).where(
             CandidateProfile.candidate_id == payload.candidate_id,
@@ -580,34 +733,36 @@ def create_profile(payload: ProfileCreate,
         profile.applied_on = datetime.now(timezone.utc)
     if getattr(profile, "source", None) is None:
         profile.source = "app"
-    # RMG screening gate (25 Aug 2026): a new applicant starts Pending and the
-    # AI-L1 actions stay locked until RMG shortlists. An RMG (or Admin) doing
-    # the apply themselves IS the screening — auto-shortlist, no notification.
-    from services.candidate_profiles import (
-        RMG_SCREENING_PENDING, RMG_SCREENING_SHORTLISTED, notify_rmg_new_applicant,
-        rmg_gate_enabled,
-    )
-    if not rmg_gate_enabled():
-        pass  # gate switched off in Settings: no stamping, no notification
-    elif user.has_any("RMG") or user.is_admin:
+    # RMG screening gate: an RMG (or Admin / a GM) creating the profile IS the
+    # screening — shortlisted on the spot. Anyone else's profile waits at
+    # Sourcing until TA sends it for Technical Screening (28 Sep 2026).
+    from services.candidate_profiles import RMG_SCREENING_SHORTLISTED, rmg_gate_enabled
+    if rmg_gate_enabled() and screens_as_rmg(db, user):
         profile.rmg_screening_status = RMG_SCREENING_SHORTLISTED
         profile.rmg_screening_by = user.id
         profile.rmg_screening_at = datetime.now(timezone.utc)
-    else:
-        profile.rmg_screening_status = RMG_SCREENING_PENDING
+        stamp_technical_submission(profile)
     db.add(profile)
     db.flush()
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "CREATED",
                  f"Candidate profile created (status Sourcing) by {user.full_name or user.username}")
+    # ATS runs by itself, as on an upload (28 Sep 2026) — best-effort, never
+    # fails the apply (`services/resumes.auto_score_profile`).
+    from services.resumes import auto_score_profile
+    auto_score_profile(db, profile, user.id)
     if notes:
         log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                      "NOTE", notes)
-    if profile.rmg_screening_status == RMG_SCREENING_PENDING:
-        notify_rmg_new_applicant(db, profile, actor=user)
+    # Candidate Location / Preferred Location blank → remind the TA who added it (29 Sep 2026).
+    from services.slot_booking import remind_missing_location
+    missing = remind_missing_location(db, profile, user.id)
     db.commit()
     db.refresh(profile)
-    return envelope(data=profile_to_dict(profile), message="Candidate profile created")
+    msg = "Candidate profile created"
+    if missing:
+        msg += f" — please add the {' and '.join(missing)}"
+    return envelope(data=profile_to_dict(profile), message=msg)
 
 
 @router.get("/{profile_id}")
@@ -639,7 +794,45 @@ def get_profile(profile_id: int,
     if changed:
         db.commit()
         db.refresh(profile)
-    return envelope(data=profile_detail(db, profile, user))
+    data = profile_detail(db, profile, user)
+    # Internal candidate (an existing Karnex employee) + whether the L1/L2
+    # fast-track to Sales applies — the button renders from these alone.
+    from services.screening_desk import direct_to_sales_block, fast_track_block, internal_employee_for
+    internal = internal_employee_for(db, profile)
+    data["internal_employee"] = internal
+    data["fast_track_block"] = fast_track_block(profile, internal)
+    data["direct_to_sales_block"] = direct_to_sales_block(profile)
+    # HR's offered CTC (0116) — present for HR / Admin / CEO ONLY; every other
+    # login never sees the key, so the tab cannot render for them.
+    if hr_offer.may_see(user):
+        from services.revenue_report import _user_names
+        by = getattr(profile, "hr_offered_by", None)
+        data["hr_offer"] = hr_offer.payload(db, profile, _user_names(db, {by}) if by else None)
+    return envelope(data=data)
+
+
+class HrOfferIn(BaseModel):
+    """HR's offered CTC — annual RUPEES (the UI converts from Lac)."""
+    offered_ctc: float = Field(..., gt=0)
+    note: str | None = Field(default=None, max_length=hr_offer.MAX_NOTE)
+
+
+@router.put("/{profile_id}/hr-offer")
+def set_hr_offer(profile_id: int, payload: HrOfferIn,
+                 db: Session = Depends(get_crm_db),
+                 user: CurrentUser = Depends(role_required("HR"))):
+    """Record the CTC HR offers at Pre-Onboarding (30 Sep 2026, user rule).
+
+    HR by role (Admin/CEO implicit) — a template grant never opens this; the
+    stage window and the figure are checked in `services.hr_offer.set_offer`.
+    """
+    profile = get_profile_or_404(db, profile_id)
+    hr_offer.set_offer(db, profile, payload.offered_ctc, payload.note, user)
+    db.commit()
+    db.refresh(profile)
+    from services.revenue_report import _user_names
+    return envelope(data=hr_offer.payload(db, profile, _user_names(db, {user.id})),
+                    message="Offered CTC recorded")
 
 
 #: The internal, human interview ladder RMG runs with the candidate.
@@ -728,6 +921,31 @@ class SkipAiL1In(BaseModel):
     request_manual_l1: bool = True
 
 
+class SendForScreeningIn(BaseModel):
+    profile_ids: list[int] = Field(min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=1000)
+
+
+@router.post("/send-for-screening")
+def send_many_for_screening(payload: SendForScreeningIn,
+                            db: Session = Depends(get_crm_db),
+                            user: CurrentUser = Depends(gated_write("profiles", "TA"))):
+    """TA sends several applicants for Technical Screening at once (a bulk ZIP
+    lands at Sourcing). One summary notice to everyone who may screen; each
+    refused row says why."""
+    profiles = db.execute(select(CandidateProfile).where(
+        CandidateProfile.id.in_(set(payload.profile_ids)))).scalars().all()
+    sent, refused = send_for_screening(db, list(profiles), user, payload.note)
+    db.commit()
+    from services.candidate_profiles import SCREENING_SCORE_INLINE
+    if len(sent) > SCREENING_SCORE_INLINE:
+        from services.resumes import score_profiles_in_background
+        score_profiles_in_background([p.id for p in sent], user.id)
+    return envelope({"sent": [p.id for p in sent], "refused": refused},
+                    message=f"{len(sent)} sent for Technical Screening"
+                            + (f", {len(refused)} skipped" if refused else ""))
+
+
 @router.post("/{profile_id}/skip-ai-l1")
 def skip_ai_l1(
     profile_id: int,
@@ -755,9 +973,7 @@ def skip_ai_l1(
     reason = "AI L1 skipped by RMG — manual interview route" + (f" — {note}" if note else "")
     moved = hand_off_to_rmg_review(db, profile, user, reason)
     already_here = moved is None
-    candidate = db.get(Candidate, profile.candidate_id)
-    cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
-             if candidate else f"Candidate #{profile.candidate_id}")
+    cname = _candidate_name(db, profile)
 
     # Asking for the manual L1 is the same request TA already knows how to
     # answer for an L2 — logged under the round's own activity type so the
@@ -767,33 +983,16 @@ def skip_ai_l1(
                      MANUAL_ROUNDS["L1"]["request_activity"],
                      "RMG requested a MANUAL L1 round instead of the AI interview"
                      + (f" — note: {note}" if note else ""))
-
-    try:
-        from services.notify import notify_role, notify_user
-        if payload.request_manual_l1:
-            title = f"Schedule manual L1: {cname}"
-            message = (f"RMG is skipping the AI interview for {cname} and wants a human L1 "
-                       "round. Please agree a time with the candidate and enter the schedule "
-                       "(date/time + meeting link)."
-                       + (f" Note: {note}" if note else ""))
-            event = MANUAL_ROUNDS["L1"]["requested_event"]
-        else:
-            title = f"AI L1 skipped: {cname}"
-            message = (f"RMG will review {cname} directly"
-                       + (f" — {note}" if note else "")
-                       + ". No AI interview is needed for this candidate.")
-            event = "profile.ai_l1_skipped"
-        link = applied_candidates_link(db, profile)
-        if profile.ta_owner_id:
-            notify_user(db, profile.ta_owner_id, title, message, link,
-                        event=event, actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-        else:
-            notify_role(db, "TA", title, message, link, exclude_user_id=user.id,
-                        event=event, actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-    except Exception:
-        pass  # notification must never cost the decision
+        _notify_ta(db, profile, f"Schedule manual L1: {cname}",
+                   f"RMG / GM chose a MANUAL L1 for {cname}. Agree a time with the candidate and "
+                   "press Schedule L1 on the Applied Candidates row (date/time + meeting link)."
+                   + (f" Note: {note}" if note else ""),
+                   MANUAL_ROUNDS["L1"]["requested_event"], user)
+    else:
+        _notify_ta(db, profile, f"AI L1 skipped: {cname}",
+                   f"RMG will review {cname} directly" + (f" — {note}" if note else "")
+                   + ". No AI interview is needed for this candidate.",
+                   "profile.ai_l1_skipped", user)
     db.commit()
     db.refresh(profile)
     if already_here and not payload.request_manual_l1:
@@ -834,6 +1033,7 @@ def rmg_screening_decision(
     profile.rmg_screening_note = note or None
     profile.rmg_screening_by = user.id
     profile.rmg_screening_at = datetime.now(timezone.utc)
+    stamp_technical_submission(profile)
 
     candidate = db.get(Candidate, profile.candidate_id)
     cname = " ".join(p for p in (getattr(candidate, "first_name", None),
@@ -846,35 +1046,200 @@ def rmg_screening_decision(
                  (f"RMG screening: {payload.decision} by {user.full_name or user.username}"
                   + (f" — {note}" if note else "")))
 
-    # Tell the TA who applied this candidate (fall back to the whole TA role
-    # when the profile has no owner, e.g. an imported row).
-    from services.notify import notify_role, notify_user
-    title = (f"RMG shortlisted: {cname}" if shortlisted else f"RMG rejected: {cname}")
-    message = (
-        f"{cname} on {opp_label} — cleared for the AI L1 interview. Contact the "
-        f"candidate, agree a slot, and send the AI L1 invitation link."
-        if shortlisted else
-        f"{cname} on {opp_label} — rejected at RMG screening"
-        + (f": {note}" if note else "") + "."
-    )
-    link = applied_candidates_link(db, profile)
-    try:
-        if profile.ta_owner_id:
-            notify_user(db, profile.ta_owner_id, title, message, link,
-                        event="profile.rmg_screening_decided", actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-        else:
-            notify_role(db, "TA", title, message, link,
-                        event="profile.rmg_screening_decided", actor=user,
-                        exclude_user_id=user.id,
-                        related_type="candidate", related_id=profile.candidate_id)
-    except Exception:
-        pass
+    # Tell the TA who applied this candidate (else every TA). A shortlist is
+    # followed by RMG / GM choosing the route (AI or manual L1) — TA's own
+    # "schedule" notice comes with that choice, so this one only informs.
+    _notify_ta(db, profile,
+               f"RMG shortlisted: {cname}" if shortlisted else f"RMG rejected: {cname}",
+               (f"{cname} on {opp_label} — cleared at Technical Screening. RMG / GM will choose "
+                "the AI or manual L1 next; you will be told which to schedule.")
+               if shortlisted else
+               (f"{cname} on {opp_label} — rejected at Technical Screening"
+                + (f": {note}" if note else "") + "."),
+               "profile.rmg_screening_decided", user)
     db.commit()
     db.refresh(profile)
     return envelope(data=profile_to_dict(profile),
-                    message=("Candidate shortlisted — TA notified to proceed with the AI L1"
-                             if shortlisted else "Candidate rejected at RMG screening — TA notified"))
+                    message=("Candidate shortlisted — now choose the AI or manual L1"
+                             if shortlisted else "Candidate rejected at screening — TA notified"))
+
+
+class TaDecisionIn(BaseModel):
+    decision: str = Field(pattern="^(screen|hold|release|reject|withdraw)$")
+    note: str | None = Field(default=None, max_length=1000)
+
+
+@router.post("/{profile_id}/ta-decision")
+def ta_decision(profile_id: int, payload: TaDecisionIn,
+                db: Session = Depends(get_crm_db),
+                user: CurrentUser = Depends(gated_write("profiles", "TA"))):
+    """TA's buttons on an Applied Candidates row: Technical Screening · Hold ·
+    Release · Reject · Self Withdraw (`services/candidate_profiles.ta_decision`)."""
+    profile = get_profile_or_404(db, profile_id)
+    message = apply_ta_decision(db, profile, payload.decision, payload.note, user)
+    db.commit()
+    db.refresh(profile)
+    return envelope(data=profile_to_dict(profile), message=message)
+
+
+class RequestAiL1In(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+@router.post("/{profile_id}/request-ai-l1")
+def request_ai_l1(profile_id: int, payload: RequestAiL1In,
+                  db: Session = Depends(get_crm_db),
+                  user: CurrentUser = Depends(rmg_roles)):
+    """RMG / GM choose the AI route after a shortlist (28 Sep 2026, user flow):
+    TA is told to schedule the AI L1 and gets the "Schedule AI L1" button.
+    The manual route is `skip-ai-l1`. Logged as `AI_L1_REQUESTED` — the status
+    reads "AI L1 – Yet to Schedule" until the link exists."""
+    from services.candidate_profiles import (
+        RMG_SCREENING_SHORTLISTED, TA_DECISION_STAGES, rmg_gate_enabled,
+    )
+    from services.resumes import AI_L1_REQUESTED
+
+    profile = get_profile_or_404(db, profile_id)
+    if rmg_gate_enabled() and profile.rmg_screening_status != RMG_SCREENING_SHORTLISTED:
+        raise HTTPException(status_code=409, detail="Shortlist the candidate first.")
+    if _status_val(profile.pipeline_status) not in TA_DECISION_STAGES:
+        raise HTTPException(status_code=409,
+                            detail="The interview route is chosen before the technical interview.")
+    if db.execute(select(AiInterviewLink.id).where(AiInterviewLink.profile_id == profile.id)
+                  .limit(1)).first() is not None:
+        raise HTTPException(status_code=409, detail="An AI interview already exists for this candidate.")
+    note = (payload.note or "").strip()
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                 AI_L1_REQUESTED, "AI L1 chosen by " + (user.full_name or user.username or "RMG")
+                 + (f" — note: {note}" if note else ""))
+    cname = _candidate_name(db, profile)
+    _notify_ta(db, profile, f"Schedule AI L1: {cname}",
+               f"RMG / GM chose the AI L1 interview for {cname}. Agree a time with the candidate "
+               "and press Schedule AI L1 on the Applied Candidates row."
+               + (f" Note: {note}" if note else ""),
+               "profile.ai_l1_requested", user)
+    db.commit()
+    return envelope(data=profile_to_dict(profile),
+                    message="AI L1 chosen — TA notified to schedule it")
+
+
+@router.get("/{profile_id}/handover-note")
+def get_handover_note(profile_id: int,
+                      db: Session = Depends(get_crm_db),
+                      user: CurrentUser = Depends(rmg_roles)):
+    """The default recommendation RMG / GM send to Sales (28 Sep 2026, user
+    ask: "the message should come from the interviews"). Built from the
+    recorded rounds, the AI L1, the skill evaluation and the candidate's
+    facts (`services/handover_note.py`); the dialog lets them edit it."""
+    from services.handover_note import handover_note, sales_readiness
+    profile = get_profile_or_404(db, profile_id)
+    return envelope(data={"note": handover_note(db, profile),
+                          # What Sales needs, so RMG / GM verify before submitting (29 Sep 2026).
+                          "checks": sales_readiness(db, profile)})
+
+
+class SalesDetailsIn(BaseModel):
+    """Only the fields the Submit-to-Sales checklist can fill (CTCs in Lac)."""
+    current_ctc: float | None = Field(default=None, ge=0, le=500)
+    expected_ctc: float | None = Field(default=None, ge=0, le=500)
+    total_experience_years: float | None = Field(default=None, ge=0, le=60)
+    notice_period: str | None = Field(default=None, max_length=60)
+    city: str | None = Field(default=None, max_length=120)
+    preferred_locations: str | None = Field(default=None, max_length=500)
+    phone: str | None = Field(default=None, max_length=32)
+
+
+@router.patch("/{profile_id}/sales-details")
+def patch_sales_details(profile_id: int, payload: SalesDetailsIn,
+                        db: Session = Depends(get_crm_db),
+                        user: CurrentUser = Depends(rmg_roles)):
+    """Fill what Sales needs from the Submit-to-Sales dialog (29 Sep 2026) —
+    whoever may take the screening decision, only the whitelisted fields,
+    only the keys sent. Returns the refreshed checklist."""
+    from services.handover_note import apply_sales_details, sales_readiness
+    profile = get_profile_or_404(db, profile_id)
+    changed = apply_sales_details(db, profile, payload.model_dump(exclude_unset=True))
+    if changed:
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     "SALES_DETAILS", "Filled before submitting to Sales: " + ", ".join(changed))
+    db.commit()
+    return envelope(data={"changed": changed, "checks": sales_readiness(db, profile)},
+                    message="Details saved" if changed else "Nothing changed")
+
+
+class FastTrackIn(BaseModel):
+    note: str = Field(min_length=1, max_length=1000)
+
+
+@router.post("/{profile_id}/fast-track-to-sales")
+def fast_track_to_sales(
+    profile_id: int,
+    payload: FastTrackIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(fast_track_gate),
+):
+    """Send an INTERNAL candidate straight to Sales for customer screening (25 Sep 2026).
+
+    An existing Karnex employee has already been vetted by us, so RMG / GM may
+    skip the L1 and L2 rounds: Sourcing / Technical Screening / RMG Review →
+    Sales Screening in one step, reason required. Sales is told as for any
+    hand-off, and the TA who applied them is told no interview is needed.
+    Rules live in services.screening_desk.fast_track_internal.
+    """
+    from services.screening_desk import fast_track_internal
+
+    profile = get_profile_or_404(db, profile_id)
+    employee = fast_track_internal(db, profile, payload.note, user)
+    db.commit()
+    db.refresh(profile)
+    who = employee.get("employee_code") or employee.get("name") or "internal candidate"
+    return envelope(data=profile_to_dict(profile),
+                    message=f"Sent to Sales for customer screening ({who}) — L1 and L2 skipped")
+
+
+@router.post("/{profile_id}/direct-to-sales")
+def direct_to_sales_route(
+    profile_id: int,
+    payload: FastTrackIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(rmg_roles),
+):
+    """RMG / GM send a strong match straight to Sales for the customer round,
+    skipping the technical L1 / L2 (30 Sep 2026, user ask). Reason mandatory
+    (≥ 10 chars); allowed from Sourcing / Technical Screening / RMG Review only.
+    Same gate as the screening decision (`profile.rmg_screening`). Rules live in
+    services.screening_desk.direct_to_sales."""
+    from services.screening_desk import direct_to_sales
+
+    profile = get_profile_or_404(db, profile_id)
+    direct_to_sales(db, profile, payload.note, user)
+    db.commit()
+    db.refresh(profile)
+    return envelope(data=profile_to_dict(profile),
+                    message="Sent to Sales for the customer round — L1 and L2 skipped")
+
+
+class ArchiveIn(BaseModel):
+    archived: bool = True
+
+
+@router.post("/{profile_id}/archive")
+def archive_applied_candidate(
+    profile_id: int,
+    payload: ArchiveIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(rmg_roles),
+):
+    """RMG / GM move a rejected / withdrawn candidate to the Applied Candidates
+    Archive tab (`archived: false` restores). Manual only — 30 Sep 2026 rule."""
+    from services.candidate_profiles import set_applied_archive
+
+    profile = get_profile_or_404(db, profile_id)
+    changed = set_applied_archive(db, profile, payload.archived, user)
+    db.commit()
+    return envelope(data={"profile_id": profile.id, "archived": payload.archived, "changed": changed},
+                    message=("Moved to Archive" if payload.archived else "Restored to Applied Candidates")
+                    if changed else "Nothing to change")
 
 
 class L2RequestIn(BaseModel):
@@ -903,7 +1268,8 @@ def request_l2_face_to_face(
     spec = manual_round_spec(payload.round)
     rl = spec["label"]
     profile = get_profile_or_404(db, profile_id)
-    if not getattr(user, "is_admin", False) and spec["owner_role"] not in (user.roles or set()):
+    if not getattr(user, "is_admin", False) and spec["owner_role"] not in (user.roles or set()) \
+            and not (spec["owner_role"] == "RMG" and screens_as_rmg(db, user)):
         raise HTTPException(status_code=403,
                             detail=f"Only {spec['owner_role']} can request the {rl} round.")
     if _status_val(profile.pipeline_status) != spec["stage"]:
@@ -911,32 +1277,23 @@ def request_l2_face_to_face(
             status_code=400,
             detail=f"An {rl} round can be requested only while the profile is in "
                    f"{spec['stage'].replace('_', ' ')}")
+    # The L2 follows the L1's verdict (28 Sep 2026, user flow): RMG / GM record
+    # the L1 feedback first, then decide whether an L2 is needed.
+    if spec["kind"] == MANUAL_ROUNDS["L2"]["kind"] and not l1_verdict_recorded(db, profile.id):
+        raise HTTPException(status_code=400,
+                            detail="Record the L1 feedback first — the L2 is requested after the L1 verdict.")
     owner = spec["owner_role"]
     note = (payload.note or "").strip()
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  spec["request_activity"],
                  f"{owner} requested a face-to-face {rl} round"
                  + (f" — note: {note}" if note else ""))
-    candidate = db.get(Candidate, profile.candidate_id)
-    cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
-             if candidate else f"Candidate #{profile.candidate_id}")
-    from services.notify import notify_role, notify_user
-    title = f"Schedule {rl} round: {cname}"
-    message = (f"{owner} wants a face-to-face {rl} with {cname}. Please agree a time with the "
-               "candidate and enter the schedule (date/time + meeting link)."
-               + (f" Note: {note}" if note else ""))
-    link = applied_candidates_link(db, profile)
-    try:
-        if profile.ta_owner_id:
-            notify_user(db, profile.ta_owner_id, title, message, link,
-                        event=spec["requested_event"], actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-        else:
-            notify_role(db, "TA", title, message, link, exclude_user_id=user.id,
-                        event=spec["requested_event"], actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-    except Exception:
-        pass
+    cname = _candidate_name(db, profile)
+    _notify_ta(db, profile, f"Schedule {rl} round: {cname}",
+               f"{owner} wants a face-to-face {rl} with {cname}. Agree a time with the candidate "
+               f"and press Schedule {rl} on the Applied Candidates row (date/time + meeting link)."
+               + (f" Note: {note}" if note else ""),
+               spec["requested_event"], user)
     db.commit()
     return envelope({"requested": True, "round": rl},
                     message=f"TA notified — they will schedule the {rl} with the candidate")
@@ -952,7 +1309,7 @@ def _derive_l2_interviewer(db: Session, profile, user: CurrentUser,
     row for this round), looked up in the legacy users table.
     """
     roles = user.roles or set()
-    if owner_role in roles:
+    if owner_role in roles or (owner_role == "RMG" and screens_as_rmg(db, user)):
         return (getattr(user, "full_name", "") or getattr(user, "username", "") or "").strip()[:200]
     try:
         req_row = db.execute(
@@ -1213,7 +1570,7 @@ def enforce_hr_edit_window(profile, user: CurrentUser, updates: dict) -> None:
     if stage not in HR_EDIT_STATUSES:
         raise HTTPException(
             status_code=403,
-            detail="HR can edit these details once the candidate reaches HR Screening / Pre Onboarding "
+            detail="HR can edit these details once the candidate reaches HR Discussion / Pre-Onboarding "
                    f"(currently {stage.replace('_', ' ')}).")
     outside = sorted(set(updates) - HR_EDITABLE_FIELDS)
     if outside:
@@ -1327,9 +1684,9 @@ def status_transition(profile_id: int, payload: ProfileStatusTransitionIn,
     notice_asked = False
     if payload.ask_notice_period and payload.new_status == PipelineStatus.SALES_SCREENING.value:
         notice_asked = _ask_ta_for_notice_period(db, profile, user)
-    scheduled_round = None
-    if payload.schedule is not None and payload.new_status in _CUSTOMER_STAGE_ROUND_KIND:
-        scheduled_round = _schedule_customer_round_with_move(
+    proposed_kind = None
+    if payload.new_status in _CUSTOMER_STAGE_ROUND_KIND:
+        proposed_kind = _propose_customer_slots(
             db, profile, payload.new_status, payload.schedule, (payload.comment or "").strip(), user)
     db.commit()
     db.refresh(profile)
@@ -1338,126 +1695,73 @@ def status_transition(profile_id: int, payload: ProfileStatusTransitionIn,
         message = "Offer recorded and sent to Sales Head for approval"
     elif notice_asked:
         message = "Submitted to Sales — TA asked to collect the notice period"
-    elif scheduled_round is not None:
-        message = (f"{round_label(scheduled_round.kind)} scheduled — the candidate is invited "
-                   "and TA notified")
+    elif proposed_kind is not None:
+        message = (f"Status changed — TA has been asked to schedule the {round_label(proposed_kind)}"
+                   + (" and has the customer's slots" if payload.schedule is not None
+                      and payload.schedule.all_slots() else ""))
     return envelope(data=profile_to_dict(profile), message=message)
 
 
-#: Moving INTO these stages can carry the customer's slot (2 Sep 2026): the
-#: stage says which of the customer's rounds is being lined up.
+#: Moving INTO these stages can carry the customer's slots (2 Sep 2026): the
+#: stage says which customer round is being lined up next — at Customer
+#: Interviewing the L1, after the L1 verdict the L2.
 _CUSTOMER_STAGE_ROUND_KIND: dict[str, str] = {
     PipelineStatus.CUSTOMER_INTERVIEW.value: "Customer_Interview",
-    PipelineStatus.L1_FEEDBACK.value: "Customer_Interview",
+    PipelineStatus.L1_FEEDBACK.value: "Customer_L2",
     PipelineStatus.L2_FEEDBACK.value: "Customer_L2",
 }
 
 
-def _fmt_slot_ist(raw: str) -> str:
-    """'2026-09-15T11:00' → '15 Sep 2026, 11:00 AM IST'. The zone is spelled
-    out because the string is exactly what the TA typed in IST."""
-    from datetime import datetime as _dt
-    try:
-        return _dt.fromisoformat(raw).strftime("%d %b %Y, %I:%M %p") + " IST"
-    except (ValueError, TypeError):
-        return raw
+#: One formatter / text shape for every slot, shared with the parser that
+#: hands the slots back to TA's scheduling form (services/candidate_profiles).
+_fmt_slot_ist = fmt_slot_ist
 
 
-def _fmt_slot(raw: str) -> str:
-    """Alias of `_fmt_slot_ist` — every customer-slot rendering says IST too."""
-    return _fmt_slot_ist(raw)
+def _propose_customer_slots(db: Session, profile, new_status: str, sched,
+                            comment: str, user: CurrentUser) -> str | None:
+    """Sales passes the customer's slots to TA — nothing is booked here.
 
+    29 Sep 2026, user flow: Sales moves the candidate to Customer Interviewing
+    and MAY add the slots the customer offered; TA asks the candidate which one
+    suits, then schedules the round on the Applied Candidates row (Schedule
+    Customer L1 / L2) — which invites the candidate and moves the status to
+    "Customer L1 – Scheduled". Until then it reads "Yet to Schedule". (Until
+    today the first slot was booked outright and the candidate mailed before
+    anyone had asked whether they could make it.)
 
-def _schedule_customer_round_with_move(db: Session, profile, new_status: str, sched,
-                                       comment: str, user: CurrentUser):
-    """Record the customer's slot on the round this stage belongs to.
+    Logged as `CUSTOMER_SLOTS_PROPOSED` (the slots travel with the profile —
+    TA's Schedule form offers them back as one-click picks, `latest_customer_slots`)
+    and sent to the TAs who work the candidate (`_ta_recipients`).
 
-    Reuses the round row the transition recorder just touched (one card per
-    customer round — the duplicate-card rule), fills in the slot, and treats
-    the move's note as the round's NOTE rather than its feedback: nothing has
-    been judged yet. Then the candidate is invited and TA + Sales are told.
-    """
-    from datetime import datetime as _dt
-    from models import InterviewEvent
-    from services.interview_rounds import read_as_ist
-
+    ⚠️ TA is told on EVERY move into a customer-round stage, slots or not
+    (29 Sep 2026, user report: Sales moved a candidate to "Customer L2
+    Interview" and TA heard nothing) — without slots the notice says the round
+    is TA's to book and to agree the time with Sales. Returns the round kind."""
+    from services.candidate_profiles import CUSTOMER_SLOTS_PROPOSED, customer_slots_comment
     kind = _CUSTOMER_STAGE_ROUND_KIND[new_status]
-    slots = sched.all_slots()
-    if not slots:
-        return None
-    primary, alternates = slots[0], slots[1:]
-    event = db.execute(
-        select(InterviewEvent).where(InterviewEvent.profile_id == profile.id,
-                                     InterviewEvent.kind == kind)
-        .order_by(InterviewEvent.id.desc())
-    ).scalars().first()
-    if event is None:
-        event = InterviewEvent(profile_id=profile.id, candidate_id=profile.candidate_id,
-                               kind=kind, created_by=user.id)
-        db.add(event)
-    try:
-        event.scheduled_at = read_as_ist(_dt.fromisoformat(primary.scheduled_at))
-    except ValueError:
-        event.scheduled_at = None
-    event.raw_when = primary.scheduled_at
-    if sched.interviewer:
-        event.interviewer = sched.interviewer.strip()[:200]
-    if primary.meeting_link and primary.meeting_link.strip():
-        event.meeting_link = primary.meeting_link.strip()
-    elif sched.meeting_link:
-        event.meeting_link = sched.meeting_link.strip()
-    if sched.duration_minutes:
-        event.duration_minutes = sched.duration_minutes
-    event.interview_category = event.interview_category or "External"
-    event.user_role = event.user_role or "Customer"
-    if not event.result:
-        event.status = "Scheduled"
-        # The transition recorder wrote the move's note as feedback; a slot is
-        # not a verdict, so keep it as the note and leave feedback for Sales.
-        if comment and (event.feedback or "").strip() == comment:
-            event.feedback = None
-        note_lines = [comment] if comment else []
-        if alternates:
-            # Multiple customer slots (7 Sep 2026): the first is booked on the
-            # round; the others travel in the note so the candidate's invite
-            # and TA's row both show every option the customer offered.
-            note_lines.append("Alternative slots offered by the customer:")
-            for i, alt in enumerate(alternates, start=2):
-                line = f"  {i}. {_fmt_slot(alt.scheduled_at)}"
-                if alt.meeting_link and alt.meeting_link.strip():
-                    line += f" — {alt.meeting_link.strip()}"
-                note_lines.append(line)
-        event.note = "\n".join(note_lines) or event.note
-    db.flush()
-    _email_candidate_round_invite(db, profile, event, user)
-    # TA sees the slot on their row and calendar; tell them (and Sales, when
-    # someone else booked it) so nobody has to go looking.
-    try:
-        from services.notify import notify_role, notify_user
-        candidate = db.get(Candidate, profile.candidate_id)
-        cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
-                 if candidate else f"Candidate #{profile.candidate_id}")
-        title = f"{round_label(kind)} scheduled: {cname}"
-        body = (f"{round_label(kind)} with {cname} on {_fmt_slot(primary.scheduled_at)}"
-                + (f" (+{len(alternates)} alternative slot{'s' if len(alternates) > 1 else ''})" if alternates else "")
-                + (f" — panel {event.interviewer}" if event.interviewer else "")
-                + ". The candidate has been invited; the round is on the Interviews tab.")
-        link = applied_candidates_link(db, profile)
-        if profile.ta_owner_id and profile.ta_owner_id != user.id:
-            notify_user(db, profile.ta_owner_id, title, body, link,
-                        event="candidate.round_scheduled", actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-        else:
-            notify_role(db, "TA", title, body, link, exclude_user_id=user.id,
-                        event="candidate.round_scheduled", actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-        if "Sales" not in (user.roles or set()):
-            notify_role(db, "Sales", title, body, link, exclude_user_id=user.id,
-                        event="candidate.round_scheduled", actor=user,
-                        related_type="candidate", related_id=profile.candidate_id)
-    except Exception:
-        pass
-    return event
+    cname = _candidate_name(db, profile)
+    if sched is not None and sched.all_slots():
+        slots = customer_slots_text(sched)
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     CUSTOMER_SLOTS_PROPOSED, customer_slots_comment(kind, sched, comment))
+        body = (f"The customer offered these slots for the {round_label(kind)} with {cname}:\n{slots}\n"
+                "Ask the candidate which one suits, then press Schedule on the Applied Candidates row — "
+                "the slots are listed in that form; pick one and the candidate is sent the link.")
+    else:
+        booked = db.execute(
+            select(InterviewEvent.id).where(
+                InterviewEvent.profile_id == profile.id, InterviewEvent.kind == kind,
+                sa.func.coalesce(InterviewEvent.status, "").notin_(NOT_HELD_STATUSES)).limit(1)
+        ).first()
+        if booked:
+            return None  # already booked — nothing for TA to do
+        body = (f"Sales moved {cname} on to the {round_label(kind)}. No customer slots were shared yet — "
+                "agree the time with Sales and the candidate, then press Schedule on the Applied "
+                "Candidates row (it is also on My Tasks ▸ Customer interviews)."
+                + (f"\nSales' note: {comment}" if comment else ""))
+    _notify_ta(db, profile, f"Schedule {round_label(kind)}: {cname}", body,
+               "candidate.customer_slots_proposed", user)
+    return kind
 
 
 def _ask_ta_for_notice_period(db: Session, profile, user: CurrentUser) -> bool:
@@ -1704,7 +2008,7 @@ def submit_for_approval(profile_id: int, payload: SubmitForApprovalIn,
                      f"Sales submitted {cname}'s terms — rate {rate_text}, customer onboarding "
                      f"{payload.customer_onboarding_date.isoformat()}. Sales Head will approve "
                      "or send them back.",
-                     f"/admin?view=crm&p=profiles/{profile.id}",
+                     f"/admin/?view=crm&p=profiles/{profile.id}",
                      exclude_user_id=user.id, actor=user, event="candidate.offer_submitted",
                      related_type="candidate", related_id=profile.candidate_id)
     except Exception:
@@ -1718,8 +2022,8 @@ def submit_for_approval(profile_id: int, payload: SubmitForApprovalIn,
 @router.post("/{profile_id}/sales-head-decision")
 def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
                         db: Session = Depends(get_crm_db),
-                        user: CurrentUser = Depends(gated_write("profiles", "Sales_Head"))):
-    """Sales Head approves the terms (→ Preboarding), sends them back to Sales
+                        user: CurrentUser = Depends(gated_write_action("profile.sales_head_decision", "profiles"))):
+    """Sales Head approves the terms (→ HR Discussion), sends them back to Sales
     (→ Shortlisted) or rejects the candidate. The submitting Sales user is told
     either way — a decision nobody hears about is not a decision."""
     profile = get_profile_or_404(db, profile_id)
@@ -1764,6 +2068,11 @@ def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
     elif payload.decision == "send_back":
         target = PipelineStatus.SHORTLISTED.value
         title = "Offer sent back — redo the terms"
+        # Read by candidate_status (29 Sep 2026): the profile reads "Terms Sent
+        # Back" until Sales resubmits, not a fresh "Customer Shortlisted".
+        from services.candidate_status import TERMS_SENT_BACK
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     TERMS_SENT_BACK, f"Sales Head sent the terms back: {payload.comment.strip()}")
     else:
         target = PipelineStatus.CUSTOMER_REJECTED.value
         title = "Candidate rejected by Sales Head"
@@ -1776,7 +2085,7 @@ def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
         candidate = db.get(Candidate, profile.candidate_id)
         cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
                  if candidate else f"Candidate #{profile.candidate_id}")
-        link = f"/admin?view=crm&p=profiles/{profile.id}"
+        link = f"/admin/?view=crm&p=profiles/{profile.id}"
         body = f"{cname}: {payload.comment}"
         event = f"candidate.offer_{payload.decision}"
         submitter = _approval_submitter_id(db, profile)
@@ -1794,9 +2103,9 @@ def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
             # bell dedupes per person, so nobody is told twice.
             from services.notify import notify_roles
             notify_roles(db, ["TA", "RMG", "HR"],
-                         f"Approved — HR Screening next: {cname}",
+                         f"Approved — HR Discussion next: {cname}",
                          f"Sales Head approved {cname}'s terms. The candidate is in HR "
-                         "Screening: HR reviews the details and requests the HR round; TA "
+                         "Discussion: HR reviews the details and requests the HR round; TA "
                          "then books it with the candidate; HR records Hire / Not Recommend.",
                          link, exclude_user_id=user.id, actor=user,
                          event="candidate.hr_screening",
@@ -1806,7 +2115,7 @@ def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
     db.commit()
     db.refresh(profile)
     return envelope(data=profile_to_dict(profile), message={
-        "approve": "Approved — moved to HR Screening; HR will review and request the HR round",
+        "approve": "Approved — moved to HR Discussion; HR will review and request the HR round",
         "send_back": "Sent back to Sales to redo the terms",
         "reject": "Candidate rejected — Sales notified",
     }[payload.decision])
@@ -1897,13 +2206,14 @@ def flag_out_of_budget(profile_id: int, payload: BudgetFlagIn,
                  "HR flagged OUT OF BUDGET: " + note
                  + (f" — {'; '.join(changes)}" if changes else ""))
 
-    # Sales Head + the Sales person who submitted the terms.
+    # Sales Head + the Sales Manager (29 Sep 2026, user flow) + the Sales person
+    # who submitted the terms.
     try:
-        from services.notify import notify_role, notify_user
+        from services.notify import notify_role, notify_roles, notify_user
         candidate = db.get(Candidate, profile.candidate_id)
         cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
                  if candidate else f"Candidate #{profile.candidate_id}")
-        link = f"/admin?view=crm&p=profiles/{profile.id}"
+        link = f"/admin/?view=crm&p=profiles/{profile.id}"
         offer = _latest_pending_offer(db, profile)
         rows = [
             ("Expected CTC (annual)", f"₹{float(profile.expected_ctc or 0):,.0f}"),
@@ -1917,9 +2227,9 @@ def flag_out_of_budget(profile_id: int, payload: BudgetFlagIn,
         message = (f"HR checked {cname} at Pre-Onboarding and the terms do not fit: {note} "
                    "Please discuss with the customer and reply to HR from the candidate's profile.")
         submitter = _approval_submitter_id(db, profile)
-        notify_role(db, "Sales_Head", title, message, link, exclude_user_id=user.id,
-                    event="candidate.out_of_budget", actor=user, rows=rows,
-                    related_type="candidate", related_id=profile.candidate_id)
+        notify_roles(db, ["Sales_Head", "Sales Manager"], title, message, link, exclude_user_id=user.id,
+                     event="candidate.out_of_budget", actor=user, rows=rows,
+                     related_type="candidate", related_id=profile.candidate_id)
         if submitter and submitter != user.id:
             notify_user(db, submitter, title, message, link, event="candidate.out_of_budget",
                         actor=user, rows=rows,
@@ -1933,13 +2243,13 @@ def flag_out_of_budget(profile_id: int, payload: BudgetFlagIn,
     db.commit()
     db.refresh(profile)
     return envelope(data=profile_to_dict(profile),
-                    message="Flagged out of budget — Sales Head and the Sales person notified")
+                    message="Flagged out of budget — Sales Head, the Sales Manager and the Sales person notified")
 
 
 @router.post("/{profile_id}/budget-resolve")
 def resolve_budget(profile_id: int, payload: BudgetResolveIn,
                    db: Session = Depends(get_crm_db),
-                   user: CurrentUser = Depends(gated_write("profiles", "Sales", "Sales_Head"))):
+                   user: CurrentUser = Depends(gated_write_action("profile.budget_resolve", "profiles"))):
     """Sales / Sales Head reply to HR's budget flag after talking to the customer.
 
     Optionally revises the approved terms (rate + unit, onboarding date) on
@@ -1951,7 +2261,12 @@ def resolve_budget(profile_id: int, payload: BudgetResolveIn,
     if profile.budget_status not in (BUDGET_OUT, BUDGET_CONCERN):
         raise HTTPException(status_code=400,
                             detail="HR has not raised a budget flag on this candidate.")
-    if not getattr(user, "is_admin", False) and not ({"Sales", "Sales_Head"} & set(user.roles or set())):
+    # Who may reply is the APPROVAL's decision (`profile.budget_resolve`,
+    # user_may — the gate's own rule): Sales / Sales Head by default, and a Sales
+    # Manager whose role or template holds it (29 Sep 2026 — a hard-coded
+    # Sales / Sales Head role check here refused them).
+    from services.action_permissions import user_may
+    if not user_may(db, user, "profile.budget_resolve"):
         raise HTTPException(status_code=403, detail="Only Sales / Sales Head reply to the budget flag.")
 
     changes: list[str] = []
@@ -1990,7 +2305,7 @@ def resolve_budget(profile_id: int, payload: BudgetResolveIn,
         candidate = db.get(Candidate, profile.candidate_id)
         cname = (f"{candidate.first_name} {candidate.last_name or ''}".strip()
                  if candidate else f"Candidate #{profile.candidate_id}")
-        link = f"/admin?view=crm&p=profiles/{profile.id}"
+        link = f"/admin/?view=crm&p=profiles/{profile.id}"
         rows = ([("Revised terms", "; ".join(changes))] if changes else []) + [
             ("Sales", _budget_actor_name(user)),
         ]
@@ -2228,7 +2543,11 @@ def interview_round_options(profile_id: int,
     get_profile_or_404(db, profile_id)
     # Pass the user so the round list is narrowed to what they may actually
     # save — offering a choice the save would reject is a trap, not a form.
-    return envelope(data=interview_round_options_data(db, user))
+    data = interview_round_options_data(db, user)
+    # The customer's slots Sales passed on (29 Sep 2026): TA's Schedule form
+    # lists them as one-click picks, so a slot is never re-typed by hand.
+    data["customer_slots"] = latest_customer_slots(db, [profile_id]).get(profile_id)
+    return envelope(data=data)
 
 
 @router.get("/{profile_id}/interview-rounds")
@@ -2301,12 +2620,17 @@ def create_interview_round(profile_id: int, payload: InterviewRoundIn,
     values = validate_round(db, payload)
     # The endpoint gate only says "may write SOME round". Which round is decided
     # here: RMG owns the technical ladder, Sales owns the customer conversation.
-    ensure_may_write_round(user, values.get("kind"))
+    ensure_may_write_round(user, values.get("kind"), db)
     _ensure_hr_verdict_is_hrs(user, values.get("kind"), values)
+    from services.interview_rounds import require_customer_meeting_link
+    require_customer_meeting_link(values)
     event = InterviewEvent(profile_id=profile.id, candidate_id=profile.candidate_id,
                            created_by=user.id, **values)
     db.add(event)
     db.flush()
+    # A verdict saved with the round is an interview result (28 Sep 2026).
+    from services.rmg_tasks import record_round_result
+    record_round_result(db, profile, event, user, None)
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "INTERVIEW_ROUND_ADDED",
                  f"{round_label(event.kind)} recorded"
@@ -2413,13 +2737,17 @@ def update_interview_round(profile_id: int, event_id: int, payload: InterviewRou
     values = validate_round(db, payload, partial=True, kind_hint=event.kind)
     # Check the round as it stands AND as it would become, so an edit cannot be
     # used to convert someone else's round into one you own, or yours into theirs.
-    ensure_may_write_round(user, event.kind)
+    ensure_may_write_round(user, event.kind, db)
     if values.get("kind") and values["kind"] != event.kind:
-        ensure_may_write_round(user, values["kind"])
+        ensure_may_write_round(user, values["kind"], db)
     _ensure_hr_verdict_is_hrs(user, values.get("kind") or event.kind, values)
     had_link = bool((event.meeting_link or "").strip())
+    previous_result = event.result
     for field, value in values.items():
         setattr(event, field, value)
+    # A new or changed verdict → "Results to review" + tell the screeners.
+    from services.rmg_tasks import record_round_result
+    record_round_result(db, profile, event, user, previous_result)
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "INTERVIEW_ROUND_UPDATED",
                  f"{round_label(event.kind)} updated: {', '.join(sorted(values)) or 'none'}")
@@ -2455,7 +2783,7 @@ def delete_interview_round(profile_id: int, event_id: int,
                            user: CurrentUser = Depends(interview_round_roles)):
     profile = get_profile_or_404(db, profile_id)
     event = get_round_or_404(db, profile.id, event_id)
-    ensure_may_write_round(user, event.kind)
+    ensure_may_write_round(user, event.kind, db)
     label = round_label(event.kind)
     db.delete(event)
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,

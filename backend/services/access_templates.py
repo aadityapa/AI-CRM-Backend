@@ -27,6 +27,8 @@ def serialize_template(t: AccessTemplate) -> dict:
         "is_active": bool(t.is_active),
         "tab_access": t.tab_access or {},
         "field_access": t.field_access or {},
+        # None = approvals not configured (role lists decide); list = explicit.
+        "action_access": template_actions(getattr(t, "action_access", None)),
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
@@ -68,6 +70,11 @@ def _strip_removed_keys(tab_access, field_access) -> tuple[dict, dict]:
     return tabs, fields
 
 
+def _clean_or_default(raw, role_name: str | None) -> list[str]:
+    from services.action_permissions import clean_action_list, default_actions_for_role
+    return clean_action_list(raw) if raw is not None else default_actions_for_role(role_name)
+
+
 def _validate(tab_access, field_access) -> None:
     try:
         access_registry.validate_access(tab_access, field_access)
@@ -91,6 +98,10 @@ def create_template(db: Session, payload: dict) -> dict:
         is_active=payload.get("is_active", True),
         tab_access=payload.get("tab_access") or {},
         field_access=payload.get("field_access") or {},
+        # A new template is always explicit: what was ticked, else the approvals
+        # the role tag's code default grants (a "Finance" template converts
+        # Proformas), else none.
+        action_access=_clean_or_default(payload.get("action_access"), payload.get("role")),
     )
     db.add(t)
     db.commit()
@@ -110,9 +121,16 @@ def update_template(db: Session, template_id: int, payload: dict) -> dict:
         if "field_access" in payload:
             payload["field_access"] = fields
         _validate(tabs, fields)
-    for field in ("name", "description", "department_id", "role", "is_active", "tab_access", "field_access"):
+    for field in ("name", "description", "department_id", "is_active", "tab_access", "field_access"):
         if field in payload and payload[field] is not None:
             setattr(t, field, payload[field])
+    if "role" in payload:
+        # The role tag may be cleared ("—" in the editor) — it used to be
+        # impossible to untag a template once tagged.
+        t.role = (payload["role"] or "").strip() or None
+    if payload.get("action_access") is not None:
+        from services.action_permissions import clean_action_list
+        t.action_access = clean_action_list(payload["action_access"])
     db.commit()
     db.refresh(t)
     return serialize_template(t)
@@ -151,8 +169,22 @@ def assign_template(db: Session, user_id: int, template_id: int | None) -> dict:
         db.add(profile)
     else:
         profile.access_template_id = template_id
+    added_role = None
+    if template_id is not None:
+        # A template decides WHICH tabs; a ROLE is what lets someone into the
+        # CRM at all. Checked BEFORE custom roles are dropped (25 Sep 2026: a
+        # user whose only role was custom got "No CRM role is assigned" right
+        # after being given a template). Adds the template's built-in role tag
+        # when they have no built-in role, else refuses with a clear message.
+        from services.users_admin import ensure_role_for_template
+        added_role = ensure_role_for_template(db, user_id, t)
+        # ONE source of access per person (23 Sep 2026): a template and a
+        # custom role are exclusive — the admin picked the template, so any
+        # custom-role membership goes.
+        from services.custom_roles import remove_user_from_all_roles
+        remove_user_from_all_roles(db, user_id)
     db.commit()
-    return {"user_id": user_id, "access_template_id": template_id}
+    return {"user_id": user_id, "access_template_id": template_id, "role_added": added_role}
 
 
 def _bare_tab_key(key: str) -> str:
@@ -179,6 +211,62 @@ def _normalize_field_modes(raw: dict | None) -> dict[str, dict[str, str]]:
     return out
 
 
+def template_actions(raw) -> list[str] | None:
+    """A template's approval grants: None when never configured (the action's
+    role list decides), else the cleaned list — an empty list means none."""
+    from services.action_permissions import clean_action_list
+    return None if raw is None else clean_action_list(raw)
+
+
+def custom_role_grants(db: Session, user_id: int) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Merged `{tab: mode}` / field grants of the user's ACTIVE custom roles.
+
+    Union with the higher rung winning per tab (`MODES` ladder), so a person in
+    two roles gets the most either allows. Empty when the user has none, and
+    never raises — a pre-0106 database must not lock anyone out.
+    """
+    tabs, fields, _ = _custom_role_grants(db, user_id)
+    return tabs, fields
+
+
+def _custom_role_grants(db: Session, user_id: int):
+    """`custom_role_grants` plus the union of the roles' approval actions. A role
+    whose approvals were never configured contributes the actions whose code
+    default names it (a "GM" role approves what GM approves)."""
+    from services.access_registry import MODES
+    from services.action_permissions import default_actions_for_role
+
+    rank = {m: i for i, m in enumerate(MODES)}
+    tabs: dict[str, str] = {}
+    fields: dict[str, dict[str, str]] = {}
+    actions: list[str] = []
+    try:
+        from models.custom_roles import CustomRole, UserCustomRole
+        roles = db.execute(
+            select(CustomRole)
+            .join(UserCustomRole, UserCustomRole.custom_role_id == CustomRole.id)
+            .where(UserCustomRole.user_id == user_id, CustomRole.is_active.is_(True))
+            .order_by(CustomRole.id)
+        ).scalars().all()
+    except Exception:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return {}, {}, []
+    for role in roles:
+        for tab, mode in _normalize_tab_modes(role.tab_access or {}).items():
+            if rank.get(mode, -1) > rank.get(tabs.get(tab, ""), -1):
+                tabs[tab] = mode
+        for tab, fmap in _normalize_field_modes(role.field_access or {}).items():
+            fields.setdefault(tab, {}).update(fmap)
+        own = template_actions(getattr(role, "action_access", None))
+        for key in (own if own is not None else default_actions_for_role(role.name)):
+            if key not in actions:
+                actions.append(key)
+    return tabs, fields, actions
+
+
 # ------------------------------------------------------------------ resolver
 def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
     """Resolve a user's effective tab/field access (modes).
@@ -188,7 +276,7 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
     """
     if roles & {"Admin", "CEO"}:
         return {"full": True, "template_id": None, "tabs": {}, "fields": {},
-                "visible_tabs": None, "source": "admin"}
+                "visible_tabs": None, "actions": None, "source": "admin"}
 
     profile = db.execute(
         select(UserProfile).where(UserProfile.user_id == user_id)
@@ -196,6 +284,9 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
 
     tabs: dict[str, str] = {}
     fields: dict[str, dict[str, str]] = {}
+    # Approval buttons (25 Sep 2026): a list = the template / custom role
+    # decides alone; None = not configured, the action's role list decides.
+    actions: list[str] | None = None
     source = "role_default"
 
     template_id = profile.access_template_id if profile else None
@@ -205,6 +296,7 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
         if t and t.is_active:
             tabs = _normalize_tab_modes(t.tab_access or {})
             fields = _normalize_field_modes(t.field_access or {})
+            actions = template_actions(getattr(t, "action_access", None))
             source = "template"
             template_applied = True
         else:
@@ -213,6 +305,20 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
             # lockout. Deactivating a template should widen back to roles,
             # never black-screen every user still linked to it.
             source = "role_default"
+
+    # Custom roles (23 Sep 2026): when nothing explicit is assigned, the user's
+    # ACTIVE custom roles supply the grant map — several roles merge with the
+    # HIGHER mode winning per tab. An explicit template still outranks them
+    # (it is the more specific decision), and the per-user override below
+    # still wins on top of either.
+    if not template_applied:
+        role_tabs, role_fields, role_actions = _custom_role_grants(db, user_id)
+        if role_tabs:
+            tabs = role_tabs
+            fields = role_fields
+            actions = role_actions
+            source = "custom_role"
+            template_applied = True
 
     # Per-user override (legacy list/dict) wins per tab/field. Granted as
     # "create": the old Users modal was a binary show/hide — a tab it granted
@@ -240,6 +346,7 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
         "tabs": tabs,
         "fields": fields,
         "visible_tabs": visible_tabs,   # None = role-based defaults (no restriction)
+        "actions": actions,
         "source": source,
     }
 

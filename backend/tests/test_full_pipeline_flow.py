@@ -156,8 +156,10 @@ def test_sales_visibility_is_unrestricted():
 
 # ------------------------------------------------------------------ AI L1 gate
 
-def test_ai_l1_can_only_be_triggered_by_ta():
-    """AI L1 is TA's step. The resume path was already TA-only; the profile
-    page let RMG and Sales fire one, so the same action had two answers."""
+def test_ai_l1_is_triggered_by_recruiting_roles_only():
+    """AI L1 belongs to recruiting: TA sources, and since the RMG shortlisting
+    desk (15 Sep 2026) RMG may fire it beside "Go manual". Sales / Finance /
+    HR never can — the profile page used to let Sales, so the same action
+    had two answers."""
     from routers.crm.ai_interviews import TRIGGER_ROLES
-    assert TRIGGER_ROLES == ("TA",)
+    assert set(TRIGGER_ROLES) == {"TA", "RMG"}

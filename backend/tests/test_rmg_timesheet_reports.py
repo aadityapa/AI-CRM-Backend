@@ -76,7 +76,9 @@ def client():
 
     app = FastAPI()
     app.include_router(ts_router.router)
-    current = {"user": CurrentUser(id=1, username="rmg", roles={"RMG"})}
+    # RMG reads the reports; since 23 Sep 2026 approve / reject / raise-proforma
+    # belong to the GM (a custom role — its name simply sits in `roles`).
+    current = {"user": CurrentUser(id=1, username="rmg", roles={"RMG", "GM"})}
 
     def _db():
         yield session

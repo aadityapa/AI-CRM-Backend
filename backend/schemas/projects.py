@@ -195,6 +195,11 @@ class ProjectEmployeeUpdate(BaseModel):
     billing_date: date | None = None  # first billable date
 
 
+class ProjectEmployeeBillingUnitIn(BaseModel):
+    """What every Commercial Details rate of the assignment is priced per."""
+    billing_unit: BillingUnit
+
+
 class CommMatrixIn(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     role: str | None = Field(default=None, max_length=120)
@@ -279,3 +284,10 @@ class ProjectLeavePolicyUpdate(BaseModel):
         _one_of(LEAVE_CREDIT_TIMINGS, "leave_credit_timing"))
     _expire_timing = field_validator("leave_expire_timing")(
         _one_of(LEAVE_CREDIT_TIMINGS, "leave_expire_timing"))
+
+
+class ProjectCloseIn(BaseModel):
+    """Close a project (25 Sep 2026). `end_date` is the LAST WORKING DAY — the
+    team is on the bench from the next day. The reason is kept on the project."""
+    end_date: date
+    reason: str = Field(min_length=1, max_length=2000)

@@ -10,6 +10,7 @@ import os
 import re
 from typing import Any
 
+from config import APP_NAME
 from openai_client import OpenAIPurpose, get_openai_client, openai_key_configured
 from prompt_logger import tracked_chat_completion
 
@@ -24,7 +25,7 @@ from ai_help.loader import (
 logger = logging.getLogger("karnex.ai_help")
 
 SYSTEM_PROMPT = (
-    "You are Ask AI — a friendly, conversational in-app guide for Karnex AI HR Suite.\n"
+    f"You are Ask AI — a friendly, conversational in-app guide for {APP_NAME}.\n"
     "Reply like a helpful chatbot: answer the user's specific question first, in plain "
     "language. Do NOT dump a generic page overview or the whole help article unless they "
     "ask for an overview.\n"

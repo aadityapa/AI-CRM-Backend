@@ -72,8 +72,10 @@ ROUND_WRITE_ROLES: dict[str, tuple[str, ...]] = {
     "L3_Interview": ("RMG", "TA"),
     "L4_Interview": ("RMG", "TA"),
     "HR_Interview": ("HR", "TA"),
-    "Customer_Interview": ("Sales", "Sales_Head", "TA"),
-    "Customer_L2": ("Sales", "Sales_Head", "TA"),
+    # + the Sales Manager custom role (29 Sep 2026): they chase the customer's
+    # verdict too, so they may record it (a custom role name is in user.roles).
+    "Customer_Interview": ("Sales", "Sales_Head", "Sales Manager", "TA"),
+    "Customer_L2": ("Sales", "Sales_Head", "Sales Manager", "TA"),
 }
 
 #: Interview_Duration, in minutes.
@@ -90,6 +92,11 @@ STATUSES = [
     "Rescheduled Requested By Panel",
     "Scheduled",
 ]
+
+#: Statuses that mean "this round did not happen as booked" — nothing to
+#: record and nothing to count (feedback-due reminders, the rounds tally).
+NOT_HELD_STATUSES = ("Cancelled", "No Show", "Rescheduled Requested By Candidate",
+                     "Rescheduled Requested By Panel")
 
 #: Result — ordered worst to best, matching the Zoho scale.
 RESULTS = ["No Hire", "Leaning No", "Leaning Hire", "Hire", "Strong Hire"]
@@ -119,25 +126,32 @@ def roles_for_round(kind: str | None) -> tuple[str, ...]:
     return ROUND_WRITE_ROLES.get(str(kind or "").strip(), ())
 
 
-def rounds_writable_by(user) -> list[str]:
+def rounds_writable_by(user, db=None) -> list[str]:
     """Round kinds this user may create or edit.
 
     Drives both the server-side guard and the form's dropdown, so a user is
-    never offered a round the save would reject.
+    never offered a round the save would reject. With `db`, a user who holds
+    the screening approval (a GM custom role) writes every round RMG writes.
     """
     if getattr(user, "is_admin", False):
         return list(ROUND_VALUES)
     user_roles = set(getattr(user, "roles", []) or [])
+    if db is not None and "RMG" not in user_roles:
+        from services.action_permissions import screens_as_rmg
+        if screens_as_rmg(db, user):
+            user_roles = user_roles | {"RMG"}
     return [kind for kind in ROUND_VALUES if user_roles & set(ROUND_WRITE_ROLES.get(kind, ()))]
 
 
-def ensure_may_write_round(user, kind: str | None) -> None:
-    """403 unless this user owns this round kind."""
+def ensure_may_write_round(user, kind: str | None, db=None) -> None:
+    """403 unless this user owns this round kind (or acts as RMG, with `db`)."""
     allowed = roles_for_round(kind)
     if getattr(user, "is_admin", False):
         return
     if not allowed:
         raise HTTPException(status_code=400, detail=f"Unknown interview round '{kind}'")
+    if str(kind or "").strip() in rounds_writable_by(user, db):
+        return
     if not (set(getattr(user, "roles", []) or []) & set(allowed)):
         raise HTTPException(
             status_code=403,
@@ -184,7 +198,7 @@ def options(db: Session, user=None) -> dict:
         .where(Employee.is_active.is_(True))
         .order_by(Employee.first_name, Employee.last_name)
     ).all()
-    writable = set(rounds_writable_by(user)) if user is not None else set(ROUND_VALUES)
+    writable = set(rounds_writable_by(user, db)) if user is not None else set(ROUND_VALUES)
     return {
         "categories": CATEGORIES,
         # Every round is listed so existing rows still render with a label;
@@ -283,6 +297,22 @@ def validate_round(db: Session, payload, *, partial: bool = False,
     if not partial or "mode" in given:
         data["mode"] = ((payload.mode or "").strip()[:60] or None)
     return data
+
+
+#: The customer's own rounds — the customer panel takes them over the link.
+CUSTOMER_ROUND_KINDS = ("Customer_Interview", "Customer_L2")
+
+
+def require_customer_meeting_link(values: dict) -> None:
+    """A customer round SCHEDULED without the customer's meeting link is
+    refused (29 Sep 2026, user rule): the candidate is invited by email with
+    that link, and TA — who books the round — adds it. A round recorded with a
+    verdict (after the fact) needs none."""
+    if (values.get("kind") in CUSTOMER_ROUND_KINDS and values.get("status") == "Scheduled"
+            and not (values.get("meeting_link") or "").strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="Add the customer's meeting link — the candidate is emailed it with the invite.")
 
 
 def get_round_or_404(db: Session, profile_id: int, event_id: int) -> InterviewEvent:

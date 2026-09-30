@@ -4,7 +4,7 @@ Writes: HR (Admin implicit). Reads: HR + Finance + Sales_Head.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -47,6 +47,7 @@ from services.employees import (
     get_employee_or_404,
     get_experience_or_404,
     leave_matrix,
+    project_history_context,
     project_names,
     serialize_education,
     serialize_employee,
@@ -98,12 +99,51 @@ def create_employee(body: EmployeeCreate, db: Session = Depends(get_crm_db),
     return envelope(serialize_employee(emp, db, detail=True), "Employee created")
 
 
+#: Orderings the list offers. `date_of_joining` stays the DEFAULT so the list
+#: does not change under anyone who already knows it.
+#:
+#: `recently_updated` exists because DOJ cannot answer "who changed just now"
+#: (22 Sep 2026): an internal employee who joined Karnex in 2022 and was placed
+#: with a customer today still sorts by 2022 and lands near the bottom — which
+#: is what the user noticed after the Joined sync.
+_EMPLOYEE_SORTS = {
+    "date_of_joining": lambda: (sa.nulls_last(Employee.date_of_joining.desc()),
+                                Employee.id.desc()),
+    "recently_updated": lambda: (sa.nulls_last(Employee.updated_at.desc()),
+                                 Employee.id.desc()),
+    "name": lambda: (Employee.first_name.asc(), Employee.last_name.asc()),
+}
+#: Latest first (29 Sep 2026, user ask): a joiner — a new employee OR an
+#: internal one whose record the join just updated — tops the list.
+DEFAULT_EMPLOYEE_SORT = "recently_updated"
+
+
 @router.get("")
 def list_employees(is_active: bool | None = None, department_id: int | None = None,
                    profile_type: str | None = None,
+                   sort_by: str | None = None,
+                   deployment: str | None = None,
                    pp: PageParams = Depends(page_params),
                    db: Session = Depends(get_crm_db), user: CurrentUser = Depends(EMP_READ)):
+    """`deployment=bench|deployed` (25 Sep 2026): Bench = an ACTIVE employee with
+    no live project assignment today — which is where a closed project's team
+    lands. Every row also carries `deployment_status` + its live projects."""
+    from services.project_closure import (
+        BENCH, DEPLOYED, deployment_by_employee, live_assignment_filter,
+    )
+
     stmt = select(Employee)
+    if deployment:
+        wanted = deployment.strip().lower()
+        if wanted not in ("bench", "deployed"):
+            raise HTTPException(status_code=400,
+                                detail="Invalid deployment. Allowed: bench, deployed")
+        live = (select(ProjectEmployee.id)
+                .where(ProjectEmployee.employee_id == Employee.id,
+                       *live_assignment_filter(date.today()))
+                .exists())
+        stmt = stmt.where(live) if wanted == "deployed" else stmt.where(
+            Employee.is_active.is_(True), ~live)
     if is_active is not None:
         stmt = stmt.where(Employee.is_active.is_(is_active))
     if department_id is not None:
@@ -124,11 +164,23 @@ def list_employees(is_active: bool | None = None, department_id: int | None = No
             Employee.email.ilike(needle),
             Employee.employee_code.ilike(needle),
         ))
-    # Newest joiner first (11 Sep 2026, user request): a re-hired / placed
-    # employee gets a fresh joining date and surfaces at the top.
-    stmt = stmt.order_by(sa.nulls_last(Employee.date_of_joining.desc()), Employee.id.desc())
+    key = (sort_by or DEFAULT_EMPLOYEE_SORT).strip()
+    if key not in _EMPLOYEE_SORTS:
+        allowed = ", ".join(sorted(_EMPLOYEE_SORTS))
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid sort_by '{sort_by}'. Allowed: {allowed}")
+    stmt = stmt.order_by(*_EMPLOYEE_SORTS[key]())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
-    return envelope([serialize_employee(e) for e in items], meta=meta)
+    deployment_map = deployment_by_employee(db, [e.id for e in items])
+    rows = []
+    for e in items:
+        row = serialize_employee(e)
+        slot = deployment_map.get(e.id, {"status": BENCH, "projects": []})
+        # An inactive / resigned person is neither deployed nor "on the bench".
+        row["deployment_status"] = slot["status"] if (e.is_active or slot["status"] == DEPLOYED) else None
+        row["current_projects"] = slot["projects"]
+        rows.append(row)
+    return envelope(rows, meta=meta)
 
 
 @router.get("/interviewer-names")
@@ -422,7 +474,11 @@ def get_project_history(employee_id: int, db: Session = Depends(get_crm_db),
         .order_by(EmployeeProjectHistory.start_date, EmployeeProjectHistory.id)
     ).scalars().all()
     names = project_names(db, {r.project_id for r in rows})
-    data = [serialize_project_history(r, project_name=names.get(r.project_id)) for r in rows]
+    # ONE batched pass for the whole list — see project_history_context.
+    context = project_history_context(db, rows, emp.id)
+    data = [serialize_project_history(r, project_name=names.get(r.project_id),
+                                      context=context.get(r.project_id))
+            for r in rows]
     return envelope(data)
 
 

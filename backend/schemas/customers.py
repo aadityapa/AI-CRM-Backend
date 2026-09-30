@@ -146,6 +146,8 @@ class BillingPolicyIn(BaseModel):
     comp_off_max_limit: float | None = None
     comp_off_max_carry_forward: float | None = None
     comp_off_covers_lop: bool | None = None
+    #: Client-specific invoice columns (0107): {"sac", "leave", "per_day"} → bool.
+    invoice_format: dict[str, bool] | None = None
     # attendance rule
     normal_hours_per_day: float | None = Field(default=None, ge=0, le=24)
     #: Karnex receivable account for this customer's invoices (0098); null =

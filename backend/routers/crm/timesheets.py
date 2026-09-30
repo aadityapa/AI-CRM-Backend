@@ -3,11 +3,11 @@ submit/approve/reject workflow, attachment upload, summary rollups,
 activity log, and the timesheet-due report/reminders (migration 0021)."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from crm_deps import (  # noqa: F401 - gated_write kept for other endpoints
@@ -23,19 +23,24 @@ from models import (
 )
 from schemas.common import RejectIn, envelope
 from schemas.timesheets import GenerateInvoiceIn, TimesheetCreate, TimesheetEntryIn
-from services import tax
+from models.finance import InvoiceKind
 from services.crm_common import log_activity, next_sequence_number, paginate, save_upload, save_upload_hashed
 from services.finance import (
-    active_po_allocation_for_project, assert_po_allows_new_drawdown,
-    resolve_or_create_po_allocation_for_project,
-    karnex_gst_tax_and_grand, log_invoice_created_on_po, serialize_invoice,
+    active_po_allocation_for_project, assert_po_allows_new_drawdown, ensure_po_covers,
+    ensure_unique_invoice_number, po_draw_amount, resolve_or_create_po_allocation_for_project,
+    karnex_gst_tax_and_grand, serialize_invoice,
 )
+from services.invoice_format import format_summary
 from services.notify import notify_employee, notify_role, notify_roles, notify_user
+from services.proforma import (
+    PROFORMA_PREFIX, customer_invoice_format, notify_proforma_ready, po_credit_days,
+    replaceable_proforma, resolve_invoice_format,
+)
 from services.timesheets import (
     BillingPolicy,
     accrue_comp_off, approvals_report_rows, attachment_out, build_generated_entry,
     compute_billables, consume_timesheet_leaves, day_name, due_report_rows, effective_billing_policy,
-    ensure_project_branch_id, resolve_timesheet_display_branch,
+    ensure_project_branch_id, freeze_invoice_figures, resolve_timesheet_display_branch,
     reverse_timesheet_ledger_effects,
     employee_display_name, employee_for_user, entry_out, for_submission_report_rows,
     get_timesheet_or_404, holidays_for_project_period, leave_billable_by_type_map,
@@ -67,7 +72,14 @@ def _apply_frozen_figures(ts, preview: dict) -> bool:
         return False
     live_sub = float(preview["totals"].get("sub_total") or 0)
     frozen_sub = float(frozen["totals"].get("sub_total") or 0)
-    preview["line_items"] = frozen["line_items"]
+    # Snapshots taken before 25 Sep 2026 carry no rate/unit check — the live
+    # line's verdict still applies to the rate the frozen figures were built on.
+    live_lines = preview.get("line_items") or []
+    warning = live_lines[0].get("rate_unit_warning") if live_lines else None
+    preview["line_items"] = [
+        {**li, "rate_unit_warning": li.get("rate_unit_warning", warning)}
+        for li in frozen["line_items"]
+    ]
     preview["totals"]["sub_total"] = frozen_sub
     preview["totals"]["frozen_at"] = frozen.get("frozen_at")
     drifted = abs(live_sub - frozen_sub) > 0.005
@@ -360,129 +372,165 @@ def timesheet_import_template(db: Session = Depends(get_crm_db),
                     headers={"Content-Disposition": 'attachment; filename="timesheet-import-template.xlsx"'})
 
 
+def _attach_import_source(db: Session, user: CurrentUser, file: UploadFile, content: bytes,
+                          timesheet_ids: list[int]) -> None:
+    """Attach the uploaded file to every sheet it touched (27 Aug 2026): the
+    original is then visible in each sheet's Attachments section, so whoever
+    verifies the grid can open the source right on the timesheet page. Stored
+    once on disk; one attachment row per sheet; the same file re-imported into
+    the same sheet adds no duplicate. Best-effort: a failure here must never
+    undo a successful import."""
+    if not timesheet_ids:
+        return
+    try:
+        import hashlib
+        import uuid as _uuid
+
+        from services.crm_common import CRM_UPLOAD_DIR, safe_upload_extension
+        target_dir = CRM_UPLOAD_DIR / "timesheets"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        ext = safe_upload_extension(file.filename or "import.bin")
+        stored = target_dir / f"{_uuid.uuid4().hex}{ext}"
+        stored.write_bytes(content)
+        src_url = f"/api/crm-files/timesheets/{stored.name}"
+        src_sha = hashlib.sha256(content).hexdigest()
+        for tid in timesheet_ids:
+            _ts = db.get(Timesheet, tid)
+            if _ts is None:
+                continue
+            dupe = db.execute(select(TimesheetAttachment).where(
+                TimesheetAttachment.timesheet_id == tid,
+                TimesheetAttachment.file_sha256 == src_sha,
+            )).scalars().first()
+            if dupe:
+                continue
+            db.add(TimesheetAttachment(
+                timesheet_id=tid, file_url=src_url,
+                file_name=f"Imported source — {file.filename or 'import'}",
+                file_sha256=src_sha, file_size=len(content),
+                kind="import_source", uploaded_by=user.id,
+            ))
+            if not _ts.file_attachment_url:
+                _ts.file_attachment_url = src_url
+            log_activity(db, TimesheetActivityLog, "timesheet_id", tid, user.id,
+                         "ATTACHMENT_ADDED",
+                         f"Import source file attached: {file.filename or 'import'}")
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 @router.post("/bulk-import")
 def timesheet_bulk_import(
     project_id: int,
     employee_id: int,
     file: UploadFile = File(...),
+    year: int | None = None,
+    month: int | None = None,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(get_current_user),
     _acc: CurrentUser = Depends(TS_EDIT),
 ):
-    """Import historic timesheet data (e.g. Harman exports) for ONE employee
-    on ONE project. Rows may span months: each month becomes (or reuses) a
-    Draft sheet with its full day grid generated, then the file's rows are
-    applied through the EXACT same path as the entry editor — so billables,
-    leave balances, comp-off and activity logs all behave identically.
-    Submitted/Approved months are skipped, never touched."""
+    """Import timesheet data for ONE employee on ONE project.
+
+    An .xlsx (template or customer matrix) is PARSED: rows may span months;
+    each month becomes (or reuses) a Draft sheet with its full day grid
+    generated, then the file's rows are applied through the EXACT same path
+    as the entry editor — so billables, leave balances, comp-off and activity
+    logs all behave identically. Submitted/Approved months are skipped.
+
+    A PDF is READ the same way (25 Sep 2026, Sales request): its tables and
+    text lines go through `services.timesheet_import` — the customer matrix
+    (a date row, then the code row, weekday rows in between are skipped) or a
+    day-per-row list. `year`/`month` complete bare day numbers (1 2 3 …) and
+    are required only when nothing in the file says which month it is. A PDF
+    with nothing readable (a scan) and any other allowed file (image, Word…)
+    is ATTACHED to that month's Draft sheet instead, as before. The original
+    file is always attached to every sheet it filled.
+    """
     import io as _io
     from openpyxl import load_workbook
 
-    if not (file.filename or "").lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Upload the filled .xlsx template")
+    from services import timesheet_import as tsi
+
     content = file.file.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large (max 5 MB)")
-    try:
-        wb = load_workbook(_io.BytesIO(content), data_only=True)
-    except Exception:
-        raise HTTPException(status_code=400,
-                            detail="Not a readable .xlsx file — download the template and fill it in")
-    ws = wb["Timesheet"] if "Timesheet" in wb.sheetnames else wb.active
+    fname = (file.filename or "").lower()
+    is_xlsx, is_pdf = fname.endswith(".xlsx"), fname.endswith(".pdf")
+    if not (is_xlsx or is_pdf):
+        return _attach_only_import(db, user, _acc, file, content, project_id, employee_id, year, month)
+    if month is not None and not 1 <= month <= 12:
+        raise HTTPException(status_code=400, detail="Month must be 1–12")
+
+    ws = None
+    if is_xlsx:
+        try:
+            wb = load_workbook(_io.BytesIO(content), data_only=True)
+        except Exception:
+            raise HTTPException(status_code=400,
+                                detail="Not a readable .xlsx file — download the template and fill it in")
+        ws = wb["Timesheet"] if "Timesheet" in wb.sheetnames else wb.active
+        grids = tsi.xlsx_grids(wb)
+    else:
+        grids = tsi.pdf_grids(content)
 
     def _cell(v):
         return "" if v is None else str(v).strip()
 
     def _parse_day(v, row_no: int) -> date:
-        if isinstance(v, datetime):
-            return v.date()
-        if isinstance(v, date):
-            return v
-        s = _cell(v)
-        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%d %b %Y", "%d %B %Y"):
-            try:
-                return datetime.strptime(s, fmt).date()
-            except ValueError:
-                continue
-        raise ValueError(f"Row {row_no}: cannot read the date '{s}' — use DD/MM/YYYY")
+        d = tsi.parse_date(v)
+        if d is None:
+            raise ValueError(f"Row {row_no}: cannot read the date '{_cell(v)}' — use DD/MM/YYYY")
+        return d
 
-    # ---- CUSTOMER MATRIX FORMAT (Harman-style, 27 Aug 2026) ----------------
-    # Real customer sheets arrive as a MATRIX: a "Day of Month" row with the
-    # dates as COLUMNS, and the row beneath carrying one code per day
-    # (P / WO / H / L / A / HD). Header blocks, legends and the summary rows
-    # ("Week Off:- WO  8", "Total Days 30") are noise — auto-detect the date
-    # row, read the code row, skip everything else. Every sheet in the
-    # workbook is scanned, so one file can carry several months.
-    def _matrix_day_codes(worksheet) -> list[tuple[date, str]]:
-        out: list[tuple[date, str]] = []
-        grid = [list(r) for r in worksheet.iter_rows(min_row=1, max_row=min(worksheet.max_row, 40),
-                                                     values_only=True)]
-        for i, row in enumerate(grid[:-1]):
-            date_cols = [(ci, v) for ci, v in enumerate(row)
-                         if isinstance(v, (datetime, date)) and not isinstance(v, str)]
-            if len(date_cols) < 5:
-                continue
-            codes = grid[i + 1]
-            for ci, v in date_cols:
-                code = _cell(codes[ci] if ci < len(codes) else "").upper()
-                d = v.date() if isinstance(v, datetime) else v
-                out.append((d, code))
-            break  # one matrix block per sheet
-        return out
+    # Our own template is recognised by its header row; every other layout
+    # (customer matrix, day list, PDF) goes through services.timesheet_import.
+    is_template = bool(is_xlsx and ws is not None and ws.max_row and [
+        _cell(c.value).lower() for c in ws[1][:3]] == [h.lower() for h in _TS_IMPORT_HEADERS[:3]])
 
     # Present hours come from the project's own policy (max hrs/day, else 8) —
-    # the matrix carries statuses, not hours.
+    # a code carries a status, not hours.
     from services.timesheets import default_hours_worked
     _proj_row = db.get(Project, project_id)
     _full_hours = default_hours_worked(_proj_row, _project_branch(db, _proj_row) if _proj_row else None)
-    _CODE_MAP: dict[str, tuple[AttendanceStatus, Decimal]] = {
-        "P": (AttendanceStatus.PRESENT, _full_hours),
-        "PRESENT": (AttendanceStatus.PRESENT, _full_hours),
-        "WO": (AttendanceStatus.WEEK_OFF, Decimal("0")),
-        "W": (AttendanceStatus.WEEK_OFF, Decimal("0")),
-        "WEEKOFF": (AttendanceStatus.WEEK_OFF, Decimal("0")),
-        "H": (AttendanceStatus.HOLIDAY, Decimal("0")),
-        "HOLIDAY": (AttendanceStatus.HOLIDAY, Decimal("0")),
-        "L": (AttendanceStatus.LEAVE, Decimal("0")),
-        "LEAVE": (AttendanceStatus.LEAVE, Decimal("0")),
-        "A": (AttendanceStatus.ABSENT, Decimal("0")),
-        "AB": (AttendanceStatus.ABSENT, Decimal("0")),
-        "ABSENT": (AttendanceStatus.ABSENT, Decimal("0")),
-        "HD": (AttendanceStatus.HALF_DAY, _full_hours / 2),
-        "HALF": (AttendanceStatus.HALF_DAY, _full_hours / 2),
-    }
+    _hours_for = {"full": _full_hours, "half": _full_hours / 2, "none": Decimal("0")}
 
     # ---- parse every row up front so a bad file fails BEFORE any DB write --
     parsed: dict[tuple[int, int], list[TimesheetEntryIn]] = {}
     failed_rows: list[dict] = []
 
-    matrix_days: list[tuple[date, str]] = []
-    for sheet in wb.worksheets:
-        matrix_days.extend(_matrix_day_codes(sheet))
-    if matrix_days:
-        seen_dates: set[date] = set()
-        for d, code in matrix_days:
-            if d in seen_dates:
-                continue
-            seen_dates.add(d)
-            if not code or code in ("-", "NA"):
-                continue  # unmarked day — keep whatever the generated grid says
-            mapped = _CODE_MAP.get(code)
-            if mapped is None:
-                failed_rows.append({"row": 0, "error": f"{d.isoformat()}: unknown code '{code}' "
-                                    "(use P / WO / H / L / A / HD)"})
-                continue
-            att, hours = mapped
-            parsed.setdefault((d.year, d.month), []).append(TimesheetEntryIn(
-                entry_date=d,
-                hours_worked=hours,
-                attendance_status=att,
-                leave_period="Full" if att == AttendanceStatus.LEAVE else None,
-                location=EntryLocation.ONSITE,
-            ))
+    day_marks = [] if is_template else tsi.read_day_marks(grids, year, month)
+    for mark in day_marks:
+        d, code = mark.day, mark.code
+        mapped = tsi.status_for(code) if code else None
+        if mapped is not None:
+            att, kind = mapped
+            hours = mark.hours if (mark.hours is not None and kind != "none") else _hours_for[kind]
+        elif not code and mark.hours is not None and mark.hours > 0:
+            att, hours = AttendanceStatus.PRESENT, mark.hours       # an hours-only sheet
+        elif not code:
+            continue  # unmarked day — keep whatever the generated grid says
+        else:
+            failed_rows.append({"row": 0, "error": f"{d.isoformat()}: unknown code '{code}' "
+                                "(use P / WO / H / L / A / HD)"})
+            continue
+        parsed.setdefault((d.year, d.month), []).append(TimesheetEntryIn(
+            entry_date=d,
+            hours_worked=hours,
+            attendance_status=att,
+            leave_period="Full" if att == AttendanceStatus.LEAVE else None,
+            location=EntryLocation.ONSITE,
+        ))
+
+    if is_pdf and not day_marks:
+        # Scanned / free-form PDF: nothing readable — keep it as evidence on
+        # the month's sheet (needs the month) exactly as before.
+        return _attach_only_import(db, user, _acc, file, content, project_id, employee_id, year, month,
+                                   note="no day-by-day attendance could be read from this PDF")
 
     row_no = 1
-    for raw in [] if matrix_days else ws.iter_rows(min_row=2, values_only=True):
+    for raw in ws.iter_rows(min_row=2, values_only=True) if is_template else []:
         row_no += 1
         raw = list(raw) + [None] * (len(_TS_IMPORT_HEADERS) - len(raw))
         date_v, hours_v, status_v, ltype_v, lperiod_v, loc_v, remark_v = raw[:7]
@@ -529,7 +577,9 @@ def timesheet_bulk_import(
         except Exception as exc:
             failed_rows.append({"row": row_no, "error": f"Row {row_no}: {exc}"})
     if not parsed and not failed_rows:
-        raise HTTPException(status_code=400, detail="The file has no data rows")
+        raise HTTPException(status_code=400, detail=(
+            "No attendance could be read from this file. Use the template, or a sheet with a row of "
+            "dates and a row of codes (P / WO / H / L / A / HD) under it"))
 
     # ---- header-vs-dates year mismatch (31 Aug 2026, user file) -----------
     # Real customer sheets carry a header block ("Year 2025 / Month Dec")
@@ -538,38 +588,8 @@ def timesheet_bulk_import(
     # period for the SAME month, trust the header: shift the dates and say so
     # in the result. Anything ambiguous is left alone for the future-period
     # guard to reject loudly.
-    def _header_period(workbook):
-        """(year, month) from the file's header block — a "Year" label with the
-        value in the cell below it, likewise "Month" (Dec / December / 12)."""
-        month_map = {m.lower(): i for i, m in enumerate(
-            ["January", "February", "March", "April", "May", "June", "July",
-             "August", "September", "October", "November", "December"], 1)}
-        for wsx in workbook.worksheets:
-            grid = [list(r) for r in wsx.iter_rows(min_row=1, max_row=min(wsx.max_row, 6),
-                                                   values_only=True)]
-            hy = hm = None
-            for ri in range(len(grid) - 1):
-                below_row = grid[ri + 1]
-                for ci, vv in enumerate(grid[ri]):
-                    if not isinstance(vv, str):
-                        continue
-                    label = vv.strip().lower()
-                    below = below_row[ci] if ci < len(below_row) else None
-                    if label == "year" and isinstance(below, (int, float)) \
-                            and 2000 <= int(below) <= 2100:
-                        hy = int(below)
-                    elif label == "month" and below is not None:
-                        key = str(below).strip().lower()
-                        hm = month_map.get(key)
-                        if hm is None and len(key) >= 3:
-                            hm = next((n for full, n in month_map.items()
-                                       if full.startswith(key[:3])), None)
-            if hy and hm:
-                return hy, hm
-        return None
-
     year_corrections: dict[tuple[int, int], str] = {}
-    _hdr = _header_period(wb)
+    _hdr = tsi.header_period(grids)
     if _hdr:
         _hy, _hm = _hdr
         _today = date.today()
@@ -648,51 +668,8 @@ def timesheet_bulk_import(
             months.append({"period": label, "timesheet_id": None, "applied": 0,
                            "skipped": f"Failed: {exc}"})
 
-    # Attach the SOURCE FILE to every month it touched (27 Aug 2026, user
-    # request): the original Excel is then visible in each sheet's Attachments
-    # section, so anyone verifying the grid can open the uploaded file right
-    # on the timesheet page. Stored once on disk; one attachment row per sheet.
-    touched_ids = [m["timesheet_id"] for m in months if m.get("timesheet_id")]
-    if touched_ids:
-        try:
-            import hashlib
-            import uuid as _uuid
-
-            from services.crm_common import CRM_UPLOAD_DIR, safe_upload_extension
-            target_dir = CRM_UPLOAD_DIR / "timesheets"
-            target_dir.mkdir(parents=True, exist_ok=True)
-            ext = safe_upload_extension(file.filename or "import.xlsx")
-            stored = target_dir / f"{_uuid.uuid4().hex}{ext}"
-            stored.write_bytes(content)
-            src_url = f"/api/crm-files/timesheets/{stored.name}"
-            src_sha = hashlib.sha256(content).hexdigest()
-            for tid in touched_ids:
-                _ts = db.get(Timesheet, tid)
-                if _ts is None:
-                    continue
-                # Same file re-imported into the same sheet → no duplicate row.
-                dupe = db.execute(select(TimesheetAttachment).where(
-                    TimesheetAttachment.timesheet_id == tid,
-                    TimesheetAttachment.file_sha256 == src_sha,
-                )).scalars().first()
-                if dupe:
-                    continue
-                db.add(TimesheetAttachment(
-                    timesheet_id=tid, file_url=src_url,
-                    file_name=f"Imported source — {file.filename or 'import.xlsx'}",
-                    file_sha256=src_sha, file_size=len(content),
-                    kind="import_source", uploaded_by=user.id,
-                ))
-                if not _ts.file_attachment_url:
-                    _ts.file_attachment_url = src_url
-                log_activity(db, TimesheetActivityLog, "timesheet_id", tid, user.id,
-                             "ATTACHMENT_ADDED",
-                             f"Import source file attached: {file.filename or 'import.xlsx'}")
-            db.commit()
-        except Exception:
-            # Attaching the source is a convenience — its failure must never
-            # undo a successful import.
-            db.rollback()
+    _attach_import_source(db, user, file, content,
+                          [m["timesheet_id"] for m in months if m.get("timesheet_id")])
 
     ok = [m for m in months if not m["skipped"]]
     summary = (f"{len(ok)} month(s) imported"
@@ -700,6 +677,41 @@ def timesheet_bulk_import(
                + (f" · {len(failed_rows)} row(s) failed" if failed_rows else ""))
     return envelope({"months": months, "failed_rows": failed_rows, "summary": summary},
                     message=summary)
+
+
+def _attach_only_import(db: Session, user: CurrentUser, _acc: CurrentUser, file: UploadFile,
+                        content: bytes, project_id: int, employee_id: int,
+                        year: int | None, month: int | None, note: str | None = None):
+    """The unreadable branch of bulk-import (Word, images, scanned PDFs):
+    get-or-create the month's Draft sheet and attach the file to it. Returns
+    the same `{months, …}` shape as the parsing branch so the import dialog
+    needs one result renderer. `note` says why nothing was read."""
+    from services.crm_common import safe_upload_extension
+    safe_upload_extension(file.filename or "")        # 400 for a type we never store
+    if not (year and month):
+        raise HTTPException(status_code=400, detail=(
+            f"{(note or 'this file cannot be read day by day').capitalize()} — choose the month it "
+            "belongs to and it will be attached to that month's sheet"))
+    if not 1 <= month <= 12:
+        raise HTTPException(status_code=400, detail="Month must be 1–12")
+    created = create_timesheet(
+        TimesheetCreate(project_id=project_id, employee_id=employee_id,
+                        year=year, month=month, generate_days=True),
+        db=db, user=user, _acc=_acc,
+    )
+    ts_id = created["data"]["id"]
+    ts = db.get(Timesheet, ts_id)
+    label = period_label(year, month)
+    if ts.status not in EDITABLE_STATUSES:
+        raise HTTPException(status_code=409,
+                            detail=f"{label} is {getattr(ts.status, 'value', ts.status)} — locked; "
+                                   "attach the file from the sheet's Attachments section instead")
+    _attach_import_source(db, user, file, content, [ts_id])
+    summary = (f"{file.filename or 'File'} attached to {label}"
+               + (f" ({note})" if note else "") + " — fill the day grid in the editor")
+    return envelope({"months": [{"period": label, "timesheet_id": ts_id, "applied": 0,
+                                 "skipped": None, "attached": True}],
+                     "failed_rows": [], "summary": summary}, message=summary)
 
 
 def _reclassify_sheet_days(db: Session, ts: Timesheet, user: CurrentUser) -> int:
@@ -990,10 +1002,26 @@ def upsert_entries(
 
 # ---------------------------------------------------------------- workflow
 
-#: Anyone in these roles can approve a timesheet — mirrors the dependency on
-#: approve_timesheet / reject_timesheet below. Notifying only one of them would
-#: leave the other two polling GET /api/timesheets/reports/approvals.
-TS_APPROVER_ROLES = ("HR", "RMG", "Sales", "CEO")
+#: Who is told a sheet awaits approval — the GM approves (23 Sep 2026, the
+#: `timesheet.approve` action default), the CEO sees it. Only the DEFAULT route:
+#: Settings ▸ Email flows can widen it.
+TS_APPROVER_ROLES = ("GM", "CEO")
+
+
+def _submitter_user_id(db: Session, ts: Timesheet) -> int | None:
+    """Who last submitted this sheet (the Sales person who filled it), from the
+    activity log — the sheet itself records no submitter. Falls back to who
+    created it."""
+    for action in ("TS_SUBMITTED", "TS_CREATED"):
+        uid = db.execute(
+            select(TimesheetActivityLog.user_id)
+            .where(TimesheetActivityLog.timesheet_id == ts.id,
+                   TimesheetActivityLog.action_type == action)
+            .order_by(TimesheetActivityLog.id.desc()).limit(1)
+        ).scalar()
+        if uid:
+            return int(uid)
+    return None
 
 
 def _timesheet_context(db: Session, ts: Timesheet) -> tuple[Employee | None, str, list[tuple[str, str]]]:
@@ -1052,18 +1080,25 @@ def submit_timesheet(
     # Tell the approvers. Until now submit notified nobody at all, so an
     # approver only found out by opening the approvals report — and invoicing
     # the customer sits behind this approval.
+    # Recipients = the route's roles (GM + CEO by default) PLUS everyone who
+    # may actually approve (25 Sep 2026): approval can come from a template's
+    # or custom role's Approvals, so a GM on a template — not in a role called
+    # "GM" — was never told a sheet was waiting.
+    from services.action_permissions import user_ids_who_may
     emp, period, rows = _timesheet_context(db, ts)
     who = employee_display_name(emp) if emp else f"Employee #{ts.employee_id}"
+    by = user.full_name or user.username
     notify_roles(
         db, TS_APPROVER_ROLES,
-        f"Timesheet submitted for approval — {who}",
-        f"{who} submitted their timesheet for {period}. It is waiting for your approval.",
+        f"Timesheet submitted for approval — {who}, {period}",
+        f"{by} submitted {who}'s timesheet for {period}. It is waiting for your approval.",
         f"timesheets/{ts.id}",
         exclude_user_id=user.id,
         actor=user,
         event="timesheet.submitted",
-        rows=rows,
+        rows=rows + [("Submitted by", by)],
         dedupe_prefix=f"timesheet.submitted:{ts.id}:{ts.submitted_at.isoformat() if ts.submitted_at else ''}",
+        user_ids=user_ids_who_may(db, "timesheet.approve"),
     )
 
     db.commit()
@@ -1075,7 +1110,7 @@ def submit_timesheet(
 def recalculate_timesheet(
     timesheet_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write_action("timesheet.approve", "timesheets", "RMG", "Sales")),
+    user: CurrentUser = Depends(gated_write_action("timesheet.approve", "timesheets")),
 ):
     """Re-freeze an APPROVED, not-yet-invoiced sheet against the CURRENT policy
     (11 Sep 2026, user request). Approval freezes the figures (0075), so fixing
@@ -1098,15 +1133,7 @@ def recalculate_timesheet(
     before = (ts.approved_figures or {}).get("totals", {}).get("sub_total")
     earned = accrue_comp_off(db, ts, entries)
     consume_timesheet_leaves(db, ts, entries)
-    import json as _json
-    _snap = timesheet_invoice_preview(db, ts, entries)
-    ts.approved_figures = _json.loads(_json.dumps({
-        "frozen_at": datetime.now(timezone.utc).isoformat(),
-        "line_items": _snap["line_items"],
-        "totals": {"sub_total": _snap["totals"]["sub_total"]},
-        "summary": timesheet_summary(db, ts, entries),
-        "recalculated_by": user.id,
-    }, default=str))
+    _snap = freeze_invoice_figures(db, ts, entries, recalculated_by=user.id)
     after = _snap["totals"]["sub_total"]
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_RECALCULATED",
                  f"Figures recalculated against the current billing policy: sub-total "
@@ -1122,10 +1149,10 @@ def recalculate_timesheet(
 def approve_timesheet(
     timesheet_id: int,
     db: Session = Depends(get_crm_db),
-    # HR reviews timesheets but does not decide them (their buttons are gone
-    # from the UI; this closes the API road too). Admin/CEO always pass. The
-    # role list is admin-editable: Users tab -> Action Permissions.
-    user: CurrentUser = Depends(gated_write_action("timesheet.approve", "timesheets", "RMG", "Sales")),
+    # An APPROVAL action: Timesheets: Edit (what Sales needs to fill the sheet)
+    # never implies it. Decided by the user's template / role Approvals, else
+    # the action's role list (default GM). Admin/CEO always pass.
+    user: CurrentUser = Depends(gated_write_action("timesheet.approve", "timesheets")),
 ):
     ts = get_timesheet_or_404(db, timesheet_id)
     if ts.status != TimesheetStatus.SUBMITTED:
@@ -1148,16 +1175,7 @@ def approve_timesheet(
     # flags any live drift instead of silently picking a side. Taken AFTER
     # consume_timesheet_leaves so the frozen paid-vs-LOP split is final.
     try:
-        import json as _json
-        _snap = timesheet_invoice_preview(db, ts, entries)
-        # default=str: any stray Decimal/date in the summary becomes a string
-        # instead of aborting the freeze (the except would silently disable it).
-        ts.approved_figures = _json.loads(_json.dumps({
-            "frozen_at": datetime.now(timezone.utc).isoformat(),
-            "line_items": _snap["line_items"],
-            "totals": {"sub_total": _snap["totals"]["sub_total"]},
-            "summary": timesheet_summary(db, ts, entries),
-        }, default=str))
+        freeze_invoice_figures(db, ts, entries)
     except Exception:
         # No assignment / preview not computable — approval itself must not
         # fail over a freeze; such a sheet simply keeps live figures.
@@ -1205,9 +1223,8 @@ def reject_timesheet(
     timesheet_id: int,
     body: TimesheetRejectIn,
     db: Session = Depends(get_crm_db),
-    # Same rule as approve: deciding is RMG / Sales / Admin-CEO, not HR.
-    # Role list admin-editable: Users tab -> Action Permissions.
-    user: CurrentUser = Depends(gated_write_action("timesheet.reject", "timesheets", "RMG", "Sales")),
+    # Same rule as approve (an APPROVAL action, default GM).
+    user: CurrentUser = Depends(gated_write_action("timesheet.reject", "timesheets")),
 ):
     ts = get_timesheet_or_404(db, timesheet_id)
     # APPROVED is rejectable too (0075) — it is the correction path when the
@@ -1263,6 +1280,9 @@ def reject_timesheet(
     # (reverse_timesheet_ledger_effects above), so telling them matters twice
     # over: they must resubmit, and their balances just moved.
     emp, period, rows = _timesheet_context(db, ts)
+    # One rejection per SUBMISSION: a resubmitted sheet rejected again with a
+    # reason of the same length used to be swallowed by the dedupe key.
+    round_key = ts.submitted_at.isoformat() if ts.submitted_at else ""
     notify_employee(
         db, emp,
         f"Timesheet rejected — {period}",
@@ -1272,8 +1292,26 @@ def reject_timesheet(
         actor=user,
         event="timesheet.rejected",
         rows=rows + [("Reason", reason)],
-        dedupe_key=f"timesheet.rejected:{ts.id}:{len(reason)}",
+        dedupe_key=f"timesheet.rejected:{ts.id}:{round_key}:{len(reason)}",
     )
+    # The person who FILLED and submitted the sheet (usually Sales) must fix
+    # it — tell them who rejected it and why (25 Sep 2026). Skipped when they
+    # are the rejecter, or the employee already told above.
+    submitter = _submitter_user_id(db, ts)
+    if submitter and submitter != user.id and submitter != getattr(emp, "user_id", None):
+        who = employee_display_name(emp) if emp else f"Employee #{ts.employee_id}"
+        by = user.full_name or user.username
+        notify_user(
+            db, submitter,
+            f"Timesheet rejected — {who}, {period}",
+            f"{by} rejected {who}'s timesheet for {period}. Reason: {reason}. "
+            f"Please correct it and submit again.",
+            f"timesheets/{ts.id}",
+            actor=user,
+            event="timesheet.rejected",
+            rows=rows + [("Rejected by", by), ("Reason", reason)],
+            dedupe_key=f"timesheet.rejected.submitter:{ts.id}:{submitter}:{round_key}:{len(reason)}",
+        )
     if undo_summary is not None:
         # Finance must know an invoice vanished from their books.
         notify_role(
@@ -1496,7 +1534,7 @@ def get_invoice_preview(
 def timesheet_po_options(
     timesheet_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write_action("timesheet.generate_invoice", "timesheets", "Finance", "RMG")),
+    user: CurrentUser = Depends(gated_write_action("timesheet.generate_invoice", "timesheets")),
 ):
     """Everything the reviewer needs to pick a PO before generating the invoice.
 
@@ -1552,6 +1590,20 @@ def timesheet_po_options(
         ).all():
             emp_names[eid] = " ".join(p for p in [first, last] if p) or f"#{eid}"
 
+    # POs this employee was billed against before (30 Sep 2026): most customers
+    # never tag a PO to a person, so "this employee's POs" was empty and the GM
+    # searched the customer's whole book. An invoice raised from one of THIS
+    # employee's timesheets is the other proof a PO is theirs. One query.
+    billed_before: dict[int, int] = {}
+    if ts.employee_id:
+        for po_id, n in db.execute(
+            select(Invoice.po_id, func.count(Invoice.id))
+            .join(Timesheet, Timesheet.id == Invoice.timesheet_id)
+            .where(Timesheet.employee_id == ts.employee_id, Invoice.po_id.isnot(None))
+            .group_by(Invoice.po_id)
+        ).all():
+            billed_before[int(po_id)] = int(n or 0)
+
     po_rows = []
     for po in pos:
         status = getattr(po.status, "value", po.status)
@@ -1581,8 +1633,13 @@ def timesheet_po_options(
             "project_used": _num(alloc.consumed_amount) if alloc else None,
             "employee_id": getattr(po, "employee_id", None),
             "employee_name": emp_names.get(getattr(po, "employee_id", None) or 0),
-            "employee_match": bool(getattr(po, "employee_id", None)
-                                   and po.employee_id == ts.employee_id),
+            # "This employee's PO" = tagged to them OR billed for them before.
+            "employee_match": bool(
+                (getattr(po, "employee_id", None) and po.employee_id == ts.employee_id)
+                or po.id in billed_before),
+            "tagged_to_employee": bool(getattr(po, "employee_id", None)
+                                       and po.employee_id == ts.employee_id),
+            "billed_before": billed_before.get(po.id, 0),
         })
 
     # Pre-select the PO already funding this project, if any.
@@ -1650,14 +1707,26 @@ def timesheet_po_options(
     }
 
     ts_emp = db.get(Employee, ts.employee_id) if ts.employee_id else None
+    customer = db.get(Customer, project.customer_id) if project.customer_id else None
     return envelope(data={
         "pos": po_rows,
+        # Names for the dialog's header (30 Sep 2026): the GM confirms WHOSE
+        # month is being billed to WHOM without a second lookup.
+        "project_name": project.name,
+        "customer_name": customer.name if customer else None,
         "selected_po_id": existing.po_id if existing is not None else None,
         "suggested_po_id": suggested["id"] if suggested else None,
         "timesheet_employee_name": (
             " ".join(p for p in [ts_emp.first_name, ts_emp.last_name] if p)
             if ts_emp else None),
         "rate": rate_info,
+        # Pre-fills the GM's "Invoice format" step: the customer's saved
+        # column choice, and — when Finance returned the Proforma — why.
+        "invoice_format": customer_invoice_format(db, ts.project_id),
+        "returned_proforma": (
+            {"invoice_number": returned.invoice_number, "reason": returned.returned_reason,
+             "returned_at": returned.returned_at.isoformat() if returned.returned_at else None}
+            if (returned := replaceable_proforma(db, ts)) is not None else None),
     })
 
 
@@ -1666,19 +1735,30 @@ def generate_invoice_from_timesheet(
     timesheet_id: int,
     body: GenerateInvoiceIn | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write_action("timesheet.generate_invoice", "timesheets", "Finance", "RMG")),
+    user: CurrentUser = Depends(gated_write_action("timesheet.generate_invoice", "timesheets")),
 ):
-    """Create an Invoice from an Approved timesheet (one invoice per timesheet).
+    """Raise the PROFORMA invoice for an Approved timesheet (one per timesheet).
 
-    sub_total comes from the invoice preview; tax uses the KARNEX GST engine
-    (tax_invoice CGST/SGST/IGST from the customer branch), and PO/allocation
-    balances are consumed exactly as in POST /api/invoices.
+    Flow since 23 Sep 2026: the GM verifies the sheet and raises a Proforma
+    (this route) → Finance reviews it on the invoice page and converts it to
+    the original tax invoice (`POST /api/invoices/{id}/convert`) or returns it
+    with a reason (`…/return`) → the GM reissues (`…/reissue`).
+
+    sub_total comes from the invoice preview and tax from the KARNEX GST
+    engine, exactly as the tax invoice will print — but NO PO balance moves
+    here: the drawdown happens at conversion (`consume_po_for_invoice`), when
+    the document becomes money against the PO. The PO is still resolved and
+    validated now so the GM learns about a missing/expired PO before Finance
+    does.
     """
     ts = get_timesheet_or_404(db, timesheet_id)
     if ts.status != TimesheetStatus.APPROVED:
         raise HTTPException(status_code=400,
                             detail="Only Approved timesheets can be invoiced")
-    if linked_invoice_for(db, ts) is not None:
+    # A Proforma Finance RETURNED is replaced by this call (same PI number);
+    # anything else already on the sheet blocks a second document.
+    returned = replaceable_proforma(db, ts)
+    if returned is None and linked_invoice_for(db, ts) is not None:
         raise HTTPException(status_code=409,
                             detail="An invoice has already been generated for this timesheet")
 
@@ -1792,31 +1872,33 @@ def generate_invoice_from_timesheet(
     tax_amount, grand_total, _gst = karnex_gst_tax_and_grand(
         db, po=po, project_id=ts.project_id, lines=[], sub_total=sub_total,
     )
-    if po is not None and Decimal(str(po.balance_value)) < grand_total:
-        raise HTTPException(status_code=400, detail="PO balance insufficient")
+    ensure_po_covers(po, po_draw_amount(sub_total))   # a PO covers the value before GST
 
-    # Invoice is dated the day it is GENERATED (product decision 2026-07-29).
-    # Due date = invoice date + credit days parsed from the PO's payment terms
-    # ("Net 30 Days" → 30); default 30.
-    import re as _re
+    # The Proforma is dated the day the GM raises it; Finance may correct the
+    # date before converting. Due date = invoice date + credit days parsed
+    # from the PO's payment terms ("Net 30 Days" → 30); default 30.
     invoice_dt = date.today()
-    credit_days = 30
-    if po is not None and po.payment_terms:
-        m = _re.search(r"(\d+)", str(po.payment_terms))
-        if m:
-            credit_days = max(0, min(int(m.group(1)), 365))
-    from datetime import timedelta as _td
-    invoice_number = (getattr(body, "invoice_number", None) or "").strip() \
-        or next_sequence_number(db, Invoice, Invoice.invoice_number, "INV")
-    from services.finance import ensure_unique_invoice_number
-    ensure_unique_invoice_number(db, invoice_number)
+    if returned is not None:
+        # Reissue: the returned document goes, its number stays.
+        proforma_number = returned.proforma_number or returned.invoice_number
+        log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PROFORMA_REISSUED",
+                     f"Proforma {proforma_number} reissued after Finance returned it: {returned.returned_reason}")
+        db.delete(returned)
+        db.flush()
+    else:
+        proforma_number = next_sequence_number(db, Invoice, Invoice.invoice_number, PROFORMA_PREFIX)
+        ensure_unique_invoice_number(db, proforma_number)
+    invoice_format = resolve_invoice_format(db, ts.project_id, getattr(body, "invoice_format", None))
     invoice = Invoice(
-        invoice_number=invoice_number,
+        invoice_number=proforma_number,
+        proforma_number=proforma_number,
+        kind=InvoiceKind.PROFORMA.value,
+        invoice_format=invoice_format,
         po_id=po.id if po is not None else None,
         project_id=ts.project_id,
         timesheet_id=ts.id,
         invoice_date=invoice_dt,
-        due_date=invoice_dt + _td(days=credit_days),
+        due_date=invoice_dt + timedelta(days=po_credit_days(po)),
         sub_total=sub_total,
         tax_amount=tax_amount,
         grand_total=grand_total,
@@ -1826,26 +1908,16 @@ def generate_invoice_from_timesheet(
         lines=line_rows,
     )
     db.add(invoice)
-    if po is not None:
-        tax.apply_po_consumption(po, grand_total)
-        alloc.consumed_amount = Decimal(str(alloc.consumed_amount)) + grand_total
     db.flush()
-    log_invoice_created_on_po(db, po, invoice, user.id)
-    log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "INVOICE_GENERATED",
-                 f"Invoice {invoice_number} generated for {float(grand_total):.2f}")
-    notify_role(
-        db, "Finance",
-        f"Invoice {invoice_number} generated from timesheet #{ts.id}",
-        f"Timesheet {ts.year}-{ts.month:02d} (project #{ts.project_id}, "
-        f"employee #{ts.employee_id}) was invoiced for {float(grand_total):.2f}.",
-        f"/invoices/{invoice.id}", exclude_user_id=user.id,
-        event="invoice.generated", actor=user,
-    )
+    log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PROFORMA_GENERATED",
+                 f"Proforma invoice {proforma_number} raised for {float(grand_total):,.2f} "
+                 f"({format_summary(invoice_format)})")
+    notify_proforma_ready(db, invoice, ts, user)
     db.commit()
     db.refresh(invoice)
     return envelope(
         data={"invoice": serialize_invoice(invoice, detail=True, db=db), "timesheet_id": ts.id},
-        message="Invoice generated from timesheet",
+        message=f"Proforma invoice {proforma_number} raised — Finance has been notified",
     )
 
 

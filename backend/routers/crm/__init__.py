@@ -18,12 +18,13 @@ log = logging.getLogger("karnex.api")
 _MODULES: tuple[str, ...] = (
     "access_templates", "me", "me_profile", "masters", "settings", "users_admin",
     "notifications", "files", "customers", "opportunities", "opportunity_attachments",
-    "requirements", "resumes", "candidates", "candidate_profiles", "ai_interviews",
+    "requirements", "requirement_positions", "resumes", "candidates", "candidate_profiles", "ai_interviews",
     "calendar", "table_preferences", "projects", "timesheets", "finance",
     "finance_reports", "credit_notes", "tax_invoice", "employees", "dashboards",
     "reports", "apply", "template_requests", "slots", "outreach", "holidays",
     "leave_policies", "leave_applications", "ai_assist", "email_outbox", "email_flows",
-    "payroll", "rate_cards", "activity_log", "public_invoice", "customer_receipts", "bank_accounts", "invoice_revisions", "backup", "support",
+    "payroll", "rate_cards", "activity_log", "public_invoice", "customer_receipts", "bank_accounts", "invoice_revisions", "backup", "support", "custom_roles",
+    "screening_desk", "ai_costs",
 )
 
 

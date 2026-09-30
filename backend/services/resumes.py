@@ -18,9 +18,10 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import AtsStatus, Location, Requirement, RequirementSkill, Resume, Skill
+from models import AtsStatus, Candidate, Location, Requirement, RequirementSkill, Resume, Skill
 from models.ai_links import hr_decision_label
 from services.crm_common import resolve_crm_file
+from services.report_links import ai_report_link
 
 logger = logging.getLogger("karnex.crm.ats")
 
@@ -62,11 +63,14 @@ def _ai_semantic_review(jd_text: str | None, mandatory: list[str], optional: lis
             '{"match_percent": 0-100, "summary": "2-3 sentence fit assessment", '
             '"strengths": ["..."], "gaps": ["..."]}'
         )
-        res = get_openai_client(ATS_OPENAI_PURPOSE).chat.completions.create(
-            model="gpt-4o-mini",
+        # Tracked (29 Sep 2026) so the ATS review shows in AI Costs ▸ Other spend.
+        from ai import _db_target
+        from prompt_logger import tracked_chat_completion
+        res = tracked_chat_completion(
+            get_openai_client(ATS_OPENAI_PURPOSE), model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            response_format={"type": "json_object"},
+            temperature=0, response_format={"type": "json_object"},
+            call_type="ats_semantic_review", db_target=_db_target(),
         )
         data = _json.loads(res.choices[0].message.content or "{}")
         pct = float(data.get("match_percent"))
@@ -143,10 +147,8 @@ def serialize_resume(r: Resume) -> dict:
 
 def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
     """Attach latest AI L1 score, report link, and invite share details from ai_interview_links."""
-    import os
-
     from auth_db import get_schedule_by_token
-    from models import AiInterviewLink, Candidate
+    from models import AiInterviewLink
     from services.ai_interview_bridge import _legacy_db_target
 
     data = [serialize_resume(r) for r in rows]
@@ -275,11 +277,7 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
         # corrected addresses) a resume-email link 404'd "Candidate not found"
         # on a report that existed.
         email = emails_by_cand.get(link.candidate_id, "") or (r.email or "").strip().lower()
-        d["ai_report_link"] = (
-            f"/admin?view=candidateReport&cid={email}&iid={link.interview_record_id}"
-            if link.interview_record_id and email
-            else None
-        )
+        d["ai_report_link"] = ai_report_link(email, link.interview_record_id)
         token = (link.invite_token or "").strip()
         if token:
             d["ai_invite_token"] = token
@@ -296,6 +294,10 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
 #: L1 (1 Sep 2026) is the round RMG runs INSTEAD of the AI screen, so the
 #: Applied Candidates row has to be able to show it exactly like the L2 —
 #: requested / scheduled / result — for a candidate who has no AI link at all.
+#: The activity row RMG / GM leave when they choose the AI L1 route and ask TA
+#: to schedule it (the AI twin of L1_REQUESTED).
+AI_L1_REQUESTED = "AI_L1_REQUESTED"
+
 _MANUAL_ROUND_SOURCES = {
     "l1_manual": ("L1_Interview", "L1_REQUESTED"),
     "l2": ("L2_F2F", "L2_REQUESTED"),
@@ -311,7 +313,7 @@ _MANUAL_ROUND_SOURCES = {
 def manual_round_state(db: Session, profile_ids) -> dict[int, dict]:
     """Per-profile state of the internal L1/L2 rounds, batched.
 
-    Two queries total, whatever the page size. Keyed by profile because that is
+    A handful of batched queries, whatever the page size. Keyed by profile because that is
     what both list paths have — the resume rows resolve theirs through the
     candidate, the profile-only rows already are one. An AI link is NOT
     required: a manually interviewed candidate never has one, and keying this
@@ -345,6 +347,40 @@ def manual_round_state(db: Session, profile_ids) -> dict[int, dict]:
         }
     for pid in ids:
         out[pid].setdefault("latest_offer", None)
+    # The rounds tally (28 Sep 2026): every interview booked for this
+    # candidacy — manual, customer, HR, L3/L4 and the AI L1 — and how many
+    # carry a verdict. Rounds that did not happen are not counted.
+    from sqlalchemy import case, func
+
+    from models import AiInterviewLink
+    from services.interview_rounds import NOT_HELD_STATUSES
+    for pid in ids:
+        out[pid].update({"rounds_booked": 0, "rounds_done": 0})
+    for pid, booked, done in db.execute(
+        select(InterviewEvent.profile_id, func.count(InterviewEvent.id),
+               func.sum(case((func.coalesce(InterviewEvent.result, "") != "", 1), else_=0)))
+        .where(InterviewEvent.profile_id.in_(ids),
+               func.coalesce(InterviewEvent.status, "").notin_(NOT_HELD_STATUSES))
+        .group_by(InterviewEvent.profile_id)
+    ).all():
+        out[pid].update({"rounds_booked": int(booked or 0), "rounds_done": int(done or 0)})
+    for pid, booked, done in db.execute(
+        select(AiInterviewLink.profile_id, func.count(AiInterviewLink.id),
+               func.sum(case((AiInterviewLink.completed_at.isnot(None), 1), else_=0)))
+        .where(AiInterviewLink.profile_id.in_(ids))
+        .group_by(AiInterviewLink.profile_id)
+    ).all():
+        # One AI L1 counts once however many links a reschedule minted.
+        out[pid]["rounds_booked"] += 1 if booked else 0
+        out[pid]["rounds_done"] += 1 if done else 0
+    # RMG / GM chose the AI route and asked TA to schedule it (28 Sep 2026).
+    ai_requested = {row[0] for row in db.execute(
+        select(CandidateProfileActivityLog.profile_id)
+        .where(CandidateProfileActivityLog.profile_id.in_(ids),
+               CandidateProfileActivityLog.action_type == AI_L1_REQUESTED)
+    ).all()}
+    for pid in ids:
+        out[pid]["ai_l1_requested"] = pid in ai_requested
     for prefix, (kind, request_action) in _MANUAL_ROUND_SOURCES.items():
         requested: set[int] = set()
         if request_action:
@@ -355,16 +391,25 @@ def manual_round_state(db: Session, profile_ids) -> dict[int, dict]:
             ).all()}
         # Latest round per profile (highest id wins): its id lets feedback be
         # recorded straight from the row, its result drives the chip.
+        # A round that did not happen (cancelled, no-show, rescheduled) is not
+        # "scheduled" (28 Sep 2026): the row offered no way to rebook it, and
+        # the tally below already leaves it out — the two now agree.
         meta: dict[int, dict] = {}
-        for pid, eid, res, when, link in db.execute(
+        for pid, eid, res, when, raw_when, link, who in db.execute(
             select(InterviewEvent.profile_id, InterviewEvent.id, InterviewEvent.result,
-                   InterviewEvent.scheduled_at, InterviewEvent.meeting_link)
-            .where(InterviewEvent.profile_id.in_(ids), InterviewEvent.kind == kind)
+                   InterviewEvent.scheduled_at, InterviewEvent.raw_when, InterviewEvent.meeting_link,
+                   InterviewEvent.interviewer)
+            .where(InterviewEvent.profile_id.in_(ids), InterviewEvent.kind == kind,
+                   func.coalesce(InterviewEvent.status, "").notin_(NOT_HELD_STATUSES))
             .order_by(InterviewEvent.id)
         ).all():
+            # The typed text stands in when it never parsed into a timestamp
+            # (28 Sep 2026: "Technical L1 – Scheduled" showed no time at all).
             meta[pid] = {"event_id": eid, "result": res or None,
-                         "when": when.isoformat() if when else None,
-                         "link": bool((link or "").strip())}
+                         "when": when.isoformat() if when else ((raw_when or "").strip() or None),
+                         "link": bool((link or "").strip()),
+                         # Who took it (30 Sep 2026): the Status cell names the panel.
+                         "interviewer": (who or "").strip() or None}
         for pid in ids:
             row = meta.get(pid) or {}
             out[pid].update({
@@ -376,7 +421,14 @@ def manual_round_state(db: Session, profile_ids) -> dict[int, dict]:
                 # Sales booked the slot without the customer's link.
                 f"{prefix}_when": row.get("when"),
                 f"{prefix}_link": bool(row.get("link")),
+                f"{prefix}_interviewer": row.get("interviewer"),
             })
+    # The customer's slots Sales passed on (29 Sep 2026) — TA sees them on the
+    # row beside "Schedule Customer L1 / L2" and picks one in the form.
+    from services.candidate_profiles import latest_customer_slots
+    offers = latest_customer_slots(db, ids)
+    for pid in ids:
+        out[pid]["customer_slots"] = offers.get(pid)
     return out
 
 
@@ -583,3 +635,236 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
     resume.ats_status = AtsStatus.SCORED
     resume.screened_by = user_id
     return {"ats_score": total, "breakdown": breakdown}
+
+
+def ensure_resume_for_profile(db: Session, profile, req) -> Resume:
+    """The Resume row a profile-only applicant needs before anything CV-shaped
+    can happen to them — built from the CV on the candidate's own record.
+
+    A candidate applied from the Candidates page (or "Apply to Opportunity")
+    has a profile but no `resumes` row, so ATS, slot invites and the AI L1
+    all had nothing to work on (user report, 2 Sep 2026). Once this row
+    exists the applicant is an ordinary resume row everywhere. Idempotent:
+    an existing (requirement, candidate) row is reused, never duplicated.
+    """
+    existing = db.execute(
+        select(Resume).where(Resume.requirement_id == req.id,
+                             Resume.candidate_id == profile.candidate_id)
+        .order_by(Resume.id.desc())
+    ).scalars().first()
+    if existing is not None:
+        return existing
+    cand = db.get(Candidate, profile.candidate_id)
+    if cand is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if not (cand.cv_url or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="No CV on file for this candidate — upload one on their record "
+                   "(Candidates → their profile → CV), then run the ATS scan.")
+    resume = Resume(
+        requirement_id=req.id,
+        candidate_id=cand.id,
+        candidate_name=(" ".join(p for p in (cand.first_name, cand.last_name) if p)
+                        or f"Candidate #{cand.id}")[:255],
+        email=cand.email,
+        phone=cand.phone,
+        source_portal=(profile.source or "app")[:64],
+        applicant_experience=(str(cand.experience_years)
+                              if cand.experience_years is not None else None),
+        resume_file_url=cand.cv_url,
+    )
+    # Stamp the application date the profile carries, not today — the row is
+    # catching up with an application that already happened. Left unset (so
+    # the column's server default applies) when the profile has no date.
+    applied = profile.applied_on or profile.created_at
+    if applied is not None:
+        resume.received_date = applied.date()
+    db.add(resume)
+    db.flush()
+    return resume
+
+
+def auto_score_profile(db: Session, profile, user_id: int | None) -> bool:
+    """ATS for a candidate applied WITHOUT an upload (Candidates page, Apply to
+    Opportunity) — the same automatic scan the upload and the bulk ZIP already
+    run (28 Sep 2026, user rule: "when TA adds a candidate the ATS is done
+    automatically", so the row carries no Run ATS button).
+
+    Materialises the resume row from the candidate's CV and scores it against
+    the opportunity's LATEST requirement. Best-effort in a savepoint: no
+    requirement, no CV or a parser failure leaves the row unscored and never
+    fails the apply. The auto-threshold pipeline is NOT run — screening is RMG
+    / GM's call. Returns True when a score was written.
+    """
+    try:
+        with db.begin_nested():
+            req = db.execute(
+                select(Requirement).where(Requirement.opportunity_id == profile.opportunity_id)
+                .order_by(Requirement.id.desc()).limit(1)
+            ).scalars().first()
+            if req is None:
+                return False
+            # An UPLOADED resume on this requirement is scored as it is — the
+            # candidate record may carry no CV of its own (30 Sep 2026: an
+            # upload that could not be scored when it arrived stayed "Not
+            # scored" for ever).
+            resume = db.execute(
+                select(Resume).where(Resume.requirement_id == req.id,
+                                     Resume.candidate_id == profile.candidate_id)
+                .order_by(Resume.id.desc())
+            ).scalars().first()
+            if resume is None:
+                cand = db.get(Candidate, profile.candidate_id)
+                if cand is None or not (cand.cv_url or "").strip():
+                    return False
+                resume = ensure_resume_for_profile(db, profile, req)
+            if resume.ats_status != AtsStatus.PENDING_SCAN or not (resume.resume_file_url or "").strip():
+                return False
+            run_ats_scan(db, resume, req, user_id)
+            return True
+    except Exception:
+        logger.info("auto ATS skipped for profile %s", getattr(profile, "id", "?"), exc_info=True)
+        return False
+
+
+#: Candidates re-scored by one JD / skills change. More than this is a job for
+#: "Score N pending" on the list — one save must not run for minutes.
+RESCORE_MAX = 200
+
+#: ATS statuses a JD / skills change may re-score. A Shortlisted / Rejected
+#: resume is a DECISION someone took — `run_ats_scan` would overwrite it.
+RESCORABLE_STATUSES = (AtsStatus.PENDING_SCAN, AtsStatus.SCORED)
+
+
+def rescore_requirement(db: Session, req: Requirement, user_id: int | None,
+                        limit: int = RESCORE_MAX) -> dict:
+    """Score every live applicant of `req` again — after RMG / GM add or change
+    the JD (text or Word / PDF) or the skills (30 Sep 2026, user report: the
+    Screening Desk read "Could not score" because the position had nothing to
+    score against, and adding the JD later changed nothing).
+
+    Covers resume rows still Pending_Scan or Scored (never a Shortlisted /
+    Rejected one), skipping closed candidacies, plus live profile-only
+    applicants with a CV on file. Each scan in its own savepoint; the caller
+    commits. Returns {scored, failed, skipped}.
+    """
+    from models import CandidateProfile
+    from services.candidate_profiles import REJECTED_BUCKET
+
+    closed = set(db.execute(
+        select(CandidateProfile.candidate_id).where(
+            CandidateProfile.opportunity_id == req.opportunity_id,
+            CandidateProfile.pipeline_status.in_(REJECTED_BUCKET),
+        )
+    ).scalars().all())
+    resumes = db.execute(
+        select(Resume).where(Resume.requirement_id == req.id,
+                             Resume.ats_status.in_(RESCORABLE_STATUSES))
+        .order_by(Resume.id.desc()).limit(limit)
+    ).scalars().all()
+    seen = {r.candidate_id for r in resumes if r.candidate_id}
+    work = [r for r in resumes if r.candidate_id not in closed or r.candidate_id is None]
+    room = max(0, limit - len(work))
+    if room and req.opportunity_id:
+        live = db.execute(
+            select(CandidateProfile).where(
+                CandidateProfile.opportunity_id == req.opportunity_id,
+                CandidateProfile.pipeline_status.not_in(REJECTED_BUCKET),
+            ).limit(room * 2)
+        ).scalars().all()
+        for prof in live:
+            if len(work) >= limit:
+                break
+            if prof.candidate_id in seen:
+                continue
+            seen.add(prof.candidate_id)
+            cand = db.get(Candidate, prof.candidate_id)
+            if cand is None or not (cand.cv_url or "").strip():
+                continue
+            try:
+                with db.begin_nested():
+                    work.append(ensure_resume_for_profile(db, prof, req))
+            except Exception:
+                continue
+    scored = failed = skipped = 0
+    for resume in work:
+        if resume.ats_status not in RESCORABLE_STATUSES or not (resume.resume_file_url or "").strip():
+            skipped += 1
+            continue
+        try:
+            with db.begin_nested():
+                run_ats_scan(db, resume, req, user_id)
+            scored += 1
+        except Exception:
+            failed += 1
+    return {"scored": scored, "failed": failed, "skipped": skipped}
+
+
+def has_ats_criteria(db: Session, req: Requirement) -> bool:
+    """Is there anything to score against — a skill, the RMG JD text, or a JD file?"""
+    from models import RequirementAttachment
+
+    if (req.rmg_jd_text or "").strip():
+        return True
+    if db.execute(select(RequirementSkill.id)
+                  .where(RequirementSkill.requirement_id == req.id).limit(1)).first():
+        return True
+    return db.execute(select(RequirementAttachment.id).where(
+        RequirementAttachment.requirement_id == req.id,
+        RequirementAttachment.kind == "rmg_jd").limit(1)).first() is not None
+
+
+def rescore_requirement_in_background(requirement_id: int, user_id: int | None) -> None:
+    """`rescore_requirement` on its own session in a daemon thread — the JD
+    save answers at once; the scores land a few seconds later."""
+    import threading
+
+    def _run() -> None:
+        from crm_db import get_session_factory
+
+        try:
+            db = get_session_factory()()
+        except Exception:
+            logger.info("ATS background scoring skipped: CRM database not available")
+            return
+        try:
+            req = db.get(Requirement, requirement_id)
+            if req is not None:
+                res = rescore_requirement(db, req, user_id)
+                db.commit()
+                logger.info("ATS re-score of requirement %s: %s", requirement_id, res)
+        except Exception:
+            db.rollback()
+            logger.warning("ATS re-score of requirement %s failed", requirement_id, exc_info=True)
+        finally:
+            db.close()
+
+    threading.Thread(target=_run, daemon=True, name=f"ats-rescore-{requirement_id}").start()
+
+
+def score_profiles_in_background(profile_ids: list[int], user_id: int | None) -> None:
+    """`auto_score_profile` for a batch sent for Technical Screening, off the request."""
+    import threading
+
+    def _run() -> None:
+        from crm_db import get_session_factory
+        from models import CandidateProfile
+
+        try:
+            db = get_session_factory()()
+        except Exception:
+            logger.info("ATS background scoring skipped: CRM database not available")
+            return
+        try:
+            for pid in profile_ids:
+                prof = db.get(CandidateProfile, pid)
+                if prof is not None and auto_score_profile(db, prof, user_id):
+                    db.commit()
+        except Exception:
+            db.rollback()
+            logger.warning("screening ATS batch failed", exc_info=True)
+        finally:
+            db.close()
+
+    threading.Thread(target=_run, daemon=True, name="ats-screening-batch").start()

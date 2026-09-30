@@ -35,6 +35,7 @@ import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from services.report_links import ai_report_link
 from models import (
     USERS_TABLE, AiInterviewLink, Candidate, CandidateProfile, Customer, Employee,
     InterviewEvent, Opportunity,
@@ -366,11 +367,7 @@ def _ai_interview_events(db: Session, window: CalendarRange) -> list[dict]:
             organiser_user_id=link.scheduled_by,
             cv_url=getattr(cand, "cv_url", None),
             detail_path=f"profiles/{link.profile_id}" if link.profile_id else None,
-            report_link=(
-                f"/admin?view=candidateReport&cid={(getattr(cand, 'email', '') or '').lower()}"
-                f"&iid={link.interview_record_id}"
-                if link.interview_record_id and getattr(cand, "email", None) else None
-            ),
+            report_link=ai_report_link(getattr(cand, "email", None), link.interview_record_id),
             # A session the candidate has already opened must not be silently moved.
             can_modify=bool(link.result == "Pending" and not started),
         ))

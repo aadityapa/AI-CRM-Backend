@@ -15,13 +15,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from models import (
-    AtsStatus, Candidate, CandidateProfile, InterviewSlot, PipelineStatus, Requirement,
-    RequirementActivityLog, Resume, SlotBooking,
+    Candidate, CandidateProfile, CandidateProfileActivityLog, InterviewSlot, PipelineStatus, Requirement,
+    Resume, SlotBooking,
 )
 from services.candidate_comms import notify_candidate, slot_invite_message
 from services.candidates import apply_cv_profile_to_candidate
-from services.crm_common import get_app_setting, log_activity
-from services.notify import notify_role
+from services.crm_common import log_activity
 
 logger = logging.getLogger("karnex.crm.slot_booking")
 
@@ -98,6 +97,68 @@ def profile_from_resume_application(resume: Resume) -> dict:
     }
 
 
+#: Activity-log action for the note TA types on the upload form.
+UPLOAD_NOTE_ACTION = "TA_NOTE"
+
+
+def record_upload_note(db: Session, profile: CandidateProfile | None, note: str,
+                       user_id: int | None) -> bool:
+    """Log TA's upload-form note on the candidate's Activity Log (29 Sep 2026).
+
+    The same text also stays on `resume.application_details["note"]`, where the
+    Applied Candidates row prints it; the log is what RMG / GM read on the
+    profile. No note or no profile → nothing written. Flushes; caller commits."""
+    note = (note or "").strip()
+    if not note or profile is None:
+        return False
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user_id,
+                 UPLOAD_NOTE_ACTION, f"TA note on upload: {note[:1000]}")
+    return True
+
+
+LOCATION_MISSING_EVENT = "profile.location_missing"
+
+
+def missing_locations(candidate) -> list[str]:
+    """Which of the two location fields Sales / HR need are blank (pure)."""
+    out = []
+    if not (getattr(candidate, "city", None) or "").strip():
+        out.append("Candidate Location")
+    if not (getattr(candidate, "preferred_locations", None) or "").strip():
+        out.append("Candidate Preferred Location")
+    return out
+
+
+def remind_missing_location(db: Session, profile: CandidateProfile | None, user_id: int | None) -> list[str]:
+    """Tell the TA who added the profile that its locations are blank (29 Sep
+    2026, user ask: "when TA adds a profile without Candidate Location /
+    Preferred Location, notify them"). Bell + email to that TA, linked to the
+    profile's Overview where both fields are filled. Never raises; returns
+    what was missing. Flushes nothing the caller did not; caller commits."""
+    if profile is None or not user_id:
+        return []
+    try:
+        cand = db.get(Candidate, profile.candidate_id)
+        missing = missing_locations(cand) if cand is not None else []
+        if not missing:
+            return []
+        from services.notify import notify_user
+        name = " ".join(x for x in (cand.first_name, cand.last_name) if x) or f"Candidate #{cand.id}"
+        with db.begin_nested():
+            notify_user(
+                db, user_id,
+                f"Add the location for {name}",
+                f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} not filled. Sales and HR need "
+                "them to match the candidate to the customer's work location — add them on the profile's Overview.",
+                f"/admin/?view=crm&p=profiles/{profile.id}",
+                event=LOCATION_MISSING_EVENT,
+                dedupe_key=f"loc_missing:{profile.id}",
+            )
+        return missing
+    except Exception:  # noqa: BLE001 — a reminder must never fail the upload / apply
+        return []
+
+
 def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candidate:
     """Match an existing Candidate by email (or full name when no email),
     else create one. candidates.email is NOT NULL + unique, so a placeholder
@@ -130,6 +191,10 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
             candidate.phone = resume.phone
         if not candidate.cv_url and resume.resume_file_url:
             candidate.cv_url = resume.resume_file_url
+    # Current location (29 Sep 2026 upload form) fills an EMPTY city only.
+    where = ((resume.application_details or {}).get("current_location") or "").strip()
+    if where and not (getattr(candidate, "city", None) or "").strip():
+        candidate.city = where[:120]
     # Carry the applicant's self-reported details (experience, education, domain,
     # skills, CTC) from the apply form into the candidate profile so every role
     # sees them. Fills only empty fields; best-effort.
@@ -141,8 +206,7 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
 
 
 def ensure_sourcing_profile(db: Session, resume: Resume, requirement: Requirement,
-                            *, ta_user=None, source: str = "ats",
-                            notify_rmg: bool = True) -> CandidateProfile | None:
+                            *, ta_user=None, source: str = "ats") -> CandidateProfile | None:
     """Every resume is an application: make sure a CandidateProfile exists for
     (candidate, opportunity) so the person shows up in the Applicants tab the
     moment their resume lands — not only once an AI interview is scheduled.
@@ -190,19 +254,11 @@ def ensure_sourcing_profile(db: Session, resume: Resume, requirement: Requiremen
             )
             from datetime import datetime, timezone
             profile.applied_on = datetime.now(timezone.utc)
-            # RMG screening gate: a new applicant starts Pending; the AI-L1
-            # actions stay locked until RMG shortlists. Bulk callers pass
-            # notify_rmg=False and send ONE summary notification instead of
-            # fifty individual ones.
-            from services.candidate_profiles import RMG_SCREENING_PENDING, rmg_gate_enabled
-            gate_on = rmg_gate_enabled()
-            if gate_on:
-                profile.rmg_screening_status = RMG_SCREENING_PENDING
+            # The upload lands at SOURCING, with TA (28 Sep 2026, user flow):
+            # nobody screens it until TA presses "Technical Screening" on the
+            # Applied Candidates row (`candidate_profiles.ta_decision`).
             db.add(profile)
             db.flush()
-            if gate_on and notify_rmg:
-                from services.candidate_profiles import notify_rmg_new_applicant
-                notify_rmg_new_applicant(db, profile, actor=ta_user)
             return profile
     except Exception:
         logger.warning("ensure_sourcing_profile failed for resume %s",
@@ -323,68 +379,3 @@ def _slot_invite_blocked(db: Session, resume: Resume, requirement: Requirement) 
 
 
 slot_invite_blocked = _slot_invite_blocked
-
-
-def auto_pipeline_after_scan(db: Session, resume: Resume, requirement: Requirement,
-                             user_id: int, base_url: str = "") -> dict:
-    """ATS auto-threshold hook, called right after a successful scan.
-
-    When ats_auto_invite is enabled and the score clears ats_auto_threshold:
-      * auto-shortlist the resume (Scored -> Shortlisted) + activity log,
-      * create the slot booking and send the invite (email/WhatsApp) when the
-        resume has contact info; otherwise notify TA to follow up manually.
-
-    NEVER raises — the scan result must be returned normally regardless.
-    Returns {"auto_shortlisted": bool, "slot_invite_sent": bool, ...details}.
-    """
-    info: dict = {"auto_shortlisted": False, "slot_invite_sent": False}
-    try:
-        if (get_app_setting(db, "ats_auto_invite", "true") or "").strip().lower() != "true":
-            return info
-        try:
-            threshold = float(get_app_setting(db, "ats_auto_threshold", "50") or "50")
-        except (TypeError, ValueError):
-            threshold = 50.0
-        if resume.ats_score is None or float(resume.ats_score) < threshold:
-            return info
-        if resume.ats_status != AtsStatus.SCORED:
-            return info
-
-        resume.ats_status = AtsStatus.SHORTLISTED
-        resume.screened_by = resume.screened_by or user_id
-        info["auto_shortlisted"] = True
-        score = float(resume.ats_score)
-        log_activity(db, RequirementActivityLog, "requirement_id", requirement.id, user_id,
-                     "ATS_AUTO_SHORTLISTED",
-                     f"ATS_AUTO_SHORTLISTED (score {score:g}%) — {resume.candidate_name} "
-                     f"cleared the auto threshold ({threshold:g}%)")
-
-        # Manual route / past the AI stage (3 Sep 2026): shortlist stands, but
-        # the AI booking link must not go out — RMG decided a human L1.
-        blocked = _slot_invite_blocked(db, resume, requirement)
-        if blocked:
-            info["slot_invite_skipped"] = blocked
-            log_activity(db, RequirementActivityLog, "requirement_id", requirement.id, user_id,
-                         "SLOT_INVITE_SKIPPED",
-                         f"SLOT_INVITE_SKIPPED for {resume.candidate_name} — {blocked}")
-        elif (resume.email or "").strip() or (resume.phone or "").strip():
-            booking, results = send_slot_invite(db, resume, requirement, base_url)
-            channels = [ch for ch, res in results.items() if res.get("sent")]
-            info["slot_invite_sent"] = bool(channels)
-            info["booking_id"] = booking.id
-            info["notified"] = results
-            log_activity(db, RequirementActivityLog, "requirement_id", requirement.id, user_id,
-                         "SLOT_INVITE_SENT",
-                         f"SLOT_INVITE_SENT ({'/'.join(channels) if channels else 'no channel delivered'}) "
-                         f"to {resume.candidate_name} — booking #{booking.id}")
-        else:
-            notify_role(db, "TA",
-                        f"Auto-shortlisted, manual follow-up needed: {resume.candidate_name}",
-                        f"ATS score {score:g}% cleared the auto threshold but the resume has "
-                        f"no email/phone — send the slot invite manually.",
-                        f"/admin?view=crm&p=requirements/{requirement.id}",
-                        event="slot.manual_followup")
-    except Exception as exc:  # pragma: no cover — must never break the scan
-        logger.error("ATS auto-pipeline hook failed for resume %s: %s", resume.id, exc)
-        info["error"] = str(exc)
-    return info

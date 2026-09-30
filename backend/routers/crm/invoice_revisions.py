@@ -31,12 +31,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, gated_read, gated_write_action, get_crm_db
-from models import Invoice, InvoiceLine, InvoicePayment, InvoiceRevision, Project, PurchaseOrder
+from models import Invoice, InvoiceRevision, Project, PurchaseOrder
 from schemas.common import envelope
-from services import tax
 from services.finance import (
-    apply_invoice_gst_totals, compute_karnex_gst, ensure_unique_invoice_number, get_invoice_or_404,
-    normalize_buyer_state_code_input, resolve_billing_branch, serialize_invoice,
+    apply_invoice_gst_totals, compute_karnex_gst, ensure_po_covers, ensure_unique_invoice_number,
+    get_invoice_or_404, move_po_drawdown, normalize_buyer_state_code_input, po_draw_amount,
+    require_tax_invoice, resolve_billing_branch, serialize_invoice,
 )
 
 router = APIRouter(prefix="/api/invoices", tags=["CRM: Invoice revisions"])
@@ -233,7 +233,7 @@ def _apply(db: Session, inv: Invoice, changes: dict) -> None:
             line.description = lc["description_change"]["to"]
         line.amount = (Decimal(str(line.qty)) * Decimal(str(line.rate))).quantize(TWO, rounding=ROUND_HALF_UP)
 
-    old_grand = Decimal(str(inv.grand_total or 0))
+    old_sub = Decimal(str(inv.sub_total or 0))   # the PO draw moves with the base value
     if changes.get("lines"):
         inv.sub_total = sum((Decimal(str(l.amount or 0)) for l in inv.lines), Decimal("0")).quantize(TWO)
     # GST always recomputed (a state-code change alone flips CGST/SGST ↔ IGST).
@@ -255,32 +255,26 @@ def _apply(db: Session, inv: Invoice, changes: dict) -> None:
         raise HTTPException(status_code=400, detail=(
             f"Cannot reduce the invoice to ₹{new_grand:,.2f}: the customer has already paid "
             f"₹{paid:,.2f}. Record a credit note instead."))
+    # PO movements follow the BASE value (sub-total before GST, 25 Sep 2026 —
+    # `po_draw_amount`), never the grand total.
+    old_draw = po_draw_amount(old_sub)
+    new_draw = po_draw_amount(inv.sub_total)
     if "po_id" in changes:
-        # Move to another PO: give the old one its money back, draw the full
-        # (new) grand total from the new one — refused if it cannot cover it.
+        # Move to another PO: give the old one its draw back, draw the (new)
+        # base value from the new one — refused if it cannot cover it.
         new_po = db.get(PurchaseOrder, changes["po_id"]["to"])
         if new_po is None:
             raise HTTPException(status_code=409, detail="The requested PO no longer exists")
-        if Decimal(str(new_po.balance_value or 0)) < new_grand:
-            raise HTTPException(status_code=400, detail=(
-                f"PO {new_po.po_number} balance ₹{Decimal(str(new_po.balance_value or 0)):,.2f} cannot cover "
-                f"this invoice's ₹{new_grand:,.2f}"))
-        if po is not None:
-            tax.apply_po_consumption(po, -old_grand)
-            db.add(po)
-        tax.apply_po_consumption(new_po, new_grand)
-        db.add(new_po)
+        ensure_po_covers(new_po, new_draw)
+        move_po_drawdown(db, po, inv.project_id, -old_draw)
+        move_po_drawdown(db, new_po, inv.project_id, new_draw)
         inv.po_id = new_po.id
         inv.po = new_po
     else:
-        delta = new_grand - old_grand
-        if po is not None and delta != 0:
-            if delta > 0 and Decimal(str(po.balance_value or 0)) < delta:
-                raise HTTPException(status_code=400, detail=(
-                    f"PO {po.po_number} balance ₹{Decimal(str(po.balance_value or 0)):,.2f} cannot cover the "
-                    f"₹{delta:,.2f} increase"))
-            tax.apply_po_consumption(po, delta)
-            db.add(po)
+        delta = new_draw - old_draw
+        if po is not None and delta > 0:
+            ensure_po_covers(po, delta)
+        move_po_drawdown(db, po, inv.project_id, delta)
     db.add(inv)
 
 
@@ -288,7 +282,7 @@ def _notify(db: Session, inv: Invoice, rev: InvoiceRevision, user: CurrentUser, 
             event: str, title: str, message: str, extra_roles=(), also_user_id: int | None = None) -> None:
     try:
         from services.notify import notify_roles, notify_user
-        link = f"/admin?view=crm&p=invoices/{inv.id}"
+        link = f"/admin/?view=crm&p=invoices/{inv.id}"
         roles = list(dict.fromkeys(list(WATCH_ROLES) + list(extra_roles)))
         notify_roles(db, roles, title, message, link, exclude_user_id=user.id, actor=user, event=event,
                      dedupe_prefix=f"{event}:{rev.id}", related_type="invoice", related_id=inv.id)
@@ -312,7 +306,9 @@ def list_revisions(invoice_id: int, db: Session = Depends(get_crm_db),
     rows = db.execute(select(InvoiceRevision).where(InvoiceRevision.invoice_id == inv.id)
                       .order_by(InvoiceRevision.requested_at.desc(), InvoiceRevision.id.desc())).scalars().all()
     pending = next((r for r in rows if r.status == "Pending"), None)
-    can_approve = user.is_admin or user.has_any("Sales", "Sales_Head")
+    from services.action_permissions import user_may
+    # Same answer as the REV_APPROVE gate (template / role Approvals, else role list).
+    can_approve = user_may(db, user, "invoice.revision.approve")
     return envelope(data=[serialize_revision(r) for r in rows], meta={
         "pending_id": pending.id if pending else None,
         "can_request": True,
@@ -365,6 +361,7 @@ def invoice_po_options(invoice_id: int, db: Session = Depends(get_crm_db),
 def request_revision(invoice_id: int, body: RevisionRequestIn, db: Session = Depends(get_crm_db),
                      user: CurrentUser = Depends(REV_REQUEST)):
     inv = get_invoice_or_404(db, invoice_id)
+    require_tax_invoice(inv, "a change request")   # a Proforma is corrected directly by Finance
     reason = (body.reason or "").strip()
     if len(reason) < MIN_REASON:
         raise HTTPException(status_code=400,

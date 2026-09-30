@@ -33,8 +33,10 @@ from models import (
     TdsRecord,
     Timesheet,
 )
+from models.finance import InvoiceKind
 from services import tax
 from services import tax_invoice as ti
+from services.invoice_format import normalize_invoice_format
 
 
 GST_MISSING_NOTE = "GST not computed — enter the buyer State Code"
@@ -531,6 +533,90 @@ def assert_po_allows_new_drawdown(po: PurchaseOrder | None, *, on_date: date | N
         )
 
 
+def po_draw_amount(sub_total) -> Decimal:
+    """What an invoice draws from its purchase order: its BASE value — the
+    sub-total before GST (25 Sep 2026, Finance).
+
+    A PO is the customer's order for the SERVICE; GST is collected on top of it
+    for the government and is not part of the order value. Drawing the grand
+    total used every PO up ~18 % early (a ₹10 L PO was "exhausted" after ₹8.47 L
+    of work). EVERY PO movement — draw, release, re-point, cover check — goes
+    through this one function so the rule cannot drift again."""
+    return tax._d(sub_total).quantize(Decimal("0.01"))
+
+
+def ensure_po_covers(po: PurchaseOrder | None, amount) -> None:
+    """400 when the PO's remaining balance cannot cover `amount` (a base value)."""
+    if po is None:
+        return
+    need = tax._d(amount)
+    have = tax._d(po.balance_value or 0)
+    if have < need:
+        raise HTTPException(status_code=400, detail=(
+            f"PO {po.po_number} balance ₹{have:,.2f} cannot cover ₹{need:,.2f} "
+            "(the invoice value before GST)"))
+
+
+def move_po_drawdown(db: Session, po: PurchaseOrder | None, project_id: int | None, amount) -> None:
+    """Draw (+) or release (−) a base amount on a PO AND its project allocation,
+    together — they used to be updated side by side in five places. No commit."""
+    if po is None:
+        return
+    delta = tax._d(amount)
+    if delta == 0:
+        return
+    tax.apply_po_consumption(po, delta)
+    if project_id is None:
+        return
+    alloc = db.execute(
+        select(POProjectAllocation).where(
+            POProjectAllocation.po_id == po.id,
+            POProjectAllocation.project_id == project_id,
+        )
+    ).scalars().first()
+    if alloc is not None:
+        alloc.consumed_amount = max(tax._d(alloc.consumed_amount or 0) + delta, Decimal("0"))
+
+
+def release_invoice_from_po(db: Session, invoice: Invoice) -> None:
+    """Give a deleted / undone TAX invoice's draw back to its PO. A Proforma
+    never drew (0107), so it gives nothing back. No commit."""
+    if invoice.po_id is None or invoice.is_proforma:
+        return
+    po = db.get(PurchaseOrder, invoice.po_id)
+    move_po_drawdown(db, po, invoice.project_id, -po_draw_amount(invoice.sub_total))
+
+
+def consume_po_for_invoice(db: Session, invoice: Invoice, po: PurchaseOrder | None, user_id: int | None) -> None:
+    """Draw the invoice's BASE value (`po_draw_amount`) from its PO — the ONE
+    place an invoice becomes real money against a purchase order (23 Sep 2026).
+
+    Called when a TAX invoice is created: the manual create, the legacy direct
+    generate path, the recurring-billing job and the Proforma → Tax conversion.
+    A Proforma never reaches here, which is what makes it a preview the
+    customer can read without a PO moving. Balance is re-checked at this
+    moment (not when the Proforma was raised) because other invoices may have
+    drawn on the same PO in between. No commit.
+    """
+    if po is None:
+        return
+    draw = po_draw_amount(invoice.sub_total)
+    ensure_po_covers(po, draw)
+    move_po_drawdown(db, po, invoice.project_id, draw)
+    db.flush()
+    log_invoice_created_on_po(db, po, invoice, user_id)
+
+
+def require_tax_invoice(invoice: Invoice, action: str) -> None:
+    """Payments, TDS, credit notes and change requests belong to a TAX invoice.
+    A Proforma is a document under review — Finance converts or returns it."""
+    if invoice.is_proforma:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{invoice.invoice_number} is a Proforma invoice — {action} is only possible "
+                   "once Finance generates the original (tax) invoice from it.")
+
+
 def require_live_po_for_project(db: Session, project_id: int, *, on_date: date | None = None,
                                 action: str = "this action",
                                 check_balance: bool = True) -> POProjectAllocation | None:
@@ -621,9 +707,9 @@ def po_commercial_block(po: PurchaseOrder) -> dict:
     (via tax.gst_component_amounts), tax_amount = their sum, and
     grand_total = total_value + tax_amount ("grand-with-tax").
 
-    Note: PO consumption itself keeps the existing convention — invoice
-    grand totals (tax-inclusive) draw down total_value via
-    tax.apply_po_consumption. This block is display/summary only.
+    PO consumption follows the same base (25 Sep 2026): an invoice draws its
+    SUB-TOTAL from total_value (`po_draw_amount`), never its GST-inclusive
+    grand total — base against base. This block is display/summary only.
     """
     amounts = tax.gst_component_amounts(po.total_value, po.sgst, po.cgst, po.igst)
     return {
@@ -846,6 +932,12 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         "paid_amount": _num(invoice.paid_amount),
         "balance_amount": _num(invoice.balance_amount),
         "invoice_pdf_url": invoice.invoice_pdf_url,
+        # Proforma → Tax lifecycle (0107)
+        "kind": invoice.kind or InvoiceKind.TAX.value,
+        "proforma_number": invoice.proforma_number,
+        "invoice_format": normalize_invoice_format(invoice.invoice_format),
+        "returned_reason": invoice.returned_reason,
+        "returned_at": _iso(invoice.returned_at),
     }
     if detail:
         from services.company_invoice_config import get_bank_details, get_seller_details
@@ -1104,7 +1196,8 @@ def log_invoice_created_on_po(db: Session, po: PurchaseOrder | None, invoice: In
     log_po_activity(
         db, po.id, user_id, "INVOICE_CREATED",
         comment=f"Invoice {invoice.invoice_number} created against PO {po.po_number} "
-                f"for {float(invoice.grand_total or 0):.2f}",
+                f"for {float(po_draw_amount(invoice.sub_total)):.2f} (value before GST; "
+                f"invoice total incl. GST {float(invoice.grand_total or 0):.2f})",
         section="invoices",
         record_id=invoice.id,
     )

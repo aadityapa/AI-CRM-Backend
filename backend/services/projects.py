@@ -17,6 +17,7 @@ from models import (
     TimesheetEntry, TimesheetStatus,
 )
 from services.finance import active_po_allocation_for_project
+from services.project_closure import closure_out
 from services.timesheets import _project_branch, effective_billing_policy, opportunity_branch_foreign_to_project, period_bounds
 
 
@@ -77,6 +78,8 @@ def project_out(p: Project) -> dict:
         "initial_no_billing_qty": p.initial_no_billing_qty,
         "initial_no_billing_period": p.initial_no_billing_period,
         "status": getattr(p.status, "value", p.status),
+        "end_date": p.end_date.isoformat() if getattr(p, "end_date", None) else None,
+        "closure": closure_out(p),
         "created_at": p.created_at.isoformat() if p.created_at else None,
     }
 

@@ -159,6 +159,35 @@ def _queue_extras(db: Session, extras, *, subject, text, html, event, actor, ded
         )
 
 
+#: A bell row identical to one the same person got within this window is a
+#: repeat (29 Sep 2026) — the twin of `email_outbox.REPEAT_WINDOW_MINUTES`.
+BELL_REPEAT_MINUTES = 30
+
+
+def _bell_is_repeat(db: Session, user_id: int, title: str, link: str) -> bool:
+    """Same person, same title, same link, within the window. Savepointed and
+    never raises — a lookup failure means "not a repeat"."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        with db.begin_nested():
+            since = datetime.now(timezone.utc) - timedelta(minutes=BELL_REPEAT_MINUTES)
+            stmt = select(Notification.id).where(
+                Notification.user_id == user_id, Notification.title == title,
+                Notification.created_at >= since)
+            stmt = stmt.where(Notification.link == link) if link else stmt.where(Notification.link.is_(None))
+            return db.execute(stmt.limit(1)).first() is not None
+    except Exception:
+        return False
+
+
+def _add_bell(db: Session, user_id: int, title: str, message: str, link: str) -> bool:
+    """Add a bell row unless it repeats one the person just got. True if added."""
+    if _bell_is_repeat(db, user_id, title, link or ""):
+        return False
+    db.add(Notification(user_id=user_id, title=title, message=message or None, link=link or None))
+    return True
+
+
 # ------------------------------------------------------------------ single user
 
 
@@ -167,7 +196,8 @@ def notify_user(db: Session, user_id: int, title: str, message: str = "", link: 
                 rows=None, dedupe_key: str | None = None,
                 related_type: str | None = None, related_id: int | None = None) -> None:
     """Bell row for one login account, plus an email to that account's address."""
-    db.add(Notification(user_id=user_id, title=title, message=message or None, link=link or None))
+    if not _add_bell(db, user_id, title, message, link):
+        return            # a repeat of what this person was just told — no bell, no mail
     if not email:
         return
     if user_id in paused_user_ids(db):
@@ -195,34 +225,62 @@ def notify_user(db: Session, user_id: int, title: str, message: str = "", link: 
 # ------------------------------------------------------------------------ role
 
 
+def _user_ids_in_role(db: Session, name: str) -> list[int]:
+    """Members of a built-in role OR a custom role (23 Sep 2026: GM / Sales
+    Manager are custom). The two live in different tables, and comparing a
+    custom name against the built-in `role_name` enum raises on Postgres —
+    so the name decides which query runs, never both."""
+    from models.rbac import RoleName
+    from services.custom_roles import user_ids_in_custom_role
+    if name in {r.value for r in RoleName}:
+        ids = list(db.execute(
+            select(UserRole.user_id).join(Role, Role.id == UserRole.role_id).where(Role.name == name)
+        ).scalars().all())
+        # …and the custom roles that carry it (29 Sep 2026: a notice for the
+        # Sales Head reaches the Sales Manager — services/role_implications).
+        from services.role_implications import custom_roles_implying
+        for custom in custom_roles_implying(name):
+            ids += [u for u in user_ids_in_custom_role(db, custom) if u not in ids]
+        return ids
+    return user_ids_in_custom_role(db, name)
+
+
 def notify_role(db: Session, role_name: str, title: str, message: str = "", link: str = "",
                 exclude_user_id: int | None = None, *, email: bool = True, actor=None,
                 event: str = "", subject: str | None = None, rows=None,
                 dedupe_prefix: str | None = None,
-                related_type: str | None = None, related_id: int | None = None) -> int:
+                related_type: str | None = None, related_id: int | None = None,
+                user_ids=None) -> int:
     """Notify every user holding a CRM role. Returns count notified (bell rows).
 
     The role in code is only the DEFAULT: when the event has an admin-edited
-    route, that route decides the roles instead.
+    route, that route decides the roles instead. `user_ids` — see `notify_roles`.
     """
     return notify_roles(db, [role_name], title, message, link,
                         exclude_user_id=exclude_user_id, email=email, actor=actor,
                         event=event, subject=subject, rows=rows,
                         dedupe_prefix=dedupe_prefix,
-                        related_type=related_type, related_id=related_id)
+                        related_type=related_type, related_id=related_id,
+                        user_ids=user_ids)
 
 
 def notify_roles(db: Session, role_names, title: str, message: str = "", link: str = "",
                  exclude_user_id: int | None = None, *, email: bool = True, actor=None,
                  event: str = "", subject: str | None = None, rows=None,
                  dedupe_prefix: str | None = None,
-                 related_type: str | None = None, related_id: int | None = None) -> int:
+                 related_type: str | None = None, related_id: int | None = None,
+                 user_ids=None) -> int:
     """Notify the union of several roles, each person once.
 
     Routing happens HERE: the admin's route for `event` (when one exists)
     replaces `role_names`, may add literal extra addresses, and may disable
     the event outright. Email-paused users are skipped for email but still
     get the bell.
+
+    `user_ids` are people who must hear about this WHATEVER the route says —
+    e.g. everyone who may approve a submitted timesheet
+    (`action_permissions.user_ids_who_may`), because approval can come from a
+    template rather than a role name. A disabled event still stays silent.
     """
     effective_roles, extras, enabled = resolve_route(db, event, role_names)
     if not enabled:
@@ -230,20 +288,26 @@ def notify_roles(db: Session, role_names, title: str, message: str = "", link: s
 
     seen_users: set[int] = set()
     for name in effective_roles:
-        user_ids = db.execute(
-            select(UserRole.user_id).join(Role, Role.id == UserRole.role_id).where(Role.name == name)
-        ).scalars().all()
-        seen_users.update(uid for uid in user_ids if uid != exclude_user_id)
+        seen_users.update(uid for uid in _user_ids_in_role(db, name) if uid != exclude_user_id)
+    direct = {int(u) for u in (user_ids or ()) if u and u != exclude_user_id} - seen_users
+    seen_users |= direct
 
-    for uid in seen_users:
-        db.add(Notification(user_id=uid, title=title, message=message or None, link=link or None))
+    for uid in list(seen_users):
+        _add_bell(db, uid, title, message, link)
 
     if email:
         text, html = _compose(title, message, link, rows=rows)
         ctx = _context(title, message, link, rows=rows)
+        recipients = roles_recipients(db, effective_roles, exclude_user_id=exclude_user_id)
+        known = {r.email.lower() for r in recipients}
+        for uid in sorted(direct):
+            rec = user_recipient(db, uid)
+            if rec is not None and rec.email.lower() not in known:
+                known.add(rec.email.lower())
+                recipients.append(rec)
         queue_for_recipients(
             db,
-            _unpaused(db, roles_recipients(db, effective_roles, exclude_user_id=exclude_user_id)),
+            _unpaused(db, recipients),
             subject=subject or title,
             body_text=text,
             body_html=html,
@@ -282,8 +346,7 @@ def notify_employee(db: Session, emp, title: str, message: str = "", link: str =
         return False
     reached = False
     if getattr(emp, "user_id", None):
-        db.add(Notification(user_id=emp.user_id, title=title, message=message or None,
-                            link=link or None))
+        _add_bell(db, emp.user_id, title, message, link)
         reached = True
     if email and getattr(emp, "user_id", None) in paused_user_ids(db):
         email = False

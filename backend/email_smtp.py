@@ -9,6 +9,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
 
+from config import APP_NAME
+
 logger = logging.getLogger("karnex.smtp")
 
 
@@ -198,25 +200,25 @@ def smtp_login_test() -> dict[str, Any]:
 
 
 def send_password_reset_email(to_email: str, full_name: str, reset_url: str) -> dict[str, Any]:
-    subject = "Reset your Karnex password"
+    subject = f"Reset your {APP_NAME} password"
     display_name = (full_name or "").strip() or "there"
     text = (
         f"Hello {display_name},\n\n"
-        f"We received a request to reset the password for your Karnex account.\n\n"
+        f"We received a request to reset the password for your {APP_NAME} account.\n\n"
         f"Open this link to choose a new password (valid for 45 minutes, single use):\n{reset_url}\n\n"
         f"If you didn't request a password reset, you can safely ignore this email — "
         f"your password will stay unchanged.\n\n"
-        f"— KARNEX AI HR\n"
+        f"— {APP_NAME}\n"
     )
     html = f"""
     <div style="font-family:Segoe UI,Arial,sans-serif;line-height:1.6;color:#1e293b;">
       <p>Hello <strong>{display_name}</strong>,</p>
-      <p>We received a request to reset the password for your <strong>Karnex</strong> account.</p>
+      <p>We received a request to reset the password for your <strong>{APP_NAME}</strong> account.</p>
       <p><a href="{reset_url}" style="display:inline-block;padding:12px 18px;background:#2563eb;color:#fff;border-radius:10px;text-decoration:none;font-weight:700;">Reset password</a></p>
       <p style="word-break:break-all;font-size:13px;color:#64748b;">{reset_url}</p>
       <p style="font-size:13px;color:#64748b;">This link is valid for <strong>45 minutes</strong> and can be used once.</p>
       <p style="font-size:13px;color:#64748b;">If you didn't request a password reset, you can safely ignore this email — your password will stay unchanged.</p>
-      <p>— KARNEX AI HR</p>
+      <p>— {APP_NAME}</p>
     </div>
     """
     # Durable-first: queue on the email outbox so the reset gets the same
@@ -257,7 +259,7 @@ def send_interview_invite_email(
     notes: str = "",
     access_key: str = "",
 ) -> dict[str, Any]:
-    subject = "Your KARNEX AI Interview — interview link"
+    subject = f"Your {APP_NAME} AI Interview — interview link"
     text = (
         f"Hello {candidate_name},\n\n"
         f"Your AI interview is scheduled.\n"
@@ -270,7 +272,7 @@ def send_interview_invite_email(
         text += "You will need both your email and access key to enter the interview.\nDo NOT share these credentials with anyone.\n\n"
     if notes:
         text += f"Notes: {notes}\n\n"
-    text += "— KARNEX AI HR\n"
+    text += f"— {APP_NAME}\n"
 
     access_key_html = ""
     if access_key:
@@ -286,13 +288,13 @@ def send_interview_invite_email(
     html = f"""
     <div style="font-family:Segoe UI,Arial,sans-serif;line-height:1.6;color:#1e293b;">
       <p>Hello <strong>{candidate_name}</strong>,</p>
-      <p>Your <strong>KARNEX AI interview</strong> is scheduled.</p>
+      <p>Your <strong>{APP_NAME} AI interview</strong> is scheduled.</p>
       <p><strong>When:</strong> {scheduled_at_local or "See HR"}</p>
       {access_key_html}
       <p><a href="{invite_url}" style="display:inline-block;padding:12px 18px;background:#2563eb;color:#fff;border-radius:10px;text-decoration:none;font-weight:700;">Open interview</a></p>
       <p style="word-break:break-all;font-size:13px;color:#64748b;">{invite_url}</p>
       {"<p><strong>Notes:</strong> " + notes + "</p>" if notes else ""}
-      <p>— KARNEX AI HR</p>
+      <p>— {APP_NAME}</p>
     </div>
     """
     return send_email(to_email, subject, text, html)

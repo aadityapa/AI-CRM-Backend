@@ -1,4 +1,8 @@
-APP_TITLE = "AI Interview Demo"
+#: The product name every user-facing surface prints (26 Sep 2026: the app is
+#: "Karnex Orbit"; "Karnex" alone stays the COMPANY name on invoices / letters).
+#: `APP_TITLE` is the same value under the older name main.py still imports.
+APP_NAME = "Karnex Orbit"
+APP_TITLE = APP_NAME
 APP_VERSION = "1.0.0"
 SESSION_ID = "demo-session"
 REPORT_CODE = "apple"

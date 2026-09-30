@@ -11,6 +11,7 @@ import logging
 import os
 from html import escape
 
+from config import APP_NAME
 from email_smtp import send_email, smtp_configured
 
 logger = logging.getLogger("karnex.crm.candidate_comms")
@@ -86,7 +87,7 @@ def send_candidate_email(to: str, subject: str, text: str, html: str | None = No
         actor_email = (getattr(actor, "email", "") or "").strip()
         result = send_email(
             to, subject, text, html, attachments=attachments,
-            from_name=f"{actor_name} (Karnex)" if actor_name else None,
+            from_name=f"{actor_name} ({APP_NAME})" if actor_name else None,
             reply_to=actor_email if _real(actor_email) else None,
             reply_to_name=actor_name or None,
         )
@@ -127,7 +128,7 @@ def build_ics_invite(summary: str, starts_at, description: str = "", location: s
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//Karnex//AI HR Suite//EN",
+        f"PRODID:-//Karnex//{APP_NAME}//EN",
         "METHOD:REQUEST",
         "BEGIN:VTIMEZONE",
         "TZID:Asia/Kolkata",

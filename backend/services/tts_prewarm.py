@@ -164,11 +164,17 @@ def prewarm_tts(text: str) -> bool:
             return False
         _inflight.add(key)
 
+    # A bare Thread does not inherit ContextVars: carry the interview
+    # attribution across so the prewarmed clip is costed to its interview.
+    from prompt_logger import current_interview_context, interview_context
+    log_ctx = current_interview_context()
+
     def _run() -> None:
         try:
             from ai import synthesize_speech_bytes
 
-            audio = synthesize_speech_bytes(payload, voice, model)
+            with interview_context(log_ctx):
+                audio = synthesize_speech_bytes(payload, voice, model, log_source="prewarm")
             put_cached(payload, voice, model, audio)
         except Exception as exc:
             # Harmless for the candidate (the live path streams instead), but a

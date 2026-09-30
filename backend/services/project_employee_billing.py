@@ -107,6 +107,40 @@ def invoice_amount_split(subperiod_billable: list[tuple[Decimal, Decimal]]) -> D
     return _money(total)
 
 
+# ------------------------------------------------------- rate/unit sanity
+#: An hour of contract staffing below / above these is almost certainly a rate
+#: typed against the WRONG unit — ₹1,414.77 saved "per Month" bills ₹8.42 an
+#: hour (reported 25 Sep 2026: a 168-hour month invoiced at ₹1,414.77). Wide on
+#: purpose: the check names a likely typo, it never blocks an invoice.
+MIN_PLAUSIBLE_HOURLY = Decimal("100")
+MAX_PLAUSIBLE_HOURLY = Decimal("25000")
+
+_UNIT_WORD = {"Hourly": "hour", "Daily": "day", "Monthly": "month", "Yearly": "year"}
+
+
+def rate_unit_warning(unit: str | None, rate, per_hour) -> str | None:
+    """Plain-language warning when a rate and its unit look mismatched, else None.
+
+    `per_hour` is what ONE hour of this employee costs under the saved unit
+    (the invoice preview already derives it). Pure — callers attach the result
+    to what they show before money is committed."""
+    if unit is None or rate is None or per_hour is None:
+        return None
+    per_hour = Decimal(str(per_hour))
+    rate = _money(rate)
+    if rate <= 0 or per_hour <= 0:
+        return None
+    word = _UNIT_WORD.get(unit, str(unit).lower())
+    if per_hour < MIN_PLAUSIBLE_HOURLY and unit != "Hourly":
+        return (f"₹{rate:,} per {word} works out to only ₹{_money(per_hour):,} an hour — "
+                f"if ₹{rate:,} is really the hourly rate, change the billing unit to "
+                f"Per Hour in the employee's Commercial Details.")
+    if per_hour > MAX_PLAUSIBLE_HOURLY:
+        return (f"₹{rate:,} per {word} works out to ₹{_money(per_hour):,} an hour — "
+                f"check that the billing unit is right in the employee's Commercial Details.")
+    return None
+
+
 # ------------------------------------------------------------- leave ledger
 CREDIT_TYPES = {"credit", "carry_forward", "adjust_add"}
 DEBIT_TYPES = {"consume", "expire", "adjust_sub"}

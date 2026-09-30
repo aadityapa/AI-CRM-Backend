@@ -108,8 +108,11 @@ def test_the_precondition_explains_itself():
 
 
 def test_no_other_stage_has_a_hidden_precondition():
-    """Preconditions are invisible until they fire; keep the set deliberate."""
-    assert set(ENTRY_REQUIREMENTS) == {PS.CUSTOMER_APPROVAL.value}
+    """Preconditions are invisible until they fire; keep the set deliberate.
+    Two today: Customer_Approval needs an offer, and Joined needs the official
+    mailbox (2 Sep 2026 — it becomes the Employees record's address)."""
+    assert set(ENTRY_REQUIREMENTS) == {PS.CUSTOMER_APPROVAL.value, PS.JOINED.value}
+    assert "mail" in ENTRY_REQUIREMENTS[PS.JOINED.value].lower()
 
 
 # ------------------------------------------------ customer feedback as a round

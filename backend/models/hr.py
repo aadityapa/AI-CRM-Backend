@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
-from models.base import Base, USERS_FK, pg_enum
+from models.base import Base, TimestampMixin, USERS_FK, pg_enum
 
 
 class ProfileType(str, enum.Enum):
@@ -15,7 +15,11 @@ class ProfileType(str, enum.Enum):
     EXTERNAL = "External"
 
 
-class Employee(Base):
+class Employee(Base, TimestampMixin):
+    """⚠️ `employees` predates `TimestampMixin` — 0105 added the two timestamp
+    columns so "recently updated" is answerable at all. Before that the list
+    could only sort by `date_of_joining`, which buries a long-serving internal
+    employee the moment they are updated."""
     __tablename__ = "employees"
     id = sa.Column(sa.Integer, primary_key=True)
     user_id = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True, unique=True)
@@ -55,6 +59,18 @@ class Employee(Base):
     skills = sa.Column(JSONB, nullable=True)            # list of skill names
     experience_years = sa.Column(sa.Numeric(4, 1), nullable=True)
     employment_type = sa.Column(sa.String(24), nullable=True)  # Full_Time/Part_Time/Contract
+    # --- Filled by HR at Joined, synced from the candidate profile (0105) -----
+    #: What HR captured in the Workflow section before flipping the profile to
+    #: Joined. These used to live ONLY on the candidate profile, so they were
+    #: invisible to anyone looking at the employee once the profile closed.
+    offer_letter_reference = sa.Column(sa.String(255), nullable=True)
+    resignation_certificate_url = sa.Column(sa.String(1024), nullable=True)
+    #: The day the CUSTOMER onboarded them onto the project — billing starts
+    #: here, and it is NOT `date_of_joining` (which is the Karnex joining date
+    #: and drives payroll and leave accrual).
+    customer_onboarding_date = sa.Column(sa.Date, nullable=True)
+    relocation_applicable = sa.Column(sa.Boolean, nullable=True)
+
     is_resigned = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     date_of_resignation = sa.Column(sa.Date, nullable=True)
     notice_period_days = sa.Column(sa.Integer, nullable=True)

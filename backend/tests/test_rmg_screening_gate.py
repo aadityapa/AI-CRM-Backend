@@ -75,9 +75,9 @@ def test_rmg_notifications_deep_link_to_applied_candidates_row():
     prof = SimpleNamespace(id=19212, opportunity_id=5, candidate_id=7)
     cand = SimpleNamespace(first_name="Dipesh", last_name="D", email="dipeshad007@gmail.com")
     assert applied_candidates_link(_DB(41, cand), prof) == \
-        "/admin?view=crm&p=requirements/41&tab=resumes&q=dipeshad007%40gmail.com"
+        "/admin/?view=crm&p=requirements/41&tab=resumes&q=dipeshad007%40gmail.com"
     # import placeholder → search by name instead
     ph = SimpleNamespace(first_name="Dipesh", last_name="D", email="dipesh.d.abc123@import.karnex.in")
     assert applied_candidates_link(_DB(41, ph), prof) == \
-        "/admin?view=crm&p=requirements/41&tab=resumes&q=Dipesh%20D"
-    assert applied_candidates_link(_DB(None, cand), prof) == "/admin?view=crm&p=profiles/19212"
+        "/admin/?view=crm&p=requirements/41&tab=resumes&q=Dipesh%20D"
+    assert applied_candidates_link(_DB(None, cand), prof) == "/admin/?view=crm&p=profiles/19212"

@@ -43,6 +43,7 @@ from typing import Any, Callable, Iterable
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from config import APP_NAME
 from models import Base
 from paths import DATA_DIR
 from services.crm_common import resolve_crm_file
@@ -78,7 +79,8 @@ DATASETS: tuple[Dataset, ...] = (
             "Opportunities, CTC slabs, skills, attachments, activity; requirements, job postings, slots, bookings",
             ("opportunities", "opportunity_ctc_slab", "opportunity_skills", "opportunity_attachments",
              "opportunity_activity_log", "requirements", "requirement_skills", "requirement_attachments",
-             "requirement_job_postings", "requirement_activity_log", "interview_slots", "slot_bookings",
+             "requirement_job_postings", "requirement_activity_log", "requirement_position_requests",
+             "interview_slots", "slot_bookings",
              "template_requests")),
     Dataset("candidates", "Candidates",
             "Candidate master with education, experience, skills, outreach, resumes (CV files included)",
@@ -106,6 +108,7 @@ DATASETS: tuple[Dataset, ...] = (
     Dataset("users", "Users & Access",
             "CRM users (no passwords), roles, profiles, access templates, action permissions, preferences",
             ("roles", "user_roles", "user_profiles", "access_templates",
+             "custom_roles", "user_custom_roles",
              "action_permissions", "user_table_preferences", "user_notify_prefs"),
             # registration_data is only a one-column FK stub in the ORM
             # (models/base.py) — read the real table through the inspector.
@@ -495,7 +498,7 @@ def build_archive(db: Session, datasets: list[Dataset], job: BackupJob, *,
             zf.write(xlsx_tmp, "karnex-backup.xlsx")
 
             readme = "\n".join([
-                "KARNEX CRM + AI HIRING — FULL DATA BACKUP",
+                f"{APP_NAME.upper()} — FULL DATA BACKUP",
                 f"Generated : {datetime.now(timezone.utc).isoformat()} (UTC)",
                 f"Requested : {job.requested_by}",
                 f"Datasets  : {', '.join(d.label for d in datasets)}",

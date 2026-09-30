@@ -1555,43 +1555,89 @@ def transcribe_speech_bytes(
     filename: str = "candidate-response.webm",
     mime_type: str = "audio/webm",
     model: str = "gpt-4o-mini-transcribe",
+    *,
+    duration_s: float = 0.0,
 ) -> str:
     """
     Transcribe candidate speech using OpenAI audio transcription API.
     Falls back cleanly if model/output format varies.
+
+    Logged + priced HERE (28 Sep 2026) because only this frame sees the
+    response's `usage` — the audio-token count that makes the cost exact.
+    `duration_s` is the browser's recording clock, the per-minute fallback.
     """
     if not audio_bytes:
         return ""
+    from prompt_logger import log_audio_call
+
     stream = BytesIO(audio_bytes)
     stream.name = filename or "candidate-response.webm"
     client = _client("transcribe")
-    resp = client.audio.transcriptions.create(
-        model=model,
-        file=stream,
-    )
-    text = ""
-    if hasattr(resp, "text"):
-        text = str(getattr(resp, "text") or "")
-    elif isinstance(resp, dict):
-        text = str(resp.get("text") or "")
-    return " ".join(text.split()).strip()
+    start = time.perf_counter()
+    resp = None
+    status, error_log, text = "success", "", ""
+    try:
+        resp = client.audio.transcriptions.create(
+            model=model,
+            file=stream,
+        )
+        if hasattr(resp, "text"):
+            text = str(getattr(resp, "text") or "")
+        elif isinstance(resp, dict):
+            text = str(resp.get("text") or "")
+        text = " ".join(text.split()).strip()
+        return text
+    except Exception as exc:
+        status, error_log = "failed", f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        try:
+            log_audio_call(db_target=_db_target(), kind="transcribe", model=model, text=text,
+                           audio_seconds=duration_s, audio_bytes=len(audio_bytes), response=resp,
+                           response_time_ms=int((time.perf_counter() - start) * 1000),
+                           status=status, error_log=error_log)
+        except Exception:
+            pass
 
 
 def synthesize_speech_bytes(
     text: str,
     voice: str = "nova",
     model: str = "gpt-4o-mini-tts",
+    log_source: str = "prewarm",
 ) -> bytes:
+    """Whole clip in one piece (the prefetch path). Logged + priced here because
+    the live stream is logged by its handler; `log_source` names which."""
     content = " ".join((text or "").split()).strip()
     if not content:
         return b""
+    from prompt_logger import log_audio_call
     from services.tts_prewarm import speech_request_kwargs
 
+    from utils.mp3_duration import mp3_duration_seconds
+
     client = _client("tts")
-    with client.audio.speech.with_streaming_response.create(
-        **speech_request_kwargs(model, voice, content)
-    ) as response:
-        return response.read()
+    start = time.perf_counter()
+    status, error_log = "success", ""
+    audio = b""
+    try:
+        with client.audio.speech.with_streaming_response.create(
+            **speech_request_kwargs(model, voice, content)
+        ) as response:
+            audio = response.read()
+            return audio
+    except Exception as exc:
+        status, error_log = "failed", f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        try:
+            # Measured from the MP3 frames — the clip's real length, not a guess from the text.
+            log_audio_call(db_target=_db_target(), kind="tts", model=model, text=content,
+                           audio_seconds=mp3_duration_seconds(audio), audio_bytes=len(audio),
+                           response_time_ms=int((time.perf_counter() - start) * 1000),
+                           status=status, error_log=error_log, source=log_source)
+        except Exception:
+            pass
 
 
 #: Bytes per chunk when relaying TTS audio to the browser. 8 KB of MP3 is roughly
@@ -3114,11 +3160,13 @@ def parse_cv_profile(cv_text: str) -> dict:
                 "Use null or empty values when absent. Do NOT invent data.\n\nRESUME:\n"
                 + text[:12000]
             )
-            res = _client().chat.completions.create(
-                model="gpt-4o-mini",
+            # Tracked (29 Sep 2026): this call used to go straight to the client
+            # and was missing from AI Costs.
+            res = tracked_chat_completion(
+                _client(), model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                response_format={"type": "json_object"},
+                temperature=0, response_format={"type": "json_object"},
+                call_type="resume_parse_cv", db_target=_db_target(),
             )
             data = _json.loads((res.choices[0].message.content or "{}"))
             if isinstance(data, dict):

@@ -85,7 +85,7 @@ def world(monkeypatch):
     po = PurchaseOrder(po_number="PO-1", customer_id=cust.id, billing_branch_id=branch.id,
                        delivery_branch_id=branch.id, received_date=date(2026, 4, 1),
                        start_date=date(2026, 4, 1), end_date=date(2026, 12, 31),
-                       total_value=D("300000"), consumed_value=D("236000"), balance_value=D("64000"),
+                       total_value=D("300000"), consumed_value=D("200000"), balance_value=D("100000"),
                        tax_slab=D("18"), cgst=D("9"), sgst=D("9"), igst=D("0"))
     s.add(po); s.flush()
     inv = Invoice(invoice_number="INV-2026-001", project_id=proj.id, po_id=po.id,
@@ -152,7 +152,8 @@ def test_sales_request_then_sales_head_approval_changes_money_and_notifies(world
     assert float(line.amount) == 190000 and float(inv.sub_total) == 190000
     assert float(inv.tax_amount) == 34200 and float(inv.grand_total) == 224200
     # PO consumption follows the new grand total (−11,800).
-    assert float(po.consumed_value) == 224200 and float(po.balance_value) == 75800
+    # The PO carries the value BEFORE GST (25 Sep 2026): 200,000 → 190,000.
+    assert float(po.consumed_value) == 190000 and float(po.balance_value) == 110000
     rev = s.get(InvoiceRevision, rid)
     assert rev.status == "Approved" and rev.decided_by == 3
     assert rev.snapshot_before["grand_total"] == 236000 and rev.snapshot_after["grand_total"] == 224200
@@ -191,9 +192,10 @@ def test_admin_edits_apply_at_once_but_are_still_recorded(world):
 
 def test_po_and_paid_guards(world):
     client, s, inv, line, po, sent, as_user = world
-    # +₹100,000 on the line → +₹118,000 grand, PO balance is ₹64,000 → refused at approval.
+    # +₹150,000 on the line (value before GST — what the PO carries), PO balance is
+    # ₹100,000 → refused at approval.
     rid = client.post(f"/api/invoices/{inv.id}/revisions", json={
-        "reason": "Customer agreed a higher rate for the month", "lines": [{"id": line.id, "rate": 300000}]}).json()["data"]["revision"]["id"]
+        "reason": "Customer agreed a higher rate for the month", "lines": [{"id": line.id, "rate": 350000}]}).json()["data"]["revision"]["id"]
     as_user(3, "Sales Head", "Sales_Head")
     r = client.post(f"/api/invoices/{inv.id}/revisions/{rid}/approve", json={})
     assert r.status_code == 400 and "PO PO-1 balance" in r.json()["detail"]
@@ -223,5 +225,5 @@ def test_move_invoice_to_another_po_rebalances_both(world):
     s.refresh(inv); s.refresh(po); s.refresh(po2)
     assert inv.po_id == po2.id
     assert float(po.consumed_value) == 0 and float(po.balance_value) == 300000
-    assert float(po2.consumed_value) == 236000 and float(po2.balance_value) == 264000
+    assert float(po2.consumed_value) == 200000 and float(po2.balance_value) == 300000   # base, not incl. GST
     assert any("PO PO-1 → PO-2" in n["message"] for n in sent)

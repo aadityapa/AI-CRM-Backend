@@ -110,6 +110,11 @@ def bank_from_settings(db=None, customer_id: int | None = None) -> dict:
                 "ifsc": BANK_IFSC, "branch": BANK_BRANCH, "account_type": "Current"}
 
 
+#: A Proforma prints its title in orange (user decision, 23 Sep 2026) so the
+#: document can never be mistaken for the tax invoice it precedes. One value
+#: for HTML, reportlab, Word and the on-screen sheet (F-V2 mirrors the hex).
+PROFORMA_COLOR = "#c2410c"
+
 #: Billing-unit → column wording for the service table (11 Sep 2026, user's
 #: reference invoice: Monthly Cost · Qty (Days) · Leave · Rate Per Day · Amount).
 UNIT_COLUMNS: dict[str, dict[str, str]] = {
@@ -180,9 +185,13 @@ def billing_breakdown_for_invoice(db, invoice) -> dict | None:
             qty_days = working_days if working_days else qty
         else:
             qty_days = qty
+        from services.invoice_format import normalize_invoice_format
         return {
             "billing_unit": unit,
             "columns": cols,
+            # The customer's column choice frozen on this document — the
+            # on-screen sheet reads it from here, the printers from Invoice.
+            "invoice_format": normalize_invoice_format(getattr(invoice, "invoice_format", None)),
             "monthly_cost": cost,
             "qty": qty_days,
             "leave_days": leave_days,
@@ -300,6 +309,77 @@ class Invoice(BaseModel):
     #: Seller / bank blocks from Settings ▸ Invoice (None = module constants).
     seller: dict | None = None
     bank: dict | None = None
+    #: "Proforma" prints PROFORMA INVOICE in orange; anything else is a Tax invoice.
+    kind: str = "Tax"
+    #: Client-specific column choice (services/invoice_format.py); None = all.
+    invoice_format: dict[str, bool] | None = None
+
+    @property
+    def is_proforma(self) -> bool:
+        return (self.kind or "Tax") == "Proforma"
+
+    @property
+    def title(self) -> str:
+        return "PROFORMA INVOICE" if self.is_proforma else "TAX INVOICE"
+
+
+# ------------------------------------------------ service table, ONE definition
+# Every renderer (HTML/WeasyPrint, reportlab, Word, and the on-screen sheet via
+# the same `columns` + `invoice_format` payload) builds its header and cells
+# from these two functions, so a column switched off for a customer is off
+# everywhere — there is no second list to forget.
+
+#: Print order of the service table. `sac`/`leave`/`per_day` are the optional
+#: ones (services/invoice_format.py); `hours`/`rate` only exist on the plain
+#: (manual-invoice) table, `cost`/`qty`/`leave`/`per_day` only with a breakdown.
+SERVICE_COLUMN_ORDER = ("sno", "desc", "sac", "cost", "qty", "leave", "per_day", "hours", "rate", "amount")
+SERVICE_COLUMN_ALIGN = {"sno": "c", "desc": "l", "sac": "c"}   # everything else is right-aligned
+
+
+def service_columns(inv: "Invoice") -> list[tuple[str, str]]:
+    """[(key, header label)] for this invoice, honouring its format."""
+    from services.invoice_format import normalize_invoice_format
+    fmt = normalize_invoice_format(inv.invoice_format)
+    cols = inv.columns
+    labels: dict[str, str] = {"sno": "S. No.", "desc": "Description of Services", "sac": "SAC Code"}
+    if cols:
+        labels.update({"cost": cols["cost"], "qty": cols["qty"], "leave": cols["leave"],
+                       "per_day": cols["per_day"], "amount": cols["amount"]})
+    else:
+        labels.update({"hours": inv.qty_label, "rate": inv.rate_label, "amount": "Amount (INR)"})
+    return [(key, labels[key]) for key in SERVICE_COLUMN_ORDER
+            if key in labels and fmt.get(key, True)]
+
+
+def service_cell(it: "LineItem", key: str, index: int) -> str:
+    """Plain-text cell value for one line; renderers only add styling."""
+    def _qty(v: float) -> str:
+        return f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
+
+    def _rs(v: float) -> str:
+        return format_inr(v).replace("INR ", "")
+
+    if key == "sno":
+        return str(index)
+    if key == "desc":
+        return line_description(it.employee_name, getattr(it, "service_month", None) or None)
+    if key == "sac":
+        return it.sac or default_sac()
+    if key == "cost":
+        return _rs(num(it.monthly_cost if it.monthly_cost is not None else it.rate_per_hour))
+    if key == "qty":
+        return _qty(num(it.billing_hours))
+    if key == "leave":
+        return _qty(num(it.leave_days))
+    if key == "per_day":
+        return _rs(num(it.rate_per_day)) if it.rate_per_day is not None else "—"
+    if key == "hours":
+        return _qty(num(it.billing_hours))
+    if key == "rate":
+        return format_inr(num(it.rate_per_hour))
+    if key == "amount":
+        return _rs(line_amount(it))
+    return ""
 
 
 #: PE billing_unit -> (qty column, rate column) on the Tax Invoice.
@@ -685,7 +765,8 @@ def pdf_filename(inv: Invoice | dict) -> str:
     else:
         no = inv.invoice_no or DEFAULT_INVOICE_NO
         emp = inv.items[0].employee_name if inv.items else ""
-    return f"{sanitize_filename_part(emp)}_{sanitize_filename_part(no)}.pdf"
+    prefix = "Proforma_" if (not isinstance(inv, dict) and inv.is_proforma) else ""
+    return f"{prefix}{sanitize_filename_part(emp)}_{sanitize_filename_part(no)}.pdf"
 
 
 # ---------------------------------------------------------------------------
@@ -1122,10 +1203,13 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
         share_url = None
 
     seller = seller_from_settings()
+    from services.invoice_format import normalize_invoice_format
     return Invoice(
         qty_label=qty_label,
         rate_label=rate_label,
         columns=columns,
+        kind=str(getattr(invoice, "kind", None) or "Tax"),
+        invoice_format=normalize_invoice_format(getattr(invoice, "invoice_format", None)),
         seller=seller,
         bank=bank_from_settings(db, customer_id),
         footer_text=(seller.get("declaration") or DEFAULT_FOOTER),
@@ -1174,61 +1258,34 @@ def render_invoice_html(inv: Invoice, totals: Totals | None = None) -> str:
 
     seller = inv.seller or seller_from_settings()
     bank = inv.bank or bank_from_settings()
-    cols = inv.columns
-    ncols = 8 if cols else 6
+    columns = service_columns(inv)
+    ncols = len(columns)
+    _TH_CLASS = {"sno": "col-sno", "desc": "col-desc", "sac": "col-sac", "cost": "col-hrs",
+                 "qty": "col-q", "leave": "col-q", "per_day": "col-rate", "hours": "col-hrs",
+                 "rate": "col-rate", "amount": "col-amt"}
 
-    def _qty(v: float) -> str:
-        return f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
+    def _td(it, key: str, index: int) -> str:
+        if key == "desc":
+            desc = _esc(service_cell(it, key, index))
+            if getattr(it, "period_label", ""):
+                desc = f"{desc}<br/><span class='muted'>Billing period {_esc(it.period_label)}</span>"
+            return f"<td>{desc}</td>"
+        align = SERVICE_COLUMN_ALIGN.get(key, "r")
+        return f"<td class='{align}'>{_esc(service_cell(it, key, index))}</td>"
 
     rows_html = []
-    items = inv.items or []
-    for i, it in enumerate(items, start=1):
-        amt = line_amount(it)
-        desc = line_description(it.employee_name, getattr(it, "service_month", None) or None)
-        if getattr(it, "period_label", ""):
-            desc = f"{desc}<br/><span class='muted'>Billing period {_esc(it.period_label)}</span>"
-        else:
-            desc = _esc(desc)
-        if cols:
-            rows_html.append(
-                "<tr>"
-                f"<td class='c'>{i}</td>"
-                f"<td>{desc}</td>"
-                f"<td class='c'>{_esc(it.sac or default_sac())}</td>"
-                f"<td class='r'>{_esc(format_inr(num(it.monthly_cost if it.monthly_cost is not None else it.rate_per_hour)).replace('INR ', ''))}</td>"
-                f"<td class='r'>{_esc(_qty(num(it.billing_hours)))}</td>"
-                f"<td class='r'>{_esc(_qty(num(it.leave_days)))}</td>"
-                f"<td class='r'>{_esc(format_inr(num(it.rate_per_day)).replace('INR ', '') if it.rate_per_day is not None else '—')}</td>"
-                f"<td class='r'>{_esc(format_inr(amt).replace('INR ', ''))}</td>"
-                "</tr>"
-            )
-        else:
-            rows_html.append(
-                "<tr>"
-                f"<td class='c'>{i}</td>"
-                f"<td>{desc}</td>"
-                f"<td class='c'>{_esc(it.sac or default_sac())}</td>"
-                f"<td class='r'>{_esc(format_inr(num(it.billing_hours)).replace('INR ', ''))}</td>"
-                f"<td class='r'>{_esc(format_inr(num(it.rate_per_hour)))}</td>"
-                f"<td class='r'>{_esc(format_inr(amt))}</td>"
-                "</tr>"
-            )
+    for i, it in enumerate(inv.items or [], start=1):
+        rows_html.append("<tr>" + "".join(_td(it, key, i) for key, _ in columns) + "</tr>")
     while len(rows_html) < 5:
         rows_html.append("<tr class='spacer'><td>&nbsp;</td>" + "<td></td>" * (ncols - 1) + "</tr>")
 
-    if cols:
-        head_html = (
-            "<th class='col-sno'>S. No.</th><th class='col-desc'>Description of Services</th>"
-            f"<th class='col-sac'>SAC Code</th><th class='col-hrs'>{_esc(cols['cost'])}</th>"
-            f"<th class='col-q'>{_esc(cols['qty'])}</th><th class='col-q'>{_esc(cols['leave'])}</th>"
-            f"<th class='col-rate'>{_esc(cols['per_day'])}</th><th class='col-amt'>{_esc(cols['amount'])}</th>"
-        )
-    else:
-        head_html = (
-            "<th class='col-sno'>S. No.</th><th class='col-desc'>Description of Services</th>"
-            f"<th class='col-sac'>SAC Code</th><th class='col-hrs'>{_esc(inv.qty_label)}</th>"
-            f"<th class='col-rate'>{_esc(inv.rate_label)}</th><th class='col-amt'>Amount (INR)</th>"
-        )
+    head_html = "".join(f"<th class='{_TH_CLASS.get(key, 'col-q')}'>{_esc(label)}</th>"
+                        for key, label in columns)
+    # Description takes whatever width the other columns leave (a column the
+    # customer switched off hands its share to the description).
+    _PCT = {"col-sno": 6, "col-sac": 9, "col-hrs": 12, "col-q": 9, "col-rate": 15, "col-amt": 14}
+    desc_pct = max(20, 100 - sum(_PCT[_TH_CLASS[key]] for key, _ in columns if key != "desc"))
+    title_class = "tax-title proforma" if inv.is_proforma else "tax-title"
 
     seller_addr = ", ".join(x for x in (seller.get("address_line1"), seller.get("address_line2")) if x)
     seller_addr_html = _esc(seller_addr)
@@ -1260,7 +1317,7 @@ def render_invoice_html(inv: Invoice, totals: Totals | None = None) -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>TAX INVOICE {_esc(inv.invoice_no)}</title>
+<title>{inv.title} {_esc(inv.invoice_no)}</title>
 <style>
 @page {{ size: A4; margin: 0; }}
 * {{ box-sizing: border-box; }}
@@ -1301,6 +1358,7 @@ html, body {{
   font-size: 26px; font-weight: 700; letter-spacing: 0.06em;
   text-transform: uppercase; color: var(--navy); margin: 0 0 8px; text-align: left;
 }}
+.tax-title.proforma {{ color: {PROFORMA_COLOR}; }}
 .meta-body {{ }}
 .meta-table {{ width: auto; border-collapse: collapse; font-size: 8.5pt; }}
 .meta-table td {{ padding: 2px 0; }}
@@ -1330,9 +1388,9 @@ table.services td {{
 table.services .c {{ text-align: center; }}
 table.services .r {{ text-align: right; }}
 table.services tr.spacer td {{ height: 16px; color: transparent; }}
-.col-sno {{ width: 6%; }} .col-desc {{ width: {"26%" if cols else "40%"}; }} .col-sac {{ width: {"9%" if cols else "12%"}; }}
-.col-hrs {{ width: 12%; }} .col-q {{ width: 9%; }} .col-rate {{ width: {"15%" if cols else "14%"}; }} .col-amt {{ width: 14%; }}
-table.services th {{ font-size: {"7pt" if cols else "8pt"}; line-height: 1.2; }}
+.col-sno {{ width: 6%; }} .col-desc {{ width: {desc_pct}%; }} .col-sac {{ width: 9%; }}
+.col-hrs {{ width: 12%; }} .col-q {{ width: 9%; }} .col-rate {{ width: 15%; }} .col-amt {{ width: 14%; }}
+table.services th {{ font-size: {"7pt" if ncols > 6 else "8pt"}; line-height: 1.2; }}
 .contact a {{ color: #fff; text-decoration: underline; font-weight: 600; }}
 .gst-row {{ display: flex; gap: 6px; }}
 .gst-box {{ flex: 1; border: 1px solid var(--border); }}
@@ -1399,7 +1457,7 @@ table.services th {{ font-size: {"7pt" if cols else "8pt"}; line-height: 1.2; }}
       </div>
     </div>
     <div class="header-right">
-      <div class="tax-title">TAX INVOICE</div>
+      <div class="{title_class}">{inv.title}</div>
       <div class="meta-body">
         <table class="meta-table">
           <tr><td class="k">Invoice No.</td><td class="sep">:</td><td>{_esc(inv.invoice_no)}</td></tr>
@@ -1543,7 +1601,8 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     )
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="InvTitle", fontName="Times-Bold", fontSize=18,
-                              textColor=navy, alignment=TA_LEFT, spaceAfter=4))
+                              textColor=HexColor(PROFORMA_COLOR) if inv.is_proforma else navy,
+                              alignment=TA_LEFT, spaceAfter=4))
     styles.add(ParagraphStyle(name="InvSmall", fontSize=7.5, textColor=muted, leading=10))
     styles.add(ParagraphStyle(name="InvBody", fontSize=8, textColor=black, leading=11))
     styles.add(ParagraphStyle(name="InvHead", fontSize=9, textColor=navy, fontName="Helvetica-Bold"))
@@ -1562,7 +1621,6 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
         left_bits.append(logo_flow)
     seller = inv.seller or seller_from_settings()
     bank = inv.bank or bank_from_settings()
-    cols = inv.columns
     seller_addr = ", ".join(x for x in (seller.get("address_line1"), seller.get("address_line2")) if x)
     left_bits.append(Paragraph(f"<b>{_esc(seller.get('name'))}</b>", styles["InvHead"]))
     if seller.get("tagline"):
@@ -1576,7 +1634,7 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     ))
 
     right_bits = [
-        Paragraph("TAX INVOICE", styles["InvTitle"]),
+        Paragraph(inv.title, styles["InvTitle"]),
         Paragraph(
             f"Invoice No.: <b>{_esc(inv.invoice_no)}</b><br/>"
             f"Invoice Date: {_esc(inv.invoice_date)}<br/>"
@@ -1641,44 +1699,28 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     def _p(text: str, st: str = "InvCell") -> Paragraph:
         return Paragraph(text, styles[st])
 
-    def _qty(v: float) -> str:
-        return f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
+    columns = service_columns(inv)
+    # Fixed widths per column; whatever is switched off is given to the
+    # description so the table always spans the page (188 mm printable).
+    base_w = {"sno": 11, "sac": 16, "cost": 24, "qty": 17, "leave": 16, "per_day": 27,
+              "hours": 22, "rate": 28, "amount": 27}
+    desc_w = 188 - sum(base_w[k] for k, _ in columns if k != "desc")
+    col_w = [(desc_w if k == "desc" else base_w[k]) * mm for k, _ in columns]
 
-    if cols:
-        svc_data = [[_p("S. No.", "InvTh"), _p("Description of Services", "InvTh"), _p("SAC Code", "InvTh"),
-                     _p(_esc(cols["cost"]), "InvTh"), _p(_esc(cols["qty"]), "InvTh"), _p(_esc(cols["leave"]), "InvTh"),
-                     _p(_esc(cols["per_day"]), "InvTh"), _p(_esc(cols["amount"]), "InvTh")]]
-        for i, it in enumerate(inv.items or [], start=1):
-            desc = _esc(line_description(it.employee_name, getattr(it, "service_month", None) or None))
-            if getattr(it, "period_label", ""):
-                desc += f"<br/><font color='#64748B'>Billing period {_esc(it.period_label)}</font>"
-            svc_data.append([
-                str(i), _p(desc), it.sac or default_sac(),
-                format_inr(num(it.monthly_cost if it.monthly_cost is not None else it.rate_per_hour)).replace("INR ", ""),
-                _qty(num(it.billing_hours)), _qty(num(it.leave_days)),
-                (format_inr(num(it.rate_per_day)).replace("INR ", "") if it.rate_per_day is not None else "—"),
-                format_inr(line_amount(it)).replace("INR ", ""),
-            ])
-        while len(svc_data) < 6:
-            svc_data.append([""] * 8)
-        col_w = [11 * mm, 50 * mm, 16 * mm, 24 * mm, 17 * mm, 16 * mm, 27 * mm, 27 * mm]
-    else:
-        svc_data = [[
-            "S. No.", "Description of Services", "SAC Code",
-            inv.qty_label, inv.rate_label, "Amount (INR)",
-        ]]
-        for i, it in enumerate(inv.items or [], start=1):
-            svc_data.append([
-                str(i),
-                line_description(it.employee_name, getattr(it, "service_month", None) or None),
-                it.sac or default_sac(),
-                f"{num(it.billing_hours):,.2f}",
-                format_inr(num(it.rate_per_hour)),
-                format_inr(line_amount(it)),
-            ])
-        while len(svc_data) < 6:
-            svc_data.append(["", "", "", "", "", ""])
-        col_w = [15 * mm, 72 * mm, 22 * mm, 22 * mm, 28 * mm, 29 * mm]
+    svc_data = [[_p(_esc(label), "InvTh") for _, label in columns]]
+    for i, it in enumerate(inv.items or [], start=1):
+        row = []
+        for key, _ in columns:
+            if key == "desc":
+                desc = _esc(service_cell(it, key, i))
+                if getattr(it, "period_label", ""):
+                    desc += f"<br/><font color='#64748B'>Billing period {_esc(it.period_label)}</font>"
+                row.append(_p(desc))
+            else:
+                row.append(service_cell(it, key, i))
+        svc_data.append(row)
+    while len(svc_data) < 6:
+        svc_data.append([""] * len(columns))
     svc = Table(svc_data, colWidths=col_w, repeatRows=1)
     svc.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), navy),
@@ -1686,8 +1728,8 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, -1), 7.5),
         ("GRID", (0, 0), (-1, -1), 0.4, border),
-        ("ALIGN", (0, 0), (0, -1), "CENTER"),
-        ("ALIGN", (3, 1), (-1, -1), "RIGHT"),
+        *[("ALIGN", (ci, 0), (ci, -1), {"c": "CENTER", "l": "LEFT"}.get(SERVICE_COLUMN_ALIGN.get(key, "r"), "RIGHT"))
+          for ci, (key, _) in enumerate(columns)],
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),

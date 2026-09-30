@@ -15,7 +15,13 @@ def test_fallback_generation_uses_multiple_question_styles():
     assert any(word in blob for word in ("debug", "incident", "scale", "trade-off", "tradeoff"))
 
 
-def test_followup_fallback_adapts_to_answer_strength():
+def test_followup_fallback_adapts_to_answer_strength(monkeypatch):
+    # The pool is shuffled on every call and the "parallel execution" prompt
+    # is appended to BOTH the weak and the strong pool, so an unpinned run
+    # picks the same sentence for both ~6 % of the time (a flake, not a bug).
+    # Pin the shuffle: the assertion is about the POOL differing by strength.
+    import ai
+    monkeypatch.setattr(ai.random, "shuffle", lambda seq: None)
     weak = generate_followup_fallback(
         jd_skills=["parallel execution"],
         previous_answer="Maybe we run it in parallel, not sure.",

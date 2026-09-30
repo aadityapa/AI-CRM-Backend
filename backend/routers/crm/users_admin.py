@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, PageParams, get_crm_db, page_params, role_required
 from schemas.common import envelope
-from schemas.users_admin import RolesIn, TabAccessIn, UserCreateIn
+from schemas.users_admin import AccessSourceIn, PasswordResetIn, RolesIn, TabAccessIn, UserCreateIn
 from services import users_admin as svc
 
 router = APIRouter(prefix="/api", tags=["CRM: Users (Admin)"])
@@ -34,8 +34,9 @@ def create_user(payload: UserCreateIn,
         password=payload.password,
         legacy_role=payload.legacy_role,
         role_names=payload.roles,
+        custom_role_ids=payload.custom_roles,
     )
-    roles_txt = ", ".join(created["roles"]) or "none"
+    roles_txt = ", ".join([*created["roles"], *created.get("custom_roles", [])]) or "none"
     return envelope(
         data=created,
         message=f"User '{created['username']}' created with CRM roles: {roles_txt}",
@@ -46,8 +47,8 @@ def create_user(payload: UserCreateIn,
 def replace_user_roles(user_id: int, payload: RolesIn,
                        db: Session = Depends(get_crm_db),
                        user: CurrentUser = Depends(admin_only)):
-    updated = svc.replace_roles(db, user_id, payload.roles)
-    roles_txt = ", ".join(updated["roles"]) or "none"
+    updated = svc.replace_roles(db, user_id, payload.roles, custom_role_ids=payload.custom_roles)
+    roles_txt = ", ".join([*updated["roles"], *updated.get("custom_roles", [])]) or "none"
     return envelope(
         data=updated,
         message=f"CRM roles for user '{updated['username']}' replaced with: {roles_txt}",
@@ -98,6 +99,28 @@ def deactivate_user(user_id: int,
                     user: CurrentUser = Depends(admin_only)):
     updated = svc.set_user_active(db, user_id, False)
     return envelope(data=updated, message=f"User '{updated['username']}' deactivated")
+
+
+@router.post("/users/{user_id}/access-source")
+def set_user_access_source(user_id: int, payload: AccessSourceIn,
+                           db: Session = Depends(get_crm_db),
+                           user: CurrentUser = Depends(admin_only)):
+    """One source of access per user: role default, an Access Template, or a
+    custom role. Picking one clears the others."""
+    out = svc.set_access_source(db, user_id, payload.kind, payload.id)
+    return envelope(data=out, message="Access updated")
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_user_password(user_id: int, payload: PasswordResetIn,
+                        db: Session = Depends(get_crm_db),
+                        user: CurrentUser = Depends(admin_only)):
+    """Admin/CEO sets (or generates) a user's password. The temporary password
+    is returned ONCE in this response and never stored in clear."""
+    out = svc.reset_password(db, user_id, payload.new_password, actor_id=user.id)
+    msg = (f"Temporary password generated for '{out['username']}' — share it securely"
+           if out["generated"] else f"Password updated for '{out['username']}'")
+    return envelope(data=out, message=msg)
 
 
 @router.post("/users/{user_id}/portal-access")

@@ -15,7 +15,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, get_crm_db, get_current_user, page_params, role_required,
+    CurrentUser, PageParams, get_crm_db, get_current_user, gated_write_action, page_params,
+    role_required,
 )
 from models import CreditNote, CreditNoteLine
 from schemas.common import envelope
@@ -25,6 +26,7 @@ from services.crm_common import next_sequence_number, paginate
 from services.finance import (
     get_credit_note_or_404,
     get_invoice_or_404,
+    require_tax_invoice,
     serialize_credit_note,
     serialize_invoice,
 )
@@ -32,6 +34,8 @@ from services.finance import (
 router = APIRouter(prefix="/api/credit-notes", tags=["CRM: Credit Notes"])
 
 WRITE = role_required("Finance")
+#: Approving a credit note is an approval button (Access Template ▸ Approvals).
+APPROVE = gated_write_action("credit_note.approve", "invoices")
 
 CREDIT_TYPES = ("Full", "Partial", "Adjustment")
 STATUSES = ("Draft", "Approved", "Settled", "Cancelled")
@@ -55,6 +59,7 @@ def create_credit_note(body: CreditNoteCreate, db: Session = Depends(get_crm_db)
     line_total = qty x unit_price x (1 + gst_percent/100) — every component
     rounded half-up to 2 decimal places (services/tax.py convention)."""
     invoice = get_invoice_or_404(db, body.invoice_id)
+    require_tax_invoice(invoice, "a credit note")
     _choice_or_400(body.credit_type, CREDIT_TYPES, "credit_type")
 
     line_rows: list[CreditNoteLine] = []
@@ -130,7 +135,7 @@ def get_credit_note(credit_note_id: int, db: Session = Depends(get_crm_db),
 
 @router.post("/{credit_note_id}/approve")
 def approve_credit_note(credit_note_id: int, db: Session = Depends(get_crm_db),
-                        user: CurrentUser = Depends(WRITE)):
+                        user: CurrentUser = Depends(APPROVE)):
     note = get_credit_note_or_404(db, credit_note_id)
     if note.status != "Draft":
         raise HTTPException(status_code=400,

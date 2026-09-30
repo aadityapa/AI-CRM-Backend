@@ -28,8 +28,16 @@ def list_access_templates(db: Session = Depends(get_crm_db),
 @router.get("/registry")
 def get_registry(db: Session = Depends(get_crm_db),
                  user: CurrentUser = Depends(admin_only)):
-    """The catalogue of grantable tabs + fields + modes for the template editor."""
-    return envelope(data=access_registry.registry(), message="Access registry")
+    """The catalogue for the template AND role editors: grantable tabs + fields +
+    modes, the approval buttons (`approvals`), and every role a template may be
+    tagged with (`role_tags` — built-in operational roles + active custom roles)."""
+    from services.action_permissions import registry as approvals_registry
+    from services.custom_roles import all_role_names
+
+    data = dict(access_registry.registry())
+    data["approvals"] = approvals_registry()
+    data["role_tags"] = [r for r in all_role_names(db) if r not in ("Admin", "CEO")]
+    return envelope(data=data, message="Access registry")
 
 
 @router.post("/assign")

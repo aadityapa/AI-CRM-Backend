@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import threading
 
+from config import APP_NAME
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -67,7 +68,7 @@ def crm_database_url() -> str:
         url = _url_from_db_parts()
     if not url:
         raise CrmNotConfiguredError(
-            "Karnex CRM requires PostgreSQL. Set CRM_DATABASE_URL (or AUTH_DB_URL, "
+            f"{APP_NAME} CRM requires PostgreSQL. Set CRM_DATABASE_URL (or AUTH_DB_URL, "
             "or DB_HOST/DB_NAME/DB_USER) to point at Postgres. See .env.example."
         )
     # Normalise scheme variants to the psycopg2 driver.
@@ -77,7 +78,7 @@ def crm_database_url() -> str:
         url = "postgresql+psycopg2://" + url[len("postgresql://"):]
     if not url.startswith("postgresql+"):
         raise CrmNotConfiguredError(
-            "Karnex CRM tables are PostgreSQL-only; got a non-postgres DSN. "
+            f"{APP_NAME} CRM tables are PostgreSQL-only; got a non-postgres DSN. "
             "SQLite is supported only for the legacy interview tables."
         )
     return url

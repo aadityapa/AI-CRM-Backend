@@ -1,7 +1,7 @@
 """Projects API: CRUD, team (project employees), timesheets view, communication matrix."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,23 +22,23 @@ from schemas.leave import apply_leave_expire_timing_consistency
 from schemas.projects import (
     ProjectEmployeeCarryForwardIn,
     CommMatrixIn, ProjectCreate, ProjectEmployeeIn, ProjectEmployeeLeaveDetailUpdate,
-    ProjectEmployeeRateIn, ProjectEmployeeRateUpdate, ProjectEmployeeUpdate,
-    ProjectLeavePolicyCreate, ProjectLeavePolicyUpdate, ProjectUpdate,
+    ProjectEmployeeBillingUnitIn, ProjectEmployeeRateIn, ProjectEmployeeRateUpdate,
+    ProjectEmployeeUpdate, ProjectCloseIn, ProjectLeavePolicyCreate, ProjectLeavePolicyUpdate, ProjectUpdate,
 )
 from services.crm_common import paginate
 from services.project_employees import (
     apply_rate_rows, clear_other_current_rates, ensure_initial_rate,
     exit_project_employee,
     get_pe_or_404, group_pe_rows_by_employee, leave_detail_out, project_employee_detail_out,
-    rate_out, seed_leave_details_from_customer_policy, sync_pe_billing_from_current_rate,
-    sync_pe_leave_from_customer_policy,
+    rate_out, seed_leave_details_from_customer_policy, set_pe_billing_unit,
+    sync_pe_billing_from_current_rate, sync_pe_leave_from_customer_policy,
 )
 from services.projects import (
     add_history_entry, comm_entry_out, get_project_or_404, open_history_row,
     project_detail_out, project_employee_out, project_history, project_leave_policy_out,
     project_out, validate_project_refs,
 )
-from services.timesheets import timesheet_out
+from services.timesheets import refreeze_uninvoiced_sheets, timesheet_out
 
 router = APIRouter(prefix="/api/projects", tags=["CRM: Projects"])
 
@@ -49,6 +49,41 @@ read_pe = gated_read("project-employees")
 # Role list admin-editable: Users tab -> Action Permissions ("Map / edit
 # project employees"). Admin/CEO always pass.
 write_pe = gated_write_action("project_employee.manage", "project-employees", "Sales_Head", "HR", "Finance")
+# The billing UNIT is Commercial Details, so it moves with the rate grant.
+write_rates = gated_write_action("project_employee.rates", "project-employees",
+                                 "Sales_Head", "Finance", "HR", "RMG")
+
+
+def _apply_commercial_changes(db: Session, pe: ProjectEmployee, changes: dict,
+                              user_id: int | None) -> list[dict]:
+    """Rate / unit edits from either PE form, applied ONE way (both PUT routes).
+
+    A unit change relabels the whole rate history (`set_pe_billing_unit`) and
+    re-freezes the approved, not-yet-invoiced sheets it priced; a rate change
+    upserts one row through `apply_rate_rows`, never stacking twins. Pops both
+    keys from `changes` so the caller's generic setattr loop cannot bypass this."""
+    moved: list[dict] = []
+    unit = changes.pop("billing_unit", None)
+    if unit is not None and set_pe_billing_unit(db, pe, unit):
+        moved = refreeze_uninvoiced_sheets(
+            db, pe, user_id,
+            f"Billing unit changed to {getattr(unit, 'value', unit)} in Commercial Details")
+    if "billing_rate" in changes:
+        pe.billing_rate = changes.pop("billing_rate")
+        # UPSERT through apply_rate_rows instead of blindly adding a row.
+        # The old code appended a NEW rate at billing_date on every save of
+        # this form, so repeated edits stacked duplicate effective dates —
+        # histories grew twins like three rates all starting 01 Apr. Same
+        # date now refines the existing row; a different date starts a new
+        # one, exactly like the Map Employee wizard.
+        from schemas.projects import MapRateIn
+        apply_rate_rows(db, pe, [MapRateIn(
+            effective_from=pe.billing_date or date.today(),
+            rate=pe.billing_rate,
+        )])
+    return moved
+# Closing a project exits its whole team (25 Sep 2026). Admin-editable role list.
+close_projects = gated_write_action("project.close", "projects")
 
 
 def _get_leave_policy_or_404(db: Session, policy_id: int) -> ProjectLeavePolicy:
@@ -446,7 +481,7 @@ def update_project_employee_by_id(
         pe.is_active and changes.get("is_active") is False and changes.get("is_exit", True) is not False
     )
     deactivating = pe.is_active and changes.get("is_active") is False
-    rate_changed = "billing_rate" in changes or "billing_unit" in changes
+    commercial = {k: changes.pop(k) for k in ("billing_rate", "billing_unit") if k in changes}
     for field, value in changes.items():
         setattr(pe, field, value)
     exit_summary = None
@@ -459,18 +494,7 @@ def update_project_employee_by_id(
         history = open_history_row(db, pe.project_id, pe.employee_id)
         if history:
             history.end_date = date.today()
-    if rate_changed:
-        # UPSERT through apply_rate_rows instead of blindly adding a row.
-        # The old code appended a NEW rate at billing_date on every save of
-        # this form, so repeated edits stacked duplicate effective dates —
-        # histories grew twins like three rates all starting 01 Apr. Same
-        # date now refines the existing row; a different date starts a new
-        # one, exactly like the Map Employee wizard.
-        from schemas.projects import MapRateIn
-        apply_rate_rows(db, pe, [MapRateIn(
-            effective_from=pe.billing_date or date.today(),
-            rate=pe.billing_rate,
-        )])
+    _apply_commercial_changes(db, pe, commercial, user.id)
     db.commit()
     db.refresh(pe)
     data = project_employee_detail_out(db, pe)
@@ -625,6 +649,31 @@ def set_pe_leave_carry_forward(
     return envelope(data={**leave_detail_out(row, policy=policy), "carry_forward": result}, message=msg)
 
 
+@router.put("/employees/{pe_id}/billing-unit")
+def set_pe_billing_unit_endpoint(
+    pe_id: int,
+    body: ProjectEmployeeBillingUnitIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(write_rates),
+):
+    """Correct WHAT the rates are priced per — Hour / Day / Month / Year.
+
+    Once saved, the unit had no editor anywhere (the Map Employee form defaulted
+    to Month and every later screen only edited the amount), so an hourly rate
+    saved as monthly could only be fixed in the database. Relabels the whole
+    rate history and re-freezes approved sheets that are not invoiced yet."""
+    pe = get_pe_or_404(db, pe_id)
+    moved = _apply_commercial_changes(db, pe, {"billing_unit": body.billing_unit}, user.id)
+    db.commit()
+    db.refresh(pe)
+    unit = getattr(pe.billing_unit, "value", pe.billing_unit)
+    msg = f"Billing unit set to {unit}"
+    if moved:
+        msg += "; recalculated " + ", ".join(
+            f"{m['month']} ({m['sub_total_before']:,.2f} → {m['sub_total_after']:,.2f})" for m in moved)
+    return envelope(data={**project_employee_detail_out(db, pe), "recalculated": moved}, message=msg)
+
+
 @router.get("/employees/{pe_id}/rates")
 def list_pe_rates(
     pe_id: int,
@@ -647,7 +696,7 @@ def create_pe_rate(
     db: Session = Depends(get_crm_db),
     # RMG added: they own invoice generation, and the Add Rate button on the
     # PO selection panel must work for the person raising the invoice.
-    user: CurrentUser = Depends(gated_write_action("project_employee.rates", "project-employees", "Sales_Head", "Finance", "HR", "RMG")),
+    user: CurrentUser = Depends(write_rates),
 ):
     pe = get_pe_or_404(db, pe_id)
     if body.is_current_rate:
@@ -675,7 +724,7 @@ def update_pe_rate(
     body: ProjectEmployeeRateUpdate,
     db: Session = Depends(get_crm_db),
     # RMG added for the same reason as create_pe_rate (Edit Rate on PO panel).
-    user: CurrentUser = Depends(gated_write_action("project_employee.rates", "project-employees", "Sales_Head", "Finance", "HR", "RMG")),
+    user: CurrentUser = Depends(write_rates),
 ):
     pe = get_pe_or_404(db, pe_id)
     row = db.get(ProjectEmployeeRate, rate_id)
@@ -705,7 +754,7 @@ def delete_pe_rate(
     db: Session = Depends(get_crm_db),
     # RMG matches create/update: whoever manages rates from the invoice flow
     # must be able to remove a wrong row too.
-    user: CurrentUser = Depends(gated_write_action("project_employee.rates", "project-employees", "Sales_Head", "Finance", "HR", "RMG")),
+    user: CurrentUser = Depends(write_rates),
 ):
     pe = get_pe_or_404(db, pe_id)
     row = db.get(ProjectEmployeeRate, rate_id)
@@ -748,6 +797,34 @@ def get_project_history(
     return envelope(data=project_history(db, project))
 
 
+def _guard_status_change(db: Session, project: Project, changes: dict) -> None:
+    """Status edits must not side-step the close flow (25 Sep 2026).
+
+    * → Completed while people are still on the project: refused — only
+      "Close project" knows the last working day and moves them to the bench.
+    * Completed → Active/On_Hold: the project reopens and forgets its closure;
+      the people who left are NOT put back (re-assign them deliberately).
+    """
+    from services.project_closure import _open_assignments, reopen_fields
+
+    if "status" not in changes or changes["status"] is None:
+        return
+    new = getattr(changes["status"], "value", changes["status"])
+    old = getattr(project.status, "value", project.status)
+    if new == old:
+        return
+    if new == ProjectStatus.COMPLETED.value:
+        if _open_assignments(db, project.id):
+            raise HTTPException(
+                status_code=400,
+                detail="People are still working on this project. Use Close project to set the "
+                       "last working day — they move to the bench after it.")
+        if project.closed_at is None:
+            project.closed_at = datetime.now(timezone.utc)
+    elif old == ProjectStatus.COMPLETED.value:
+        reopen_fields(project)
+
+
 @router.put("/{project_id}")
 def update_project(
     project_id: int,
@@ -784,6 +861,7 @@ def update_project(
             status_code=400,
             detail="hours_required_half_day cannot exceed hours_required_full_day",
         )
+    _guard_status_change(db, project, changes)
     for field, value in changes.items():
         setattr(project, field, value)
     # If opportunity changed and branch_id was not explicitly set, adopt opp.branch_id
@@ -986,6 +1064,94 @@ def delete_project_leave_policy(
     return envelope(data=project_leave_policy_out(db, policy), message="Leave policy deactivated")
 
 
+# ---------------------------------------------------------------- close
+
+
+def _guard_assignment_against_closure(project: Project, onboarding: date | None) -> None:
+    """Nobody joins a closed project, or starts after its last working day."""
+    from services.project_closure import STATE_CLOSED, closure_state
+
+    if closure_state(project) == STATE_CLOSED:
+        raise HTTPException(status_code=409,
+                            detail="This project is closed. Reopen it before assigning people.")
+    if project.end_date and onboarding and onboarding > project.end_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This project's last working day is {project.end_date:%d %b %Y}; "
+                   "the onboarding date cannot be after it.")
+
+
+@router.get("/{project_id}/close-preview")
+def close_project_preview(
+    project_id: int,
+    end_date: date,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_projects),
+):
+    """Who rolls off, and on which day, if the project closed on `end_date`."""
+    from services.project_closure import closure_out, team_preview
+
+    project = get_project_or_404(db, project_id)
+    return envelope(data={"closure": closure_out(project),
+                          "end_date": end_date.isoformat(),
+                          "team": team_preview(db, project, end_date)})
+
+
+@router.post("/{project_id}/close")
+def close_project(
+    project_id: int,
+    body: ProjectCloseIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(close_projects),
+):
+    """Set the last working day. A day already gone closes at once; a future day
+    is scheduled and the daily job moves the team to the bench after it."""
+    from services.project_closure import (
+        ClosureConflict, ClosureError, Released, notify_closed, notify_scheduled,
+        schedule_project_close,
+    )
+
+    project = get_project_or_404(db, project_id)
+    try:
+        result = schedule_project_close(db, project, end_date=body.end_date, reason=body.reason,
+                                        user_id=user.id)
+    except ClosureConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ClosureError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if result["state"] == "closed":
+        released = [Released(r["pe_id"], r["employee_id"], r["name"], date.fromisoformat(r["exit_date"]))
+                    for r in result["released"]]
+        notify_closed(db, project, released, actor_id=user.id)
+        message = f"Project closed — {len(released)} moved to the bench"
+    else:
+        notify_scheduled(db, project, result["team"], actor_id=user.id)
+        message = f"Project closes after {body.end_date:%d %b %Y}"
+    db.commit()
+    db.refresh(project)
+    return envelope(data={**result, "project": project_out(project)}, message=message)
+
+
+@router.delete("/{project_id}/close")
+def cancel_project_close_endpoint(
+    project_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(close_projects),
+):
+    """Withdraw a SCHEDULED close; every exit date it capped is restored."""
+    from services.project_closure import ClosureConflict, cancel_project_close
+
+    project = get_project_or_404(db, project_id)
+    try:
+        restored = cancel_project_close(db, project)
+    except ClosureConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    db.commit()
+    db.refresh(project)
+    return envelope(data={"project": project_out(project), "exits_restored": restored},
+                    message="Scheduled close cancelled")
+
+
 # ---------------------------------------------------------------- team
 
 @router.post("/{project_id}/employees")
@@ -999,6 +1165,7 @@ def add_project_employee(
     employee = db.get(Employee, body.employee_id)
     if not employee:
         raise HTTPException(status_code=400, detail="Employee not found")
+    _guard_assignment_against_closure(project, body.onboarding_date)
     existing = db.execute(
         select(ProjectEmployee).where(
             ProjectEmployee.project_id == project.id,
@@ -1072,25 +1239,14 @@ def update_project_employee(
         raise HTTPException(status_code=404, detail="Project employee not found")
     changes = body.model_dump(exclude_unset=True)
     deactivating = pe.is_active and changes.get("is_active") is False
-    rate_changed = "billing_rate" in changes or "billing_unit" in changes
+    commercial = {k: changes.pop(k) for k in ("billing_rate", "billing_unit") if k in changes}
     for field, value in changes.items():
         setattr(pe, field, value)
     if deactivating:
         history = open_history_row(db, project_id, pe.employee_id)
         if history:
             history.end_date = date.today()
-    if rate_changed:
-        # UPSERT through apply_rate_rows instead of blindly adding a row.
-        # The old code appended a NEW rate at billing_date on every save of
-        # this form, so repeated edits stacked duplicate effective dates —
-        # histories grew twins like three rates all starting 01 Apr. Same
-        # date now refines the existing row; a different date starts a new
-        # one, exactly like the Map Employee wizard.
-        from schemas.projects import MapRateIn
-        apply_rate_rows(db, pe, [MapRateIn(
-            effective_from=pe.billing_date or date.today(),
-            rate=pe.billing_rate,
-        )])
+    _apply_commercial_changes(db, pe, commercial, user.id)
     db.commit()
     db.refresh(pe)
     return envelope(data=project_employee_out(pe), message="Project employee updated")

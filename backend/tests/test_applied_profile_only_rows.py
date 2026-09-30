@@ -107,21 +107,28 @@ def _rows(db, req, **kw):
     return _profile_only_applied_rows(db, req, **kw)
 
 
-def test_only_rmg_shortlisted_without_a_resume_appear(db):
+def test_every_applicant_without_a_resume_appears(db):
+    """All applied candidates live in Applied Candidates (28 Sep 2026) — the
+    TA's separate Applicants tab is gone, so pending / rejected profiles with
+    no CV row must show here too. Hidden profiles and CV-backed ones do not."""
     req = _req(db)
-    _applicant(db, req, "Vamsi", screening="Shortlisted")            # ✅ belongs
-    _applicant(db, req, "Pending", screening="Pending")              # still with RMG
-    _applicant(db, req, "Rejected", screening="Rejected")            # screened out
-    _applicant(db, req, "HasCv", screening="Shortlisted", with_resume=True)  # already listed
+    _applicant(db, req, "Vamsi", screening="Shortlisted")
+    _applicant(db, req, "Pending", screening="Pending")
+    _applicant(db, req, "Rejected", screening="Rejected")
+    _applicant(db, req, "HasCv", screening="Shortlisted", with_resume=True)  # listed as a resume
+    hidden = _applicant(db, req, "Hidden", screening="Pending")
+    hidden.is_hidden = True
+    db.flush()
 
     rows = _rows(db, req)
-    assert [r["candidate_name"] for r in rows] == ["Vamsi"]
-    row = rows[0]
+    assert sorted(r["candidate_name"] for r in rows) == ["Pending", "Rejected", "Vamsi"]
+    row = next(r for r in rows if r["candidate_name"] == "Vamsi")
     assert row["is_profile_only"] is True
     assert row["profile_id"] is not None
     assert row["id"] < 0, "profile-only rows use a negative id so they cannot collide"
     assert row["rmg_screening_status"] == "Shortlisted"
     assert row["ats_score"] is None and row["ats_status"] is None
+    assert row["over_budget"] is False
 
 
 def test_ai_l1_state_reaches_the_row(db):
@@ -164,21 +171,6 @@ def test_search_and_applied_by_filters_apply(db):
     assert _rows(db, req, dismissed=True) == []
 
 
-def test_stage_pill_filters_profile_only_rows(db):
-    """The pills filter resumes server-side; these rows must answer them too,
-    or "Sourcing" would show a candidate who is already at RMG Review."""
-    req = _req(db)
-    a = _applicant(db, req, "AtSourcing", screening="Shortlisted")
-    b = _applicant(db, req, "AtRmg", screening="Shortlisted")
-    b.pipeline_status = PipelineStatus.RMG_REVIEW
-    db.flush()
-
-    assert [r["candidate_name"] for r in
-            _rows(db, req, stages=[PipelineStatus.RMG_REVIEW])] == ["AtRmg"]
-    assert [r["candidate_name"] for r in
-            _rows(db, req, stages=[a.pipeline_status])] == ["AtSourcing"]
-
-
 def test_merged_page_counts_and_orders_both_kinds(db):
     """The header count and the table have to agree (user report, 1 Sep 2026).
 
@@ -208,6 +200,29 @@ def test_merged_page_counts_and_orders_both_kinds(db):
     assert len(order2) == 2 and meta2["total"] == 6
     # No row appears on both pages.
     assert not (set(order) & set(order2))
+
+
+def test_the_candidate_just_acted_on_comes_first(db):
+    """28 Sep 2026, user ask: once RMG / GM act on a candidate (shortlist, the
+    manual L1 route), their row tops Applied Candidates so TA's next move is
+    the first thing on the list — whatever the upload order."""
+    from datetime import datetime, timedelta, timezone
+
+    from models import CandidateProfileActivityLog
+    from routers.crm.resumes import _last_activity_by_candidate, _paginate_merged
+    from sqlalchemy import select as _select
+
+    req = _req(db)
+    old = _applicant(db, req, "OldWithCv", screening="Shortlisted", with_resume=True)
+    for i in range(3):
+        _applicant(db, req, f"New{i}", screening="Pending", with_resume=True)
+    db.add(CandidateProfileActivityLog(profile_id=old.id, user_id=1, action_type="L1_REQUESTED",
+                                       timestamp=datetime.now(timezone.utc) + timedelta(hours=1)))
+    db.flush()
+    stmt = _select(Resume).where(Resume.requirement_id == req.id)
+    items, _extra, order, _meta = _paginate_merged(
+        db, stmt, [], 1, 10, _last_activity_by_candidate(db, req.opportunity_id))
+    assert items[0].candidate_name == "OldWithCv"
 
 
 # ------------------------------------------------ ATS for a profile-only row
@@ -242,3 +257,146 @@ def test_profile_only_applicant_gets_a_resume_row_from_their_cv(db):
     assert ensure_resume_for_profile(db, p, req).id == resume.id
     # And the row is no longer profile-only in the list.
     assert _rows(db, req) == []
+
+
+def test_stage_pills_split_the_sourcing_stage(db, monkeypatch):
+    """"Sourcing" / "Technical Screening" / "Technical Interview" are DERIVED
+    stages that all live in the Sourcing pipeline stage (28 Sep 2026) — the
+    pill must narrow the resume rows AND the profile-only rows to the right
+    phase, and every row carries the budget check."""
+    from crm_deps import PageParams
+    from fastapi import HTTPException
+    import routers.crm.resumes as resumes_router
+
+    monkeypatch.setattr(resumes_router, "enrich_resumes_with_ai",
+                        lambda _db, items: [{"id": r.id, "candidate_id": r.candidate_id,
+                                             "candidate_name": r.candidate_name}
+                                            for r in items])
+    req = _req(db)
+    req.budget_ctc_max = 1_000_000
+    _applicant(db, req, "WithTa", screening=None, with_resume=True)
+    rich = _applicant(db, req, "WithRmg", screening="Pending", with_resume=True)
+    rich.expected_ctc = 1_500_000
+    _applicant(db, req, "ShortCv", screening="Shortlisted", with_resume=True)
+    _applicant(db, req, "ShortNoCv", screening="Shortlisted")
+    db.commit()
+
+    def rows(phase):
+        res = resumes_router.list_resumes(
+            req.id, phase=phase, ats_status=None, ai_interview_status=None,
+            applied_by=None, applied_from=None, applied_to=None, dismissed=False,
+            p=PageParams(page=1, limit=20, search=None, sort_by=None, sort_dir="desc"),
+            db=db, user=SimpleNamespace(id=1))
+        return res["data"]
+
+    def names(phase):
+        return sorted(r["candidate_name"] for r in rows(phase))
+
+    assert names("sourcing") == ["WithTa"]
+    assert names("technical_screening") == ["WithRmg"]
+    assert names("technical_interview") == ["ShortCv", "ShortNoCv"]
+    everyone = rows(None)
+    assert len(everyone) == 4
+    over = {r["candidate_name"]: r["over_budget"] for r in everyone}
+    assert over == {"WithTa": False, "WithRmg": True, "ShortCv": False, "ShortNoCv": False}
+    stage = {r["candidate_name"]: r["profile_status"]["stage"]["label"] for r in everyone}
+    assert stage["WithRmg"] == "Technical Screening"
+    with pytest.raises(HTTPException):
+        names("bogus")
+
+
+def _list(db, req, **kw):
+    """Call the handler the way FastAPI does, with every filter defaulted."""
+    from crm_deps import PageParams
+    import routers.crm.resumes as resumes_router
+
+    kw = {"phase": None, "status_key": None, "bucket": "live", "ats_status": None,
+          "ai_interview_status": None, "applied_by": None, "applied_from": None,
+          "applied_to": None, "dismissed": False, **kw}
+    return resumes_router.list_resumes(
+        req.id, p=PageParams(page=1, limit=20, search=None, sort_by=None, sort_dir="desc"),
+        db=db, user=SimpleNamespace(id=1), **kw)
+
+
+def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
+    """Archive is MANUAL (30 Sep 2026, user rule): a rejected / withdrawn
+    candidate stays on the live list — its row offering RMG / GM an Archive
+    button (`archivable`) — until someone archives it; Restore brings it back.
+    A live candidacy cannot be archived (409). A legacy resume with no profile
+    stays live. The chips count each bucket apart."""
+    from fastapi import HTTPException
+    import routers.crm.resumes as resumes_router
+    from services.candidate_profiles import set_applied_archive
+
+    monkeypatch.setattr(resumes_router, "enrich_resumes_with_ai",
+                        lambda _db, items: [{"id": r.id, "candidate_id": r.candidate_id,
+                                             "candidate_name": r.candidate_name}
+                                            for r in items])
+    req = _req(db)
+    live_p = _applicant(db, req, "Live", screening="Pending", with_resume=True)
+    gone = _applicant(db, req, "Gone", screening="Rejected", with_resume=True)
+    gone.pipeline_status = PipelineStatus.RMG_REJECTED
+    left = _applicant(db, req, "Left", screening="Shortlisted")
+    left.pipeline_status = PipelineStatus.SELF_WITHDRAWN
+    db.add(Resume(requirement_id=req.id, candidate_id=None, candidate_name="Legacy",
+                  email="legacy@example.com", resume_file_url="/x/l.pdf"))
+    db.commit()
+    rmg = SimpleNamespace(id=1, full_name="Ravi RMG")
+
+    live = _list(db, req)
+    assert sorted(r["candidate_name"] for r in live["data"]) == ["Gone", "Left", "Legacy", "Live"]
+    flags = {r["candidate_name"]: r["archivable"] for r in live["data"]}
+    assert flags == {"Gone": True, "Legacy": False, "Left": True, "Live": False}
+    assert _list(db, req, bucket="archive")["data"] == []
+
+    with pytest.raises(HTTPException) as err:
+        set_applied_archive(db, live_p, True, rmg)
+    assert err.value.status_code == 409
+    assert set_applied_archive(db, gone, True, rmg) is True
+    assert set_applied_archive(db, gone, True, rmg) is False   # idempotent
+    db.commit()
+
+    live = _list(db, req)
+    assert sorted(r["candidate_name"] for r in live["data"]) == ["Left", "Legacy", "Live"]
+    archive = _list(db, req, bucket="archive")
+    assert [r["candidate_name"] for r in archive["data"]] == ["Gone"]
+    assert archive["data"][0]["archived"] is True and archive["data"][0]["archivable"] is False
+    counts = live["meta"]["status_counts"]
+    assert counts["live_total"] == 2 and counts["archive_total"] == 1
+    assert counts["archive"] == {"rmg_rejected": 1}
+
+    assert set_applied_archive(db, gone, False, rmg) is True
+    db.commit()
+    assert _list(db, req, bucket="archive")["data"] == []
+    with pytest.raises(HTTPException):
+        _list(db, req, bucket="bin")
+
+
+def test_status_chips_narrow_both_kinds_of_row_and_rows_say_how_long_they_wait(db, monkeypatch):
+    """`status_key` filters resume rows AND profile-only rows by the DERIVED
+    status (the chip strip is status-based now, the Stage column hidden), and
+    every row carries `waiting_days` — days since the last thing that
+    happened to the candidacy, else since they applied."""
+    from datetime import datetime, timedelta
+    import routers.crm.resumes as resumes_router
+    from models import CandidateProfileActivityLog
+
+    monkeypatch.setattr(resumes_router, "enrich_resumes_with_ai",
+                        lambda _db, items: [{"id": r.id, "candidate_id": r.candidate_id,
+                                             "candidate_name": r.candidate_name,
+                                             "created_at": r.created_at.isoformat()}
+                                            for r in items])
+    req = _req(db)
+    fresh = _applicant(db, req, "Fresh", screening=None, with_resume=True)
+    pending = _applicant(db, req, "Pending", screening="Pending")
+    db.add(CandidateProfileActivityLog(profile_id=pending.id, user_id=1, action_type="SENT_FOR_SCREENING",
+                                       comment="sent", timestamp=datetime.utcnow() - timedelta(days=4)))
+    db.commit()
+
+    rows = _list(db, req, status_key="technical_screening")["data"]
+    assert [r["candidate_name"] for r in rows] == ["Pending"]
+    assert rows[0]["waiting_days"] == 4
+    rows = _list(db, req, status_key="sourcing")["data"]
+    assert [r["candidate_name"] for r in rows] == ["Fresh"]
+    assert rows[0]["waiting_days"] == 0 and rows[0]["waiting_since"]
+    assert fresh.id  # the resume-backed row was matched through its profile

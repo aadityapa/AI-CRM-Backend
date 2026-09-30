@@ -124,8 +124,14 @@ def test_tiles_follow_roles_and_are_capped(db):
 
 def test_admin_gets_the_company_desk(db):
     _seed(db)
-    keys = [t["key"] for t in desk.today_tiles(db, _user("Admin"))["tiles"]]
-    assert keys[:4] == ["co_open_positions", "co_deployed", "co_cash_at_risk", "co_approvals"]
+    tiles = desk.today_tiles(db, _user("Admin"))["tiles"]
+    keys = [t["key"] for t in tiles]
+    assert keys[:5] == ["co_revenue_month", "co_open_positions", "co_deployed", "co_cash_at_risk", "co_approvals"]
+    # The revenue tile deep-links into the CEO report tab (Admin/CEO only).
+    assert tiles[0]["path"] == "reports?tab=revenue" and tiles[0]["format"] == "money"
+    # Nobody else gets the company tiles.
+    assert not any(k.startswith("co_") for k in
+                   (t["key"] for t in desk.today_tiles(db, _user("Finance"))["tiles"]))
 
 
 def test_upcoming_lists_dated_items_the_caller_can_open(db):

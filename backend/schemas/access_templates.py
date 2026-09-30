@@ -12,6 +12,8 @@ class AccessTemplateCreate(BaseModel):
     is_active: bool = True
     tab_access: dict[str, str] | None = None                 # { tab: "view"|"edit" }
     field_access: dict[str, dict[str, str]] | None = None    # { tab: { field: "view"|"edit" } }
+    # Approval buttons this template grants (services.action_permissions.APPROVAL_ACTIONS).
+    action_access: list[str] | None = None
 
 
 class AccessTemplateUpdate(BaseModel):
@@ -22,6 +24,7 @@ class AccessTemplateUpdate(BaseModel):
     is_active: bool | None = None
     tab_access: dict[str, str] | None = None
     field_access: dict[str, dict[str, str]] | None = None
+    action_access: list[str] | None = None
 
 
 class AssignTemplateIn(BaseModel):

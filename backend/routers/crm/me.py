@@ -17,6 +17,11 @@ from services.timesheets import employee_for_user
 router = APIRouter(prefix="/api/me", tags=["CRM: Me"])
 
 
+def _sees_team(user: CurrentUser) -> bool:
+    from services.role_implications import sees_team
+    return bool(user.is_admin or "Sales_Head" in user.roles or sees_team(user.roles))
+
+
 def _legacy_ui_tab_keys(visible: list[str] | None) -> list[str] | None:
     """Map resolver bare keys → UI keys (`crm:` / `iv:`) expected by the admin shell.
 
@@ -53,13 +58,27 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
             tab_access = _legacy_ui_tab_keys(access["visible_tabs"])
     except Exception:
         access = {"full": user.is_admin, "template_id": None, "tabs": {}, "fields": {},
-                  "visible_tabs": None, "source": "role_default"}
+                  "visible_tabs": None, "actions": None, "source": "role_default"}
+    try:
+        # The approval buttons this user may press — computed by the SAME
+        # function the server gate uses, so the UI never offers a button the
+        # server would refuse (the Sales "Approve" on a timesheet, 25 Sep 2026).
+        from services.action_permissions import allowed_approvals
+        approvals = allowed_approvals(db, user, access)
+    except Exception:
+        approvals = []
     return envelope(data={
         "id": user.id,
         "username": user.username,
         "full_name": user.full_name,
         "email": user.email,
         "roles": sorted(user.roles),
+        # The roles the user HOLDS (no implied ones) — the header chips and the
+        # greeting print these, so a Sales Manager reads "Sales Manager", not
+        # "Sales · Sales Manager · Sales Head" (29 Sep 2026).
+        "display_roles": sorted(user.held_roles or user.roles),
+        # A manager rung (Sales Manager) works the whole team's deals.
+        "sees_team": _sees_team(user),
         "is_superadmin": user.is_admin,   # Admin or CEO
         "is_ceo": user.is_ceo,
         # None => full role-based access; list => only these tab keys are visible.
@@ -68,6 +87,8 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
         "field_access": field_access,
         # NEW: mode-aware effective access {full, template_id, tabs:{tab:mode}, fields:{tab:{field:mode}}, source}
         "access": access,
+        # ["timesheet.approve", ...] — every approval action this user may do.
+        "approvals": approvals,
     })
 
 

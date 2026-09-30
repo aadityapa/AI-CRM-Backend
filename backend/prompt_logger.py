@@ -7,6 +7,7 @@ token usage, and timing data. Writes to both file-based logs and database.
 from __future__ import annotations
 
 import atexit
+import contextvars
 import json
 import logging
 import os
@@ -54,6 +55,61 @@ PROMPT_LOG_ENABLED = _bool_env("PROMPT_LOG_ENABLED", True)
 PROMPT_LOG_FILE_ENABLED = _bool_env("PROMPT_LOG_FILE_ENABLED", True)
 PROMPT_LOG_DB_ENABLED = _bool_env("PROMPT_LOG_DB_ENABLED", True)
 PROMPT_LOG_QUEUE_MAX = int(os.getenv("PROMPT_LOG_QUEUE_MAX", "1000"))
+
+
+# ---------------------------------------------------------------------------
+# Interview attribution (28 Sep 2026)
+# ---------------------------------------------------------------------------
+# Every AI call an interview makes — question generation, follow-ups, per-turn
+# and final evaluation, the spoken question (TTS), the candidate's speech
+# (transcription), the report upgrade that runs after submit — is logged from
+# somewhere deep in ai.py that has no idea which interview it serves. The
+# Candidate column on AI Logs read "-" for every row, and per-interview cost was
+# impossible. Rather than thread five extra parameters through fourteen call
+# sites, the handlers that DO know the session set a context here and
+# `log_openai_call` fills its blanks from it.
+#
+# A ContextVar follows the request through `run_in_threadpool` (anyio copies
+# the context) but NOT into a bare `threading.Thread` — those callers capture
+# `current_interview_context()` and re-enter it (see `tts_prewarm.prewarm_tts`).
+
+#: Keys a context may carry — the prompt-log columns they land in.
+INTERVIEW_CONTEXT_KEYS = ("interview_id", "candidate_id", "candidate_name",
+                          "candidate_role", "template_id", "template_name")
+
+_interview_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "karnex_interview_log_context", default=None)
+
+
+def current_interview_context() -> dict:
+    """The context in force (a copy), or {}."""
+    return dict(_interview_ctx.get() or {})
+
+
+def set_interview_context(**fields) -> contextvars.Token:
+    """Set (or replace) the context for the rest of this task/thread.
+    Blank values are dropped so a partial context never erases a fuller one."""
+    clean = {k: str(v) for k, v in fields.items()
+             if k in INTERVIEW_CONTEXT_KEYS and v not in (None, "")}
+    return _interview_ctx.set(clean or None)
+
+
+class interview_context:
+    """`with interview_context(interview_id=..., candidate_name=...):` — set for
+    the block, restored afterwards. Also usable as `interview_context(ctx_dict)`."""
+
+    def __init__(self, ctx: dict | None = None, **fields):
+        self._fields = {**(ctx or {}), **fields}
+        self._token: contextvars.Token | None = None
+
+    def __enter__(self):
+        self._token = set_interview_context(**self._fields)
+        return self
+
+    def __exit__(self, *exc):
+        if self._token is not None:
+            _interview_ctx.reset(self._token)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +216,20 @@ CREATE TABLE IF NOT EXISTS ai_prompt_logs (
     created_at TEXT NOT NULL,
     created_at_ist TEXT NOT NULL,
     created_date_ist TEXT NOT NULL,
-    created_time_ist TEXT NOT NULL
+    created_time_ist TEXT NOT NULL,
+    audio_seconds REAL DEFAULT 0,
+    cost_usd REAL
 )
 """
+
+#: Columns added after the table first shipped (28 Sep 2026): the audio length
+#: behind a TTS / transcription call and the USD cost priced AT LOG TIME
+#: (`services/ai_pricing`), so a later price change never rewrites history.
+#: Added with ALTER on both dialects, the way `interview_schedule` grows.
+_ADDED_COLUMNS: dict[str, str] = {
+    "audio_seconds": "REAL DEFAULT 0",
+    "cost_usd": "REAL",
+}
 
 _INDEX_STMTS = [
     "CREATE INDEX IF NOT EXISTS idx_apl_call_type ON ai_prompt_logs (call_type)",
@@ -174,14 +241,34 @@ _INDEX_STMTS = [
 ]
 
 
+def _ensure_added_columns_postgres(cur) -> None:
+    cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'ai_prompt_logs'"
+    )
+    existing = {str(r[0]) for r in (cur.fetchall() or [])}
+    for col, ddl in _ADDED_COLUMNS.items():
+        if col not in existing:
+            cur.execute(f"ALTER TABLE ai_prompt_logs ADD COLUMN {col} {ddl}")
+
+
+def _ensure_added_columns_sqlite(conn: sqlite3.Connection) -> None:
+    existing = {str(r[1]) for r in conn.execute("PRAGMA table_info(ai_prompt_logs)").fetchall()}
+    for col, ddl in _ADDED_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE ai_prompt_logs ADD COLUMN {col} {ddl}")
+
+
 def init_prompt_log_table(db_target: str) -> None:
-    """Create the ai_prompt_logs table if it doesn't exist."""
+    """Create the ai_prompt_logs table if it doesn't exist, add any newer
+    columns, and price the rows written before costs were stored."""
     try:
         if _is_postgres(db_target):
             import psycopg2 as pg
             with pg.connect(db_target) as conn:
                 with conn.cursor() as cur:
                     cur.execute(_POSTGRES_CREATE)
+                    _ensure_added_columns_postgres(cur)
                     for stmt in _INDEX_STMTS:
                         cur.execute(stmt)
                 conn.commit()
@@ -190,11 +277,56 @@ def init_prompt_log_table(db_target: str) -> None:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             with sqlite3.connect(str(db_path)) as conn:
                 conn.execute(_SQLITE_CREATE)
+                _ensure_added_columns_sqlite(conn)
                 for stmt in _INDEX_STMTS:
                     conn.execute(stmt)
                 conn.commit()
+        backfill_prompt_log_costs(db_target)
     except Exception as exc:
         logger.warning("Failed to init ai_prompt_logs table: %s", exc)
+
+
+def backfill_prompt_log_costs(db_target: str) -> int:
+    """Price every row with `cost_usd IS NULL` from its tokens at TODAY's rates —
+    once, for the rows written before costs were stored. Idempotent: a priced
+    row is never touched again, so live prices only ever apply to new calls."""
+    from services.ai_pricing import estimate_cost_usd, pricing_table
+
+    table = pricing_table()
+    is_pg = _is_postgres(db_target)
+    ph = "%s" if is_pg else "?"
+    updated = 0
+    try:
+        conn = _connect(db_target)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT model, call_type FROM ai_prompt_logs WHERE cost_usd IS NULL")
+            pairs = [(str(r[0] or ""), str(r[1] or "")) for r in (cur.fetchall() or [])]
+            for model, call_type in pairs:
+                unit_in = estimate_cost_usd(model=model, call_type=call_type, prompt_tokens=1_000_000, table=table)
+                unit_out = estimate_cost_usd(model=model, call_type=call_type, completion_tokens=1_000_000, table=table)
+                unit_audio = estimate_cost_usd(model=model, call_type=call_type, audio_seconds=60.0, table=table)
+                cur.execute(
+                    "UPDATE ai_prompt_logs SET cost_usd = "
+                    f"(COALESCE(prompt_tokens, 0) * {ph} + COALESCE(completion_tokens, 0) * {ph}) / 1000000.0 "
+                    f"+ COALESCE(audio_seconds, 0) / 60.0 * {ph} "
+                    f"WHERE cost_usd IS NULL AND COALESCE(model, '') = {ph} AND COALESCE(call_type, '') = {ph}",
+                    (unit_in, unit_out, unit_audio, model, call_type),
+                )
+                updated += int(cur.rowcount or 0)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("Prompt-log cost backfill failed: %s", exc)
+    return updated
+
+
+def _connect(db_target: str):
+    if _is_postgres(db_target):
+        import psycopg2 as pg
+        return pg.connect(db_target)
+    return sqlite3.connect(str(db_target))
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +376,7 @@ def _write_db_log(db_target: str, entry: dict) -> bool:
         "request_payload", "response_payload", "prompt_tokens", "completion_tokens",
         "total_tokens", "temperature", "max_tokens", "response_time_ms",
         "status", "error_log", "created_at", "created_at_ist",
-        "created_date_ist", "created_time_ist",
+        "created_date_ist", "created_time_ist", "audio_seconds", "cost_usd",
     ]
     vals = [entry.get(c) for c in cols]
 
@@ -298,13 +430,25 @@ def log_openai_call(
     interview_id: str = "",
     selected_skills: list[str] | None = None,
     difficulty: str = "",
+    audio_seconds: float = 0.0,
+    audio_tokens: int = 0,
 ) -> dict:
     """
     Log a single OpenAI API call to both file and database.
     Returns the log entry dict.
+
+    Blank attribution fields (interview / candidate / template) are filled from
+    the interview context in force; the USD cost is priced now and stored.
     """
     now = _now_ist()
     log_id = uuid4().hex[:16]
+    ctx = current_interview_context()
+    interview_id = interview_id or ctx.get("interview_id", "")
+    candidate_id = candidate_id or ctx.get("candidate_id", "")
+    candidate_name = candidate_name or ctx.get("candidate_name", "")
+    candidate_role = candidate_role or ctx.get("candidate_role", "")
+    template_id = template_id or ctx.get("template_id", "")
+    template_name = template_name or ctx.get("template_name", "")
 
     system_prompt = ""
     user_prompt = ""
@@ -340,10 +484,17 @@ def log_openai_call(
         except Exception:
             resp_text = str(response)[:2000]
 
-    if not prompt_tokens and response and hasattr(response, "usage") and response.usage:
-        prompt_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-        completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-        total_tokens = getattr(response.usage, "total_tokens", 0) or 0
+    cached_tokens = 0
+    if response is not None and getattr(response, "usage", None):
+        usage = response.usage
+        if not prompt_tokens:
+            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+            total_tokens = getattr(usage, "total_tokens", 0) or 0
+        # Cached prompt tokens are billed at a lower rate (28 Sep 2026): the
+        # question template repeats across an interview, so this is not a rounding error.
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached_tokens = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
 
     entry = {
         "id": log_id,
@@ -374,6 +525,9 @@ def log_openai_call(
         "created_at_ist": now.isoformat(),
         "created_date_ist": now.strftime("%Y-%m-%d"),
         "created_time_ist": now.strftime("%H:%M:%S"),
+        "audio_seconds": round(float(audio_seconds or 0.0), 2),
+        "cost_usd": _cost_now(model, call_type, prompt_tokens, completion_tokens, audio_seconds,
+                              cached_tokens=cached_tokens, audio_tokens=audio_tokens),
     }
 
     if not PROMPT_LOG_ENABLED:
@@ -381,6 +535,79 @@ def log_openai_call(
 
     _enqueue_log(entry, db_target)
     return entry
+
+
+def _cost_now(model: str, call_type: str, prompt_tokens: int, completion_tokens: int,
+              audio_seconds: float, *, cached_tokens: int = 0, audio_tokens: int = 0) -> float:
+    """Priced from the ONE price list; a failed call that returned no usage costs
+    nothing. Never raises — a pricing bug must not lose the log."""
+    try:
+        from services.ai_pricing import estimate_cost_usd
+        return estimate_cost_usd(model=model, call_type=call_type, prompt_tokens=prompt_tokens,
+                                 completion_tokens=completion_tokens, cached_tokens=cached_tokens,
+                                 audio_tokens=audio_tokens, audio_seconds=audio_seconds)
+    except Exception:
+        return 0.0
+
+
+def log_audio_call(
+    *,
+    db_target: str = "",
+    kind: str,
+    model: str,
+    text: str = "",
+    audio_seconds: float = 0.0,
+    audio_bytes: int = 0,
+    response_time_ms: int = 0,
+    status: str = "success",
+    error_log: str = "",
+    response: Any = None,
+    source: str = "",
+) -> dict:
+    """Log a text-to-speech ("tts") or transcription ("transcribe") call.
+
+    Priced by `services/ai_pricing`: per audio TOKEN when the count is known
+    (a transcription response with `usage` — the gpt-4o-*-transcribe models —
+    is exact), else per minute of `audio_seconds` — the caller's MEASURED
+    length (the MP3 frames of a clip, the browser's recording clock); only
+    when neither exists is TTS estimated from the text and transcription from
+    the upload size. `source` distinguishes the live stream from a prewarm."""
+    from services.ai_pricing import (
+        stt_seconds_for_bytes, text_tokens_estimate, tts_seconds_for_text,
+    )
+    kind = "tts" if kind == "tts" else "transcribe"
+    call_type = f"{kind}_{source}" if source else kind
+    seconds = float(audio_seconds or 0.0)
+    prompt_tokens = completion_tokens = audio_tokens = 0
+    if kind == "tts":
+        prompt_tokens = text_tokens_estimate(text)
+        if seconds <= 0:
+            seconds = tts_seconds_for_text(text)
+    else:
+        if seconds <= 0:
+            seconds = stt_seconds_for_bytes(audio_bytes)
+        usage = getattr(response, "usage", None) if response is not None else None
+        if usage is not None:
+            completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            details = getattr(usage, "input_token_details", None)
+            audio_tokens = int(getattr(details, "audio_tokens", 0) or 0) if details is not None else 0
+            if not audio_tokens:
+                audio_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    return log_openai_call(
+        db_target=db_target,
+        call_type=call_type,
+        model=model,
+        messages=[{"role": "user", "content": text}] if text else None,
+        response_text=text if kind == "transcribe" else "",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        response_time_ms=response_time_ms,
+        status=status,
+        error_log=error_log,
+        audio_seconds=seconds,
+        audio_tokens=audio_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -454,19 +681,6 @@ def _shutdown_worker() -> None:
 
 
 atexit.register(_shutdown_worker)
-
-
-def prompt_logger_status() -> dict:
-    """Snapshot for /admin/ai/usage style endpoints."""
-    return {
-        "enabled": PROMPT_LOG_ENABLED,
-        "file_enabled": PROMPT_LOG_FILE_ENABLED,
-        "db_enabled": PROMPT_LOG_DB_ENABLED,
-        "queue_size": _log_queue.qsize(),
-        "queue_max": PROMPT_LOG_QUEUE_MAX,
-        "dropped": _log_dropped,
-        "worker_alive": bool(_log_worker and _log_worker.is_alive()),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -568,249 +782,6 @@ def tracked_chat_completion(
 
 
 # ---------------------------------------------------------------------------
-# Query API for admin dashboard
-# ---------------------------------------------------------------------------
-
-def query_prompt_logs(
-    db_target: str,
-    *,
-    call_type: str = "",
-    model: str = "",
-    status: str = "",
-    candidate_id: str = "",
-    interview_id: str = "",
-    template_id: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    search: str = "",
-    limit: int = 50,
-    offset: int = 0,
-    sort_by: str = "created_at_ist",
-    sort_order: str = "desc",
-) -> dict:
-    """Query prompt logs with filtering, pagination, and sorting."""
-    conditions: list[str] = []
-    params: list[Any] = []
-    is_pg = _is_postgres(db_target)
-    ph = "%s" if is_pg else "?"
-
-    if call_type:
-        conditions.append(f"call_type = {ph}")
-        params.append(call_type)
-    if model:
-        conditions.append(f"model = {ph}")
-        params.append(model)
-    if status:
-        conditions.append(f"status = {ph}")
-        params.append(status)
-    if candidate_id:
-        conditions.append(f"candidate_id = {ph}")
-        params.append(candidate_id)
-    if interview_id:
-        conditions.append(f"interview_id = {ph}")
-        params.append(interview_id)
-    if template_id:
-        conditions.append(f"template_id = {ph}")
-        params.append(template_id)
-    if date_from:
-        conditions.append(f"created_date_ist >= {ph}")
-        params.append(date_from)
-    if date_to:
-        conditions.append(f"created_date_ist <= {ph}")
-        params.append(date_to)
-    if search:
-        like_val = f"%{search}%"
-        conditions.append(
-            f"(candidate_name LIKE {ph} OR template_name LIKE {ph} "
-            f"OR user_prompt LIKE {ph} OR call_type LIKE {ph})"
-        )
-        params.extend([like_val, like_val, like_val, like_val])
-
-    where = " AND ".join(conditions) if conditions else "1=1"
-    allowed_sorts = {
-        "created_at_ist", "response_time_ms", "total_tokens",
-        "prompt_tokens", "call_type", "model", "status",
-    }
-    col = sort_by if sort_by in allowed_sorts else "created_at_ist"
-    order = "ASC" if sort_order.lower() == "asc" else "DESC"
-
-    count_sql = f"SELECT COUNT(*) FROM ai_prompt_logs WHERE {where}"
-    data_sql = (
-        f"SELECT * FROM ai_prompt_logs WHERE {where} "
-        f"ORDER BY {col} {order} LIMIT {ph} OFFSET {ph}"
-    )
-    params_data = params + [limit, offset]
-
-    try:
-        if is_pg:
-            import psycopg2 as pg
-            from psycopg2.extras import RealDictCursor
-            with pg.connect(db_target) as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute(count_sql, params)
-                    total = cur.fetchone()["count"]
-                    cur.execute(data_sql, params_data)
-                    rows = [dict(r) for r in cur.fetchall()]
-        else:
-            with sqlite3.connect(str(db_target)) as conn:
-                conn.row_factory = sqlite3.Row
-                cur = conn.cursor()
-                cur.execute(count_sql, params)
-                total = cur.fetchone()[0]
-                cur.execute(data_sql, params_data)
-                rows = [dict(r) for r in cur.fetchall()]
-
-        for row in rows:
-            for key in ("created_at",):
-                if key in row and row[key] is not None:
-                    row[key] = str(row[key])
-
-        return {
-            "logs": rows,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "has_more": (offset + limit) < total,
-        }
-    except Exception as exc:
-        logger.warning("query_prompt_logs failed: %s", exc)
-        return {"logs": [], "total": 0, "limit": limit, "offset": offset, "has_more": False}
-
-
-def get_prompt_log_by_id(db_target: str, log_id: str) -> dict | None:
-    """Fetch a single prompt log by ID."""
-    is_pg = _is_postgres(db_target)
-    ph = "%s" if is_pg else "?"
-    sql = f"SELECT * FROM ai_prompt_logs WHERE id = {ph}"
-    try:
-        if is_pg:
-            import psycopg2 as pg
-            from psycopg2.extras import RealDictCursor
-            with pg.connect(db_target) as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute(sql, [log_id])
-                    row = cur.fetchone()
-                    return dict(row) if row else None
-        else:
-            with sqlite3.connect(str(db_target)) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(sql, [log_id]).fetchone()
-                return dict(row) if row else None
-    except Exception as exc:
-        logger.warning("get_prompt_log_by_id failed: %s", exc)
-        return None
-
-
-def get_token_usage_stats(db_target: str, days: int = 30) -> dict:
-    """Aggregate token usage statistics for the admin dashboard."""
-    is_pg = _is_postgres(db_target)
-    ph = "%s" if is_pg else "?"
-    cutoff = (_now_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-    queries = {
-        "total_summary": f"""
-            SELECT
-                COUNT(*) as total_calls,
-                COALESCE(SUM(prompt_tokens), 0) as total_prompt_tokens,
-                COALESCE(SUM(completion_tokens), 0) as total_completion_tokens,
-                COALESCE(SUM(total_tokens), 0) as total_tokens,
-                COALESCE(AVG(response_time_ms), 0) as avg_response_ms,
-                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_calls
-            FROM ai_prompt_logs
-            WHERE created_date_ist >= {ph}
-        """,
-        "by_call_type": f"""
-            SELECT
-                call_type,
-                COUNT(*) as call_count,
-                COALESCE(SUM(total_tokens), 0) as tokens,
-                COALESCE(AVG(total_tokens), 0) as avg_tokens,
-                COALESCE(AVG(response_time_ms), 0) as avg_response_ms
-            FROM ai_prompt_logs
-            WHERE created_date_ist >= {ph}
-            GROUP BY call_type
-            ORDER BY tokens DESC
-        """,
-        "by_model": f"""
-            SELECT
-                model,
-                COUNT(*) as call_count,
-                COALESCE(SUM(total_tokens), 0) as tokens
-            FROM ai_prompt_logs
-            WHERE created_date_ist >= {ph}
-            GROUP BY model
-            ORDER BY tokens DESC
-        """,
-        "by_date": f"""
-            SELECT
-                created_date_ist as date,
-                COUNT(*) as call_count,
-                COALESCE(SUM(total_tokens), 0) as tokens
-            FROM ai_prompt_logs
-            WHERE created_date_ist >= {ph}
-            GROUP BY created_date_ist
-            ORDER BY created_date_ist DESC
-            LIMIT 30
-        """,
-        "most_expensive": f"""
-            SELECT id, call_type, model, total_tokens, response_time_ms,
-                   candidate_name, interview_id, created_at_ist
-            FROM ai_prompt_logs
-            WHERE created_date_ist >= {ph}
-            ORDER BY total_tokens DESC
-            LIMIT 10
-        """,
-        "slowest_calls": f"""
-            SELECT id, call_type, model, total_tokens, response_time_ms,
-                   candidate_name, interview_id, created_at_ist
-            FROM ai_prompt_logs
-            WHERE created_date_ist >= {ph}
-            ORDER BY response_time_ms DESC
-            LIMIT 10
-        """,
-    }
-
-    results: dict[str, Any] = {}
-    try:
-        if is_pg:
-            import psycopg2 as pg
-            from psycopg2.extras import RealDictCursor
-            with pg.connect(db_target) as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    for key, sql in queries.items():
-                        cur.execute(sql, [cutoff])
-                        rows = cur.fetchall()
-                        results[key] = [dict(r) for r in rows] if rows else []
-        else:
-            with sqlite3.connect(str(db_target)) as conn:
-                conn.row_factory = sqlite3.Row
-                for key, sql in queries.items():
-                    rows = conn.execute(sql, [cutoff]).fetchall()
-                    results[key] = [dict(r) for r in rows] if rows else []
-
-        summary = results.get("total_summary", [{}])
-        if summary:
-            s = summary[0] if isinstance(summary, list) else summary
-            for k in ("avg_response_ms", "avg_tokens"):
-                if k in s and s[k] is not None:
-                    s[k] = round(float(s[k]), 1)
-            results["total_summary"] = s
-
-        for key in ("by_call_type", "by_model"):
-            for row in results.get(key, []):
-                for k in ("avg_tokens", "avg_response_ms"):
-                    if k in row and row[k] is not None:
-                        row[k] = round(float(row[k]), 1)
-
-    except Exception as exc:
-        logger.warning("get_token_usage_stats failed: %s", exc)
-        results = {"total_summary": {}, "by_call_type": [], "by_model": [], "by_date": [],
-                    "most_expensive": [], "slowest_calls": []}
-
-    return results
-
-
-# ---------------------------------------------------------------------------
 # Log cleanup / rotation
 # ---------------------------------------------------------------------------
 
@@ -837,51 +808,33 @@ def cleanup_old_file_logs(max_age_days: int | None = None) -> int:
     return removed
 
 
-def cleanup_old_db_logs(db_target: str, max_age_days: int | None = None) -> int:
-    """Remove database logs older than max_age_days. Returns count of removed rows."""
+def prune_prompt_log_text(db_target: str, max_age_days: int | None = None) -> int:
+    """Retention that keeps the MONEY (28 Sep 2026). The old cleanup DELETED rows
+    older than `PROMPT_LOG_RETENTION_DAYS`, which would erase the per-interview
+    cost history the CEO page reports across years. Only the heavy text —
+    prompts, payloads, responses (up to 50 KB each) — is dropped from rows
+    past the retention window; tokens, audio seconds, cost and attribution stay
+    forever. Idempotent; returns the number of rows pruned this run."""
     days = max_age_days if max_age_days is not None else MAX_LOG_AGE_DAYS
     if days <= 0:
         return 0
     cutoff = (_now_ist() - timedelta(days=days)).strftime("%Y-%m-%d")
-    is_pg = _is_postgres(db_target)
-    ph = "%s" if is_pg else "?"
-    sql = f"DELETE FROM ai_prompt_logs WHERE created_date_ist < {ph}"
+    ph = "%s" if _is_postgres(db_target) else "?"
+    sql = (
+        "UPDATE ai_prompt_logs SET system_prompt = NULL, user_prompt = NULL, final_prompt = NULL, "
+        "request_payload = NULL, response_payload = NULL "
+        f"WHERE created_date_ist < {ph} AND (final_prompt IS NOT NULL OR response_payload IS NOT NULL)"
+    )
     try:
-        if is_pg:
-            import psycopg2 as pg
-            with pg.connect(db_target) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, [cutoff])
-                    removed = cur.rowcount
-                conn.commit()
-                return removed
-        else:
-            with sqlite3.connect(str(db_target)) as conn:
-                cur = conn.execute(sql, [cutoff])
-                removed = cur.rowcount
-                conn.commit()
-                return removed
+        conn = _connect(db_target)
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, [cutoff])
+            pruned = int(cur.rowcount or 0)
+            conn.commit()
+            return pruned
+        finally:
+            conn.close()
     except Exception as exc:
-        logger.warning("cleanup_old_db_logs failed: %s", exc)
+        logger.warning("prune_prompt_log_text failed: %s", exc)
         return 0
-
-
-def get_distinct_values(db_target: str, column: str) -> list[str]:
-    """Get distinct values for a column (for filter dropdowns)."""
-    allowed = {"call_type", "model", "status", "difficulty", "template_name"}
-    if column not in allowed:
-        return []
-    is_pg = _is_postgres(db_target)
-    sql = f"SELECT DISTINCT {column} FROM ai_prompt_logs WHERE {column} IS NOT NULL AND {column} != '' ORDER BY {column}"
-    try:
-        if is_pg:
-            import psycopg2 as pg
-            with pg.connect(db_target) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql)
-                    return [str(r[0]) for r in cur.fetchall()]
-        else:
-            with sqlite3.connect(str(db_target)) as conn:
-                return [str(r[0]) for r in conn.execute(sql).fetchall()]
-    except Exception:
-        return []

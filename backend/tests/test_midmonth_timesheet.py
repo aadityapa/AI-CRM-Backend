@@ -246,9 +246,11 @@ def test_approval_freezes_invoice_figures(db):
     app = FastAPI()
     app.include_router(ts_router.router)
     app.dependency_overrides[crm_deps.get_crm_db] = lambda: db
-    # RMG approves; Finance views the invoice preview — one user, both hats.
+    # The GM approves (23 Sep 2026 flow); Finance views the invoice preview —
+    # one user, both hats. (This used to say RMG and only passed through the
+    # stale RMG + Sales Action Permissions row that 0108 removes.)
     app.dependency_overrides[crm_deps.get_current_user] = lambda: crm_deps.CurrentUser(
-        id=1, username="rmg", roles={"RMG", "Finance"})
+        id=1, username="gm", roles={"GM", "Finance"})
     client = TestClient(app)
 
     r = client.post(f"/api/timesheets/{ts.id}/approve")
@@ -302,22 +304,33 @@ def _client_as(db, roles):
     return TestClient(app)
 
 
-def test_admin_can_undo_an_invoiced_timesheet_but_nobody_else(db):
+def test_admin_can_undo_an_invoiced_timesheet_but_nobody_else(db, monkeypatch):
     """3 Sep 2026 (user decision): a wrong sheet invoiced by mistake must be
     reversible — by Admin/CEO only. Everyone else keeps the 409; the undo
     deletes the invoice, reverses its payments, and rejects the sheet."""
     from decimal import Decimal as D
 
     from models import Invoice, InvoicePayment, TimesheetStatus
+    from services import action_permissions
+
+    # The action-permission cache reads the LIVE database's saved rows (an
+    # admin-edited role list), not this SQLite world — pin the code defaults
+    # so the assertion is about the code, not about the dev box's settings.
+    monkeypatch.setattr(action_permissions, "roles_for_action",
+                        lambda action, defaults: list(defaults or []))
 
     ts = _seed_sheet(db, onboarding=date(2026, 1, 1))
     ts.status = TimesheetStatus.SUBMITTED
     db.commit()
 
-    rmg = _client_as(db, {"RMG", "Finance"})
+    # 23 Sep 2026: the GM (custom role — a plain name in `roles`) approves and
+    # raises the Proforma; RMG/Finance no longer can.
+    assert _client_as(db, {"RMG", "Finance"}).post(f"/api/timesheets/{ts.id}/approve").status_code == 403
+    rmg = _client_as(db, {"GM"})
     assert rmg.post(f"/api/timesheets/{ts.id}/approve").status_code == 200
     r = rmg.post(f"/api/timesheets/{ts.id}/generate-invoice")
     assert r.status_code == 200, r.text
+    assert r.json()["data"]["invoice"]["kind"] == "Proforma"
     inv = db.execute(select(Invoice).where(Invoice.timesheet_id == ts.id)).scalars().one()
     inv_number = inv.invoice_number
     db.add(InvoicePayment(invoice_id=inv.id, payment_date=date(2026, 3, 5), amount=D("1000"),
@@ -649,3 +662,60 @@ def test_weekend_work_does_not_cover_lop_by_default(db):
     assert summary["total_loss_of_pay_days"] == 1.0
     assert summary["lop_covered_days"] == 0.0
     assert summary["comp_off_earned"] == 1.0
+
+
+def test_a_half_day_counts_half_in_present_days_like_billable_days(db):
+    """29 Sep 2026, user rule: 21 full days + one half day (4 h) reads 21.5 in
+    Total Present Days, the same as Total Billable Days — never 21."""
+    from decimal import Decimal as D
+
+    from models import AttendanceStatus, TimesheetEntry, TimesheetStatus
+    from services.timesheets import timesheet_summary
+
+    ts = _seed_sheet(db, onboarding=date(2026, 1, 1), unit="Hourly", rate=1200)
+    ts.status = TimesheetStatus.DRAFT
+    half = db.execute(select(TimesheetEntry).where(
+        TimesheetEntry.timesheet_id == ts.id, TimesheetEntry.entry_date == date(2026, 2, 27))).scalars().one()
+    half.hours_worked = D("4")
+    half.attendance_status = AttendanceStatus.HALF_DAY
+    db.commit()
+    entries = list(db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)).scalars())
+    s = timesheet_summary(db, ts, entries)
+    assert s["half_days"] == 1
+    assert s["present_days"] == 19.5                       # Feb 2026: 20 weekdays, one of them half
+    assert s["present_days"] == s["total_billable_days"]
+
+
+def test_po_options_names_the_pos_this_employee_was_billed_against(db, monkeypatch):
+    """"Show only this employee's POs" (30 Sep 2026): a PO counts as the employee's
+    when it is TAGGED to them or an invoice of one of THEIR timesheets drew on it —
+    most customers never tag a PO to a person, so the tag alone left the list empty."""
+    from datetime import date
+    from types import SimpleNamespace
+
+    from models import Invoice, POStatus, PurchaseOrder, Timesheet, TimesheetStatus
+    import routers.crm.timesheets as ts_router
+
+    ts = _seed_sheet(db, onboarding=date(2026, 1, 1))
+    project = db.get(ts_router.Project, ts.project_id)
+    tagged = PurchaseOrder(po_number="VL-AS-1", customer_id=project.customer_id, status=POStatus.ACTIVE,
+                           total_value=500000, consumed_value=0, balance_value=500000, employee_id=ts.employee_id)
+    billed = PurchaseOrder(po_number="VL-AS-2", customer_id=project.customer_id, status=POStatus.ACTIVE,
+                           total_value=500000, consumed_value=0, balance_value=500000)
+    other = PurchaseOrder(po_number="VL-XX-3", customer_id=project.customer_id, status=POStatus.ACTIVE,
+                          total_value=500000, consumed_value=0, balance_value=500000)
+    db.add_all([tagged, billed, other]); db.flush()
+    earlier = Timesheet(project_id=ts.project_id, employee_id=ts.employee_id,
+                        project_employee_id=ts.project_employee_id, month=1, year=2026,
+                        status=TimesheetStatus.APPROVED)
+    db.add(earlier); db.flush()
+    db.add(Invoice(invoice_number="INV-1", po_id=billed.id, project_id=ts.project_id, timesheet_id=earlier.id,
+                   invoice_date=date(2026, 2, 1), sub_total=100000, grand_total=118000))
+    db.commit()
+
+    out = ts_router.timesheet_po_options(ts.id, db=db, user=SimpleNamespace(id=1))["data"]
+    by_no = {p["po_number"]: p for p in out["pos"]}
+    assert by_no["VL-AS-1"]["employee_match"] and by_no["VL-AS-1"]["tagged_to_employee"]
+    assert by_no["VL-AS-2"]["employee_match"] and by_no["VL-AS-2"]["billed_before"] == 1
+    assert not by_no["VL-AS-2"]["tagged_to_employee"]
+    assert not by_no["VL-XX-3"]["employee_match"] and by_no["VL-XX-3"]["billed_before"] == 0

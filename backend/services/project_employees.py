@@ -314,6 +314,27 @@ def sync_pe_billing_from_current_rate(pe: ProjectEmployee, rate: ProjectEmployee
         pe.billing_unit = rate.billing_unit
 
 
+def set_pe_billing_unit(db: Session, pe: ProjectEmployee, unit) -> bool:
+    """Change WHAT the assignment's rates are priced per (25 Sep 2026).
+
+    The unit is a property of the whole Commercial Details history, not of one
+    row: the invoice engine reads `pe.billing_unit` for every rate stretch. So
+    a correction ("₹1,414.77 was per HOUR, not per month") relabels every rate
+    row and never mints a new one — the old PUT path upserted a fresh row
+    dated today, which left the history half in one unit and half in the other.
+    Returns True when the unit actually changed; issued invoices are untouched
+    (their figures are what the customer received)."""
+    if pe.billing_unit == unit:
+        return False
+    pe.billing_unit = unit
+    for row in db.execute(
+        select(ProjectEmployeeRate).where(ProjectEmployeeRate.project_employee_id == pe.id)
+    ).scalars():
+        row.billing_unit = unit
+    db.flush()
+    return True
+
+
 def clear_other_current_rates(db: Session, pe_id: int, keep_id: int | None = None) -> None:
     rows = db.execute(
         select(ProjectEmployeeRate).where(

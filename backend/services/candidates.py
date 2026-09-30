@@ -218,7 +218,6 @@ def candidate_to_dict(candidate: Candidate) -> dict:
         "city": getattr(candidate, "city", None),
         "preferred_locations": getattr(candidate, "preferred_locations", None),
         "recruiter_email": getattr(candidate, "recruiter_email", None),
-        "created_at": candidate.created_at.isoformat() if getattr(candidate, "created_at", None) else None,
         "created_by_id": getattr(candidate, "created_by_id", None),
         "created_by_name": getattr(candidate, "created_by_name", None),
         "cv_original_filename": getattr(candidate, "cv_original_filename", None),
@@ -285,6 +284,8 @@ def candidate_detail(db: Session, candidate: Candidate) -> dict:
                 .group_by(InterviewEvent.profile_id)
             ).all()
         )
+    from services.candidate_status import statuses_for
+    statuses = statuses_for(db, [p for p, *_ in profile_rows])
     data["profiles"] = [
         {
             "id": p.id,
@@ -298,6 +299,7 @@ def candidate_detail(db: Session, candidate: Candidate) -> dict:
             "applied_on": _dt(getattr(p, "applied_on", None)) or _dt(p.created_at),
             "ta_owner_name": getattr(p, "ta_owner_name", None),
             "interview_rounds": rounds.get(p.id, 0),
+            "candidate_status": statuses.get(p.id),
         }
         for p, opp_code, title, customer_name in profile_rows
     ]

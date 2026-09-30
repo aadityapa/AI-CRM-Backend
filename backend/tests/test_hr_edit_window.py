@@ -50,7 +50,7 @@ def test_hr_is_read_only_at_every_other_stage(stage):
     with pytest.raises(HTTPException) as err:
         enforce_hr_edit_window(_profile(stage), _user("HR"), {"current_ctc": 1})
     assert err.value.status_code == 403
-    assert "Pre Onboarding" in err.value.detail
+    assert "Pre-Onboarding" in err.value.detail
 
 
 def test_hr_never_touches_the_approval_amount():

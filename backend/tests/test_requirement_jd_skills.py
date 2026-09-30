@@ -141,3 +141,55 @@ def test_terminal_requirements_are_frozen(db, status):
     with pytest.raises(HTTPException) as e:
         set_requirement_jd_skills(req.id, JdSkillsIn(rmg_jd_text="x"), db=db, user=_rmg())
     assert e.value.status_code == 400
+
+
+def test_ta_may_write_the_jd_and_the_three_jd_routes_share_one_role_list():
+    """30 Sep 2026, user report: a TA opened "Edit JD & skills" but the JD-file
+    upload answered 403 (the attachment route said RMG alone). The PATCH, the
+    upload and the delete now read ONE tuple, and TA is on it."""
+    import inspect
+
+    import routers.crm.requirements as rr
+
+    assert "TA" in rr.JD_EDIT_ROLES and "RMG" in rr.JD_EDIT_ROLES
+    for fn in (rr.set_requirement_jd_skills, rr.add_requirement_attachment,
+               rr.delete_requirement_attachment):
+        assert 'gated_write("requirements", *JD_EDIT_ROLES)' in inspect.getsource(fn), fn.__name__
+
+
+def test_an_uploaded_jd_file_fills_a_blank_jd_text_and_is_returned_for_review(db, monkeypatch):
+    """30 Sep 2026, user ask: "Edit JD & skills" takes the JD as a PDF / Word file.
+    The file's text is read out — a blank `rmg_jd_text` is filled from it (the ATS
+    and the AI interview read the TEXT), a written one is left alone — and the text
+    comes back so the dialog can show it. An unreadable file keeps the attachment."""
+    import io
+
+    from fastapi import UploadFile
+
+    import routers.crm.requirements as rr
+
+    req = _req(db)
+    monkeypatch.setattr(rr, "save_upload_hashed", lambda f, folder: ("/api/crm-files/requirement_attachments/x.pdf", "sha", 10))
+    monkeypatch.setattr("services.resumes.extract_resume_text", lambda url: "  Senior AUTOSAR engineer, 5+ yrs, CAN, Ethernet.  ")
+
+    def upload(name="jd.pdf"):
+        return UploadFile(filename=name, file=io.BytesIO(b"%PDF-1.4 fake"))
+
+    out = rr.add_requirement_attachment(req.id, file=upload(), kind="rmg_jd", db=db, user=_rmg())
+    assert out["data"]["jd_text_filled"] is True
+    assert out["data"]["extracted_text"] == "Senior AUTOSAR engineer, 5+ yrs, CAN, Ethernet."
+    assert db.get(Requirement, req.id).rmg_jd_text == "Senior AUTOSAR engineer, 5+ yrs, CAN, Ethernet."
+    assert "saved" in out["message"]
+
+    # A second file never overwrites the JD text someone wrote / already has.
+    monkeypatch.setattr("services.resumes.extract_resume_text", lambda url: "Another JD")
+    out2 = rr.add_requirement_attachment(req.id, file=upload("jd2.docx"), kind="rmg_jd", db=db, user=_rmg())
+    assert out2["data"]["jd_text_filled"] is False and out2["data"]["extracted_text"] == "Another JD"
+    assert db.get(Requirement, req.id).rmg_jd_text.startswith("Senior AUTOSAR")
+
+    # Unreadable (a scan): the attachment stays, nothing is filled, no error.
+    def boom(url):
+        raise RuntimeError("no text layer")
+    monkeypatch.setattr("services.resumes.extract_resume_text", boom)
+    out3 = rr.add_requirement_attachment(req.id, file=upload("scan.pdf"), kind="rmg_jd", db=db, user=_rmg())
+    assert out3["data"]["extracted_text"] is None and out3["data"]["id"]

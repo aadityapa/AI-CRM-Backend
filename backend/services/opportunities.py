@@ -46,6 +46,161 @@ STAGE_TRANSITIONS: dict[str, list[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Cascade: opportunity stage -> the child requirement (22 Sep 2026)
+# ---------------------------------------------------------------------------
+#
+# Reported 21 Sep 2026: Sales closed "Senior non-AUTOSAR engineer" as Closed_Won
+# ("Ganesh T Selected") and TA carried on sourcing it for days. `stage_transition`
+# moved the opportunity and hid the candidate profiles, but never touched the
+# REQUIREMENT — which stayed `In_Progress`, i.e. inside `TA_VISIBLE_STATUSES`.
+# TA's "Opportunities" nav actually renders the requirements list, so the dead
+# deal sat in their queue looking live.
+#
+# The stage is therefore the single source of truth and the requirement follows
+# it. Deliberately DIFFERENTIATED rather than one blanket "Closed": won and lost
+# are not the same fact, and a report that cannot tell them apart is worth less
+# than the column it costs. In this business Closed_Won means the role was
+# FILLED (hence "Ganesh T Selected"), so it stops sourcing exactly like a loss —
+# the difference is why, not whether.
+
+#: Closing stages -> the terminal requirement status they imply.
+STAGE_CLOSES_REQUIREMENT: dict[str, str] = {
+    PipelineStage.CLOSED_WON.value: "Closed",        # role filled — stop sourcing
+    PipelineStage.CLOSED_PARTIAL.value: "Closed",    # partially filled — ditto
+    PipelineStage.CLOSED_LOST.value: "Cancelled",    # never happening
+    PipelineStage.REJECTED.value: "Cancelled",
+    PipelineStage.ARCHIVED.value: "Cancelled",
+}
+
+#: Stages that PAUSE sourcing. Reuses the requirement's own hold mechanism
+#: (`held_from_status`, RMG's pause/resume from 25 Aug 2026) so resuming lands
+#: on the exact status it left — never a guessed Open_For_Sourcing.
+STAGE_HOLDS_REQUIREMENT = frozenset({
+    PipelineStage.ON_HOLD.value,        # "Customer Hold" in the UI
+    PipelineStage.SALES_HOLD.value,
+})
+
+#: The stage that RESUMES sourcing (the "Reactivate" button).
+STAGE_RESUMES_REQUIREMENT = PipelineStage.ACTIVE.value
+
+#: Requirement statuses the cascade must NOT overwrite.
+#:
+#: Pre-sourcing states belong to the approval chain — closing a deal that never
+#: reached sourcing should not fabricate a "Closed" requirement that was never
+#: open. `Fulfilled` is left alone because it is a fact that already happened:
+#: the positions WERE filled, and rewriting that to "Closed" would lose it.
+#: `Closed`/`Cancelled` are already terminal, so re-applying is a no-op anyway.
+#:
+#: 29 Sep 2026 (user report — "if Sales close or hold an opportunity it does not
+#: reflect in every login"): the pre-sourcing states are NO LONGER protected. A
+#: deal closed while its requirement waited for the Sales Head or RMG stayed in
+#: the RMG Review Queue and the Screening Desk approvals strip for ever, and RMG
+#: was asked to approve work that would never happen. Closing now settles it
+#: (Cancelled / Closed) and holding pauses it with `held_from_status`, so
+#: Reactivate hands it back to the exact approval step it left.
+CASCADE_PROTECTED_STATUSES = frozenset({
+    "Fulfilled", "Closed", "Cancelled",
+})
+
+#: Requirement statuses that come BEFORE sourcing — still waiting on an approval
+#: or on Sales to resubmit. The cascade may pause or settle them (see above).
+PRE_SOURCING_STATUSES = frozenset({
+    "Draft", "Pending_Sales_Head_Approval", "Sales_Head_Rejected",
+    "Pending_Engineering_Review", "Engineering_Rejected",
+})
+
+
+def requirement_status_for_stage(stage: str, current_status: str,
+                                 held_from: str | None) -> str | None:
+    """The status the requirement should take, or None to leave it alone.
+
+    Pure decision function — no DB, no side effects — so every branch is
+    testable without a session. The caller applies the result.
+    """
+    from models import RequirementStatus
+
+    if stage in STAGE_CLOSES_REQUIREMENT:
+        if current_status in CASCADE_PROTECTED_STATUSES:
+            return None
+        return STAGE_CLOSES_REQUIREMENT[stage]
+
+    if stage in STAGE_HOLDS_REQUIREMENT:
+        # Only a live sourcing requirement can be paused; an already-held one
+        # stays held (re-holding would overwrite held_from_status with
+        # "On_Hold" and strand the resume path).
+        if current_status in _HOLDABLE_BY_CASCADE:
+            return RequirementStatus.ON_HOLD.value
+        return None
+
+    if stage == STAGE_RESUMES_REQUIREMENT:
+        # Reactivate: give back exactly what it held from. A requirement that
+        # is not on hold is untouched — reactivating a deal must not drag a
+        # Cancelled requirement back to life behind RMG's back.
+        if current_status == RequirementStatus.ON_HOLD.value:
+            return held_from or RequirementStatus.OPEN_FOR_SOURCING.value
+        return None
+
+    return None
+
+
+#: Sourcing statuses the cascade may pause. Mirrors `_HOLDABLE_STATUSES` in
+#: routers/crm/requirements.py — the manual RMG hold and this automatic one
+#: must agree on what "live sourcing" means.
+_HOLDABLE_BY_CASCADE = frozenset({
+    "Open_For_Sourcing", "Posted_On_Portals", "In_Progress",
+}) | PRE_SOURCING_STATUSES
+
+
+def cascade_stage_to_requirements(db: Session, opp: Opportunity, new_stage: str,
+                                  acting_user_id: int, reason: str = "") -> list[dict]:
+    """Move the opportunity's requirement(s) to match the new stage.
+
+    Returns one dict per requirement actually changed — `[]` when nothing moved,
+    which is the normal case for a deal that never reached sourcing. The caller
+    uses the list for the activity comment and to decide whether to notify:
+    mailing TA that "nothing changed" is noise.
+
+    An opportunity spawns exactly one requirement today (`approve` is
+    idempotent), but the query is written for many so a future split does not
+    silently update just the first one.
+    """
+    from models import RequirementActivityLog, RequirementStatus
+    from services.crm_common import log_activity
+
+    reqs = db.execute(
+        select(Requirement).where(Requirement.opportunity_id == opp.id)
+    ).scalars().all()
+
+    changed: list[dict] = []
+    for req in reqs:
+        current = req.status.value if hasattr(req.status, "value") else str(req.status)
+        target = requirement_status_for_stage(new_stage, current, req.held_from_status)
+        if not target or target == current:
+            continue
+
+        if target == RequirementStatus.ON_HOLD.value:
+            # Remember where to come back to, exactly as the manual RMG hold does.
+            req.held_from_status = current
+            req.held_reason = reason or f"Opportunity moved to {new_stage.replace('_', ' ')}"
+        elif current == RequirementStatus.ON_HOLD.value:
+            # Resuming or closing out of a hold — the hold bookkeeping is spent.
+            req.held_from_status = None
+            req.held_reason = None
+
+        req.status = RequirementStatus(target)
+        note = (f"Opportunity {opp.opp_id} moved to {new_stage.replace('_', ' ')} — "
+                f"sourcing status {current.replace('_', ' ')} → {target.replace('_', ' ')}")
+        if reason:
+            note += f": {reason}"
+        log_activity(db, RequirementActivityLog, "requirement_id", req.id,
+                     acting_user_id, "OPPORTUNITY_STAGE", note)
+        changed.append({"id": req.id, "title": req.title,
+                        "from": current, "to": target})
+    return changed
+
+
+
 def _ev(value):
     return value.value if hasattr(value, "value") else value
 

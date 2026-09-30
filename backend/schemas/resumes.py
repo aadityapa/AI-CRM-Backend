@@ -19,9 +19,6 @@ class ResumeScanResult(BaseModel):
     status: str  # "Scored" | "Failed"
     ats_score: float | None = None
     error: str | None = None
-    # ATS auto-threshold pipeline outcome (see services/slot_booking.py)
-    auto_shortlisted: bool = False
-    slot_invite_sent: bool = False
 
 
 class ScheduleAiInterviewOut(BaseModel):

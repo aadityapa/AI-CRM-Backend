@@ -96,6 +96,16 @@ def build_report_record(session: dict, report_result: dict, evaluated_ist: dict)
         report_result.setdefault(
             "communication_required", bool(meta.get("communication_required", True))
         )
+        # 22 Sep 2026: an interview that ended before a single scored question
+        # was answered has nothing to judge, and must not reach a TA reading
+        # "Reject". This is the ONE funnel every report record passes through,
+        # so stamping it here covers the fast path, the AI upgrade and both
+        # recovery paths at once.
+        from services.interview_outcome import apply_not_attempted
+
+        apply_not_attempted(
+            report_result, session.get("questions"), session.get("answers"), meta
+        )
     return {
         "id": meta.get("interview_id", str(uuid4())),
         "created_at": meta.get("created_at"),

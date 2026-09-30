@@ -66,6 +66,9 @@ class CurrentUser:
     full_name: str = ""
     email: str = ""
     roles: set[str] = field(default_factory=set)
+    #: the roles the user actually HOLDS (built-in + custom names), before
+    #: `role_implications` adds implied ones — what the UI prints as chips.
+    held_roles: set[str] = field(default_factory=set)
 
     def has_any(self, *names: str) -> bool:
         return bool(self.roles.intersection(names))
@@ -100,9 +103,19 @@ def get_current_user(request: Request, db: Session = Depends(get_crm_db)) -> Cur
         select(Role.name).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == row["id"])
     ).scalars().all()
     roles = {r.value if hasattr(r, "value") else str(r) for r in role_rows}
+    # Custom roles (23 Sep 2026): Admin/CEO-defined names carry their own tab
+    # grants (services/access_templates.effective_access). Their NAMES join
+    # the role set so a user whose only role is "GM" is not "no CRM role".
+    roles |= custom_role_names(db, row["id"])
+    # A custom role may carry built-in roles (29 Sep 2026: the Sales Manager
+    # has the whole of Sales, like the Sales Head) — services/role_implications.
+    from services.role_implications import with_implied
+    held = set(roles)
+    roles = with_implied(roles)
     user = CurrentUser(
         id=row["id"], username=username,
         full_name=row["full_name"] or "", email=row["email"] or "", roles=roles,
+        held_roles=held,
     )
     # Outgoing mail triggered by this request is sent as this person
     # (services/actor_context.py).
@@ -112,6 +125,25 @@ def get_current_user(request: Request, db: Session = Depends(get_crm_db)) -> Cur
     except Exception:
         pass
     return user
+
+
+def custom_role_names(db: Session, user_id: int) -> set[str]:
+    """Names of the user's ACTIVE custom roles. Never raises — a missing table
+    (pre-0106 database) must not lock every login out."""
+    try:
+        from models.custom_roles import CustomRole, UserCustomRole
+        rows = db.execute(
+            select(CustomRole.name)
+            .join(UserCustomRole, UserCustomRole.custom_role_id == CustomRole.id)
+            .where(UserCustomRole.user_id == user_id, CustomRole.is_active.is_(True))
+        ).scalars().all()
+        return {str(r) for r in rows if r}
+    except Exception:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return set()
 
 
 def role_required(*allowed: str, allow_admin: bool = True):
@@ -339,11 +371,28 @@ def gated_write_action(action: str, tab: str, *default_roles: str, field: str | 
     allow_admin), which makes lock-out impossible. Any lookup problem falls
     back to the code default, so this can never fail closed by accident.
 
-    Template users: a template grant of edit+ on the tab is authoritative here
-    too (chosen deliberately — Admin/CEO decide access, roles are the
-    fallback), and a templated user WITHOUT the grant is refused before the
-    action's role list is even consulted.
+    Template users, MANAGE actions: a template grant of edit+ on the tab is
+    authoritative (Admin/CEO decide access, roles are the fallback), and a
+    templated user WITHOUT the grant is refused before the role list is read.
+
+    APPROVAL actions (25 Sep 2026, `action_permissions.APPROVAL`): the tab
+    grant only lets the user REACH the record (view is enough) — it never
+    implies the decision. Reported: Sales fills a timesheet with Timesheets:
+    Edit and that same grant let them approve it. The decision is
+    `action_permissions.user_may` — the template's / custom role's own
+    Approvals list when it has one, else the action's role list. /api/me
+    publishes the same answer, so the UI shows the button exactly when this
+    gate accepts the click.
     """
+    from services.action_permissions import ACTIONS as _REGISTRY, is_approval
+
+    approval = is_approval(action)
+    # The registry is the ONE home of an action's default roles; a call site
+    # that names none takes them from there (two endpoints of one action used
+    # to carry different defaults — timesheet recalculate said RMG + Sales).
+    if not default_roles and action in _REGISTRY:
+        default_roles = _REGISTRY[action].roles
+
     def dep(
         user: CurrentUser = Depends(get_current_user),
         db: Session = Depends(get_crm_db),
@@ -352,6 +401,20 @@ def gated_write_action(action: str, tab: str, *default_roles: str, field: str | 
             return user
         if not user.roles:
             raise HTTPException(status_code=403, detail="No CRM role assigned to this user")
+
+        if approval:
+            from services.access_templates import effective_access
+            from services.action_permissions import ACTIONS, user_may
+
+            _template_verdict(db, user, tab, "view", field=field)   # raises when the tab is not granted
+            access = effective_access(db, user.id, set(user.roles))
+            if user_may(db, user, action, access):
+                return user
+            raise HTTPException(
+                status_code=403,
+                detail=f"You are not allowed to: {ACTIONS[action].label.lower()} — "
+                       "ask Admin/CEO to enable it in your access template or role",
+            )
 
         verdict = _template_verdict(db, user, tab, "edit", field=field)
         if verdict is True:

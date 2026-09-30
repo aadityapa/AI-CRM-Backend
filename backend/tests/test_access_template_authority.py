@@ -271,23 +271,32 @@ def test_field_guard_field_grant_can_unlock_beyond_view_tab(db):
                             {"phone": "+911234567890"}, {"phone": "phone"})
 
 
-def test_gated_write_action_honours_template(db):
-    """Action-permission gates (timesheet approve etc.) also defer to a
-    template grant of edit+ on the tab."""
+def test_an_approval_action_needs_the_templates_approvals_not_the_tab_edit(db, monkeypatch):
+    """25 Sep 2026 — this test used to pin the BUG: a template grant of
+    Timesheets: Edit let anyone approve (Sales approved the sheet they filled).
+    An APPROVAL action is now decided by the template's own Approvals list;
+    see tests/test_approval_permissions.py for the full contract."""
     from fastapi import Depends
+    from services import action_permissions as ap
 
+    monkeypatch.setattr(ap, "roles_for_action", lambda action, defaults: list(defaults))
     _assign_template(db, 1, {"timesheets": "edit"})
     app = FastAPI()
 
     @app.post("/approve", dependencies=[Depends(
-        crm_deps.gated_write_action("timesheet.approve", "timesheets", "RMG", "Sales"))])
+        crm_deps.gated_write_action("timesheet.approve", "timesheets"))])
     def _approve():
         return {"ok": True}
 
     app.dependency_overrides[crm_deps.get_crm_db] = lambda: db
     app.dependency_overrides[crm_deps.get_current_user] = lambda: _user(1, "HR")
     client = TestClient(app)
-    # HR is not in the action's role list, but the template grants timesheets edit.
+    # Tab Edit alone: refused (Approvals never configured → role list = GM).
+    assert client.post("/approve").status_code == 403
+    # The template ticks the approval → allowed, whatever the role.
+    t = db.get(AccessTemplate, db.query(UserProfile).filter_by(user_id=1).one().access_template_id)
+    t.action_access = ["timesheet.approve"]
+    db.commit()
     assert client.post("/approve").status_code == 200
 
 

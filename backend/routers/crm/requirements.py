@@ -18,10 +18,10 @@ from sqlalchemy.orm import Session
 
 from crm_deps import (
     CurrentUser, PageParams, gated_create, get_crm_db, get_current_user, page_params,
-    role_required, gated_read, gated_write)
-from crm_deps import gated_read, gated_write
+    role_required, gated_read, gated_write, gated_write_action)
 from models import (
-    Opportunity, Priority, Requirement, RequirementActivityLog, RequirementAttachment,
+    Opportunity, PipelineStage, Priority, Requirement, RequirementActivityLog,
+    RequirementAttachment,
     RequirementJobPosting, RequirementSkill, RequirementStatus, Skill, WorkMode,
 )
 from schemas.common import CommentIn, RejectIn, envelope
@@ -46,6 +46,7 @@ router = APIRouter(prefix="/api/requirements", tags=["CRM: Requirements"])
 create_requirements_gate = gated_create("opportunities", "Sales")
 
 _STATUS_VALUES = {s.value for s in RequirementStatus}
+_STAGE_VALUES = {s.value for s in PipelineStage}
 _PRIORITY_VALUES = {p.value for p in Priority}
 _JOB_POSTING_STATUSES = (
     RequirementStatus.OPEN_FOR_SOURCING,
@@ -82,7 +83,32 @@ def _validated_skills(db: Session, skills: list[RequirementSkillIn]) -> list[Req
 def _one(db: Session, req: Requirement) -> dict:
     data = serialize_requirement(req, skills_by_requirement(db, [req.id]).get(req.id, []))
     data["ctc_bands"] = _safe_ctc_bands(db, req)
+    _attach_names(db, data, req)
     return enrich_requirement_jd(db, data, req)
+
+
+def _attach_names(db: Session, data: dict, req: Requirement) -> None:
+    """Customer + location NAMES on every single-requirement response (28 Sep 2026).
+
+    The list endpoint already carried them; the detail page fetched the name from
+    `/api/customers/{id}`, which is gated to the Customers tab — so TA / RMG / GM
+    saw "Customer #60" in the page header. The payload is now self-sufficient,
+    exactly like the list rows.
+    """
+    from models import Customer, Location
+
+    data["customer_name"] = (
+        db.execute(select(Customer.name).where(Customer.id == req.customer_id)).scalar_one_or_none()
+        if req.customer_id else None
+    )
+    loc = None
+    if req.location_id:
+        row = db.execute(
+            select(Location.city, Location.state).where(Location.id == req.location_id)
+        ).first()
+        if row:
+            loc = ", ".join(p for p in row if p) or None
+    data["location_name"] = loc
 
 
 def _safe_ctc_bands(db: Session, req: Requirement) -> list[dict]:
@@ -164,17 +190,41 @@ def create_requirement(
 @router.get("")
 def list_requirements(
     status: str | None = None,
+    #: Deal-stage filter (22 Sep 2026) — CSV, because the Sales-style tabs group
+    #: several stages ("Closed" is Won + Lost + Partial). Every role's list can
+    #: now be sliced by what SALES did, not only by sourcing status.
+    opportunity_stage: str | None = None,
     customer_id: int | None = None,
     priority: str | None = None,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(get_current_user),
 ):
-    stmt = apply_visibility(select(Requirement), user)
+    stmt = apply_visibility(select(Requirement), user, status, db=db)
+    # ⚠️ `Opportunity` is the MODULE-level import. A `from models import
+    # Opportunity` further down this function (the search branch) made the name
+    # a local for the WHOLE function, so this line raised UnboundLocalError —
+    # every stage-tab request 500'd (reported 23 Sep 2026). Never re-import a
+    # module-level name inside a function body.
+    joined_opportunity = False
+    if opportunity_stage:
+        wanted = [v.strip() for v in opportunity_stage.split(",") if v.strip()]
+        bad = [v for v in wanted if v not in _STAGE_VALUES]
+        if bad:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid opportunity stage filter '{bad[0]}'")
+        stmt = (stmt.outerjoin(Opportunity, Opportunity.id == Requirement.opportunity_id)
+                    .where(Opportunity.pipeline_stage.in_(
+                        [PipelineStage(v) for v in wanted])))
+        joined_opportunity = True
     if status:
-        if status not in _STATUS_VALUES:
-            raise HTTPException(status_code=400, detail=f"Invalid status filter '{status}'")
-        stmt = stmt.where(Requirement.status == RequirementStatus(status))
+        # CSV accepted (29 Sep 2026) so TA's Active tab asks for the three
+        # sourcing statuses in ONE paginated request instead of a fan-out.
+        wanted_st = [v.strip() for v in status.split(",") if v.strip()]
+        bad_st = [v for v in wanted_st if v not in _STATUS_VALUES]
+        if bad_st:
+            raise HTTPException(status_code=400, detail=f"Invalid status filter '{bad_st[0]}'")
+        stmt = stmt.where(Requirement.status.in_([RequirementStatus(v) for v in wanted_st]))
     if customer_id is not None:
         stmt = stmt.where(Requirement.customer_id == customer_id)
     if priority:
@@ -185,8 +235,11 @@ def list_requirements(
         like = f"%{p.search}%"
         # Searching by the OPPORTUNITY id must find the requirement too — all
         # roles track one number (18 Aug 2026). Outer join: never drops rows.
-        from models import Opportunity
-        stmt = stmt.outerjoin(Opportunity, Opportunity.id == Requirement.opportunity_id).where(
+        # Join once: a second join of the same table is a SQL error.
+        if not joined_opportunity:
+            stmt = stmt.outerjoin(Opportunity, Opportunity.id == Requirement.opportunity_id)
+            joined_opportunity = True
+        stmt = stmt.where(
             or_(Requirement.title.ilike(like), Requirement.req_number.ilike(like),
                 Opportunity.opp_id.ilike(like)))
     # Eager-load the parent opportunity: the serializer reads its opp_id for
@@ -225,7 +278,7 @@ def get_requirement(
     user: CurrentUser = Depends(get_current_user),
 ):
     req = get_requirement_or_404(db, requirement_id)
-    ensure_visible(user, req)
+    ensure_visible(user, req, db=db)
     # Backfill Experience/Budget/Work mode/Location/Target closure from the
     # linked opportunity for requirements created before the carry-over existed.
     if backfill_requirement_from_opportunity(db, req):
@@ -313,7 +366,9 @@ def sales_head_approve(
     requirement_id: int,
     payload: CommentIn | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "Sales_Head")),
+    # Approval buttons (Access Template ▸ Approvals) — Requirements: Edit alone
+    # never implied the Sales Head / Engineering decision.
+    user: CurrentUser = Depends(gated_write_action("requirement.sales_head_approve", "requirements")),
 ):
     req = get_requirement_or_404(db, requirement_id)
     _require_status(req, (RequirementStatus.PENDING_SALES_HEAD_APPROVAL,), "sales-head-approve")
@@ -324,17 +379,17 @@ def sales_head_approve(
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "SALES_HEAD_APPROVED", comment or "Approved by Sales Head")
     notify_role(db, "RMG",
-                f"Requirement {requirement_label(req)} pending engineering review",
-                f"'{req.title}' was approved by Sales Head and needs engineering review.",
+                f"Requirement {requirement_label(req)} pending RMG review",
+                f"'{req.title}' was approved by Sales Head and needs RMG review.",
                 f"/requirements/{req.id}", exclude_user_id=user.id,
                 event="requirement.sales_approved", actor=user)
     if req.created_by != user.id:
         notify_user(db, req.created_by,
                     f"Requirement {requirement_label(req)} approved by Sales Head",
-                    "Moved to engineering review.", f"/requirements/{req.id}",
+                    "Moved to RMG review.", f"/requirements/{req.id}",
                     actor=user)
     db.commit()
-    return envelope(_one(db, req), message="Approved; moved to engineering review")
+    return envelope(_one(db, req), message="Approved; moved to RMG review")
 
 
 @router.post("/{requirement_id}/sales-head-reject")
@@ -342,7 +397,7 @@ def sales_head_reject(
     requirement_id: int,
     payload: RejectIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "Sales_Head")),
+    user: CurrentUser = Depends(gated_write_action("requirement.sales_head_approve", "requirements")),
 ):
     try:
         reason = payload.validated_reason()
@@ -366,7 +421,7 @@ def engineering_approve(
     requirement_id: int,
     payload: EngineeringApproveIn | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "RMG")),
+    user: CurrentUser = Depends(gated_write_action("requirement.engineering_approve", "requirements")),
 ):
     req = get_requirement_or_404(db, requirement_id)
     _require_status(req, (RequirementStatus.PENDING_ENGINEERING_REVIEW,), "engineering-approve")
@@ -435,6 +490,7 @@ def engineering_approve(
                     "Now open for sourcing.", f"/requirements/{req.id}",
                     actor=user)
     db.commit()
+    _rescore_after_jd_change(db, req, user.id)
     return envelope(_one(db, req), message="Approved; open for sourcing")
 
 
@@ -443,7 +499,7 @@ def engineering_reject(
     requirement_id: int,
     payload: RejectIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "RMG")),
+    user: CurrentUser = Depends(gated_write_action("requirement.engineering_approve", "requirements")),
 ):
     try:
         reason = payload.validated_reason()
@@ -524,12 +580,12 @@ def hold_requirement(
                 f"Requirement on hold: {requirement_label(req)}",
                 f"'{req.title}' was put on hold by {user.full_name or user.username}: {reason}. "
                 "New uploads and interview scheduling are paused until it resumes.",
-                f"/admin?view=crm&p=requirements/{req.id}",
+                f"/admin/?view=crm&p=requirements/{req.id}",
                 event="requirement.on_hold", actor=user, exclude_user_id=user.id)
     if req.created_by != user.id:
         notify_user(db, req.created_by,
                     f"Requirement {requirement_label(req)} on hold",
-                    reason, f"/admin?view=crm&p=requirements/{req.id}", actor=user)
+                    reason, f"/admin/?view=crm&p=requirements/{req.id}", actor=user)
     db.commit()
     return envelope(_one(db, req), message="Requirement put on hold — TA notified")
 
@@ -561,7 +617,7 @@ def resume_requirement(
                 f"Requirement resumed: {requirement_label(req)}",
                 f"'{req.title}' is back in sourcing ({back_to.value.replace('_', ' ')})."
                 + (f" {comment}" if comment else ""),
-                f"/admin?view=crm&p=requirements/{req.id}",
+                f"/admin/?view=crm&p=requirements/{req.id}",
                 event="requirement.resumed", actor=user, exclude_user_id=user.id)
     db.commit()
     return envelope(_one(db, req), message="Requirement resumed — TA notified")
@@ -589,6 +645,13 @@ def set_requirement_priority(
     return envelope(_one(db, req), message=f"Priority set to {payload.priority}")
 
 
+#: Who may write the JD text, the skills and the JD FILE — one tuple, so the
+#: dialog's Save and its file drop zone can never disagree on who is let in.
+#: (30 Sep 2026, user report: TA could open "Edit JD & skills" but the upload
+#: answered 403 — the attachment route said RMG alone.)
+JD_EDIT_ROLES = ("RMG", "Sales", "Sales_Head", "TA")
+
+
 class JdSkillsIn(BaseModel):
     """`None` = leave that part untouched; a value replaces it."""
     rmg_jd_text: str | None = None
@@ -604,8 +667,10 @@ def set_requirement_jd_skills(
     # Forgotten JD / skills (15 Sep 2026): RMG, Sales, Sales Head and Admin/CEO
     # may fill or fix them at ANY non-terminal status — unlike the full PUT,
     # which is creator-only and Draft/Rejected-only. Deliberately narrow: no
-    # budget, positions or status fields can move through here.
-    user: CurrentUser = Depends(gated_write("requirements", "RMG", "Sales", "Sales_Head")),
+    # budget, positions or status fields can move through here. TA joined the
+    # list on 30 Sep 2026 (user ask): a recruiter who has the JD in hand adds
+    # it — the same roles that may attach the JD file below.
+    user: CurrentUser = Depends(gated_write("requirements", *JD_EDIT_ROLES)),
 ):
     req = get_requirement_or_404(db, requirement_id)
     if req.status in TERMINAL_STATUSES:
@@ -633,7 +698,23 @@ def set_requirement_jd_skills(
                  "JD_SKILLS", f"{user.full_name or user.username} updated: {', '.join(changed)}")
     db.commit()
     db.refresh(req)
-    return envelope(_one(db, req), message="JD & skills updated")
+    rescoring = _rescore_after_jd_change(db, req, user.id)
+    return envelope({**_one(db, req), "rescoring": rescoring},
+                    message="JD & skills updated" + (" — re-scoring the applicants' ATS" if rescoring else ""))
+
+
+def _rescore_after_jd_change(db: Session, req, user_id: int | None) -> bool:
+    """A JD / skills change re-scores the position's applicants in the
+    background (30 Sep 2026). Nothing to score against yet → nothing started."""
+    from services.resumes import has_ats_criteria, rescore_requirement_in_background
+
+    try:
+        if not has_ats_criteria(db, req):
+            return False
+        rescore_requirement_in_background(req.id, user_id)
+        return True
+    except Exception:
+        return False
 
 
 def _manual_terminal(db: Session, requirement_id: int, user: CurrentUser,
@@ -665,7 +746,7 @@ def list_requirement_attachments(
     user: CurrentUser = Depends(_REQ_ATT_READER),
 ):
     req = get_requirement_or_404(db, requirement_id)
-    ensure_visible(user, req)
+    ensure_visible(user, req, db=db)
     rows = db.execute(
         select(RequirementAttachment)
         .where(RequirementAttachment.requirement_id == requirement_id)
@@ -680,7 +761,7 @@ def add_requirement_attachment(
     file: UploadFile = File(...),
     kind: str | None = Form(None),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "RMG")),
+    user: CurrentUser = Depends(gated_write("requirements", *JD_EDIT_ROLES)),
 ):
     req = get_requirement_or_404(db, requirement_id)
     data = file.file.read()
@@ -705,16 +786,50 @@ def add_requirement_attachment(
         db, RequirementActivityLog, "requirement_id", req.id, user.id,
         "ATTACHMENT_ADDED", f"Attachment added ({kind_norm}): {att.file_name or 'file'}",
     )
+    # A JD uploaded as PDF / Word (30 Sep 2026, user ask): the ATS and the AI
+    # interview read `rmg_jd_text`, so the file's text is read out and — when
+    # the field is still blank — becomes the JD text at once. The text is also
+    # returned so the dialog can show it for review. Best-effort: a scan or an
+    # unreadable file keeps the attachment and fills nothing.
+    extracted, filled = None, False
+    if kind_norm == "rmg_jd":
+        extracted = _jd_text_from_file(url)
+        if extracted and not (req.rmg_jd_text or "").strip():
+            req.rmg_jd_text = extracted
+            filled = True
+            log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
+                         "JD_SKILLS", f"RMG JD text read from {att.file_name or 'the uploaded file'}")
     db.commit()
     db.refresh(att)
-    return envelope(serialize_attachment_row(att), message="Attachment added")
+    rescoring = kind_norm == "rmg_jd" and _rescore_after_jd_change(db, req, user.id)
+    msg = "JD text read from the file and saved" if filled else "Attachment added"
+    return envelope({**serialize_attachment_row(att), "extracted_text": extracted, "jd_text_filled": filled,
+                     "rescoring": rescoring},
+                    message=msg + (" — re-scoring the applicants' ATS" if rescoring else ""))
+
+
+#: A JD longer than this is clipped — the ATS keyword pass and the interview
+#: prompt need the substance, not a 40-page appendix.
+JD_TEXT_MAX_CHARS = 20_000
+
+
+def _jd_text_from_file(url: str) -> str | None:
+    """The text of an uploaded JD (PDF / DOCX / TXT), or None when unreadable."""
+    from services.resumes import extract_resume_text
+
+    try:
+        text = extract_resume_text(url)
+    except Exception:
+        return None
+    text = (text or "").strip()
+    return text[:JD_TEXT_MAX_CHARS] or None
 
 
 @router.delete("/attachments/{attachment_id}")
 def delete_requirement_attachment(
     attachment_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "RMG")),
+    user: CurrentUser = Depends(gated_write("requirements", *JD_EDIT_ROLES)),
 ):
     att = db.get(RequirementAttachment, attachment_id)
     if att is None:
@@ -765,7 +880,7 @@ def list_job_postings(
     user: CurrentUser = Depends(get_current_user),
 ):
     req = get_requirement_or_404(db, requirement_id)
-    ensure_visible(user, req)
+    ensure_visible(user, req, db=db)
     postings = db.execute(
         select(RequirementJobPosting)
         .where(RequirementJobPosting.requirement_id == req.id)
@@ -783,7 +898,7 @@ def get_activity_log(
     user: CurrentUser = Depends(get_current_user),
 ):
     req = get_requirement_or_404(db, requirement_id)
-    ensure_visible(user, req)
+    ensure_visible(user, req, db=db)
     logs = db.execute(
         select(RequirementActivityLog)
         .where(RequirementActivityLog.requirement_id == req.id)

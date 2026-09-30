@@ -24,14 +24,15 @@ import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from config import APP_NAME
 from crm_db import CrmNotConfiguredError, crm_database_url, get_session_factory
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Opportunity,
     OpportunitySkill, PipelineStatus, Requirement, RequirementSkill, Resume, Skill,
-    TemplateRequest, TemplateRequestStatus,
+    TemplateRequest,
 )
 from services.crm_common import get_app_setting, log_activity
-from services.notify import notify_role
+from services.notify import notify_role, notify_roles
 
 logger = logging.getLogger("karnex.crm.ai_bridge")
 
@@ -282,7 +283,7 @@ def schedule_l1_interview(
             cfg["show_spoken_text"] = "true" if show_text else "false"
             cfg["enable_transcript_input"] = "true" if show_text else "false"
     title = requirement.title if requirement is not None else (opportunity.title if opportunity else "CRM Screening")
-    headline = f"Karnex CRM AI L1 interview — {title}"
+    headline = f"{APP_NAME} AI L1 interview — {title}"
     if (extra_notes or "").strip():
         headline = f"{headline}\n{extra_notes.strip()}"
     notes = _pack_notes(headline, cfg)
@@ -363,12 +364,18 @@ def _rating_from_score(score_0_10) -> int:
     return max(1, min(5, round(val / 2)))
 
 
+def _review_link(profile_id: int) -> str:
+    """The Screening Desk AT this candidate, on the "Results to review" task
+    (28 Sep 2026) — the report, the verdict and the next button in one place."""
+    return f"/admin/?view=crm&p=screening-desk&task=results&focus={profile_id}"
+
+
 def _applied_link(db, profile_id: int) -> str:
     """Applied Candidates row for the RMG review notification (8 Sep 2026)."""
     from models import CandidateProfile
     from services.candidate_profiles import applied_candidates_link
     prof = db.get(CandidateProfile, profile_id)
-    return applied_candidates_link(db, prof) if prof else f"/admin?view=crm&p=profiles/{profile_id}"
+    return applied_candidates_link(db, prof) if prof else f"/admin/?view=crm&p=profiles/{profile_id}"
 
 
 def sync_completed_interview(record: dict) -> bool:
@@ -414,9 +421,17 @@ def sync_completed_interview(record: dict) -> bool:
             if already_synced:
                 return True
 
+            # Tell people ONCE per verdict (29 Sep 2026, user report: the same
+            # candidate's two mails each arrived twice). The report is saved
+            # more than once — a quick fallback first, then the AI upgrade with
+            # a slightly different score — and every save used to re-notify.
+            # A new score with the SAME verdict updates the link quietly.
+            new_result = "Passed" if passed else "Failed"
+            announce = link.completed_at is None or (link.result or "") != new_result
+
             link.interview_record_id = str(record.get("id") or "") or link.interview_record_id
             link.overall_score_percent = pct
-            link.result = "Passed" if passed else "Failed"
+            link.result = new_result
             link.completed_at = datetime.now(timezone.utc)
 
             if link.resume_id:
@@ -453,24 +468,35 @@ def sync_completed_interview(record: dict) -> bool:
                             "VALUES (:p, :s, :r)"
                         ), {"p": link.profile_id, "s": skill.id, "r": rating})
 
-            if link.scheduled_by:
+            if link.scheduled_by and announce:
                 log_activity(
                     db, CandidateProfileActivityLog, "profile_id", link.profile_id, link.scheduled_by,
                     "AI_INTERVIEW_COMPLETED",
                     f"AI L1 interview completed — score {pct if pct is not None else 'n/a'}% "
                     f"({'Passed' if passed else 'Failed'}, threshold {threshold}%)",
                 )
+            if not announce:
+                db.commit()
+                return True
             candidate = db.get(Candidate, link.candidate_id)
             cname = f"{candidate.first_name} {candidate.last_name or ''}".strip() if candidate else f"#{link.candidate_id}"
-            notify_role(
-                db, "TA",
+            # The TA mail goes to the TAs who WORK this candidate (the owner and
+            # whoever sent them for screening), not the whole TA team — and not
+            # to anyone who also screens: they get the "review" mail below,
+            # which says the same thing and what to do next.
+            screeners = _screeners(db) if link.profile_id else set()
+            ta_ids = [u for u in _candidate_tas(db, link.profile_id) if u not in screeners]
+            notify_roles(
+                db, [] if ta_ids else ["TA"],
                 f"AI interview completed: {cname}",
-                f"Score {pct if pct is not None else 'n/a'}% — {'Passed' if passed else 'Failed'}",
+                f"Score {pct if pct is not None else 'n/a'}% — {new_result}",
                 # Deep-link straight to the AI Interview tab — the score and the
                 # report are there, and landing on Overview makes the reader hunt
                 # for the thing the notification is about.
-                f"/admin?view=crm&p=profiles/{link.profile_id}&tab=ai",
+                f"/admin/?view=crm&p=profiles/{link.profile_id}&tab=ai",
                 event="ai_interview.completed",
+                user_ids=ta_ids,
+                dedupe_prefix=f"ai_done:{link.id}:{new_result}",
             )
 
             # PASSED L1 → hand off to RMG: auto-advance the profile to RMG_Review
@@ -502,9 +528,25 @@ def sync_completed_interview(record: dict) -> bool:
                         f"AI L1 passed — review {cname}",
                         f"Score {pct}%. Review the interview report and decide: "
                         f"request an L2 round or submit to the Sales team.",
-                        _applied_link(db, link.profile_id),
+                        _review_link(link.profile_id),
                         event="ai_interview.passed_review",
+                        # Everyone who screens — a GM is a custom role (28 Sep 2026).
+                        user_ids=screeners,
+                        dedupe_prefix=f"ai_review:{link.id}:Passed",
                     )
+            elif link.profile_id:
+                # FAILED L1 → the screeners still decide (28 Sep 2026): reject, or
+                # take a manual L1 when the AI read looks wrong.
+                notify_role(
+                    db, "RMG",
+                    f"AI L1 not cleared — decide on {cname}",
+                    f"Score {pct if pct is not None else 'n/a'}% (threshold {threshold}%). Review the "
+                    "report, then reject the candidate or take a manual L1 instead.",
+                    _review_link(link.profile_id),
+                    event="ai_interview.failed_review",
+                    user_ids=screeners,
+                    dedupe_prefix=f"ai_review:{link.id}:Failed",
+                )
             db.commit()
             return True
         finally:
@@ -512,6 +554,25 @@ def sync_completed_interview(record: dict) -> bool:
     except Exception as exc:  # pragma: no cover — must never break the interview flow
         logger.error("CRM interview sync failed: %s", exc)
         return False
+
+
+def _candidate_tas(db: Session, profile_id) -> list[int]:
+    """The TA owner + the TA who sent the candidate for screening (never raises)."""
+    if not profile_id:
+        return []
+    try:
+        from services.candidate_profiles import ta_user_ids
+        profile = db.get(CandidateProfile, profile_id)
+        return ta_user_ids(db, profile) if profile is not None else []
+    except Exception:
+        return []
+
+
+def _screeners(db: Session) -> set[int]:
+    """Everyone who may screen (RMG · GM · template approvers) — local import:
+    candidate_profiles imports this module's neighbours at load time."""
+    from services.candidate_profiles import screening_notify_user_ids
+    return screening_notify_user_ids(db)
 
 
 def sync_hr_decision(*, decision: str | None, decided_by: str | None = None,

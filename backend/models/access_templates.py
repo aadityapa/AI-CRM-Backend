@@ -31,5 +31,9 @@ class AccessTemplate(Base, TimestampMixin):
     tab_access = sa.Column(sa.JSON, nullable=True)
     # { tab_key: { field_key: "view" | "edit" } }
     field_access = sa.Column(sa.JSON, nullable=True)
+    # ["timesheet.approve", ...] — the APPROVAL buttons this template grants
+    # (25 Sep 2026, `services.action_permissions.APPROVAL_ACTIONS`). NULL = not
+    # configured: the action's role list decides, exactly as before.
+    action_access = sa.Column(sa.JSON, nullable=True)
 
     department = relationship("Department")

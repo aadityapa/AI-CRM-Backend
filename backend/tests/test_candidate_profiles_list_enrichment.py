@@ -156,3 +156,28 @@ def test_list_profiles_search_by_email(env):
     r2 = env.get("/api/candidate-profiles?search=nobody-here")
     assert r2.status_code == 200
     assert r2.json()["data"] == []
+
+
+def test_latest_change_sorts_first(env):
+    """29 Sep 2026 user ask: "latest change first on top". A candidacy that
+    something just happened to (an activity row) outranks a newer but untouched
+    one when sorting by last_activity."""
+    from datetime import datetime, timedelta, timezone
+    from models.profiles import CandidateProfileActivityLog
+    s = env._session
+    cand = Candidate(first_name="Ravi", last_name="K", email="ravi@example.com")
+    s.add(cand); s.flush()
+    newer = CandidateProfile(candidate_id=cand.id, opportunity_id=env._opp_id,
+                             pipeline_status=PipelineStatus.SOURCING)
+    s.add(newer); s.flush()
+    s.add(CandidateProfileActivityLog(
+        profile_id=env._profile_id, user_id=1, action_type="STATUS_CHANGE",
+        comment="moved", timestamp=datetime.now(timezone.utc) + timedelta(hours=1)))
+    s.commit()
+    env._roles["roles"] = {"Sales"}
+    r = env.get("/api/candidate-profiles?sort=last_activity:desc")
+    assert r.status_code == 200, r.text
+    ids = [row["id"] for row in r.json()["data"]]
+    assert ids[0] == env._profile_id
+    from routers.crm.table_preferences import TABLE_REGISTRY
+    assert "last_activity" in TABLE_REGISTRY["candidate_profiles"]["sortable"]

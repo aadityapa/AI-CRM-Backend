@@ -46,6 +46,12 @@ def _iso(value):
     return value.isoformat() if value else None
 
 
+def _val(value):
+    """Enum -> its stored string, anything else untouched. Mirrors the helper
+    every other serializer in the CRM uses."""
+    return getattr(value, "value", value)
+
+
 def full_name(emp: Employee) -> str:
     return " ".join(part for part in (emp.first_name, emp.last_name) if part)
 
@@ -238,6 +244,13 @@ def serialize_employee(emp: Employee, db: Session | None = None, detail: bool = 
         data["notice_period_days"] = emp.notice_period_days
         data["last_working_day"] = _iso(emp.last_working_day)
         data["candidate_profile_id"] = emp.candidate_profile_id
+        # Synced from the candidate profile at Joined (0105) — HR captured
+        # these in the Workflow section and they had nowhere to live before.
+        data["offer_letter_reference"] = emp.offer_letter_reference
+        data["resignation_certificate_url"] = emp.resignation_certificate_url
+        data["customer_onboarding_date"] = _iso(emp.customer_onboarding_date)
+        data["relocation_applicable"] = emp.relocation_applicable
+        data["updated_at"] = _iso(emp.updated_at)
         data["min_hours_full_day"] = _num(emp.min_hours_full_day)
         data["min_hours_half_day"] = _num(emp.min_hours_half_day)
         data["normal_hours_per_day"] = _num(emp.normal_hours_per_day)
@@ -264,7 +277,16 @@ def serialize_leave_balance(row: EmployeeLeaveBalance, leave_type_name: str | No
     }
 
 
-def serialize_project_history(row: EmployeeProjectHistory, project_name: str | None = None) -> dict:
+def serialize_project_history(row: EmployeeProjectHistory, project_name: str | None = None,
+                              context: dict | None = None) -> dict:
+    """One row of "where has this person worked".
+
+    `context` carries the deal the placement came from — customer, opportunity,
+    headcount, rate — resolved in ONE batched pass by `project_history_context`
+    rather than per row. Without it the tab showed a project name and two dates,
+    which does not answer "what was this placement for?" (22 Sep 2026).
+    """
+    ctx = context or {}
     return {
         "id": row.id,
         "employee_id": row.employee_id,
@@ -272,8 +294,76 @@ def serialize_project_history(row: EmployeeProjectHistory, project_name: str | N
         "project_name": project_name,
         "start_date": _iso(row.start_date),
         "end_date": _iso(row.end_date),
+        # The designation they held ON that project, captured at assignment —
+        # NOT their current one, which may have changed since.
         "role": row.role,
+        "is_current": row.end_date is None,
+        **ctx,
     }
+
+
+def project_history_context(db: Session, rows: list[EmployeeProjectHistory],
+                            employee_id: int) -> dict[int, dict]:
+    """{project_id: deal context} for a whole history list in THREE queries.
+
+    Batched deliberately: a per-row lookup here would be an N+1 on a page that
+    renders every placement a long-serving employee has ever had.
+    """
+    from models import Customer, Opportunity, ProjectEmployee, Requirement
+
+    project_ids = {r.project_id for r in rows if r.project_id}
+    if not project_ids:
+        return {}
+
+    projects = db.execute(
+        select(Project.id, Project.name, Project.customer_id, Project.opportunity_id,
+               Customer.name)
+        .outerjoin(Customer, Customer.id == Project.customer_id)
+        .where(Project.id.in_(project_ids))
+    ).all()
+
+    opp_ids = {p[3] for p in projects if p[3]}
+    opps: dict[int, tuple] = {}
+    if opp_ids:
+        opps = {
+            o[0]: o for o in db.execute(
+                select(Opportunity.id, Opportunity.opp_id, Opportunity.title,
+                       Requirement.no_of_positions, Requirement.status)
+                .outerjoin(Requirement, Requirement.opportunity_id == Opportunity.id)
+                .where(Opportunity.id.in_(opp_ids))
+            ).all()
+        }
+
+    # The assignment that produced the placement carries the commercials.
+    pes = {
+        pe[0]: pe for pe in db.execute(
+            select(ProjectEmployee.project_id, ProjectEmployee.billing_rate,
+                   ProjectEmployee.billing_unit, ProjectEmployee.onboarding_date,
+                   ProjectEmployee.exit_date, ProjectEmployee.is_exit)
+            .where(ProjectEmployee.project_id.in_(project_ids),
+                   ProjectEmployee.employee_id == employee_id)
+        ).all()
+    }
+
+    out: dict[int, dict] = {}
+    for pid, pname, _cust_id, opp_id, cust_name in projects:
+        opp = opps.get(opp_id)
+        pe = pes.get(pid)
+        out[pid] = {
+            "customer_name": cust_name,
+            "opportunity_id": opp_id,
+            "opportunity_opp_id": opp[1] if opp else None,
+            "opportunity_title": opp[2] if opp else None,
+            # What the deal was sourcing for, so the placement reads in context.
+            "positions_total": opp[3] if opp else None,
+            "requirement_status": _val(opp[4]) if opp else None,
+            "billing_rate": _num(pe[1]) if pe else None,
+            "billing_unit": _val(pe[2]) if pe else None,
+            "onboarding_date": _iso(pe[3]) if pe else None,
+            "exit_date": _iso(pe[4]) if pe else None,
+            "has_exited": bool(pe[5]) if pe else None,
+        }
+    return out
 
 
 def serialize_education(row: EmployeeEducation) -> dict:

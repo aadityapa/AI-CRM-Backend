@@ -210,6 +210,9 @@ def candidate_profiles_report(db: Session, team: str | None = None,
             CandidateProfile.expected_ctc,
             CandidateProfile.hike_percent,
             CandidateProfile.created_at,
+            CandidateProfile.id,
+            CandidateProfile.rmg_screening_status,
+            CandidateProfile.withdrawn_from_status,
         )
         .join(Candidate, Candidate.id == CandidateProfile.candidate_id)
         .join(Opportunity, Opportunity.id == CandidateProfile.opportunity_id)
@@ -225,18 +228,21 @@ def candidate_profiles_report(db: Session, team: str | None = None,
         )
 
     rows = db.execute(stmt).all()
+    # The same status words the Candidate Profiles list shows.
+    from services.candidate_status import statuses_for
+    statuses = statuses_for(db, rows)
     return [
         {
-            "candidate_name": " ".join(part for part in (first_name, last_name) if part),
-            "opportunity": opp_title,
-            "pipeline_status": _ev(pipeline_status),
-            "current_ctc": _fnum(current_ctc),
-            "expected_ctc": _fnum(expected_ctc),
-            "hike_percent": _fnum(hike_percent),
-            "created_at": _iso(created_at),
+            "candidate_name": " ".join(part for part in (row.first_name, row.last_name) if part),
+            "opportunity": row.title,
+            "pipeline_status": _ev(row.pipeline_status),
+            "candidate_status": statuses.get(row.id),
+            "current_ctc": _fnum(row.current_ctc),
+            "expected_ctc": _fnum(row.expected_ctc),
+            "hike_percent": _fnum(row.hike_percent),
+            "created_at": _iso(row.created_at),
         }
-        for (first_name, last_name, opp_title, pipeline_status,
-             current_ctc, expected_ctc, hike_percent, created_at) in rows
+        for row in rows
     ]
 
 

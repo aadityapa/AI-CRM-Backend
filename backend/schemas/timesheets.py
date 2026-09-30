@@ -36,6 +36,11 @@ class GenerateInvoiceIn(BaseModel):
     #: line and the amount becomes qty × rate. None = computed values.
     quantity: float | None = Field(default=None, gt=0)
     rate_per_unit: float | None = Field(default=None, gt=0)
+    #: Client-specific column choice the GM confirmed for this Proforma
+    #: (23 Sep 2026): {"sac": bool, "leave": bool, "per_day": bool}. Frozen on
+    #: the document AND saved to the customer's billing policy for next time.
+    #: None = the customer's saved format (or every column).
+    invoice_format: dict[str, bool] | None = None
 
 
 class TimesheetEntryIn(BaseModel):
