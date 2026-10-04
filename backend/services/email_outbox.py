@@ -210,6 +210,9 @@ NEVER_COLLAPSE_EVENTS = frozenset({
     "support.ticket_replied", "candidate.direct_message", "candidate.ai_invite",
     "candidate.slot_invite", "candidate.round_invite", "candidate.interview_link",
     "candidate.hiring_interest", "candidate.round_scheduled",
+    # Deduped per candidacy by its own key; two openings with the same title
+    # are two different mails.
+    "candidate.opening_interest",
 })
 
 

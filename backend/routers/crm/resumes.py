@@ -15,7 +15,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, gated_write,
+    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, gated_write, screener_or,
 )
 from models import (
     AiInterviewStatus, AtsStatus, Candidate, CandidateProfile,
@@ -287,12 +287,17 @@ def _bulk_jobs_get(job_id: str) -> dict | None:
 
 
 def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
-                      user_name: str, files: list[tuple[str, str, bytes]]) -> None:
+                      user_name: str, files: list[tuple[str, str, bytes]],
+                      user_email: str = "", send_opening_email: bool = True) -> None:
     """The worker. Own DB session (we are on a thread, not in a request).
 
     Progress is written to the job store after every file so the UI can show
     "23 / 50". Every terminal path sets status done/error — a job must never
     hang in "running" forever.
+
+    `send_opening_email` (1 Oct 2026, user ask): every applied candidate with a
+    real address gets the "we have an opening — are you interested?" mail
+    (`services/opening_interest`); replies reach the TA's mailbox.
     """
     import hashlib
     import uuid as _uuid
@@ -303,6 +308,9 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
     from services.resume_parse import (
         duplicate_summary, find_duplicate_candidate, find_name_match,
         name_match_summary, parse_resume_bytes,
+    )
+    from services.opening_interest import (
+        mailable_email, opening_facts, send_opening_mail, sender_for,
     )
     from services.resumes import run_ats_scan
     from services.slot_booking import (
@@ -319,9 +327,20 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
         if req is None:
             _bulk_jobs_put(job_id, {"status": "error", "error": "Requirement not found"})
             return
-        ta_user = SimpleNamespace(id=user_id, full_name=user_name, username=user_name)
+        ta_user = SimpleNamespace(id=user_id, full_name=user_name, username=user_name,
+                                  email=user_email)
         target_dir = CRM_UPLOAD_DIR / "resumes"
         target_dir.mkdir(parents=True, exist_ok=True)
+        # The opening mail's facts and signature are the same for every file.
+        mail_facts = mail_sender = None
+        if send_opening_email:
+            try:
+                with db.begin_nested():
+                    mail_facts = opening_facts(db, req)
+                mail_sender = sender_for(db, ta_user)
+            except Exception:
+                logger.warning("bulk zip: opening-mail setup failed", exc_info=True)
+                send_opening_email = False
 
         for i, (short, ext, data) in enumerate(files):
             _bulk_jobs_put(job_id, {"done": i, "current": short})
@@ -411,8 +430,22 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
                         profile = ensure_sourcing_profile(db, resume, req, ta_user=ta_user)
                         if name_note and name_note.get("candidate_id") == cand.id:
                             name_note = None  # matched by name and REUSED — not a second record
+                        mail = {"status": "off", "email": mailable_email(resume.email)
+                                or mailable_email(cand.email) or None}
+                        if send_opening_email and profile is not None:
+                            # Own savepoint: a mail problem never costs the CV.
+                            try:
+                                with db.begin_nested():
+                                    mail = send_opening_mail(
+                                        db, profile, cand, req, ta_user, facts=mail_facts,
+                                        sender=mail_sender, to_email=resume.email)
+                            except Exception:
+                                logger.warning("bulk zip: opening mail for %s failed", short, exc_info=True)
+                                mail = {"status": "not_sent", "email": mail["email"]}
                         applied.append({"file": short, "resume_id": resume.id,
                                         "candidate_id": cand.id, "name": name,
+                                        "email": mail.get("email"),
+                                        "opening_mail": mail.get("status"),
                                         "ats_score": ats_score,
                                         "name_match": name_note,
                                         "profile_id": getattr(profile, "id", None)})
@@ -434,6 +467,12 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
         db.commit()
 
         parts = [f"{len(applied)} applied"]
+        mailed = sum(1 for a in applied if a.get("opening_mail") == "sent")
+        no_email = sum(1 for a in applied if a.get("opening_mail") == "no_email")
+        if send_opening_email and applied:
+            parts.append(f"{mailed} opening email(s) sent")
+            if no_email:
+                parts.append(f"{no_email} without a usable email")
         if held:
             parts.append(f"{len(held)} possible duplicate(s) held for review")
         if skipped:
@@ -444,7 +483,9 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
             "status": "done", "done": len(files), "current": None,
             "message": ", ".join(parts),
             "result": {"applied": applied, "held": held, "skipped": skipped,
-                       "failed": failed, "total": len(files)},
+                       "failed": failed, "total": len(files),
+                       "opening_mail": {"enabled": send_opening_email, "sent": mailed,
+                                        "no_email": no_email}},
         })
     except Exception:
         logger.exception("bulk zip job %s crashed", job_id)
@@ -459,6 +500,9 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
 def bulk_zip_upload(
     requirement_id: int,
     file: UploadFile = File(...),
+    #: Email every applied candidate about the opening (1 Oct 2026; the upload
+    #: dialog's checkbox, on by default).
+    send_opening_email: bool = Form(True),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA")),
 ):
@@ -520,7 +564,8 @@ def bulk_zip_upload(
     })
     threading.Thread(
         target=_run_bulk_zip_job,
-        args=(job_id, req.id, user.id, user.full_name or user.username, files),
+        args=(job_id, req.id, user.id, user.full_name or user.username, files,
+              user.email or "", send_opening_email),
         daemon=True,
         name=f"bulk-zip-{job_id[:8]}",
     ).start()
@@ -868,7 +913,7 @@ def dismiss_held_duplicate(
 def reparse_resume(
     resume_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG", "Sales_Head")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG", "Sales_Head"))),
 ):
     """Fresh AI read of the stored resume file (28 Aug 2026, user request):
     bypasses the parse cache (which may predate newer PARSE_FIELDS and hold a
@@ -929,7 +974,7 @@ def reparse_resume(
 def resume_review(
     resume_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG", "Sales_Head")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG", "Sales_Head"))),
 ):
     """Side-by-side verify payload (28 Aug 2026, user request): after a bulk
     ZIP upload the TA steps through each applied resume — the FILE on one
@@ -967,7 +1012,7 @@ def list_resumes(
     bucket: str = LIVE_BUCKET,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG", "Sales_Head")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG", "Sales_Head"))),
 ):
     req = get_requirement_or_404(db, requirement_id)
     if bucket not in (LIVE_BUCKET, ARCHIVE_BUCKET):
@@ -1098,7 +1143,9 @@ def list_resumes(
     # with no buttons at all.
     from services.resumes import manual_round_state
     rounds = manual_round_state(db, [p[1] for p in prof.values() if p[1]])
+    avail = availability_by_candidate(db, cand_ids)
     for row, item in zip(data, items):
+        _with_availability(row, avail.get(item.candidate_id) if item.candidate_id else None)
         owner, pid, screening, stage, budget, expected = (
             prof.get(item.candidate_id, (None,) * 6)
             if item.candidate_id else (None,) * 6)
@@ -1131,7 +1178,15 @@ def list_resumes(
     # Manual Archive (30 Sep 2026): a closed candidacy offers RMG / GM an
     # Archive button (`archivable`); an archived one offers Restore.
     from services.candidate_profiles import REJECTED_BUCKET as _CLOSED
+    from services.candidate_status import closing_notes
     archived_set = set(archived_ids)
+    # Why a closed candidacy was closed, by whom (1 Oct 2026, user ask) —
+    # printed on the Rejected rows; ONE query for the page's closed profiles.
+    notes = closing_notes(db, [r.get("profile_id") for r in page_rows
+                               if r.get("profile_pipeline_status") in _CLOSED])
+    # The opening email and the candidate's answer (1 Oct 2026) — ONE query.
+    from services.opening_interest import opening_states
+    opening = opening_states(db, [r.get("profile_id") for r in page_rows])
     for row in page_rows:
         row.update(waiting_since(activity.get(row.get("candidate_id")),
                                  row.get("received_date") or row.get("created_at")))
@@ -1139,6 +1194,8 @@ def list_resumes(
         stage = row.get("profile_pipeline_status")
         row["archived"] = bool(pid and pid in archived_set)
         row["archivable"] = bool(pid and stage in _CLOSED and not row["archived"])
+        row["closed_note"] = notes.get(pid) if pid and stage in _CLOSED else None
+        row["opening_mail"] = opening.get(pid) if pid else None
     return envelope(page_rows, meta=meta)
 
 
@@ -1361,9 +1418,47 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
             **budget_fit(_first_set(profile.expected_ctc, cand.expected_ctc), req.budget_ctc_max),
             "received_date": profile.applied_on.isoformat() if profile.applied_on else None,
             "created_at": profile.created_at.isoformat() if profile.created_at else None,
+            "notice_period": (cand.notice_period or "").strip() or None,
+            "resignation_status": bool(cand.resignation_status),
+            "last_working_day": cand.last_working_day.isoformat() if cand.last_working_day else None,
             **ai_by_profile.get(profile.id, {}),
         })
     return out
+
+
+def availability_by_candidate(db: Session, candidate_ids) -> dict[int, dict]:
+    """Notice period · resignation · last working day per candidate — ONE query
+    (1 Oct 2026, user ask: "under Opportunities show notice period / last
+    working day"). The notice period on an Applied Candidates row prefers what
+    the TA typed on THIS application (`application_details.notice_period`);
+    this is the candidate-record fallback and the only home of the last day.
+    """
+    ids = [int(c) for c in set(candidate_ids or ()) if c]
+    if not ids:
+        return {}
+    out: dict[int, dict] = {}
+    for cid, notice, resigned, last_day in db.execute(
+        select(Candidate.id, Candidate.notice_period, Candidate.resignation_status,
+               Candidate.last_working_day)
+        .where(Candidate.id.in_(ids))
+    ).all():
+        out[int(cid)] = {
+            "notice_period": (notice or "").strip() or None,
+            "resignation_status": bool(resigned),
+            "last_working_day": last_day.isoformat() if last_day else None,
+        }
+    return out
+
+
+def _with_availability(row: dict, avail: dict | None) -> None:
+    """Fill the three availability keys on a row; an application's own notice
+    period wins over the candidate record's."""
+    avail = avail or {}
+    details = row.get("application_details") or {}
+    typed = (details.get("notice_period") or "").strip() if isinstance(details, dict) else ""
+    row["notice_period"] = typed or avail.get("notice_period")
+    row["resignation_status"] = avail.get("resignation_status", False)
+    row["last_working_day"] = avail.get("last_working_day")
 
 
 def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]:
@@ -1508,6 +1603,13 @@ def update_resume(
             detail_changed = True
     if detail_changed:
         resume.application_details = details or None
+    # A location TA edits here is the candidate's (1 Oct 2026): the profile's
+    # Locations section reads the candidate record, not the resume.
+    loc_keys = tuple(k for k in ("current_location", "preferred_location") if k in changes)
+    if loc_keys and resume.candidate_id:
+        from services.slot_booking import copy_locations_to_candidate
+        copy_locations_to_candidate(db.get(Candidate, resume.candidate_id), details,
+                                    overwrite=True, keys=loc_keys)
     log_activity(db, RequirementActivityLog, "requirement_id", resume.requirement_id, user.id,
                  "RESUME_UPDATED", f"Resume details updated for {resume.candidate_name}")
     db.commit()
@@ -1551,7 +1653,7 @@ def ats_scan(
     db: Session = Depends(get_crm_db),
     # RMG runs the same deterministic scan while screening (25 Aug 2026): the
     # score is shared — what differs between the roles is the decision.
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG"))),
 ):
     resume = _get_resume_or_404(db, resume_id)
     req = get_requirement_or_404(db, resume.requirement_id)
@@ -1586,7 +1688,7 @@ def ats_scan_profile(
     profile_id: int,
     requirement_id: int | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG"))),
 ):
     """ATS-scan a profile-only applicant against a requirement (TA or RMG).
 
@@ -1609,7 +1711,7 @@ def ats_scan_profile(
 def scan_all_resumes(
     requirement_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG"))),
 ):
     req = get_requirement_or_404(db, requirement_id)
     pending = db.execute(
@@ -1746,7 +1848,7 @@ def schedule_ai_interview(
     body: ScheduleAiInterviewIn | None = None,
     db: Session = Depends(get_crm_db),
     # RMG added 2 Sep 2026 — RMG picks the route (AI vs manual L1) from the row.
-    user: CurrentUser = Depends(gated_write("requirements", "TA", "RMG")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG"))),
 ):
     resume = _get_resume_or_404(db, resume_id)
     req = get_requirement_or_404(db, resume.requirement_id)

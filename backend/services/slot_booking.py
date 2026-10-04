@@ -159,6 +159,40 @@ def remind_missing_location(db: Session, profile: CandidateProfile | None, user_
         return []
 
 
+#: Upload / Edit applicant form key → the candidate field the profile's
+#: Locations section reads (Candidate Location · Candidate Preferred Location).
+LOCATION_FIELDS = (("current_location", "city", 120),
+                   ("preferred_location", "preferred_locations", 500))
+
+
+def copy_locations_to_candidate(candidate, details: dict, *, overwrite: bool = False,
+                                keys: tuple | None = None) -> list[str]:
+    """Write the form's locations onto the CANDIDATE record (1 Oct 2026, user
+    report: TA typed the Preferred Location on the upload form, yet the profile
+    said "Candidate Preferred Location — missing"). The form kept it on the
+    resume's `application_details` only, and the profile, the Submit-to-Sales
+    checklist and the missing-location reminder all read the candidate.
+
+    An upload fills EMPTY fields only (a known candidate's data is never
+    overwritten by a new CV); an explicit edit (`overwrite=True`, restricted to
+    the `keys` TA changed) replaces them. Returns the candidate fields written."""
+    if candidate is None:
+        return []
+    written = []
+    for key, field, cap in LOCATION_FIELDS:
+        if keys is not None and key not in keys:
+            continue
+        value = (str((details or {}).get(key) or "")).strip()
+        if not value:
+            continue
+        current = (getattr(candidate, field, None) or "").strip()
+        if current and (not overwrite or current == value[:cap]):
+            continue
+        setattr(candidate, field, value[:cap])
+        written.append(field)
+    return written
+
+
 def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candidate:
     """Match an existing Candidate by email (or full name when no email),
     else create one. candidates.email is NOT NULL + unique, so a placeholder
@@ -191,10 +225,8 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
             candidate.phone = resume.phone
         if not candidate.cv_url and resume.resume_file_url:
             candidate.cv_url = resume.resume_file_url
-    # Current location (29 Sep 2026 upload form) fills an EMPTY city only.
-    where = ((resume.application_details or {}).get("current_location") or "").strip()
-    if where and not (getattr(candidate, "city", None) or "").strip():
-        candidate.city = where[:120]
+    # Current + preferred location from the upload form fill EMPTY fields only.
+    copy_locations_to_candidate(candidate, resume.application_details or {})
     # Carry the applicant's self-reported details (experience, education, domain,
     # skills, CTC) from the apply form into the candidate profile so every role
     # sees them. Fills only empty fields; best-effort.

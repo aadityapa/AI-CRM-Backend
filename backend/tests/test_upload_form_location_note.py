@@ -115,3 +115,35 @@ def test_the_edit_applicant_dialog_can_change_the_current_location():
     from routers.crm.resumes import ResumeUpdateIn, _DETAIL_KEYS
     assert "current_location" in _DETAIL_KEYS
     assert ResumeUpdateIn(current_location="Pune").current_location == "Pune"
+
+
+def test_preferred_location_reaches_the_candidate_record(db):
+    """1 Oct 2026: TA typed the Preferred location on the upload form and the
+    profile still said "missing" — it stayed on the resume. An upload fills a
+    BLANK candidate field; a later CV never overwrites one on record."""
+    fresh = Resume(candidate_name="Ravi K", email="ravi@mail.com",
+                   application_details={"current_location": "Pune",
+                                        "preferred_location": "Chennai, Pune"})
+    cand = sb.find_or_create_candidate_from_resume(db, fresh)
+    assert (cand.city, cand.preferred_locations) == ("Pune", "Chennai, Pune")
+    again = Resume(candidate_name="Ravi K", email="ravi@mail.com",
+                   application_details={"preferred_location": "Bangalore"})
+    assert sb.find_or_create_candidate_from_resume(db, again).preferred_locations == "Chennai, Pune"
+    assert sb.missing_locations(cand) == []
+
+
+def test_an_edit_overwrites_only_the_locations_ta_changed():
+    from types import SimpleNamespace
+    cand = SimpleNamespace(city="Pune", preferred_locations="Chennai")
+    written = sb.copy_locations_to_candidate(
+        cand, {"current_location": "Mumbai", "preferred_location": "Hyderabad"},
+        overwrite=True, keys=("preferred_location",))
+    assert written == ["preferred_locations"]
+    assert (cand.city, cand.preferred_locations) == ("Pune", "Hyderabad")
+    assert sb.copy_locations_to_candidate(cand, {"preferred_location": ""}, overwrite=True) == []
+
+
+def test_the_edit_route_copies_locations_to_the_candidate():
+    src = (BACKEND / "routers" / "crm" / "resumes.py").read_text(encoding="utf-8")
+    body = src.split('@router.put("/api/resumes/{resume_id}")', 1)[1].split("@router.", 1)[0]
+    assert "copy_locations_to_candidate(" in body and "overwrite=True" in body

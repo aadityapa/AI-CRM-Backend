@@ -364,6 +364,10 @@ def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
     counts = live["meta"]["status_counts"]
     assert counts["live_total"] == 2 and counts["archive_total"] == 1
     assert counts["archive"] == {"rmg_rejected": 1}
+    # The stage chips (1 Oct 2026) read per bucket too: the live list holds one
+    # screening candidate and one closed (withdrawn) one; the archive one closed.
+    assert counts["phases"]["live"] == {"technical_screening": 1, "closed": 1}
+    assert counts["phases"]["archive"] == {"closed": 1}
 
     assert set_applied_archive(db, gone, False, rmg) is True
     db.commit()

@@ -144,6 +144,30 @@ class RequirementActivityLog(Base):
     requirement = relationship("Requirement", back_populates="activity_log")
 
 
+class RequirementTaAssignment(Base):
+    """A TA assigned to source a position (1 Oct 2026, user ask: "RMG / GM can
+    assign a position to multiple TAs").
+
+    One row per (requirement, TA login); several TAs per requirement. RMG / GM
+    (whoever screens as RMG) or the Sales Head writes the list, the TA hears
+    about it, and the TA's Opportunities page can filter to "assigned to me".
+    It is an assignment, NOT a visibility rule: every TA still sees every
+    sourcing requirement — the list says who is EXPECTED to work it.
+    """
+
+    __tablename__ = "requirement_ta_assignments"
+    id = sa.Column(sa.Integer, primary_key=True)
+    requirement_id = sa.Column(sa.Integer, sa.ForeignKey("requirements.id", ondelete="CASCADE"),
+                               nullable=False, index=True)
+    user_id = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=False, index=True)
+    user_name = sa.Column(sa.String(255), nullable=True)
+    assigned_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    assigned_by_name = sa.Column(sa.String(255), nullable=True)
+    assigned_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    note = sa.Column(sa.Text, nullable=True)
+    __table_args__ = (sa.UniqueConstraint("requirement_id", "user_id", name="uq_req_ta_assignment"),)
+
+
 class RequirementPositionRequest(Base):
     """A requested change to a requirement's headcount (21 Sep 2026, user flow).
 

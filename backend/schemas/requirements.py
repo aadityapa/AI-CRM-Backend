@@ -114,6 +114,9 @@ class EngineeringApproveIn(BaseModel):
     skills: list[RequirementSkillIn] | None = None
     # Optional per-requirement ATS component weights (null = leave unchanged).
     ats_weights: dict | None = None
+    # TAs to source the position (1 Oct 2026): assigned in the same click as the
+    # approval. None = leave the team untouched; a list REPLACES it.
+    ta_user_ids: list[int] | None = None
 
     _ats = field_validator("ats_weights")(_validate_ats_weights)
 

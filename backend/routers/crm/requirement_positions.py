@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, gated_read, gated_write_action, get_crm_db
+from crm_deps import CurrentUser, gated_read, gated_write_action, get_crm_db, screener_or
 from models import (
     Customer, Opportunity, Requirement, RequirementActivityLog, RequirementPositionRequest,
     RequirementStatus,
@@ -56,7 +56,9 @@ from services.requirements import (
 
 router = APIRouter(prefix="/api/requirements", tags=["CRM: Requirement positions"])
 
-POS_READ = gated_read("requirements", "TA", "RMG", "Sales", "Sales_Head")
+#: A screener (RMG by role, GM by approval) reads positions even when the
+#: custom role / template never granted the `requirements` tab (1 Oct 2026).
+POS_READ = screener_or(gated_read("requirements", "TA", "RMG", "Sales", "Sales_Head"))
 #: Who may ASK for a change — Sales owns the customer conversation.
 POS_REQUEST = gated_write_action("requirement.positions.request", "requirements", "Sales", "Sales_Head")
 #: Who may APPROVE — RMG only by default; Admin/CEO always (user decision,

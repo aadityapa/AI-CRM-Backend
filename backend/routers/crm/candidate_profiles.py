@@ -1065,7 +1065,8 @@ def rmg_screening_decision(
 
 
 class TaDecisionIn(BaseModel):
-    decision: str = Field(pattern="^(screen|hold|release|reject|withdraw)$")
+    decision: str = Field(
+        pattern="^(screen|hold|release|reject|withdraw|reapply|interested|not_interested)$")
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -1074,12 +1075,49 @@ def ta_decision(profile_id: int, payload: TaDecisionIn,
                 db: Session = Depends(get_crm_db),
                 user: CurrentUser = Depends(gated_write("profiles", "TA"))):
     """TA's buttons on an Applied Candidates row: Technical Screening · Hold ·
-    Release · Reject · Self Withdraw (`services/candidate_profiles.ta_decision`)."""
+    Release · Reject · Self Withdraw · Re-apply (`services/candidate_profiles.ta_decision`)."""
     profile = get_profile_or_404(db, profile_id)
     message = apply_ta_decision(db, profile, payload.decision, payload.note, user)
     db.commit()
     db.refresh(profile)
     return envelope(data=profile_to_dict(profile), message=message)
+
+
+class OpeningEmailIn(BaseModel):
+    resend: bool = False
+
+
+@router.post("/{profile_id}/opening-email")
+def send_opening_email(profile_id: int, payload: OpeningEmailIn,
+                       db: Session = Depends(get_crm_db),
+                       user: CurrentUser = Depends(gated_write("profiles", "TA"))):
+    """Send (or re-send) the "we have an opening — are you interested?" email
+    for one candidacy (1 Oct 2026). A bulk upload sends it on its own; this is
+    for a single upload, a held duplicate applied later, or after TA corrected
+    a wrong address. Closed candidacies and unusable addresses are refused."""
+    from services.opening_interest import send_opening_mail
+
+    profile = get_profile_or_404(db, profile_id)
+    stage = getattr(profile.pipeline_status, "value", profile.pipeline_status)
+    if stage in REJECTED_BUCKET:
+        raise HTTPException(status_code=409, detail="This candidacy is closed — re-apply it first.")
+    req = db.execute(select(Requirement).where(
+        Requirement.opportunity_id == profile.opportunity_id
+    ).order_by(Requirement.id.desc()).limit(1)).scalar_one_or_none()
+    if req is None:
+        raise HTTPException(status_code=409, detail="This opportunity has no position to describe yet.")
+    cand = db.get(Candidate, profile.candidate_id)
+    res = send_opening_mail(db, profile, cand, req, user, resend=payload.resend)
+    if res["status"] == "no_email":
+        raise HTTPException(status_code=400,
+                            detail="No usable email for this candidate — correct it with Edit, then send.")
+    if res["status"] == "already_sent":
+        raise HTTPException(status_code=409, detail="The opening email was already sent — use Resend.")
+    if res["status"] != "sent":
+        raise HTTPException(status_code=503,
+                            detail="The email could not be queued — email may be switched off in Settings.")
+    db.commit()
+    return envelope(data=res, message=f"Opening email {'re-sent' if payload.resend else 'sent'} to {res['email']}")
 
 
 class RequestAiL1In(BaseModel):

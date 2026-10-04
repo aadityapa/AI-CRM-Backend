@@ -175,6 +175,46 @@ def test_self_withdraw_is_recorded_at_any_live_stage(db):
     assert p.pipeline_status == PS.SELF_WITHDRAWN
 
 
+def test_a_withdrawn_candidate_can_reapply_and_starts_afresh(db):
+    """1 Oct 2026, user ask: after Self Withdrawn, a button to apply to this
+    opportunity again. Only a withdrawal reopens; the candidate lands back at
+    Sourcing with TA, the screening cleared, an archive flag lifted."""
+    from services.candidate_profiles import set_applied_archive
+    from services.candidate_status import archived_profile_ids
+    p = _profile(db, PS.RMG_REVIEW, "Shortlisted")
+    ta_decision(db, p, "withdraw", "Took another offer", TA)
+    rmg = CurrentUser(id=1, username="rmg", full_name="Ravi RMG", roles={"RMG"})
+    set_applied_archive(db, p, True, rmg)
+    db.flush()
+    assert p.id in archived_profile_ids(db, [p.id])
+    msg = ta_decision(db, p, "reapply", "Candidate is interested again", TA)
+    assert "Re-applied" in msg
+    assert p.pipeline_status == PS.SOURCING
+    assert p.withdrawn_from_status is None and p.rmg_screening_status is None
+    assert p.id not in archived_profile_ids(db, [p.id])
+    assert _status(db, p)["stage"]["key"] == "sourcing"
+    assert "REAPPLIED" in _actions(db, p)
+    # A rejection is somebody else's decision — re-applying over it needs a
+    # reason (1 Oct 2026, later: "if we want to apply again after a rejection"),
+    # and the rejection's own note is what the Rejected filter prints.
+    from services.candidate_status import closing_notes
+    q = _profile(db)
+    ta_decision(db, q, "reject", "Expected CTC far above budget", TA)
+    note = closing_notes(db, [q.id])[q.id]
+    assert note["status"] == "Rejected" and note["by_id"] == TA.id
+    assert note["reason"] == "Rejected by TA: Expected CTC far above budget"
+    with pytest.raises(HTTPException) as err:
+        ta_decision(db, q, "reapply", "", TA)
+    assert err.value.status_code == 400
+    assert "Re-applied" in ta_decision(db, q, "reapply", "Budget revised by the customer", TA)
+    assert q.pipeline_status == PS.SOURCING
+    assert closing_notes(db, [q.id]) == {}   # reopened — no longer closed
+    # A live candidacy never reopens.
+    with pytest.raises(HTTPException) as err:
+        ta_decision(db, q, "reapply", "again", TA)
+    assert err.value.status_code == 409
+
+
 def test_nothing_else_is_decided_after_the_interview_started(db):
     p = _profile(db, PS.RMG_REVIEW, "Shortlisted")
     for decision in ("hold", "screen", "reject"):

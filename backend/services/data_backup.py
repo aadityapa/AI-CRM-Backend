@@ -80,6 +80,7 @@ DATASETS: tuple[Dataset, ...] = (
             ("opportunities", "opportunity_ctc_slab", "opportunity_skills", "opportunity_attachments",
              "opportunity_activity_log", "requirements", "requirement_skills", "requirement_attachments",
              "requirement_job_postings", "requirement_activity_log", "requirement_position_requests",
+             "requirement_ta_assignments",
              "interview_slots", "slot_bookings",
              "template_requests")),
     Dataset("candidates", "Candidates",

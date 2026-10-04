@@ -152,9 +152,12 @@ def test_ta_may_write_the_jd_and_the_three_jd_routes_share_one_role_list():
     import routers.crm.requirements as rr
 
     assert "TA" in rr.JD_EDIT_ROLES and "RMG" in rr.JD_EDIT_ROLES
+    src = inspect.getsource(rr)
+    # 2 Oct 2026: the one gate also admits screeners (GM) through `screener_or`.
+    assert 'JD_EDIT_GATE = screener_or(gated_write("requirements", *JD_EDIT_ROLES))' in src
     for fn in (rr.set_requirement_jd_skills, rr.add_requirement_attachment,
                rr.delete_requirement_attachment):
-        assert 'gated_write("requirements", *JD_EDIT_ROLES)' in inspect.getsource(fn), fn.__name__
+        assert "Depends(JD_EDIT_GATE)" in inspect.getsource(fn), fn.__name__
 
 
 def test_an_uploaded_jd_file_fills_a_blank_jd_text_and_is_returned_for_review(db, monkeypatch):
@@ -193,3 +196,26 @@ def test_an_uploaded_jd_file_fills_a_blank_jd_text_and_is_returned_for_review(db
     monkeypatch.setattr("services.resumes.extract_resume_text", boom)
     out3 = rr.add_requirement_attachment(req.id, file=upload("scan.pdf"), kind="rmg_jd", db=db, user=_rmg())
     assert out3["data"]["extracted_text"] is None and out3["data"]["id"]
+
+
+def test_a_customer_jd_added_from_the_card_lands_on_the_opportunity(db, monkeypatch):
+    """2 Oct 2026, user ask: RMG / GM add the missing customer JD from the JD & skills
+    card. It is the OPPORTUNITY's attachment (kind customer_jd) — where the
+    opportunity form puts it and where both pages read the reference JD from."""
+    import io
+
+    from fastapi import UploadFile
+
+    import routers.crm.requirements as rr
+    from models import OpportunityAttachment
+
+    req = _req(db)
+    monkeypatch.setattr(rr, "save_upload_hashed", lambda f, folder: (f"/api/crm-files/{folder}/c.pdf", "sha", 10))
+    out = rr.add_requirement_attachment(
+        req.id, file=UploadFile(filename="customer.pdf", file=io.BytesIO(b"%PDF")), kind="customer_jd",
+        db=db, user=_rmg())
+    assert out["message"] == "Customer JD added" and out["data"]["kind"] == "customer_jd"
+    att = db.query(OpportunityAttachment).one()
+    assert att.opportunity_id == req.opportunity_id and att.kind == "customer_jd"
+    assert att.file_url.startswith("/api/crm-files/opportunity_attachments/")
+    assert db.get(Requirement, req.id).rmg_jd_text is None  # the reference never becomes the RMG JD

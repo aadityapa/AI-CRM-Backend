@@ -130,7 +130,9 @@ def env():
 
 def test_create_stores_opportunity_id(env):
     env._roles["roles"] = {"TA"}
-    # recreate as TA create
+    # The fixture's request is live; a cancelled one no longer blocks a new ask.
+    env._session.get(TemplateRequest, env._tr_id).status = TemplateRequestStatus.CANCELLED
+    env._session.commit()
     r = env.post("/api/template-requests", json={"requirement_id": env._req.id})
     assert r.status_code == 200, r.text
     data = r.json()["data"]
@@ -197,3 +199,21 @@ def test_autosend_defaults_off(monkeypatch):
     assert ai_interview_autosend_enabled() is False
     monkeypatch.setenv("AI_INTERVIEW_AUTOSEND", "true")
     assert ai_interview_autosend_enabled() is True
+
+
+def test_one_live_template_request_per_opportunity(env):
+    """1 Oct 2026: TA pressed Request template repeatedly and RMG got duplicates.
+    While a request is live (Pending RMG / Template ready / Prepared) a second
+    one is refused with the request's number; after a cancel TA may ask again."""
+    env._roles["roles"] = {"TA"}
+    r = env.post("/api/template-requests", json={"requirement_id": env._req.id})
+    assert r.status_code == 409, r.text
+    assert "TR-2026-001" in r.json()["detail"] and "waiting for RMG" in r.json()["detail"]
+    tr = env._session.get(TemplateRequest, env._tr_id)
+    tr.status = TemplateRequestStatus.TEMPLATE_READY
+    env._session.commit()
+    assert env.post("/api/template-requests", json={"requirement_id": env._req.id}).status_code == 409
+    tr.status = TemplateRequestStatus.CANCELLED
+    env._session.commit()
+    assert env.post("/api/template-requests", json={"requirement_id": env._req.id}).status_code == 200
+    assert env.post("/api/template-requests", json={"requirement_id": env._req.id}).status_code == 409

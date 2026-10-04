@@ -342,6 +342,37 @@ def _gate(tab: str, required_mode: str, roles: tuple[str, ...],
     return dep
 
 
+def screener_or(gate):
+    """Admit whoever screens as RMG when `gate` (a `_gate` / `gated_write_action`
+    dependency) refuses with a 403 — 1 Oct 2026.
+
+    Reported with a screenshot: a login holding RMG + the GM custom role opened
+    an opportunity and got "You do not have access to the 'requirements' tab"
+    on Applied Candidates and on Positions. Their access comes from the custom
+    role, so the template decides ALONE (`_gate` step 2) and the built-in RMG
+    role never gets a say; a GM role configured without the `requirements` tab
+    locks every screener out of the very list they screen from. The Screening
+    Desk's own gate is the APPROVAL `profile.rmg_screening`, and
+    `action_permissions.screens_as_rmg` is already the ONE answer to "does this
+    person work the technical ladder" — so the recruiting reads a screener
+    needs follow it too. Admin/CEO and everyone the gate already admits are
+    unchanged; a 403 for anyone else stays a 403.
+    """
+    def dep(user: CurrentUser = Depends(get_current_user),
+            db: Session = Depends(get_crm_db)) -> CurrentUser:
+        try:
+            return gate(user, db)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            from services.action_permissions import screens_as_rmg
+            if screens_as_rmg(db, user):
+                return user
+            raise
+
+    return dep
+
+
 def gated_read(tab: str, *roles: str, allow_admin: bool = True):
     """Template view access when templated; else role check (empty = any CRM role)."""
     return _gate(tab, "view", roles, allow_admin=allow_admin)

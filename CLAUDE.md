@@ -43,7 +43,7 @@ resolved by `paths._resolve_frontend_dir()` (`FRONTEND_DIR` env → `<repo>/fron
 **Working tree, 8 Sep 2026:** branch `main`, head **`dd61630`**, ~90 modified + 63 untracked paths,
 none committed. `git status` is dominated by CRLF churn — review with `git diff --ignore-all-space`.
 
-**Migration head is now 0116** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
+**Migration head is now 0118** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
 Deploying REQUIRES `alembic upgrade head` before serving traffic — the ORM maps columns from every
 one of them. Tests: **1034 pass**, 2 stale pins fail (`test_full_pipeline_flow::test_ai_l1_can_only_be_triggered_by_ta`,
 `test_pipeline_tail::test_no_other_stage_has_a_hidden_precondition`) plus the §9 known set.
@@ -2023,6 +2023,160 @@ puts a **`ta_pending` "Pending activities"** tab in front of them — every sche
 `activity` (the list it came from), `section` (the position — My Tasks groups by it; the "· customer offered …" suffix
 stripped) and its `round_kind`; keys `pend:<original>`. Tab order for a TA: feedback · ta_pending · schedule_customer ·
 schedule_internal · schedule_hr · sourcing · upcoming · queues. The desk's F-V2 filter bar gains Activity + Round.
+
+**1 Oct 2026 — Applied Candidates chips are STAGES again (`test_applied_profile_only_rows` re-pinned; no
+migration):** user decision reversing the 30 Sep status chips ("under Opportunities, every login: show stages, not
+status"). `candidate_status.status_counts` now also returns **`phases: {live: {stage key: n}, archive: {…}}`** — the
+`phase_counts` rule (`stage_for`, a closed candidacy under "closed") per Archive bucket, from the SAME facts load — so
+`GET /api/requirements/{id}/resumes` `meta.status_counts` serves both the stage chips (`?phase=`, F-V2) and anything
+still reading the status counts. `status_key` keeps working.
+
+**1 Oct 2026 — a withdrawn candidate can re-apply (`test_ta_decision` +1; no migration):** user ask — "after Self
+Withdrawn I need a button to apply to this opportunity again". `TA_DECISIONS` gains **`reapply`** →
+`candidate_profiles.reapply_candidacy(db, profile, note, user)`: ONLY a `Self_Withdrawn` candidacy reopens (409 for a
+rejection — that was somebody else's decision); it lands back at **Sourcing with TA** — `withdrawn_from_status` and the
+RMG screening (`rmg_screening_status/note/by/at`) cleared so TA sends them for Technical Screening afresh, a TA hold
+dropped, an Archive flag lifted (`RESTORED_ACTION` row) — logged as `STATUS_CHANGE Self_Withdrawn -> Sourcing: Re-applied`
++ **`REAPPLIED`**. Interview rounds / AI links stay (they happened). Same route, `POST …/ta-decision {decision: "reapply",
+note?}` (`gated_write("profiles","TA")`), note optional.
+
+**1 Oct 2026 — HR Interviewing + Joined phases, RMG / GM read Applied Candidates through the screener gate, TA
+assignments per position, availability on the rows, migration 0117, head is now 0117
+(`tests/test_requirement_ta_assignments.py` 4, `test_candidate_status` re-pinned):** four screenshot asks. (1) **Phases**:
+`candidate_status.STAGES` gains `hr_interviewing` (HR_Interviewing) and `joined` (Joined) — `_STAGE_BY_PIPELINE` maps them,
+so the chips, `?phase=`, `phase_counts` / `status_counts.phases` and the Stage column all split "HR Screening" from "HR
+Interviewing" and "Onboarding" from "Joined". (2) ⚠️ **`crm_deps.screener_or(gate)`** — reported: a login holding RMG + the
+GM custom role got "You do not have access to the 'requirements' tab" on Applied Candidates and Positions (`GET
+/api/requirements/{id}/resumes` 403). Their access comes from the custom role, so the template decides ALONE and the built-in
+RMG role never gets a say. The wrapper runs the gate and, on a 403 only, admits whoever `action_permissions.screens_as_rmg`
+says screens as RMG. Applied to the seven RMG-including gates in `routers/crm/resumes.py` (resumes list, review, reparse,
+the three scan routes, schedule-ai-interview), `requirement_positions.POS_READ` and the priority PATCH; pinned by a source
+scan. (3) **TA assignments**: `requirement_ta_assignments` (0117; one row per (requirement, TA login), CASCADE),
+`services/requirement_assignments.py` — `ta_options` (active TA logins), `assignments_by_requirement` (ONE query per
+page), `assigned_requirement_ids`, `set_assignments` (replace-list; only active TA ids, else ValueError → 400; logs
+`TA_ASSIGNED`; newly assigned TAs get bell + email, event `requirement.ta_assigned` in `email_flows.EVENTS`, deduped per
+(requirement, TA); removed ones hear nothing). `routers/crm/requirement_assignments.py` (`_MODULES` += it): `GET
+/api/requirements/{id}/ta-assignments` (`POS_READ`; `meta.can_assign`, `options` only for writers) · `PUT …` `{user_ids,
+note?}` (`screener_or(gated_write("requirements","RMG","Sales_Head"))`), both scoped by `_visible_requirement`. ⚠️ An
+assignment is NOT a visibility rule — every TA still sees every sourcing position; `GET /api/requirements?assigned_to_me=true`
+is the opt-in narrowing. Payloads: `assigned_tas` on requirement list rows and `_one`; `positions_by_opportunity` (the
+opportunity list + detail) adds `requirement_priority` + `assigned_tas`. Table added to `data_backup.DATASETS["opportunities"]`.
+(4) **Availability**: Applied Candidates rows carry `notice_period` (the application's typed value, else
+`Candidate.notice_period` — `routers/crm/resumes.availability_by_candidate` / `_with_availability`, one query),
+`resignation_status`, `last_working_day`; `TABLE_REGISTRY["requirement_resumes"]` gains `availability` (announced after
+Status). Deploy: `alembic upgrade head`, restart.
+
+**1 Oct 2026 — the closing note, re-apply after a rejection, no email to employees (`test_ta_decision` re-pinned; no
+migration):** (1) **`candidate_status.closing_notes(db, profile_ids)`** — who closed each candidacy, when and WHY: the
+LATEST `STATUS_CHANGE` row ("<from> -> <to>: <reason>", the shape `perform_transition` always writes) whose target is in
+`REJECTED_BUCKET`; a later move to a live status drops it. `GET /api/requirements/{id}/resumes` prints it as `closed_note`
+`{status, reason, by, by_id, at}` on closed rows only (ONE query for the page). Every rejection already requires the reason
+(`comment_required_for`, TA reject ≥ 5, RMG screening note), so nothing new is asked — it is now SHOWN. (2)
+**`reapply_candidacy` reopens ANY closed candidacy** (user: "if we want to apply again after a rejection"): a withdrawal
+needs no reason, re-applying over a rejection needs one (≥ `MIN_COMMENT_LENGTH`, 400 otherwise); a live candidacy stays 409.
+Other opportunities: the Candidates page's Apply to Opportunity (the candidate master keeps the whole history). (3) **Checked:
+every Upload Resume and Bulk ZIP creates / enriches the Candidate master** (`find_or_create_candidate_from_resume` by email,
+else name; placeholder `resume-<id>@noemail.karnex.local` when the CV has none) plus a Sourcing profile — nothing to change.
+(4) ⚠️ **Employees get no email** — reported with a screenshot: a project employee deployed at Harman received "Timesheet due
+for September 2026" from noreply@karnex.in. `notify.employee_emails_enabled()` reads Settings `notify.employee_emails`
+(`EMPLOYEE_EMAILS`, default **false**) and `notify_employee` skips the mail unless it is on — timesheet-due reminders, leave
+decisions, approvals, all of them; bells to a linked login still fire; candidate / login / role mail is a different path.
+Settings ▸ Operations ▸ "Email employees on the HR master".
+
+**1 Oct 2026 (evening) — the Opportunities list carries the position row's facts (no migration):**
+`services/requirements.positions_by_opportunity` (the headcount map on `GET /api/opportunities` + the detail) now joins the
+Opportunity once and adds `requirement_experience_min/max`, `requirement_budget_ctc_min/max`,
+`requirement_target_closure_date`, `requirement_work_mode`, `requirement_location_name` (one `Location` query for the
+page) and `requirement_display_status` (`display_status_for(req status, deal stage)` — the ONE wording TA's list badges),
+so the pipeline list prints the same row as TA's position list for every role (F-V2 `CLAUDE.md`). Still three queries +
+one for a whole page, never per row.
+
+**1 Oct 2026 (night) — a deal on hold parks its candidates (`tests/test_candidate_status.py` +2; no migration):**
+screenshot report — C-2026-00086 was on Customer Hold yet Debjani Das still read "Submitted to Customer" on Candidate
+Profiles. Closing a deal hides its profiles (`_set_profiles_hidden`); a HOLD never did, and nothing on the row said the
+deal was parked. Deliberately NOT hidden — a hold is reversible and the candidacy must resume exactly where it was —
+instead the derived status says it: `candidate_status.StatusFacts.opportunity_stage` (ONE extra batched query in
+`load_facts`: profile → `Opportunity.pipeline_stage`), `DEAL_HOLD_STATUS_KEY` (`On_Hold` → **"Customer Hold"**,
+`Sales_Hold` → **"Sales Hold"**, tone WARN, new group **`parked` "Opportunity on hold"**, declared over every live
+stage so the `status_key` filter finds them), applied in `_derive` BEFORE every other rule unless the stored stage is
+in `_SETTLED` (Joined + the rejections / withdrawal keep their own word). The stored stage, `stage_for` (the phase chips /
+Stage column), TA's buttons and permissions are untouched; the Status cell prints "Opportunity · Customer Hold". The
+hint spells out that the candidate may be applied to other opportunities meanwhile — `POST /api/candidate-profiles`'s
+duplicate check is per (candidate, opportunity), so that already works. F-V2 needs no change: the badge reads tone / group
+from the catalogue. Deploy: restart.
+
+**1 Oct 2026 (night, last) — TAs assigned at RMG approval (`tests/test_requirement_ta_assignments.py` now 5; no
+migration):** user ask — "RMG / GM assign the TA at the time of RMG approval, and from the Opportunities list without
+going inside". `EngineeringApproveIn.ta_user_ids: list[int] | None` — `POST /api/requirements/{id}/engineering-approve`
+calls `requirement_assignments.set_assignments` after the approval (None = team untouched; a list REPLACES it; a non-TA
+id → 400 and nothing is approved); the assigned TAs get the "assigned to you" bell + email on top of the role-wide
+"open for sourcing" notice, and the reply message counts them. The list-row button is UI only (the existing
+`GET / PUT …/ta-assignments`). F-V2: `AssignTasButton`, `TaPicker` (see that repo's notes).
+
+**1 Oct 2026 (night) — JD & skills card on the position AND opportunity pages (F-V2 only; no server change):** the
+client now mirrors `routers/crm/requirements.JD_EDIT_ROLES` through the requirements Edit grant, so a GM / custom role
+that passes `gated_write("requirements", *JD_EDIT_ROLES)` also sees the Add / Edit JD & skills button. Everything else
+(`PATCH …/jd-skills`, the `rmg_jd` attachment upload that reads the file's text, the re-score) is unchanged — see F-V2
+`CLAUDE.md`.
+
+**1 Oct 2026 (night) — one template request per opportunity; the upload form's locations reach the candidate,
+migration 0118, head is now 0118 (`test_template_request_fulfill_link` +1 / re-pinned, `test_upload_form_location_note`
++3):** two screenshot reports. (1) TA pressed "Request template" several times → RMG got duplicates.
+`routers/crm/template_requests.open_request_for(db, req)` = the live (not Cancelled) request of the requirement's
+OPPORTUNITY (else the requirement); `POST /api/template-requests` answers **409** naming it ("TR-…, waiting for RMG /
+template ready"); a cancelled request does not block a new ask. F-V2 replaces the button with "Template requested · TR-…".
+(2) TA typed Preferred location on Upload Resume and the profile said "Candidate Preferred Location — missing": the form
+kept it on `resumes.application_details` only, while the profile, the Submit-to-Sales checklist and the missing-location
+reminder read `candidates.preferred_locations`. `slot_booking.copy_locations_to_candidate(candidate, details,
+overwrite=, keys=)` (`LOCATION_FIELDS`: current_location → `city`, preferred_location → `preferred_locations`) — an upload
+fills BLANKS only (`find_or_create_candidate_from_resume`), the Edit applicant PUT (`update_resume`) overwrites the ones TA
+changed. **0118** backfills blank candidate city / preferred locations from each candidate's latest resume that carries
+one (Postgres `DISTINCT ON`; downgrade no-op). Deploy: `alembic upgrade head`, restart.
+
+**1 Oct 2026 (night) — bulk upload emails every candidate about the opening; the CV's email is checked
+(`tests/test_opening_interest.py`, 22; no migration):** user ask — "when TA bulk-uploads, every candidate gets a
+professional 'we have this opening, are you interested?' mail; they reply; TA confirms the details and moves them to
+Technical Screening; make sure the email from the resume is right". (1) **Email extraction** (`services/resume_parse.py`):
+`clean_email(raw)` (PURE — lower-case, drops `mailto:` / wrapping punctuation, un-glues a phone number a PDF ran into the
+address, fixes unambiguous provider typos `_DOMAIN_TYPOS` + `.con`→`.com`, refuses file names (`image001.png@…`),
+`_EXAMPLE_DOMAINS`, our placeholders, malformed addresses); `find_resume_emails(text)` (rejoins "john @ gmail . com" /
+"[at] [dot]"); `pick_resume_email(text, name)` — the CANDIDATE's address among several: local part carries their name,
+not a role mailbox (`_ROLE_LOCALS` hr@ careers@ noreply@ …), first in reading order; ⚠️ `reconcile_email(model, text, name)`
+— **the model may only CHOOSE among addresses literally in the CV** (or there with line breaks removed); an invented
+address is dropped for the best literal one (the old merge let the model's answer win). Applied in `_regex_parse`,
+`_ai_parse`, the OCR path (clean only — no text) and on every cache hit (entries cached before the cleaner).
+(2) **`services/opening_interest.py`**: `opening_facts(db, req)` (role · experience band · location (requirement
+location, else the opportunity's `tm_work_location`) · work mode · ≤ 6 skills, mandatory first) — ⚠️ **the customer is
+never named** (first-touch mail about a client's opening); `opening_message(...)` subject "Job opportunity: <role> — are
+you interested?", a facts table and five asks (interest Yes/No · current + expected CTC · notice / LWD · current +
+preferred location · a time for a call), signed by the TA (`sender_details`, savepointed); admin-editable draft, event
+**`candidate.opening_interest`** (`email_flows.EVENTS` kind candidate, `builtin_candidate_draft`, `CANDIDATE_MAIL_EVENTS`
+label, `NEVER_COLLAPSE_EVENTS`); `send_opening_mail(db, profile, candidate, req, user, to_email=, resend=)` — address =
+THIS CV's (`resume.email`) else the record's, through `clean_email` (placeholders never mailed); one per candidacy
+(`OPENING_MAIL_SENT` activity row + outbox `dedupe_key opening_interest:<profile>`; `resend` skips both); **Reply-To =
+the TA** (company mailbox when the login has none) so the candidate's answer lands with a person; never raises — returns
+sent · no_email · already_sent · not_sent. `opening_states(db, ids)` = the latest of `OPENING_MAIL_SENT` /
+`CANDIDATE_INTERESTED` / `CANDIDATE_NOT_INTERESTED` (one query) → `opening_mail` on every Applied Candidates row.
+`send_candidate_email` gained `dedupe_key=`. (3) **Bulk ZIP** (`POST …/resumes/bulk-zip`): Form `send_opening_email`
+(default true; the dialog's checkbox); `_run_bulk_zip_job(..., user_email, send_opening_email)` builds the facts + signature
+ONCE and mails each APPLIED row in its own savepoint (a mail problem never costs the CV); held duplicates are not mailed
+(TA resolves them, then uses the row button). Applied rows carry `email` + `opening_mail`; the job result adds
+`opening_mail {enabled, sent, no_email}` and the message counts them. (4) **TA's answer**: `TA_DECISIONS` += `interested`
+(logs `CANDIDATE_INTERESTED`, then `send_for_screening` — same refusals) and `not_interested` (logs
+`CANDIDATE_NOT_INTERESTED`, then Self_Withdrawn with `NOT_INTERESTED_NOTE` when no note; screeners are NOT told — it never
+reached them); both at the derived Sourcing stage only. **`POST /api/candidate-profiles/{id}/opening-email {resend}`**
+(`gated_write("profiles","TA")`) — single uploads, an applied held duplicate, or after TA corrected a wrong address
+(409 closed / already sent, 400 no usable email, 503 when the outbox declines). Deploy: restart.
+
+**2 Oct 2026 — RMG / GM add the missing skills, RMG JD and customer JD from the JD & skills card
+(`test_requirement_jd_skills` re-pinned +1; no migration):** (1) `routers/crm/requirements.JD_EDIT_GATE =
+screener_or(gated_write("requirements", *JD_EDIT_ROLES))` is now the ONE dependency of `PATCH …/jd-skills`, `POST
+…/attachments` and `DELETE /attachments/{id}` — a GM (custom role) or a template-limited RMG who screens as RMG
+(`screens_as_rmg`) is admitted on the 403 path, exactly like the resumes routes. (2) `POST /api/requirements/{id}/
+attachments` with **`kind=customer_jd`** (`_add_customer_jd`) stores the file as the OPPORTUNITY's attachment
+(`opportunity_attachments`, kind customer_jd, folder `opportunity_attachments`) — where the opportunity form puts it and
+where `serialize_requirement` reads `customer_jd_attachments` — logs on both activity logs, never touches `rmg_jd_text`
+and starts no re-score. The opportunity's own attachment routes (Sales / Sales Head) are unchanged. Deploy: restart.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

@@ -50,6 +50,139 @@ _PHONE_RE = re.compile(r"(?:\+?\d[\d \-()]{8,}\d)")
 _EXP_RE = re.compile(r"(\d{1,2}(?:\.\d)?)\s*\+?\s*(?:years|yrs|year)", re.IGNORECASE)
 
 
+# ------------------------------------------------------------------ email
+# A bulk upload mails every candidate it reads (1 Oct 2026, user ask: "make
+# sure from the resume we get the proper email, not any mistake"). A wrong
+# address either bounces or — worse — reaches a stranger, so the extracted
+# address goes through ONE cleaner and a literal-match rule before anything
+# is stored or mailed.
+
+#: The whole address, strictly: no leading/trailing dot in the local part, real
+#: domain labels, an alphabetic TLD.
+_EMAIL_FULL_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9._%+-]{0,62}[a-z0-9_%+-])?"
+    r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$"
+)
+#: "image001.png@01D9…" and friends — Word/Outlook artefacts, never a mailbox.
+_FILE_TLDS = frozenset({
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "pdf", "doc", "docx",
+    "txt", "js", "css", "htm", "html", "xml", "json",
+})
+#: Template / example addresses CVs are written from.
+_EXAMPLE_DOMAINS = frozenset({
+    "example.com", "example.org", "example.net", "example.in", "domain.com",
+    "yourdomain.com", "yourcompany.com", "company.com", "test.com", "sample.com",
+})
+#: Mailboxes that belong to an employer or a job board, not the candidate.
+_ROLE_LOCALS = frozenset({
+    "hr", "careers", "career", "jobs", "job", "info", "noreply", "no-reply",
+    "donotreply", "recruitment", "hiring", "support", "admin", "contact", "sales",
+})
+#: Well-known provider typos, fixed only where the intent is unambiguous.
+_DOMAIN_TYPOS = {
+    "gmial.com": "gmail.com", "gmai.com": "gmail.com", "gamil.com": "gmail.com",
+    "gmaill.com": "gmail.com", "gnail.com": "gmail.com", "gmail.co": "gmail.com",
+    "gmail.cm": "gmail.com", "gmail.con": "gmail.com", "gmail.om": "gmail.com",
+    "gmail.comm": "gmail.com", "yahoo.con": "yahoo.com", "yaho.com": "yahoo.com",
+    "hotmail.con": "hotmail.com", "outlook.con": "outlook.com", "rediffmail.con": "rediffmail.com",
+}
+#: Our own synthesised placeholders (slot_booking / importers) — never real.
+_PLACEHOLDER_MARKERS = ("@noemail.", "@import.karnex.in")
+
+
+def clean_email(raw) -> str:
+    """One extracted address made safe to store and mail, or "" when it is not
+    a real candidate mailbox. PURE.
+
+    Lower-cases; drops "mailto:" and wrapping punctuation; un-glues a phone
+    number a PDF ran into the address ("9876543210john@…"); fixes the obvious
+    provider typos ("gmail.con"); refuses file names, example domains, our own
+    placeholders and anything that is not a well-formed address.
+    """
+    s = str(raw or "").strip().lower()
+    if s.startswith("mailto:"):
+        s = s[7:]
+    s = re.sub(r"^[\s<>()\[\]{}\"'`,;:|]+|[\s<>()\[\]{}\"'`,;:|.]+$", "", s)
+    s = re.sub(r"\s*@\s*", "@", s)
+    if not s or " " in s or s.count("@") != 1 or len(s) > 254:
+        return ""
+    local, domain = s.split("@")
+    # A phone number glued to the address by text extraction.
+    glued = re.match(r"^(?:\+?\d{10,13})([a-z][a-z0-9._%+-]*)$", local)
+    if glued:
+        local = glued.group(1)
+    domain = _DOMAIN_TYPOS.get(domain, domain)
+    if domain.endswith(".con"):
+        domain = domain[:-4] + ".com"
+    s = f"{local}@{domain}"
+    if ".." in s or not _EMAIL_FULL_RE.match(s):
+        return ""
+    if domain.rsplit(".", 1)[-1] in _FILE_TLDS or domain in _EXAMPLE_DOMAINS:
+        return ""
+    if any(m in s for m in _PLACEHOLDER_MARKERS):
+        return ""
+    return s
+
+
+def _rejoin_split_emails(text: str) -> str:
+    """Undo the spacing PDF extraction and anti-spam writing put inside an
+    address: "john @ gmail . com", "john[at]gmail[dot]com"."""
+    t = re.sub(r"\s*[\[(]\s*at\s*[\])]\s*", "@", text, flags=re.I)
+    t = re.sub(r"\s*[\[(]\s*dot\s*[\])]\s*", ".", t, flags=re.I)
+    t = re.sub(r"(?<=[A-Za-z0-9._%+-])[ \t]*@[ \t]*(?=[A-Za-z0-9])", "@", t)
+    return re.sub(r"(@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)[ \t]*\.[ \t]*([A-Za-z]{2,6})\b", r"\1.\2", t)
+
+
+def find_resume_emails(text: str) -> list[str]:
+    """Every distinct, cleaned address in the text, in reading order. PURE."""
+    out: list[str] = []
+    for m in _EMAIL_RE.finditer(_rejoin_split_emails(text or "")):
+        e = clean_email(m.group(0))
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+def _name_tokens(name: str | None) -> list[str]:
+    return [t for t in re.findall(r"[a-z]+", (name or "").lower()) if len(t) >= 3]
+
+
+def pick_resume_email(text: str, name: str | None = None) -> str:
+    """The candidate's OWN address out of every address in the CV, or "". PURE.
+
+    A CV can carry several: the candidate's, a previous employer's HR mailbox,
+    a referee's. Ranked by — the local part carries the candidate's name,
+    it is not a role mailbox (hr@, careers@, noreply@ …), and it comes first
+    (contact details lead a CV)."""
+    emails = find_resume_emails(text)
+    if not emails:
+        return ""
+    tokens = _name_tokens(name)
+
+    def score(item: tuple[int, str]) -> tuple:
+        pos, e = item
+        local = e.split("@", 1)[0]
+        named = any(t in local for t in tokens)
+        role = re.split(r"[._+-]", local)[0] in _ROLE_LOCALS
+        return (not named, role, pos)
+
+    return min(enumerate(emails), key=score)[1]
+
+
+def reconcile_email(model_email, text: str, name: str | None = None) -> str:
+    """The address to keep when the model and the text both had a say. PURE.
+
+    The model may only CHOOSE among addresses that are literally in the CV
+    (or that are there with the spaces removed — a line break inside an
+    address); an address it produced from nowhere is dropped. With no usable
+    model answer the best literal address wins."""
+    literal = find_resume_emails(text)
+    m = clean_email(model_email)
+    if m and (m in literal or m in re.sub(r"\s+", "", text or "").lower()):
+        return m
+    return pick_resume_email(text, name) if literal else ""
+
+
 # ------------------------------------------------------------------ text
 
 def extract_text_from_bytes(data: bytes, ext: str) -> str:
@@ -87,9 +220,6 @@ def _regex_parse(text: str) -> dict:
     name guess. Everything else stays blank for the TA to fill by hand."""
     out: dict = {k: "" for k in PARSE_FIELDS}
     out["skills"] = []
-    m = _EMAIL_RE.search(text)
-    if m:
-        out["email"] = m.group(0)
     m = _PHONE_RE.search(text)
     if m:
         out["phone"] = re.sub(r"[^\d+]", "", m.group(0))[:16]
@@ -110,6 +240,7 @@ def _regex_parse(text: str) -> dict:
         if 2 <= len(ln) <= 80:
             out["name"] = ln
             break
+    out["email"] = pick_resume_email(text, out["name"])
     return out
 
 
@@ -165,11 +296,12 @@ def _ai_parse(text: str, base: dict) -> tuple[dict, bool]:
                     out["skills"] = [str(s).strip() for s in v if str(s).strip()][:25]
             elif isinstance(v, (str, int, float)) and str(v).strip():
                 out[key] = str(v).strip()[:255]
-        # The regex email/phone are high-precision — keep them when the model
-        # returned nothing (the reverse is never done: the model must not
-        # override a literal match with a guess).
-        if not out.get("email") and base.get("email"):
-            out["email"] = base["email"]
+        # The email is checked against the CV itself (1 Oct 2026): the model
+        # may pick among the addresses written there, never invent one, and a
+        # garbled answer falls back to the best literal address.
+        out["email"] = reconcile_email(out.get("email"), text, out.get("name"))
+        # The regex phone is high-precision — keep it when the model returned
+        # nothing (the model must not override a literal match with a guess).
         if not out.get("phone") and base.get("phone"):
             out["phone"] = base["phone"]
         return out, True
@@ -235,6 +367,8 @@ def _ai_parse_pdf_file(data: bytes) -> tuple[dict, bool]:
                     out["skills"] = [str(s).strip() for s in v if str(s).strip()][:25]
             elif isinstance(v, (str, int, float)) and str(v).strip():
                 out[key] = str(v).strip()[:255]
+        # No text to check it against — the cleaner is the whole guard here.
+        out["email"] = clean_email(out.get("email"))
         # A scan that produced no name AND no email almost certainly failed —
         # treat as unusable rather than prefilling garbage.
         if not out.get("name") and not out.get("email"):
@@ -283,6 +417,8 @@ def parse_resume_bytes(data: bytes, ext: str, *, db: Session | None = None,
                 # then overwrites the stale cache entry).
                 if all(k in row.parsed for k in PARSE_FIELDS):
                     out = dict(row.parsed)
+                    # Entries cached before the email cleaner existed.
+                    out["email"] = clean_email(out.get("email"))
                     out["text_extracted"] = True
                     out["from_cache"] = True
                     return out

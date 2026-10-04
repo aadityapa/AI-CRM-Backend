@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from crm_deps import (
     CurrentUser, PageParams, gated_create, get_crm_db, get_current_user, page_params,
-    role_required, gated_read, gated_write, gated_write_action)
+    role_required, gated_read, gated_write, gated_write_action, screener_or)
 from models import (
     Opportunity, PipelineStage, Priority, Requirement, RequirementActivityLog,
     RequirementAttachment,
@@ -84,6 +84,8 @@ def _one(db: Session, req: Requirement) -> dict:
     data = serialize_requirement(req, skills_by_requirement(db, [req.id]).get(req.id, []))
     data["ctc_bands"] = _safe_ctc_bands(db, req)
     _attach_names(db, data, req)
+    from services.requirement_assignments import assignments_by_requirement
+    data["assigned_tas"] = assignments_by_requirement(db, [req.id]).get(req.id, [])
     return enrich_requirement_jd(db, data, req)
 
 
@@ -196,11 +198,18 @@ def list_requirements(
     opportunity_stage: str | None = None,
     customer_id: int | None = None,
     priority: str | None = None,
+    #: Only the positions a TA was ASSIGNED to (1 Oct 2026) — the "Assigned to
+    #: me" switch on TA's Opportunities page. Never the default: every TA still
+    #: sees every sourcing position.
+    assigned_to_me: bool = False,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(get_current_user),
 ):
     stmt = apply_visibility(select(Requirement), user, status, db=db)
+    if assigned_to_me:
+        from services.requirement_assignments import assigned_requirement_ids
+        stmt = stmt.where(Requirement.id.in_(assigned_requirement_ids(db, user.id) or [-1]))
     # ⚠️ `Opportunity` is the MODULE-level import. A `from models import
     # Opportunity` further down this function (the search branch) made the name
     # a local for the WHOLE function, so this line raised UnboundLocalError —
@@ -265,9 +274,12 @@ def list_requirements(
             select(Location.id, Location.city, Location.state).where(Location.id.in_(loc_ids))
         ).all() if loc_ids else [])
     }
+    from services.requirement_assignments import assignments_by_requirement
+    assigned = assignments_by_requirement(db, [r.id for r in items])
     for row in rows:
         row["customer_name"] = cust_names.get(row.get("customer_id"))
         row["location_name"] = loc_names.get(row.get("location_id"))
+        row["assigned_tas"] = assigned.get(row["id"], [])
     return envelope(rows, meta=meta)
 
 
@@ -489,9 +501,21 @@ def engineering_approve(
                     f"Requirement {requirement_label(req)} approved by Engineering",
                     "Now open for sourcing.", f"/requirements/{req.id}",
                     actor=user)
+    # The sourcing team is picked in the same dialog (1 Oct 2026, user ask):
+    # the assigned TAs hear "assigned to you" on top of the role-wide notice.
+    assigned = None
+    if payload is not None and payload.ta_user_ids is not None:
+        from services.requirement_assignments import set_assignments
+        try:
+            assigned = set_assignments(db, req, payload.ta_user_ids, None, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     db.commit()
     _rescore_after_jd_change(db, req, user.id)
-    return envelope(_one(db, req), message="Approved; open for sourcing")
+    message = "Approved; open for sourcing"
+    if assigned and assigned["added"]:
+        message += f" — {len(assigned['added'])} TA(s) assigned"
+    return envelope(_one(db, req), message=message)
 
 
 @router.post("/{requirement_id}/engineering-reject")
@@ -634,7 +658,7 @@ def set_requirement_priority(
     db: Session = Depends(get_crm_db),
     # Deliberately NOT the full edit form: RMG sets urgency without gaining
     # access to budget fields.
-    user: CurrentUser = Depends(gated_write("requirements", "RMG", "Sales_Head")),
+    user: CurrentUser = Depends(screener_or(gated_write("requirements", "RMG", "Sales_Head"))),
 ):
     req = get_requirement_or_404(db, requirement_id)
     previous = getattr(req.priority, "value", req.priority)
@@ -650,6 +674,11 @@ def set_requirement_priority(
 #: (30 Sep 2026, user report: TA could open "Edit JD & skills" but the upload
 #: answered 403 — the attachment route said RMG alone.)
 JD_EDIT_ROLES = ("RMG", "Sales", "Sales_Head", "TA")
+#: The ONE gate the three JD routes share. `screener_or` (2 Oct 2026, user ask:
+#: "RMG / GM can add the missing skills, RMG JD and customer JD from here") also
+#: admits whoever screens as RMG — a GM custom role, or an RMG whose access comes
+#: from a template without the requirements Edit grant.
+JD_EDIT_GATE = screener_or(gated_write("requirements", *JD_EDIT_ROLES))
 
 
 class JdSkillsIn(BaseModel):
@@ -670,7 +699,7 @@ def set_requirement_jd_skills(
     # budget, positions or status fields can move through here. TA joined the
     # list on 30 Sep 2026 (user ask): a recruiter who has the JD in hand adds
     # it — the same roles that may attach the JD file below.
-    user: CurrentUser = Depends(gated_write("requirements", *JD_EDIT_ROLES)),
+    user: CurrentUser = Depends(JD_EDIT_GATE),
 ):
     req = get_requirement_or_404(db, requirement_id)
     if req.status in TERMINAL_STATUSES:
@@ -761,7 +790,7 @@ def add_requirement_attachment(
     file: UploadFile = File(...),
     kind: str | None = Form(None),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", *JD_EDIT_ROLES)),
+    user: CurrentUser = Depends(JD_EDIT_GATE),
 ):
     req = get_requirement_or_404(db, requirement_id)
     data = file.file.read()
@@ -771,6 +800,8 @@ def add_requirement_attachment(
         raise HTTPException(status_code=400, detail="Empty file")
     file.file.seek(0)
     kind_norm = (kind or "rmg_jd").strip().lower() or "rmg_jd"
+    if kind_norm == "customer_jd":
+        return _add_customer_jd(db, req, file, user)
     url, sha, size = save_upload_hashed(file, "requirement_attachments")
     att = RequirementAttachment(
         requirement_id=req.id,
@@ -808,6 +839,30 @@ def add_requirement_attachment(
                     message=msg + (" — re-scoring the applicants' ATS" if rescoring else ""))
 
 
+def _add_customer_jd(db: Session, req, file: UploadFile, user: CurrentUser):
+    """The customer's reference JD (2 Oct 2026, user ask). It belongs to the
+    OPPORTUNITY (`opportunity_attachments`, kind customer_jd — where the
+    opportunity form puts it and where both pages read it from), but whoever may
+    write the position's JD may add it from the JD & skills card."""
+    from models import OpportunityActivityLog, OpportunityAttachment
+
+    url, sha, size = save_upload_hashed(file, "opportunity_attachments")
+    att = OpportunityAttachment(
+        opportunity_id=req.opportunity_id, file_url=url,
+        file_name=(file.filename or "")[:255] or None, file_sha256=sha, file_size=size,
+        kind="customer_jd", uploaded_by=user.id,
+    )
+    db.add(att)
+    log_activity(db, OpportunityActivityLog, "opportunity_id", req.opportunity_id, user.id,
+                 "Attachment_Added", f"Customer JD added: {att.file_name or 'file'}")
+    log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
+                 "ATTACHMENT_ADDED", f"Customer JD added: {att.file_name or 'file'}")
+    db.commit()
+    db.refresh(att)
+    return envelope({**serialize_attachment_row(att), "kind": "customer_jd"},
+                    message="Customer JD added")
+
+
 #: A JD longer than this is clipped — the ATS keyword pass and the interview
 #: prompt need the substance, not a 40-page appendix.
 JD_TEXT_MAX_CHARS = 20_000
@@ -829,7 +884,7 @@ def _jd_text_from_file(url: str) -> str | None:
 def delete_requirement_attachment(
     attachment_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", *JD_EDIT_ROLES)),
+    user: CurrentUser = Depends(JD_EDIT_GATE),
 ):
     att = db.get(RequirementAttachment, attachment_id)
     if att is None:

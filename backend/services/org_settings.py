@@ -55,6 +55,12 @@ KEYS: dict[str, tuple[str, str]] = {
     "scheduler.project_closures": ("", "true"),
     "scheduler.prompt_log_retention": ("", "true"),
     "scheduler.interview_feedback_due": ("", "true"),
+    # Emails to EMPLOYEES on the HR master (timesheet-due reminders, leave
+    # decisions, approvals) — OFF by default since 1 Oct 2026 (user decision: a
+    # project employee deployed at a customer must receive nothing from this
+    # application; Sales fills their timesheet). Bell notifications to a linked
+    # login are unaffected. Candidate / login / role mail is a different path.
+    "notify.employee_emails": ("EMPLOYEE_EMAILS", "false"),
     # CEO revenue close mail on the 1st (catches up until the 7th) — 18 Sep 2026.
     "scheduler.revenue_month_close": ("", "true"),
     # Finance — an office move or a bank change must not be a code deploy.

@@ -104,6 +104,7 @@ CANDIDATE_MAIL_EVENTS: dict[str, str] = {
     "candidate.hr_invite": "HR interview scheduled",
     "candidate.round_invite": "Interview scheduled",
     "candidate.hiring_interest": "Hiring interest",
+    "candidate.opening_interest": "Opening — interested?",
     "candidate.direct_message": "Direct message",
 }
 

@@ -479,13 +479,27 @@ def positions_by_opportunity(db: Session, opportunity_ids) -> dict[int, dict]:
     ids = [int(i) for i in set(opportunity_ids or ()) if i]
     if not ids:
         return {}
+    from models import Location, Opportunity
     reqs = db.execute(
         select(Requirement.id, Requirement.opportunity_id, Requirement.no_of_positions,
-               Requirement.status)
+               Requirement.status, Requirement.priority, Requirement.experience_min,
+               Requirement.experience_max, Requirement.budget_ctc_min, Requirement.budget_ctc_max,
+               Requirement.target_closure_date, Requirement.work_mode, Requirement.location_id,
+               Opportunity.pipeline_stage)
+        .join(Opportunity, Opportunity.id == Requirement.opportunity_id)
         .where(Requirement.opportunity_id.in_(ids))
     ).all()
     if not reqs:
         return {}
+    from services.requirement_assignments import assignments_by_requirement
+    assigned = assignments_by_requirement(db, [r[0] for r in reqs])
+    loc_ids = {r[11] for r in reqs if r[11]}
+    loc_names = {
+        lid: ", ".join(p for p in (city, state) if p) or None
+        for lid, city, state in (db.execute(
+            select(Location.id, Location.city, Location.state).where(Location.id.in_(loc_ids))
+        ).all() if loc_ids else [])
+    }
     joined_by_opp = joined_counts_for_opportunities(db, [r[1] for r in reqs])
     pending = {
         int(r[0]) for r in db.execute(
@@ -495,7 +509,8 @@ def positions_by_opportunity(db: Session, opportunity_ids) -> dict[int, dict]:
         ).all()
     }
     out: dict[int, dict] = {}
-    for req_id, opp_id, total, status in reqs:
+    for (req_id, opp_id, total, status, priority, exp_min, exp_max, bud_min, bud_max,
+         target, work_mode, loc_id, opp_stage) in reqs:
         # One opportunity spawns exactly one requirement, but be defensive:
         # if a second ever exists, the positions add up rather than overwrite.
         summary = positions_summary(total, joined_by_opp.get(int(opp_id), 0))
@@ -507,6 +522,23 @@ def positions_by_opportunity(db: Session, opportunity_ids) -> dict[int, dict]:
             **summary,
             "requirement_id": int(req_id),
             "requirement_status": _val(status),
+            # The position's urgency + the TAs working it (1 Oct 2026) — the
+            # opportunity page prints both for RMG / GM, who never open the
+            # requirement page.
+            "requirement_priority": _val(priority),
+            "assigned_tas": assigned.get(int(req_id), []),
+            # The position row's facts (1 Oct 2026): the Opportunities list
+            # prints the same row as TA's list for every role — band, budget,
+            # work mode · location, target date and the ONE status wording
+            # (`display_status_for`: Sales words once the deal is settled).
+            "requirement_experience_min": float(exp_min) if exp_min is not None else None,
+            "requirement_experience_max": float(exp_max) if exp_max is not None else None,
+            "requirement_budget_ctc_min": float(bud_min) if bud_min is not None else None,
+            "requirement_budget_ctc_max": float(bud_max) if bud_max is not None else None,
+            "requirement_target_closure_date": target.isoformat() if target else None,
+            "requirement_work_mode": _val(work_mode),
+            "requirement_location_name": loc_names.get(loc_id),
+            "requirement_display_status": display_status_for(_val(status), _val(opp_stage)),
             "positions_change_pending": int(req_id) in pending or bool(prev and prev.get("positions_change_pending")),
         }
     return out

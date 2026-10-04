@@ -22,7 +22,8 @@ logger = logging.getLogger("karnex.crm.candidate_comms")
 def send_candidate_email(to: str, subject: str, text: str, html: str | None = None,
                          attachments: list[tuple[str, bytes, str]] | None = None,
                          *, db=None, event: str = "candidate", actor=None,
-                         to_name: str = "", candidate_id: int | None = None) -> dict:
+                         to_name: str = "", candidate_id: int | None = None,
+                         dedupe_key: str | None = None) -> dict:
     """Send one candidate email. Never raises. Sent as the logged-in user when
     the caller passes no `actor` (services/actor_context.py).
 
@@ -65,6 +66,7 @@ def send_candidate_email(to: str, subject: str, text: str, html: str | None = No
                     # shared/test addresses were merging different candidates.
                     related_type="candidate" if candidate_id else None,
                     related_id=candidate_id,
+                    dedupe_key=dedupe_key,
                 )
                 if row is not None:
                     return {"sent": True, "error": None, "queued": True}
@@ -483,6 +485,16 @@ def builtin_candidate_draft(event: str) -> dict | None:
         if event == "candidate.round_invite":
             s, b = customer_round_invite_message("{candidate}", "{round}", "{when}", "{link}", "{note}")
             return {"subject": s, "body": b}
+        if event == "candidate.opening_interest":
+            from services.opening_interest import opening_message
+            m = opening_message(
+                "{first_name}",
+                {k: "{" + k + "}" for k in ("role", "experience", "location", "work_mode", "skills")},
+                {"name": "{sender}", "designation": "{sender_designation}", "phone": "{sender_phone}",
+                 "email": "{sender_email}", "company": "{company}", "company_name": "{company_name}",
+                 "company_website": "{company_website}"},
+                db=None)
+            return {"subject": m["subject"], "body": m["text"]}
         if event == "candidate.hiring_interest":
             from routers.crm.opportunities import CANDIDATE_EMAIL_BODY, CANDIDATE_EMAIL_SUBJECT
             return {"subject": CANDIDATE_EMAIL_SUBJECT, "body": CANDIDATE_EMAIL_BODY}

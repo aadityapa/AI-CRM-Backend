@@ -33,6 +33,8 @@ catalogue the UI's filter, badges and exports all read — ordered as the flow.
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field, replace
 from typing import Iterable
 
@@ -59,6 +61,7 @@ GROUPS: list[tuple[str, str]] = [
     ("internal", "Technical interview & internal rounds"),
     ("customer", "Sales & customer"),
     ("selection", "Selection & joining"),
+    ("parked", "Opportunity on hold"),
     ("closed", "Closed"),
 ]
 
@@ -119,6 +122,21 @@ _BUDGET_STAGES = {PS.PREBOARDING.value, PS.HR_INTERVIEWING.value}
 #: "send back" (a resubmission clears it) — read by `load_facts`.
 TERMS_SENT_BACK = "OFFER_SENT_BACK"
 TERMS_SUBMITTED = "SUBMITTED_FOR_APPROVAL"
+
+#: Opportunity stages that PARK every live candidacy on the deal (1 Oct 2026).
+#: `Opportunity.pipeline_stage` values — "On_Hold" is "Customer Hold" in the UI.
+DEAL_HOLD_STATUS_KEY: dict[str, str] = {"On_Hold": "deal_customer_hold",
+                                        "Sales_Hold": "deal_sales_hold"}
+#: Stored stages a deal hold never overrides: the candidacy is already settled.
+_SETTLED = frozenset({
+    PS.JOINED.value, PS.SALES_REJECTED.value, PS.RMG_REJECTED.value, PS.CUSTOMER_REJECTED.value,
+    PS.CUSTOMER_SCREEN_REJECTED.value, PS.CUSTOMER_L1_REJECTED.value, PS.CUSTOMER_L2_REJECTED.value,
+    PS.SELF_WITHDRAWN.value, PS.REJECTED.value,
+})
+_LIVE_PIPELINES = frozenset(p.value for p in PS) - _SETTLED
+_HOLD_HINT = ("Sales put the opportunity on {who} — the candidacy is parked where it was, not closed. "
+              "It resumes when the deal is reactivated; the candidate can be applied to other "
+              "opportunities meanwhile.")
 
 STATUS_DEFS: list[StatusDef] = [
     _d("sourcing", "Sourcing", INFO, "sourcing",
@@ -185,6 +203,10 @@ STATUS_DEFS: list[StatusDef] = [
     _d("budget_replied", "Budget Reply – With HR", INFO, "selection",
        "Sales replied to HR's budget flag — HR decides whether to complete onboarding.", _BUDGET_STAGES),
     _d("joined", "Joined", OK, "selection", "The candidate has joined.", {PS.JOINED.value}),
+    _d("deal_customer_hold", "Customer Hold", WARN, "parked", _HOLD_HINT.format(who="Customer Hold"),
+       _LIVE_PIPELINES),
+    _d("deal_sales_hold", "Sales Hold", WARN, "parked", _HOLD_HINT.format(who="Sales Hold"),
+       _LIVE_PIPELINES),
     _d("sales_rejected", "Sales Rejected", BAD, "closed",
        "Sales decided not to submit the candidate to the customer.", {PS.SALES_REJECTED.value}),
     _d("customer_rejected", "Customer Rejected", BAD, "closed",
@@ -281,6 +303,8 @@ class StatusFacts:
     ta_closed: str | None = None
     #: Sales Head's last word on the terms was "send back" (not yet resubmitted).
     terms_sent_back: bool = False
+    #: `Opportunity.pipeline_stage` of the deal — a hold parks a live candidacy.
+    opportunity_stage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -395,6 +419,12 @@ _FIXED: dict[str, str] = {
 
 def _derive(f: StatusFacts) -> CandidateStatus:
     stage = f.pipeline_status
+    # A deal on hold parks every live candidacy on it (1 Oct 2026, user report:
+    # "the opportunity is on Customer Hold, why does the candidate still read
+    # Submitted to Customer?"). The stored stage is untouched — Reactivate
+    # resumes exactly there — and a settled candidacy keeps its own word.
+    if f.opportunity_stage in DEAL_HOLD_STATUS_KEY and stage not in _SETTLED:
+        return _status(DEAL_HOLD_STATUS_KEY[f.opportunity_stage])
     if stage == PS.SHORTLISTED.value and f.terms_sent_back:
         return _status("terms_sent_back")
     if stage in _BUDGET_STAGES and f.budget_status in _BUDGET_STATUS_KEY:
@@ -446,7 +476,9 @@ STAGES: list[tuple[str, str]] = [
     ("customer_interviewing", "Customer Interviewing"),
     ("selection", "Customer Shortlisted"),   # renamed 28 Sep 2026 (user) — was "Candidate Selected"
     ("hr_screening", "HR Screening"),
+    ("hr_interviewing", "HR Interviewing"),   # 1 Oct 2026 (user): its own chip after HR Screening
     ("onboarding", "Onboarding"),
+    ("joined", "Joined"),                     # 1 Oct 2026 (user): its own chip after Onboarding
     ("closed", "Closed"),
 ]
 STAGE_LABEL: dict[str, str] = dict(STAGES)
@@ -468,9 +500,9 @@ _STAGE_BY_PIPELINE: dict[str, str] = {
     PS.SHORTLISTED.value: "selection",
     PS.CUSTOMER_APPROVAL.value: "selection",
     PS.HR_SCREENING.value: "hr_screening",
-    PS.HR_INTERVIEWING.value: "hr_screening",
+    PS.HR_INTERVIEWING.value: "hr_interviewing",
     PS.PREBOARDING.value: "onboarding",
-    PS.JOINED.value: "onboarding",
+    PS.JOINED.value: "joined",
 }
 
 
@@ -531,6 +563,8 @@ _STATUS_ROUND: dict[str, tuple[str | None, str, str | None]] = {
     "budget_concern": (None, "Pre-Onboarding", "Budget concern"),
     "budget_flagged": (None, "Budget", "With Sales"),
     "budget_replied": (None, "Budget", "With HR"),
+    "deal_customer_hold": (None, "Opportunity", "Customer Hold"),
+    "deal_sales_hold": (None, "Opportunity", "Sales Hold"),
 }
 
 
@@ -588,7 +622,8 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
     """
     from sqlalchemy import select
 
-    from models import AiInterviewLink, CandidateProfileActivityLog, InterviewEvent
+    from models import (AiInterviewLink, CandidateProfile, CandidateProfileActivityLog,
+                        InterviewEvent, Opportunity)
 
     base = {int(p.id): p for p in profiles if getattr(p, "id", None)}
     ids = sorted(base)
@@ -597,7 +632,15 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
     ai: dict[int, str] = {}
     ta_closed: dict[int, str] = {}
     sent_back: dict[int, bool] = {}
+    deal_stage: dict[int, str] = {}
     for chunk in _chunks(ids):
+        # The deal's stage — a hold parks the candidacy (one query, never per row).
+        for pid, opp_stage in db.execute(
+            select(CandidateProfile.id, Opportunity.pipeline_stage)
+            .join(Opportunity, Opportunity.id == CandidateProfile.opportunity_id)
+            .where(CandidateProfile.id.in_(chunk))
+        ).all():
+            deal_stage[pid] = _value(opp_stage)
         for pid, kind, stage, status, result, when in db.execute(
             select(InterviewEvent.profile_id, InterviewEvent.kind, InterviewEvent.stage,
                    InterviewEvent.status, InterviewEvent.result, InterviewEvent.scheduled_at)
@@ -645,6 +688,7 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
             budget_status=getattr(base[pid], "budget_status", None),
             ta_closed=ta_closed.get(pid),
             terms_sent_back=sent_back.get(pid, False),
+            opportunity_stage=deal_stage.get(pid),
         )
         for pid in ids
     }
@@ -846,6 +890,51 @@ def archived_profile_ids(db, profile_ids) -> set[int]:
     return {pid for pid, action in latest.items() if action == ARCHIVED_ACTION}
 
 
+_STATUS_CHANGE_RE = re.compile(r"^\s*(\w+)\s*->\s*(\w+)\s*:?\s*(.*)$", re.S)
+
+
+def closing_notes(db, profile_ids) -> dict[int, dict]:
+    """Who closed each candidacy, when, and WHY (1 Oct 2026, user ask: "whoever
+    rejected the candidate — show the note why, in the Rejected filter").
+
+    Every rejection / withdrawal already writes ONE `STATUS_CHANGE` row shaped
+    "<from> -> <to>: <reason>" (`perform_transition` requires the reason), so
+    this reads the LATEST such row whose target is in `REJECTED_BUCKET` per
+    profile — one query + one names lookup. Returns
+    `{profile_id: {status, reason, by_id, by, at}}`; a profile with no closing
+    row is absent.
+    """
+    from services.candidate_profiles import REJECTED_BUCKET  # lazy: that module imports this one
+    from services.revenue_report import _user_names
+    from models import CandidateProfileActivityLog as Log
+    from sqlalchemy import select
+
+    ids = list({int(i) for i in profile_ids if i is not None})
+    if not ids:
+        return {}
+    rows = db.execute(select(Log.profile_id, Log.user_id, Log.comment, Log.timestamp).where(
+        Log.profile_id.in_(ids), Log.action_type == "STATUS_CHANGE")
+        .order_by(Log.profile_id, Log.id)).all()
+    latest: dict[int, dict] = {}
+    for pid, uid, comment, at in rows:
+        m = _STATUS_CHANGE_RE.match(comment or "")
+        if not m:
+            continue
+        if m.group(2) not in REJECTED_BUCKET:
+            latest.pop(int(pid), None)   # reopened (re-applied) — the old note no longer applies
+            continue
+        latest[int(pid)] = {
+            "status": m.group(2),
+            "reason": (m.group(3) or "").strip() or None,
+            "by_id": uid,
+            "at": at.isoformat() if at else None,
+        }
+    names = _user_names(db, {d["by_id"] for d in latest.values() if d["by_id"]})
+    for d in latest.values():
+        d["by"] = names.get(d["by_id"]) if d["by_id"] else None
+    return latest
+
+
 def applied_buckets(db, stmt) -> tuple[list[int], list[int]]:
     """(live profile ids, archived profile ids) of the profiles `stmt` selects.
 
@@ -871,9 +960,12 @@ def status_counts(db, stmt) -> dict:
     filter by STATUS, not stage — the Stage column is hidden there).
 
     `{"live": {status key: n}, "archive": {status key: n}, "live_total": n,
-    "archive_total": n}` over the profiles `stmt` selects — the SAME
-    `derive_status` every row prints, so a chip's count is what clicking it
-    lists. One query + one facts load.
+    "archive_total": n, "phases": {"live": {stage key: n}, "archive": {…}}}`
+    over the profiles `stmt` selects — the SAME `derive_status` every row
+    prints, so a chip's count is what clicking it lists. `phases` (1 Oct 2026:
+    the Applied Candidates chips are STAGES again, per bucket) follows the
+    `phase_counts` rule — a closed candidacy counts under "closed", whatever
+    phase it closed in. One query + one facts load.
     """
     from services.candidate_profiles import REJECTED_BUCKET  # lazy: that module imports this one
     from models import CandidateProfile
@@ -884,7 +976,8 @@ def status_counts(db, stmt) -> dict:
         CandidateProfile.budget_status).order_by(None)).all()
     statuses = statuses_for(db, rows)
     flagged = archived_profile_ids(db, [r[0] for r in rows if _value(r[1]) in REJECTED_BUCKET])
-    out = {LIVE_BUCKET: {}, ARCHIVE_BUCKET: {}, "live_total": 0, "archive_total": 0}
+    out = {LIVE_BUCKET: {}, ARCHIVE_BUCKET: {}, "live_total": 0, "archive_total": 0,
+           "phases": {LIVE_BUCKET: {}, ARCHIVE_BUCKET: {}}}
     for r in rows:
         status = statuses.get(r[0])
         if status is None:
@@ -892,6 +985,8 @@ def status_counts(db, stmt) -> dict:
         bucket = ARCHIVE_BUCKET if r[0] in flagged else LIVE_BUCKET
         out[bucket][status["key"]] = out[bucket].get(status["key"], 0) + 1
         out[f"{bucket}_total"] += 1
+        phase = "closed" if _value(r[1]) in REJECTED_BUCKET else status["stage"]["key"]
+        out["phases"][bucket][phase] = out["phases"][bucket].get(phase, 0) + 1
     return out
 
 

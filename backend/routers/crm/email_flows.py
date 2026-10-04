@@ -73,6 +73,12 @@ EVENTS: list[dict] = [
      "description": "Sent on the 1st of each month to Admin/CEO: last month's billing, collections, "
                     "margin, target attainment and the alert list, with a link to Reports ▸ Revenue.",
      "default_roles": ["Admin", "CEO"]},
+    {"event": "requirement.ta_assigned",
+     "label": "Position assigned to a TA",
+     "description": "Sent to a TA when RMG / GM (or the Sales Head) assigns them to source a position — "
+                    "the opportunity, how many positions, the priority and any note. Only the TAs "
+                    "named on the assignment receive it.",
+     "default_roles": ["TA"]},
     {"event": "requirement.positions_requested",
      "label": "Position change requested",
      "description": "Sent to RMG (and Sales Head) when Sales asks to increase or reduce the number of "
@@ -408,6 +414,16 @@ EVENTS: list[dict] = [
                     "Keep the {{double-brace}} placeholders — they are filled per candidate at send time.",
      "default_roles": [],
      "tokens": ["{{first_name}}", "{{full_name}}", "{{role}}", "{{customer}}", "{{sender}}"]},
+    {"event": "candidate.opening_interest", "kind": "candidate",
+     "label": "Candidate — we have an opening, are you interested? (bulk upload)",
+     "description": "Sent to every candidate a TA bulk-uploads onto an opportunity (when the upload's "
+                    "\"Email each candidate\" box is ticked) and from the row's Opening email button. "
+                    "The candidate replies to the TA; TA records Interested / Not interested on "
+                    "Applied Candidates. The customer is never named.",
+     "default_roles": [],
+     "tokens": ["candidate", "first_name", "role", "experience", "location", "work_mode", "skills",
+                "sender", "sender_designation", "sender_phone", "sender_email", "company",
+                "company_name", "company_website"]},
 ]
 
 

@@ -93,7 +93,7 @@ TABLE_REGISTRY: dict[str, dict] = {
     "requirement_resumes": {
         "columns": [
             "candidate_name", "applied_by",
-            "profile_stage", "profile_pipeline_status", "received_date", "ats_score",
+            "profile_stage", "profile_pipeline_status", "availability", "received_date", "ats_score",
             "ai_interview_status", "rounds", "_actions",
         ],
         "sortable": [],
@@ -102,7 +102,9 @@ TABLE_REGISTRY: dict[str, dict] = {
         # (`_clean`). "RMG Screening" and "Source" went the same way on 30 Sep
         # 2026. Stage stays beside Status (user decision, 30 Sep 2026) and is
         # announced so every saved layout shows it.
-        "announce": {"profile_stage": "applied_by"},
+        # "availability" (notice period · last working day, 1 Oct 2026) is
+        # announced after Status so every saved layout shows it.
+        "announce": {"profile_stage": "applied_by", "availability": "profile_pipeline_status"},
     },
 }
 #: How many sort levels a user may stack. Beyond this the query stops being

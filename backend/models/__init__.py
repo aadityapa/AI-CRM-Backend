@@ -19,6 +19,7 @@ from models.opportunities import (  # noqa: F401
 from models.requirements import (  # noqa: F401
     JobPostingStatus, Priority, Requirement, RequirementActivityLog, RequirementAttachment,
     RequirementJobPosting, RequirementPositionRequest, RequirementSkill, RequirementStatus,
+    RequirementTaAssignment,
 )
 from models.candidates import (  # noqa: F401
     Candidate, CandidateEducation, CandidateExperience, CandidateSkill,

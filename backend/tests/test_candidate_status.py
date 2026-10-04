@@ -103,9 +103,11 @@ def test_every_candidate_has_a_stage_and_a_round():
     assert st(PS.SALES_SCREENING) == ("Sales Screening", "With Sales – Ready to Submit", None)
     assert st(PS.L1_FEEDBACK, rounds={"customer_l1": cs.SCHEDULED}) == \
         ("Customer Interviewing", "Customer L1 Interview", "Scheduled")
-    assert st(PS.HR_INTERVIEWING) == ("HR Screening", "HR Round", "Scheduled")
+    assert st(PS.HR_SCREENING) == ("HR Screening", "HR Discussion", None)
+    # 1 Oct 2026 (user): HR Interviewing and Joined are phases of their own.
+    assert st(PS.HR_INTERVIEWING) == ("HR Interviewing", "HR Round", "Scheduled")
     assert st(PS.PREBOARDING) == ("Onboarding", "Preboarding", None)
-    assert st(PS.JOINED) == ("Onboarding", "Joined", None)
+    assert st(PS.JOINED) == ("Joined", "Joined", None)
     assert st(PS.SELF_WITHDRAWN, withdrawn_from=PS.SALES_SCREENING.value)[0] == "Sales Screening"
     assert st(PS.REJECTED)[0] == "Closed"
     # The round key tells the client which row field carries the date.
@@ -413,3 +415,47 @@ def test_moved_on_to_customer_l2_reads_yet_to_schedule():
     nothing to press. With no L2 booked it is TA's move."""
     assert _label(PS.L2_FEEDBACK, rounds={"customer_l1": cs.PASSED}) == "Customer L2 – Yet to Schedule"
     assert _label(PS.L2_FEEDBACK, rounds={"customer_l2": cs.SCHEDULED}) == "Customer L2 – Scheduled"
+
+
+# ------------------------------------------------------- deal on hold (1 Oct 2026)
+
+def test_a_held_opportunity_parks_every_live_candidacy_but_not_a_settled_one():
+    """Reported with a screenshot: the deal was on Customer Hold yet the candidate
+    still read "Submitted to Customer". The hold is the status now; the stored
+    stage (and so the phase) is untouched, so Reactivate resumes exactly there."""
+    held = derive_status(StatusFacts(PS.CUSTOMER_SCREENING.value, opportunity_stage="On_Hold"))
+    assert held.key == "deal_customer_hold" and held.label == "Customer Hold"
+    assert held.tone == cs.WARN and held.group == "parked"
+    assert held.stage_key == "customer_screening"          # the phase is kept
+    assert held.round_label == "Opportunity" and held.round_state == "Customer Hold"
+    assert _label(PS.RMG_REVIEW, rounds={"manual_l1": cs.SCHEDULED},
+                  opportunity_stage="Sales_Hold") == "Sales Hold"
+    # Settled candidacies keep their own word — joined, rejected, withdrawn.
+    assert _key(PS.JOINED, opportunity_stage="On_Hold") == "joined"
+    assert _key(PS.CUSTOMER_REJECTED, opportunity_stage="On_Hold") == "customer_rejected"
+    assert _key(PS.SELF_WITHDRAWN, opportunity_stage="Sales_Hold") == "self_withdrawn"
+    # A live deal changes nothing.
+    assert _key(PS.CUSTOMER_SCREENING, opportunity_stage="Active") == "submitted_to_customer"
+    # Every live stage can produce the hold status (the list filter pre-narrows on it).
+    for stage in PS:
+        if stage.value not in cs._SETTLED:
+            assert stage.value in cs.STATUS_BY_KEY["deal_customer_hold"].stages
+
+
+def test_load_facts_reads_the_deal_stage_and_the_status_filter_finds_held_candidates(db):
+    from models import PipelineStage
+    from routers.crm.candidate_profiles import _narrow_by_status
+
+    parked = _profile(db, PS.CUSTOMER_SCREENING)
+    live = _profile(db, PS.CUSTOMER_SCREENING)
+    db.get(Opportunity, parked.opportunity_id).pipeline_stage = PipelineStage.ON_HOLD
+    db.flush()
+    facts = cs.load_facts(db, [parked, live])
+    assert facts[parked.id].opportunity_stage == "On_Hold"
+    assert facts[live.id].opportunity_stage == "New"
+    statuses = cs.statuses_for(db, [parked, live])
+    assert statuses[parked.id]["key"] == "deal_customer_hold"
+    assert statuses[live.id]["key"] == "submitted_to_customer"
+    stmt = _narrow_by_status(db, select(CandidateProfile), "deal_customer_hold")
+    assert [p.id for p in db.execute(stmt).scalars()] == [parked.id]
+

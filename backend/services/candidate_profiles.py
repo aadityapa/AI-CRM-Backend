@@ -2332,7 +2332,63 @@ def interview_events_for_profile(db: Session, profile_id: int) -> list[dict]:
 # candidacy (Sourcing / Technical_Screening); a withdrawal can be recorded at
 # any live stage (perform_transition's own rule decides).
 
-TA_DECISIONS = ("screen", "hold", "release", "reject", "withdraw")
+#: `interested` / `not_interested` (1 Oct 2026) answer the opening email a bulk
+#: upload sends (`services/opening_interest`).
+TA_DECISIONS = ("screen", "hold", "release", "reject", "withdraw", "reapply",
+                "interested", "not_interested")
+#: The withdrawal note when the candidate says no to the opening email.
+NOT_INTERESTED_NOTE = "Not interested in this opening (replied to the opening email)"
+
+#: Activity row written when a withdrawn candidate re-applies (1 Oct 2026).
+REAPPLIED_ACTION = "REAPPLIED"
+
+
+def reapply_candidacy(db: Session, profile: CandidateProfile, note: str, user: CurrentUser) -> str:
+    """Reopen a CLOSED candidacy at Sourcing (1 Oct 2026, user ask: "after Self
+    Withdrawn I need a button to apply to this opportunity again", widened the
+    same day to "if we want to apply again after a rejection").
+
+    Any candidacy in `REJECTED_BUCKET` reopens (409 otherwise). A withdrawal
+    needs no reason; re-applying over a REJECTION — somebody else's decision —
+    needs one (≥ `MIN_COMMENT_LENGTH`), and it is logged beside the rejection's
+    own note so the history reads both. The candidate starts the flow afresh: back
+    with TA at Sourcing, the RMG screening cleared (TA sends them for
+    Technical Screening again), any hold / withdrawn-from note cleared, and
+    an Archive flag lifted. Interview history stays — it happened. Logged as
+    a STATUS_CHANGE plus `REAPPLIED`. The caller commits.
+    """
+    from services.candidate_status import RESTORED_ACTION, archived_profile_ids
+
+    current = profile.pipeline_status.value if hasattr(profile.pipeline_status, "value") \
+        else str(profile.pipeline_status or "")
+    if current not in REJECTED_BUCKET:
+        raise HTTPException(status_code=409,
+                            detail="Only a closed candidacy (withdrawn or rejected) can re-apply to "
+                                   "this opportunity.")
+    if current != PS.SELF_WITHDRAWN.value and len(note or "") < MIN_COMMENT_LENGTH:
+        raise HTTPException(status_code=400,
+                            detail="Say why the candidate should be considered again despite the "
+                                   f"rejection (at least {MIN_COMMENT_LENGTH} characters).")
+    uid = getattr(user, "id", None)
+    actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "TA"
+    was_archived = profile.id in archived_profile_ids(db, [profile.id])
+    profile.pipeline_status = PS.SOURCING
+    profile.withdrawn_from_status = None
+    profile.rmg_screening_status = None
+    profile.rmg_screening_note = None
+    profile.rmg_screening_by = None
+    profile.rmg_screening_at = None
+    if profile.budget_status == TA_HOLD:
+        profile.budget_status = None
+    why = f": {note}" if note else ""
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid, "STATUS_CHANGE",
+                 f"{current} -> {PS.SOURCING.value}: Re-applied{why}")
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid, REAPPLIED_ACTION,
+                 f"{actor} re-applied the candidate to this opportunity{why}")
+    if was_archived:
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, uid, RESTORED_ACTION,
+                     f"{actor} restored the candidate to Applied Candidates (re-applied)")
+    return "Re-applied — the candidate is back at Sourcing with you"
 #: Activity row written when TA hands a candidate to RMG / GM.
 SENT_FOR_SCREENING = "SENT_FOR_SCREENING"
 
@@ -2509,6 +2565,10 @@ def ta_decision(db: Session, profile: CandidateProfile, decision: str,
                notifications as any rejection) + a `TA_REJECTED` row, so the
                status reads "Rejected by TA". Reason required.
     withdraw → Self_Withdrawn through `perform_transition`. Reason required.
+    reapply  → a Self_Withdrawn candidacy reopens at Sourcing (`reapply_candidacy`).
+    interested     → the candidate said yes to the opening email: the reply is
+                     logged and they go for Technical Screening (as `screen`).
+    not_interested → they said no: logged, then Self_Withdrawn (note optional).
     """
     if decision not in TA_DECISIONS:
         raise HTTPException(status_code=400,
@@ -2521,12 +2581,26 @@ def ta_decision(db: Session, profile: CandidateProfile, decision: str,
         perform_transition(db, profile, PS.SELF_WITHDRAWN.value, f"Self withdrew: {clean}", user)
         notify_screeners_of_ta_close(db, profile, "withdrew", clean, user)
         return "Recorded — the candidate withdrew"
+    if decision == "reapply":
+        return reapply_candidacy(db, profile, clean, user)
     # Technical Screening, Hold and Reject belong to the SOURCING phase
     # (28 Sep 2026, user rule): once the candidate is with RMG / GM or has an
     # interview asked for, only Self Withdraw is TA's to record.
     stage = _ta_stage(db, [profile]).get(profile.id)
     if stage != SOURCING_STAGE:
         raise HTTPException(status_code=409, detail=_not_at_sourcing(stage))
+    if decision in ("interested", "not_interested"):
+        from services.opening_interest import record_reply
+        if decision == "not_interested":
+            record_reply(db, profile, False, clean, user)
+            perform_transition(db, profile, PS.SELF_WITHDRAWN.value,
+                               f"Self withdrew: {clean or NOT_INTERESTED_NOTE}", user)
+            return "Recorded — the candidate is not interested (Self Withdrawn)"
+        record_reply(db, profile, True, clean, user)
+        sent, refused = send_for_screening(db, [profile], user, clean)
+        if refused:
+            raise HTTPException(status_code=409, detail=refused[0]["reason"])
+        return "Interested — sent for Technical Screening, RMG / GM notified"
     if decision == "screen":
         sent, refused = send_for_screening(db, [profile], user, clean)
         if refused:

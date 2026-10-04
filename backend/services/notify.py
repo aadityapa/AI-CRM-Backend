@@ -328,6 +328,22 @@ def notify_roles(db: Session, role_names, title: str, message: str = "", link: s
 # -------------------------------------------------------------------- employee
 
 
+def employee_emails_enabled() -> bool:
+    """Settings ▸ Operations ▸ `notify.employee_emails` (default OFF).
+
+    Reported 1 Oct 2026 with a screenshot: a project employee deployed at
+    Harman got "Timesheet due for September 2026" from noreply@karnex.in.
+    Deployed employees are not users of this application (Sales fills and
+    submits their sheets since 23 Sep 2026), so the ONE employee-mail channel
+    is off unless Admin switches it on. Bells to a linked login still fire.
+    """
+    try:
+        from services.org_settings import setting_bool
+        return setting_bool("notify.employee_emails")
+    except Exception:  # noqa: BLE001 — no settings store → the safe default (silent)
+        return False
+
+
 def notify_employee(db: Session, emp, title: str, message: str = "", link: str = "",
                     *, email: bool = True, actor=None, event: str = "",
                     subject: str | None = None, rows=None, dedupe_key: str | None = None) -> bool:
@@ -348,6 +364,8 @@ def notify_employee(db: Session, emp, title: str, message: str = "", link: str =
     if getattr(emp, "user_id", None):
         _add_bell(db, emp.user_id, title, message, link)
         reached = True
+    if email and not employee_emails_enabled():
+        email = False   # 1 Oct 2026: employees get no mail unless Admin turns it on
     if email and getattr(emp, "user_id", None) in paused_user_ids(db):
         email = False
     if email:

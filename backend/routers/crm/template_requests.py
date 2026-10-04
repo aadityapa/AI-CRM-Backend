@@ -137,6 +137,26 @@ def _stamp_template_opportunity(job_id: str, opp_id: str) -> dict:
     return upsert_job_template(_legacy_db_target(), tpl)
 
 
+#: How an open request reads in the refusal and on the opportunity page.
+_STATUS_WORDS = {
+    TemplateRequestStatus.PENDING_RMG.value: "waiting for RMG",
+    TemplateRequestStatus.TEMPLATE_READY.value: "template ready",
+    TemplateRequestStatus.PREPARED.value: "template ready",
+}
+
+
+def open_request_for(db: Session, req: Requirement) -> TemplateRequest | None:
+    """The live (not Cancelled) template request of this requirement's
+    OPPORTUNITY — or of the requirement itself when it has none. A cancelled
+    request does not count, so TA can ask again after RMG / TA cancels it."""
+    cond = (TemplateRequest.opportunity_id == req.opportunity_id) if req.opportunity_id \
+        else (TemplateRequest.requirement_id == req.id)
+    return db.execute(
+        select(TemplateRequest).where(cond, TemplateRequest.status != TemplateRequestStatus.CANCELLED)
+        .order_by(TemplateRequest.id.desc()).limit(1)
+    ).scalars().first()
+
+
 @router.post("")
 def create_request(
     payload: TemplateRequestCreate,
@@ -146,6 +166,16 @@ def create_request(
     req = db.get(Requirement, payload.requirement_id)
     if req is None:
         raise HTTPException(status_code=404, detail="Requirement not found")
+    # ONE live request per opportunity (1 Oct 2026, user report: TA pressed
+    # "Request template" several times and RMG got a pile of duplicates).
+    existing = open_request_for(db, req)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A template was already requested for this opportunity ({existing.tr_number}, "
+                   f"{_STATUS_WORDS.get(_ev(existing.status), _ev(existing.status))}). "
+                   "Open Template Requests to follow it up.",
+        )
     tr = TemplateRequest(
         tr_number=next_sequence_number(db, TemplateRequest, TemplateRequest.tr_number, "TR"),
         requirement_id=req.id,
