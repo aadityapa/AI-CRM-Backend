@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -82,8 +83,8 @@ KEYS: dict[str, tuple[str, str]] = {
     "invoice.seller_email": ("INVOICE_SELLER_EMAIL", "karnex.singh@karnex.in"),
     "invoice.seller_contact_email": ("INVOICE_SELLER_CONTACT_EMAIL", "info@karnex.in"),
     "invoice.seller_website": ("INVOICE_SELLER_WEBSITE", "www.karnex.in"),
-    "invoice.seller_gstin": ("INVOICE_SELLER_GSTIN", "27AAJCK2474BA1ZL"),
-    "invoice.seller_pan": ("INVOICE_SELLER_PAN", "AAJCK2474BA"),
+    "invoice.seller_gstin": ("INVOICE_SELLER_GSTIN", "27AAHCK4749A1ZL"),
+    "invoice.seller_pan": ("INVOICE_SELLER_PAN", "AAHCK4749A"),
     "invoice.seller_cin": ("INVOICE_SELLER_CIN", "U72900RJ2018PTC638288"),
     "invoice.seller_logo_url": ("INVOICE_SELLER_LOGO_URL", "/admin/assets/karnex-logo-invoice.png"),
     "invoice.seller_seal_url": ("INVOICE_SELLER_SEAL_URL", "/admin/assets/karnex-seal-sign.png"),
@@ -118,6 +119,35 @@ KEYS: dict[str, tuple[str, str]] = {
     # e.g. https://karnex-invoice-viewer.vercel.app/?src={data_url}
     "invoice.qr_viewer_url": ("INVOICE_QR_VIEWER_URL", ""),
 }
+
+#: Shape checks for values that print on a tax document (5 Oct 2026, user
+#: report: the GSTIN and PAN had been saved into each other's boxes and the Tax
+#: Invoice printed them swapped). GSTIN = state code + PAN + entity + Z + check.
+_FORMATS: dict[str, tuple[re.Pattern, str]] = {
+    "invoice.seller_gstin": (
+        re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$"),
+        "GSTIN must be 15 characters, e.g. 27AAHCK4749A1ZL"),
+    "invoice.seller_pan": (
+        re.compile(r"^[A-Z]{5}\d{4}[A-Z]$"),
+        "PAN must be 10 characters, e.g. AAHCK4749A"),
+}
+
+
+def normalize_value(key: str, value: str) -> str:
+    """Trim; tax identifiers are upper-cased (they are printed as such)."""
+    value = (value or "").strip()
+    return value.upper() if key in _FORMATS else value
+
+
+def validation_error(key: str, value: str) -> str | None:
+    """Why `value` cannot be saved for `key`, or None. Blank is always allowed
+    (it means "fall back to the environment / default")."""
+    fmt = _FORMATS.get(key)
+    if not fmt or not value:
+        return None
+    pattern, message = fmt
+    return None if pattern.match(value) else message
+
 
 _TTL_SECONDS = 60.0
 _lock = threading.Lock()

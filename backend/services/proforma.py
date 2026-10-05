@@ -32,10 +32,11 @@ from models import CustomerBillingPolicy, Invoice, Project, PurchaseOrder, Times
 from models.finance import InvoiceKind
 from services.crm_common import next_sequence_number
 from services.finance import (
-    consume_po_for_invoice, ensure_po_covers, ensure_unique_invoice_number, po_draw_amount,
+    apply_round_off, consume_po_for_invoice, ensure_po_covers, ensure_unique_invoice_number,
+    po_draw_amount,
 )
 from services.invoice_format import format_summary, normalize_invoice_format
-from services.notify import notify_role
+from services.notify import notify_role, notify_roles
 
 PROFORMA_PREFIX = "PI"
 TAX_PREFIX = "INV"
@@ -44,7 +45,7 @@ TAX_PREFIX = "INV"
 #: the role here is only the default route.
 EVENT_PROFORMA_READY = "invoice.proforma_ready"        # → Finance
 EVENT_PROFORMA_RETURNED = "invoice.proforma_returned"  # → GM
-EVENT_INVOICE_GENERATED = "invoice.generated"          # → Sales Manager
+EVENT_INVOICE_GENERATED = "invoice.generated"          # → Sales Manager + Sales Head
 
 ROLE_GM = "GM"
 ROLE_SALES_MANAGER = "Sales Manager"
@@ -62,6 +63,27 @@ def po_credit_days(po: PurchaseOrder | None, default: int = 30) -> int:
         if m:
             return max(0, min(int(m.group(1)), 365))
     return default
+
+
+def invoice_credit_days(db: Session, project_id: int | None,
+                        po: PurchaseOrder | None, default: int = 30) -> tuple[int, str]:
+    """(credit days, where they came from) for a new / converted invoice.
+
+    5 Oct 2026, user ask: the due date follows the CUSTOMER BRANCH. The
+    project's delivery branch (else the PO's billing branch) wins when it has
+    `invoice_due_days`; then the PO's payment terms; then 30. Source is
+    "branch" | "po" | "default" — the invoice editor prints it.
+    """
+    from models import CustomerBranch
+
+    project = db.get(Project, project_id) if project_id else None
+    branch_id = getattr(project, "branch_id", None) or getattr(po, "billing_branch_id", None)
+    branch = db.get(CustomerBranch, branch_id) if branch_id else None
+    if branch is not None and branch.invoice_due_days is not None:
+        return max(0, min(int(branch.invoice_due_days), 365)), "branch"
+    if po is not None and po.payment_terms and re.search(r"\d", str(po.payment_terms)):
+        return po_credit_days(po, default), "po"
+    return default, "default"
 
 
 def _billing_policy_for_project(db: Session, project_id: int) -> CustomerBillingPolicy | None:
@@ -141,12 +163,15 @@ def _notify_returned(db: Session, invoice: Invoice, actor, reason: str) -> None:
 
 
 def _notify_generated(db: Session, invoice: Invoice, actor) -> None:
-    notify_role(
-        db, ROLE_SALES_MANAGER,
-        f"Invoice {invoice.invoice_number} generated",
+    # 5 Oct 2026: the Sales Manager OR the Sales Head sends it to the customer
+    # and confirms the customer's approval back to Finance (IRN next).
+    notify_roles(
+        db, [ROLE_SALES_MANAGER, "Sales_Head"],
+        f"Invoice {invoice.invoice_number} generated — send it to the customer",
         f"Finance generated the original invoice {invoice.invoice_number} "
         f"(from proforma {invoice.proforma_number}) for ₹{float(invoice.grand_total or 0):,.2f} incl. GST. "
-        f"Due {invoice.due_date.isoformat() if invoice.due_date else '—'}.",
+        f"Due {invoice.due_date.isoformat() if invoice.due_date else '—'}. Send it to the customer; once "
+        "they accept it unchanged, press \"Confirm customer approval\" on the invoice so Finance adds the IRN.",
         f"/invoices/{invoice.id}", exclude_user_id=getattr(actor, "id", None),
         event=EVENT_INVOICE_GENERATED, actor=actor,
         dedupe_prefix=f"{EVENT_INVOICE_GENERATED}:{invoice.id}",
@@ -182,7 +207,8 @@ def return_to_gm(db: Session, invoice: Invoice, actor, reason: str) -> Invoice:
 
 def convert_to_tax_invoice(db: Session, invoice: Invoice, actor, *,
                            invoice_number: str | None = None,
-                           invoice_date: date | None = None) -> Invoice:
+                           invoice_date: date | None = None,
+                           round_off: bool | None = None) -> Invoice:
     """Finance turns the reviewed Proforma into the original tax invoice.
 
     In place, not a copy: the id, lines, GST and PO link stay, so every link
@@ -208,7 +234,10 @@ def convert_to_tax_invoice(db: Session, invoice: Invoice, actor, *,
     invoice.kind = InvoiceKind.TAX.value
     if invoice_date is not None:
         invoice.invoice_date = invoice_date
-    invoice.due_date = (invoice.invoice_date or date.today()) + timedelta(days=po_credit_days(po))
+    invoice.due_date = (invoice.invoice_date or date.today()) + timedelta(
+        days=invoice_credit_days(db, invoice.project_id, po)[0])
+    if round_off is not None:
+        apply_round_off(invoice, round_off)
     db.flush()
     consume_po_for_invoice(db, invoice, po, getattr(actor, "id", None))
     _notify_generated(db, invoice, actor)

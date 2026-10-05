@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -53,9 +54,11 @@ from services import tax
 from services.crm_common import log_activity, next_sequence_number, paginate, save_upload
 from services.invoice_format import format_summary, normalize_invoice_format
 from services.proforma import convert_to_tax_invoice, return_to_gm
+from services import invoice_customer_approval as invoice_approval
 from services.finance import (
     apply_gst_split,
     apply_invoice_gst_totals,
+    apply_round_off,
     assert_po_allows_new_drawdown,
     compute_karnex_gst,
     consume_po_for_invoice,
@@ -747,12 +750,19 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
 def list_invoices(payment_status: str | None = None, project_id: int | None = None,
                   po_id: int | None = None, customer_id: int | None = None,
                   kind: str | None = None,
+                  customer_approved: bool | None = None,
                   pp: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
     stmt = select(Invoice)
     if kind:
         # "Proforma" = Finance's review queue; "Tax" = issued invoices. Blank = both.
         stmt = stmt.where(Invoice.kind == _enum_or_400(InvoiceKind, kind, "kind").value)
+    if customer_approved is not None:
+        # 5 Oct 2026: Finance's "Customer approved" list (true) / the invoices
+        # still waiting for the Sales Manager's confirmation (false). Tax only.
+        stmt = stmt.where(Invoice.kind == InvoiceKind.TAX.value,
+                          Invoice.customer_approved_at.isnot(None) if customer_approved
+                          else Invoice.customer_approved_at.is_(None))
     if payment_status:
         stmt = stmt.where(
             Invoice.payment_status == _enum_or_400(PaymentStatus, payment_status, "payment_status"))
@@ -766,9 +776,11 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
         stmt = stmt.where(Invoice.po_id == po_id)
     if pp.search:
         stmt = stmt.where(Invoice.invoice_number.ilike(f"%{pp.search}%"))
-    stmt = stmt.order_by(Invoice.id.desc())
+    stmt = stmt.order_by(Invoice.customer_approved_at.desc().nullslast(), Invoice.id.desc()) \
+        if customer_approved else stmt.order_by(Invoice.id.desc())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
     rows = [serialize_invoice(inv) for inv in items]
+    see_irn = invoice_approval.may_see_irn(user)
     # Customer on every LIST row (14 Sep 2026): the Projects hub groups the
     # tab by customer. One batched query for the page — via the PO when the
     # invoice has one (the billed party), else the project's customer.
@@ -782,6 +794,11 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
         cid = (inv.po.customer_id if inv.po is not None and inv.po.customer_id else proj_cust.get(inv.project_id))
         r["customer_id"] = cid
         r["customer_name"] = cust_names.get(cid)
+        r["customer_approved_at"] = inv.customer_approved_at.isoformat() if inv.customer_approved_at else None
+        if see_irn:
+            # The IRN itself stays on the invoice page; the list says only whether it is in.
+            r["irn_recorded"] = bool(inv.irn_number)
+            r["ack_number"] = inv.ack_number
     return envelope(data=rows, meta=meta)
 
 
@@ -800,7 +817,67 @@ def get_invoice(invoice_id: int, request: Request, db: Session = Depends(get_crm
     # The QR's public link needs an absolute origin: Settings → public base URL
     # wins; the caller's origin is the fallback so a LAN deployment still works.
     origin = str(request.base_url).rstrip("/") if request else ""
-    return envelope(serialize_invoice(invoice, detail=True, db=db, share_base_url=origin))
+    return envelope(_with_approval(db, invoice, user,
+                                   serialize_invoice(invoice, detail=True, db=db, share_base_url=origin)))
+
+
+def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
+    """Customer approval for everyone who reads the invoice; the e-invoice IRN
+    block only for Finance / Admin / CEO (`invoice_approval.payload`)."""
+    from services.revenue_report import _user_names
+
+    data.update(invoice_approval.payload(invoice, user,
+                                         _user_names(db, invoice_approval.user_ids(invoice))))
+    return data
+
+
+class CustomerApprovalIn(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class EInvoiceIn(BaseModel):
+    irn: str = Field(min_length=1, max_length=80)
+    ack_number: str = Field(min_length=1, max_length=40)
+    ack_date: date | None = None
+
+
+@router.post("/invoices/{invoice_id}/customer-approval")
+def confirm_customer_approval(invoice_id: int, body: CustomerApprovalIn | None = None,
+                              db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
+    """Sales Manager / Sales Head: the customer accepted the original invoice
+    unchanged — Finance is told to record the IRN (5 Oct 2026)."""
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice_approval.confirm_customer_approval(db, invoice, user, body.note if body else None)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"Customer approval of {invoice.invoice_number} confirmed — Finance notified")
+
+
+@router.delete("/invoices/{invoice_id}/customer-approval")
+def withdraw_customer_approval(invoice_id: int, db: Session = Depends(get_crm_db),
+                               user: CurrentUser = Depends(INV_READ)):
+    """Undo a confirmation made by mistake (only before Finance records the IRN)."""
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice_approval.withdraw_customer_approval(db, invoice, user)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"Customer approval of {invoice.invoice_number} withdrawn")
+
+
+@router.put("/invoices/{invoice_id}/einvoice")
+def record_einvoice(invoice_id: int, body: EInvoiceIn, db: Session = Depends(get_crm_db),
+                    user: CurrentUser = Depends(INV_READ)):
+    """Finance records the e-invoice IRN + Acknowledgement No. on a
+    customer-approved tax invoice (Finance / Admin / CEO only)."""
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice_approval.record_irn(db, invoice, user, irn=body.irn, ack_number=body.ack_number,
+                                ack_date=body.ack_date)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"IRN saved on {invoice.invoice_number}")
 
 
 @router.api_route("/invoices/{invoice_id}", methods=["PUT", "PATCH"])
@@ -827,9 +904,14 @@ def update_invoice(invoice_id: int, body: InvoiceUpdate, db: Session = Depends(g
             invoice.invoice_format = normalize_invoice_format(data["invoice_format"])
             log_timesheet_activity(db, invoice, user.id, "PROFORMA_FORMAT_CHANGED",
                                    f"Finance set the invoice format: {format_summary(invoice.invoice_format)}")
+        if data.get("round_off") is not None:
+            apply_round_off(invoice, bool(data["round_off"]))
     elif "invoice_format" in data:
         raise HTTPException(status_code=400,
                             detail="The column format is fixed once the original invoice is generated")
+    elif data.get("round_off") is not None:
+        raise HTTPException(status_code=400,
+                            detail="Round off is chosen before the original invoice is generated")
 
     for field in ("invoice_date", "due_date"):
         if field in data:
@@ -895,6 +977,7 @@ def convert_proforma(invoice_id: int, body: ConvertProformaIn | None = None,
         db, invoice, user,
         invoice_number=body.invoice_number if body else None,
         invoice_date=body.invoice_date if body else None,
+        round_off=body.round_off if body else None,
     )
     log_timesheet_activity(db, invoice, user.id, "INVOICE_GENERATED",
                            f"Original invoice {invoice.invoice_number} generated from proforma "

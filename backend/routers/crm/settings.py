@@ -66,7 +66,11 @@ def upsert_setting(key: str, payload: SettingValueIn,
     key = (key or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="Setting key must not be empty")
-    value = (payload.value or "").strip()
+    from services.org_settings import invalidate, normalize_value, validation_error
+
+    value = normalize_value(key, payload.value or "")
+    if err := validation_error(key, value):
+        raise HTTPException(status_code=400, detail=err)
 
     if key == PASS_THRESHOLD_KEY:
         try:
@@ -89,5 +93,6 @@ def upsert_setting(key: str, payload: SettingValueIn,
             setting.description = payload.description
         action = "updated"
     db.commit()
+    invalidate()
     return envelope(data=SettingOut.model_validate(setting).model_dump(),
                     message=f"Setting '{key}' {action}")

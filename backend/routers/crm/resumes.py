@@ -1143,9 +1143,7 @@ def list_resumes(
     # with no buttons at all.
     from services.resumes import manual_round_state
     rounds = manual_round_state(db, [p[1] for p in prof.values() if p[1]])
-    avail = availability_by_candidate(db, cand_ids)
     for row, item in zip(data, items):
-        _with_availability(row, avail.get(item.candidate_id) if item.candidate_id else None)
         owner, pid, screening, stage, budget, expected = (
             prof.get(item.candidate_id, (None,) * 6)
             if item.candidate_id else (None,) * 6)
@@ -1175,11 +1173,13 @@ def list_resumes(
     # How long the candidate has been waiting on whoever holds them (30 Sep
     # 2026): days since the last thing that happened to the candidacy — the
     # same activity clock that orders the list — else since they applied.
-    # Manual Archive (30 Sep 2026): a closed candidacy offers RMG / GM an
-    # Archive button (`archivable`); an archived one offers Restore.
+    # Archive (5 Oct 2026): any candidacy may be archived by hand
+    # (`archivable`); `archive_reason` says why one is archived — "manual"
+    # (offers Restore) or "hold" (comes back when the deal is reactivated).
     from services.candidate_profiles import REJECTED_BUCKET as _CLOSED
-    from services.candidate_status import closing_notes
+    from services.candidate_status import archive_reasons, closing_notes
     archived_set = set(archived_ids)
+    reasons = archive_reasons(db, [r.get("profile_id") for r in page_rows if r.get("profile_id") in archived_set])
     # Why a closed candidacy was closed, by whom (1 Oct 2026, user ask) —
     # printed on the Rejected rows; ONE query for the page's closed profiles.
     notes = closing_notes(db, [r.get("profile_id") for r in page_rows
@@ -1187,13 +1187,19 @@ def list_resumes(
     # The opening email and the candidate's answer (1 Oct 2026) — ONE query.
     from services.opening_interest import opening_states
     opening = opening_states(db, [r.get("profile_id") for r in page_rows])
+    # Availability + the candidate line, for resume AND profile-only rows (ONE query).
+    avail = availability_by_candidate(db, [r.get("candidate_id") for r in page_rows])
     for row in page_rows:
+        cand_avail = avail.get(row.get("candidate_id")) if row.get("candidate_id") else None
+        _with_availability(row, cand_avail)
+        _with_applicant_facts(row, cand_avail)
         row.update(waiting_since(activity.get(row.get("candidate_id")),
                                  row.get("received_date") or row.get("created_at")))
         pid = row.get("profile_id")
         stage = row.get("profile_pipeline_status")
         row["archived"] = bool(pid and pid in archived_set)
-        row["archivable"] = bool(pid and stage in _CLOSED and not row["archived"])
+        row["archive_reason"] = reasons.get(pid) if row["archived"] else None
+        row["archivable"] = bool(pid and not row["archived"])
         row["closed_note"] = notes.get(pid) if pid and stage in _CLOSED else None
         row["opening_mail"] = opening.get(pid) if pid else None
     return envelope(page_rows, meta=meta)
@@ -1437,17 +1443,41 @@ def availability_by_candidate(db: Session, candidate_ids) -> dict[int, dict]:
     if not ids:
         return {}
     out: dict[int, dict] = {}
-    for cid, notice, resigned, last_day in db.execute(
+    for (cid, notice, resigned, last_day, years, cur_ctc, exp_ctc, city, preferred) in db.execute(
         select(Candidate.id, Candidate.notice_period, Candidate.resignation_status,
-               Candidate.last_working_day)
+               Candidate.last_working_day, Candidate.experience_years, Candidate.current_ctc,
+               Candidate.expected_ctc, Candidate.city, Candidate.preferred_locations)
         .where(Candidate.id.in_(ids))
     ).all():
         out[int(cid)] = {
             "notice_period": (notice or "").strip() or None,
             "resignation_status": bool(resigned),
             "last_working_day": last_day.isoformat() if last_day else None,
+            # The candidate record's facts — the fallback for what an
+            # application did not type (6 Oct 2026, `_with_applicant_facts`).
+            "facts": {
+                "experience": _short_number(years),
+                "current_ctc": _lakhs(cur_ctc),
+                "expected_ctc": _lakhs(exp_ctc),
+                "current_location": (city or "").strip() or None,
+                "preferred_location": (preferred or "").strip() or None,
+            },
         }
     return out
+
+
+def _short_number(value) -> str | None:
+    """12.50 → "12.5", 4.00 → "4"."""
+    if value is None:
+        return None
+    return f"{float(value):.2f}".rstrip("0").rstrip(".")
+
+
+def _lakhs(rupees) -> str | None:
+    """A CTC stored in rupees, written the way the forms take it (lakhs)."""
+    if rupees is None or float(rupees) <= 0:
+        return None
+    return _short_number(float(rupees) / 100_000)
 
 
 def _with_availability(row: dict, avail: dict | None) -> None:
@@ -1459,6 +1489,27 @@ def _with_availability(row: dict, avail: dict | None) -> None:
     row["notice_period"] = typed or avail.get("notice_period")
     row["resignation_status"] = avail.get("resignation_status", False)
     row["last_working_day"] = avail.get("last_working_day")
+
+
+def _with_applicant_facts(row: dict, avail: dict | None) -> None:
+    """ONE candidate line on every Applied Candidates row (6 Oct 2026, user
+    report: a candidate applied from the Candidates tab and one uploaded on the
+    position showed different details). What THIS application typed wins; the
+    candidate record fills every gap — experience, notice, current / expected
+    CTC, current and preferred location. A copy: the stored application is
+    never changed."""
+    facts = dict((avail or {}).get("facts") or {})
+    notice = (avail or {}).get("notice_period")
+    details = row.get("application_details") if isinstance(row.get("application_details"), dict) else {}
+    merged = dict(details or {})
+    for key in ("current_ctc", "expected_ctc", "current_location", "preferred_location"):
+        if not str(merged.get(key) or "").strip() and facts.get(key):
+            merged[key] = facts[key]
+    if not str(merged.get("notice_period") or "").strip() and notice:
+        merged["notice_period"] = notice
+    row["application_details"] = merged or None
+    if not str(row.get("applicant_experience") or "").strip() and facts.get("experience"):
+        row["applicant_experience"] = facts["experience"]
 
 
 def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]:
@@ -1606,10 +1657,22 @@ def update_resume(
     # A location TA edits here is the candidate's (1 Oct 2026): the profile's
     # Locations section reads the candidate record, not the resume.
     loc_keys = tuple(k for k in ("current_location", "preferred_location") if k in changes)
-    if loc_keys and resume.candidate_id:
-        from services.slot_booking import copy_locations_to_candidate
-        copy_locations_to_candidate(db.get(Candidate, resume.candidate_id), details,
-                                    overwrite=True, keys=loc_keys)
+    fact_keys = tuple(k for k in ("notice_period", "current_ctc", "expected_ctc", "experience") if k in changes)
+    if (loc_keys or fact_keys) and resume.candidate_id:
+        from services.slot_booking import copy_application_facts_to_candidate, copy_locations_to_candidate
+        cand = db.get(Candidate, resume.candidate_id)
+        copy_locations_to_candidate(cand, details, overwrite=True, keys=loc_keys)
+        # Notice / CTC / experience too (6 Oct 2026): the profile, the Candidates
+        # list and the Submit-to-Sales checklist read the candidate record.
+        written = copy_application_facts_to_candidate(cand, details, experience=resume.applicant_experience,
+                                                      keys=fact_keys)
+        req_row = get_requirement_or_404(db, resume.requirement_id)
+        if "expected_ctc" in written and req_row.opportunity_id:
+            # The application's own expected CTC drives the budget check.
+            for prof in db.execute(select(CandidateProfile).where(
+                    CandidateProfile.candidate_id == cand.id,
+                    CandidateProfile.opportunity_id == req_row.opportunity_id)).scalars():
+                prof.expected_ctc = cand.expected_ctc
     log_activity(db, RequirementActivityLog, "requirement_id", resume.requirement_id, user.id,
                  "RESUME_UPDATED", f"Resume details updated for {resume.candidate_name}")
     db.commit()
@@ -1713,12 +1776,17 @@ def scan_all_resumes(
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(screener_or(gated_write("requirements", "TA", "RMG"))),
 ):
+    from services.resumes import ats_outdated
+
     req = get_requirement_or_404(db, requirement_id)
-    pending = db.execute(
+    # Pending rows, plus Scored rows the current rules would score differently
+    # (`ats_outdated`, 6 Oct 2026) — "Score N" on Applied Candidates catches both up.
+    pending = [r for r in db.execute(
         select(Resume)
-        .where(Resume.requirement_id == req.id, Resume.ats_status == AtsStatus.PENDING_SCAN)
+        .where(Resume.requirement_id == req.id,
+               Resume.ats_status.in_([AtsStatus.PENDING_SCAN, AtsStatus.SCORED]))
         .order_by(Resume.id.asc())
-    ).scalars().all()
+    ).scalars().all() if r.ats_status == AtsStatus.PENDING_SCAN or ats_outdated(r)]
     results: list[dict] = []
     scored = failed = 0
     for resume in pending:
@@ -1744,7 +1812,7 @@ def scan_all_resumes(
     db.commit()
     return envelope(
         {"total_pending": len(pending), "scored": scored, "failed": failed, "results": results},
-        message=f"Scanned {scored} of {len(pending)} pending resume(s); {failed} failed",
+        message=f"Scored {scored} of {len(pending)} resume(s); {failed} failed",
     )
 
 

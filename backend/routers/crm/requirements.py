@@ -859,8 +859,11 @@ def _add_customer_jd(db: Session, req, file: UploadFile, user: CurrentUser):
                  "ATTACHMENT_ADDED", f"Customer JD added: {att.file_name or 'file'}")
     db.commit()
     db.refresh(att)
-    return envelope({**serialize_attachment_row(att), "kind": "customer_jd"},
-                    message="Customer JD added")
+    # The ATS falls back to the customer's JD when the position has no RMG JD
+    # (6 Oct 2026, `services.resumes.ats_jd_text`) — re-score then.
+    rescoring = not (req.rmg_jd_text or "").strip() and _rescore_after_jd_change(db, req, user.id)
+    return envelope({**serialize_attachment_row(att), "kind": "customer_jd", "rescoring": rescoring},
+                    message="Customer JD added" + (" — re-scoring the applicants' ATS" if rescoring else ""))
 
 
 #: A JD longer than this is clipped — the ATS keyword pass and the interview

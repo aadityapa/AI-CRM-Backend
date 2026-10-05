@@ -322,7 +322,7 @@ def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
     """Archive is MANUAL (30 Sep 2026, user rule): a rejected / withdrawn
     candidate stays on the live list — its row offering RMG / GM an Archive
     button (`archivable`) — until someone archives it; Restore brings it back.
-    A live candidacy cannot be archived (409). A legacy resume with no profile
+    Since 5 Oct 2026 a live candidacy may be archived too. A legacy resume with no profile
     stays live. The chips count each bucket apart."""
     from fastapi import HTTPException
     import routers.crm.resumes as resumes_router
@@ -346,12 +346,13 @@ def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
     live = _list(db, req)
     assert sorted(r["candidate_name"] for r in live["data"]) == ["Gone", "Left", "Legacy", "Live"]
     flags = {r["candidate_name"]: r["archivable"] for r in live["data"]}
-    assert flags == {"Gone": True, "Legacy": False, "Left": True, "Live": False}
+    # 5 Oct 2026: ANY candidacy may be archived by hand (Sales / RMG / GM).
+    assert flags == {"Gone": True, "Legacy": False, "Left": True, "Live": True}
     assert _list(db, req, bucket="archive")["data"] == []
 
-    with pytest.raises(HTTPException) as err:
-        set_applied_archive(db, live_p, True, rmg)
-    assert err.value.status_code == 409
+    assert set_applied_archive(db, live_p, True, rmg) is True
+    assert set_applied_archive(db, live_p, False, rmg) is True
+    db.commit()
     assert set_applied_archive(db, gone, True, rmg) is True
     assert set_applied_archive(db, gone, True, rmg) is False   # idempotent
     db.commit()
@@ -361,6 +362,7 @@ def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
     archive = _list(db, req, bucket="archive")
     assert [r["candidate_name"] for r in archive["data"]] == ["Gone"]
     assert archive["data"][0]["archived"] is True and archive["data"][0]["archivable"] is False
+    assert archive["data"][0]["archive_reason"] == "manual"
     counts = live["meta"]["status_counts"]
     assert counts["live_total"] == 2 and counts["archive_total"] == 1
     assert counts["archive"] == {"rmg_rejected": 1}
@@ -374,6 +376,39 @@ def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
     assert _list(db, req, bucket="archive")["data"] == []
     with pytest.raises(HTTPException):
         _list(db, req, bucket="bin")
+
+
+def test_a_held_deal_parks_its_live_candidates_in_archive(db, monkeypatch):
+    """5 Oct 2026: while the opportunity is on Customer / Sales Hold its live
+    candidacies sit in Archive (reason "hold") and cannot be restored by hand;
+    reactivating the deal brings them back. A Joined candidate stays put."""
+    from fastapi import HTTPException
+    import routers.crm.resumes as resumes_router
+    from models import PipelineStage
+    from services.candidate_profiles import set_applied_archive
+
+    monkeypatch.setattr(resumes_router, "enrich_resumes_with_ai",
+                        lambda _db, items: [{"id": r.id, "candidate_id": r.candidate_id,
+                                             "candidate_name": r.candidate_name}
+                                            for r in items])
+    req = _req(db)
+    live_p = _applicant(db, req, "Live", screening="Pending", with_resume=True)
+    joined = _applicant(db, req, "Joined", screening="Shortlisted", with_resume=True)
+    joined.pipeline_status = PipelineStatus.JOINED
+    opp = db.get(Opportunity, req.opportunity_id)
+    opp.pipeline_stage = PipelineStage.ON_HOLD
+    db.commit()
+
+    assert sorted(r["candidate_name"] for r in _list(db, req)["data"]) == ["Joined"]
+    archive = _list(db, req, bucket="archive")["data"]
+    assert [(r["candidate_name"], r["archive_reason"]) for r in archive] == [("Live", "hold")]
+    with pytest.raises(HTTPException) as err:
+        set_applied_archive(db, live_p, False, SimpleNamespace(id=1, full_name="S"))
+    assert err.value.status_code == 409
+
+    opp.pipeline_stage = PipelineStage.ACTIVE
+    db.commit()
+    assert sorted(r["candidate_name"] for r in _list(db, req)["data"]) == ["Joined", "Live"]
 
 
 def test_status_chips_narrow_both_kinds_of_row_and_rows_say_how_long_they_wait(db, monkeypatch):

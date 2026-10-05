@@ -90,6 +90,33 @@ def sourcing_opportunity_clause():
     )
 
 
+#: Requirement statuses that mean "an approval is still owed" — Sales Head
+#: (requirement-level) or RMG. The Opportunities "Pending Approval" tab.
+AWAITING_APPROVAL_STATUSES = (
+    RequirementStatus.PENDING_SALES_HEAD_APPROVAL,
+    RequirementStatus.PENDING_ENGINEERING_REVIEW,
+)
+
+
+def awaiting_approval_clause():
+    """Deals still waiting on ANY approval (5 Oct 2026, user report: two positions
+    waiting for RMG approval sat under Active while Pending Approval was empty):
+    the opportunity itself awaits the Sales Head, OR it is approved and live
+    (New / Active) with a requirement awaiting the Sales Head / RMG. Negate it
+    for the stage tabs so every deal lives in exactly one tab."""
+    from models import Opportunity, OpportunityApprovalStatus, PipelineStage
+    return or_(
+        Opportunity.approval_status == OpportunityApprovalStatus.PENDING_SALES_HEAD_APPROVAL,
+        and_(
+            Opportunity.approval_status == OpportunityApprovalStatus.APPROVED,
+            Opportunity.pipeline_stage.in_((PipelineStage.NEW, PipelineStage.ACTIVE)),
+            Opportunity.id.in_(
+                select(Requirement.opportunity_id)
+                .where(Requirement.status.in_(AWAITING_APPROVAL_STATUSES))),
+        ),
+    )
+
+
 def recruiter_only(user) -> bool:
     """TA with no role that may raise, approve or screen work — the login the
     sourcing-only rule applies to. Sales / RMG / heads / admins keep their

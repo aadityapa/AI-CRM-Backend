@@ -54,6 +54,8 @@ class _BranchBillingFields(BaseModel):
     billing_frequency: str | None = Field(default=None, max_length=40)
     billing_cycle_start_day: int | None = Field(default=None, ge=1, le=31)
     billing_cycle_end_day: int | None = Field(default=None, ge=1, le=31)
+    #: Invoice credit days (0120): due date = invoice date + N. Null = PO terms.
+    invoice_due_days: int | None = Field(default=None, ge=0, le=365)
     is_max_billable_hours_per_day: bool | None = None
     max_billable_hours_per_day: float | None = None
     is_max_billable_hours_per_month: bool | None = None
@@ -111,6 +113,7 @@ class BranchBillingPolicyIn(BaseModel):
     billing_frequency: str | None = Field(default=None, max_length=40)
     billing_cycle_start_day: int | None = Field(default=None, ge=1, le=31)
     billing_cycle_end_day: int | None = Field(default=None, ge=1, le=31)
+    invoice_due_days: int | None = Field(default=None, ge=0, le=365)
     is_max_billable_hours_per_day: bool | None = None
     max_billable_hours_per_day: float | None = Field(default=None, ge=0)
     is_max_billable_hours_per_month: bool | None = None

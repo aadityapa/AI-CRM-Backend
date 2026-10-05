@@ -494,6 +494,7 @@ def score_resume_against_requirement(
     city: str | None = None,
     jd_text: str | None = None,
     weights: dict | None = None,
+    candidate_facts: dict | None = None,
 ) -> dict:
     """Deterministically score resume `text` against a requirement.
 
@@ -506,8 +507,15 @@ def score_resume_against_requirement(
     When `jd_text` is provided, a JD-keyword overlap component is included.
     `weights` optionally overrides the per-component point pools (per requirement).
     Skill matching is alias-aware (React≈ReactJS) and symbol-safe (C++, C#, .NET).
+
+    `candidate_facts` (6 Oct 2026) — what TA typed for THIS application:
+    `experience_years` (wins over a number read from the CV, which Naukri-style
+    "3y 2m" CVs often do not state in words) and `locations` (current +
+    preferred; the position's city counts as matched when the candidate lives
+    there or is willing to work there, not only when the CV names it).
     """
     text = text or ""
+    facts = candidate_facts or {}
     mandatory = [s.strip() for s in (mandatory_skills or []) if s and s.strip()]
     optional = [s.strip() for s in (optional_skills or []) if s and s.strip()]
     jd_keywords = extract_jd_keywords(jd_text) if (jd_text or "").strip() else []
@@ -548,7 +556,11 @@ def score_resume_against_requirement(
                 evidence[s] = evidence_snippet(variant or s, text)
 
     # --- experience (only when a bound is configured) ---
-    detected_years = detect_experience_years(text)
+    stated_years = facts.get("experience_years")
+    detected_years = (float(stated_years) if stated_years is not None
+                      else detect_experience_years(text))
+    experience_source = ("application" if stated_years is not None
+                         else "resume" if detected_years is not None else None)
     exp_match: bool | None
     if exp_min is not None or exp_max is not None:
         possible += w["experience"]
@@ -570,7 +582,8 @@ def score_resume_against_requirement(
     loc_match: bool | None
     if city:
         possible += w["location"]
-        loc_match = _word_match(city, text)
+        loc_match = _word_match(city, text) or any(
+            _word_match(city, str(loc)) for loc in (facts.get("locations") or []) if loc)
         if loc_match:
             earned += w["location"]
     else:
@@ -619,6 +632,7 @@ def score_resume_against_requirement(
         "mandatory_total": len(mandatory),
         "all_required_matched": all_required,
         "detected_experience_years": detected_years,
+        "experience_source": experience_source,
         "location_match": loc_match,
         "education_keywords_found": edu_hits,
         "jd_applied": bool(jd_keywords),

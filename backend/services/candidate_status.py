@@ -862,15 +862,60 @@ def phase_counts(db, stmt) -> dict[str, int]:
     return counts
 
 
-#: Applied Candidates buckets (30 Sep 2026): a rejected / withdrawn candidacy
-#: moves to the Archive tab when RMG / GM archive it (never on its own).
+#: Applied Candidates / Candidate Profiles buckets. A candidacy sits in Archive
+#: when someone archived it by hand, OR (5 Oct 2026) its opportunity is on
+#: Customer / Sales Hold — see `archive_clause`.
 LIVE_BUCKET, ARCHIVE_BUCKET = "live", "archive"
 
 
-#: Activity actions that move a CLOSED candidacy in and out of the Archive tab
-#: (30 Sep 2026, user rule: "RMG / GM move a rejected candidate to Archive by
-#: hand — nothing goes there on its own"). The latest of the two wins.
+#: Activity actions that move a candidacy in and out of Archive by hand (RMG /
+#: GM / Sales, any stage since 5 Oct 2026). The latest of the two wins.
 ARCHIVED_ACTION, RESTORED_ACTION = "APPLIED_ARCHIVED", "APPLIED_RESTORED"
+
+#: Opportunity stages that PARK their live candidacies in Archive (5 Oct 2026,
+#: user report: a held position's candidates still filled every Candidate
+#: Profiles list). Reactivating the deal brings them back — nothing is written.
+HOLD_STAGES = tuple(DEAL_HOLD_STATUS_KEY)
+
+
+def archive_clause():
+    """SQL: the profile is in Archive — archived by hand (latest archive action
+    is ARCHIVED) OR its deal is on hold while the candidacy is still live
+    (Joined / closed candidacies keep their own place). ONE definition for the
+    Candidate Profiles directory, its export and Applied Candidates, so a hold
+    and a manual archive read the same everywhere. Correlated on CandidateProfile.
+    """
+    from sqlalchemy import and_, or_, select
+    from models import (
+        CandidateProfile as CP, CandidateProfileActivityLog as Log, Opportunity, PipelineStage,
+    )
+
+    latest = (select(Log.action_type)
+              .where(Log.profile_id == CP.id, Log.action_type.in_((ARCHIVED_ACTION, RESTORED_ACTION)))
+              .order_by(Log.id.desc()).limit(1)
+              .correlate(CP).scalar_subquery())
+    held = and_(
+        CP.opportunity_id.in_(select(Opportunity.id).where(
+            Opportunity.pipeline_stage.in_([PipelineStage(s) for s in HOLD_STAGES]))),
+        CP.pipeline_status.not_in([PS(s) for s in sorted(_SETTLED)]),
+    )
+    return or_(latest == ARCHIVED_ACTION, held)
+
+
+def archive_reasons(db, profile_ids) -> dict[int, str]:
+    """`{profile_id: "manual" | "hold"}` for the archived ones among `profile_ids`.
+    A hand archive wins the label (it survives a reactivation). Two queries."""
+    from sqlalchemy import select
+    from models import CandidateProfile as CP
+
+    ids = list({int(i) for i in profile_ids if i is not None})
+    if not ids:
+        return {}
+    out = {pid: "manual" for pid in archived_profile_ids(db, ids)}
+    held = db.execute(select(CP.id).where(CP.id.in_(ids), archive_clause())).scalars()
+    for pid in held:
+        out.setdefault(int(pid), "hold")
+    return out
 
 
 def archived_profile_ids(db, profile_ids) -> set[int]:
@@ -936,23 +981,15 @@ def closing_notes(db, profile_ids) -> dict[int, dict]:
 
 
 def applied_buckets(db, stmt) -> tuple[list[int], list[int]]:
-    """(live profile ids, archived profile ids) of the profiles `stmt` selects.
-
-    Archive is MANUAL (30 Sep 2026, user rule): a candidacy is archived only
-    when it is closed (`REJECTED_BUCKET`) AND RMG / GM pressed Archive on it.
-    A rejected candidate stays on the live list — with its Rejected status —
-    until then; a candidacy reopened after archiving is live again. Two queries.
+    """(live profile ids, archived profile ids) of the profiles `stmt` selects,
+    split by `archive_clause` (hand archive, or the deal on hold). Two queries.
     """
-    from services.candidate_profiles import REJECTED_BUCKET  # lazy: that module imports this one
     from models import CandidateProfile
 
-    rows = db.execute(stmt.with_only_columns(
-        CandidateProfile.id, CandidateProfile.pipeline_status).order_by(None)).all()
-    closed = [pid for pid, st in rows if _value(st) in REJECTED_BUCKET]
-    flagged = archived_profile_ids(db, closed)
-    archived = [pid for pid in closed if pid in flagged]
-    live = [pid for pid, _ in rows if pid not in flagged]
-    return live, archived
+    base = stmt.with_only_columns(CandidateProfile.id).order_by(None)
+    every = [r[0] for r in db.execute(base).all()]
+    archived_set = {r[0] for r in db.execute(base.where(archive_clause())).all()}
+    return [p for p in every if p not in archived_set], [p for p in every if p in archived_set]
 
 
 def status_counts(db, stmt) -> dict:
@@ -975,7 +1012,7 @@ def status_counts(db, stmt) -> dict:
         CandidateProfile.rmg_screening_status, CandidateProfile.withdrawn_from_status,
         CandidateProfile.budget_status).order_by(None)).all()
     statuses = statuses_for(db, rows)
-    flagged = archived_profile_ids(db, [r[0] for r in rows if _value(r[1]) in REJECTED_BUCKET])
+    flagged = set(applied_buckets(db, stmt)[1])
     out = {LIVE_BUCKET: {}, ARCHIVE_BUCKET: {}, "live_total": 0, "archive_total": 0,
            "phases": {LIVE_BUCKET: {}, ARCHIVE_BUCKET: {}}}
     for r in rows:

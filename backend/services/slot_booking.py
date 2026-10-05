@@ -193,6 +193,38 @@ def copy_locations_to_candidate(candidate, details: dict, *, overwrite: bool = F
     return written
 
 
+#: Edit applicant form key → candidate field + parser (6 Oct 2026).
+APPLICATION_FACT_FIELDS = (("notice_period", "notice_period", lambda v: str(v).strip()[:60] or None),
+                           ("current_ctc", "current_ctc", _ctc_from_str),
+                           ("expected_ctc", "expected_ctc", _ctc_from_str))
+
+
+def copy_application_facts_to_candidate(candidate, details: dict, *, experience=None,
+                                        keys: tuple = ()) -> list[str]:
+    """TA's explicit EDIT of an applicant's notice / CTC / experience reaches the
+    candidate record (6 Oct 2026, user report: the details typed on Upload /
+    Edit applicant did not show where the Candidates-tab details do). Only the
+    `keys` TA changed are written — overwrite, since the edit is the newest
+    word; a blank never erases. `experience` is the form's years text when it
+    changed. Returns the candidate fields written."""
+    if candidate is None:
+        return []
+    written = []
+    for key, field, parse in APPLICATION_FACT_FIELDS:
+        if key not in keys:
+            continue
+        value = parse((details or {}).get(key)) if (details or {}).get(key) else None
+        if value is not None and getattr(candidate, field, None) != value:
+            setattr(candidate, field, value)
+            written.append(field)
+    if "experience" in keys:
+        years = _years_from_str(experience)
+        if years is not None and candidate.experience_years != years:
+            candidate.experience_years = years
+            written.append("experience_years")
+    return written
+
+
 def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candidate:
     """Match an existing Candidate by email (or full name when no email),
     else create one. candidates.email is NOT NULL + unique, so a placeholder

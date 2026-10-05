@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, not_ as sa_not, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
@@ -168,6 +168,9 @@ def list_opportunities(
     #: requirement in sourcing. The Apply-to-Opportunity picker sends it; a
     #: recruiter-only TA is ALWAYS given this list there — see create_profile.
     sourcing: bool = False,
+    #: true = the "Pending Approval" tab (Sales Head OR a requirement awaiting
+    #: Sales Head / RMG); false = everything else. See `awaiting_approval_clause`.
+    awaiting_approval: bool | None = None,
     p: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(read_opportunities),
@@ -178,6 +181,10 @@ def list_opportunities(
     if sourcing:
         from services.requirements import sourcing_opportunity_clause
         stmt = stmt.where(sourcing_opportunity_clause())
+    if awaiting_approval is not None:
+        from services.requirements import awaiting_approval_clause
+        clause = awaiting_approval_clause()
+        stmt = stmt.where(clause if awaiting_approval else sa_not(clause))
     if opp_id:
         stmt = stmt.where(Opportunity.opp_id.ilike(f"%{opp_id.strip()}%"))
     if title:

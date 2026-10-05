@@ -148,6 +148,9 @@ class Invoice(Base):
     sub_total = sa.Column(sa.Numeric(14, 2), nullable=False)
     tax_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     grand_total = sa.Column(sa.Numeric(14, 2), nullable=False)
+    #: Rupee round-off folded into grand_total (0120). NULL = not rounded;
+    #: 0.00 = rounded and already whole. See services.finance.apply_round_off.
+    round_off = sa.Column(sa.Numeric(6, 2), nullable=True)
     # Per-invoice GST buyer state override (2-digit). Resolution:
     # invoice.buyer_state_code → branch.state (2-digit) → GSTIN[:2].
     buyer_state_code = sa.Column(sa.String(2), nullable=True)
@@ -169,6 +172,19 @@ class Invoice(Base):
     returned_reason = sa.Column(sa.Text, nullable=True)
     returned_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
     returned_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    # ---- Customer approval + e-invoice IRN (0121, 5 Oct 2026) -------------
+    #: The Sales Manager / Sales Head confirmed the customer accepted the
+    #: original invoice unchanged (services/invoice_customer_approval.py).
+    customer_approved_at = sa.Column(sa.DateTime(timezone=True), nullable=True, index=True)
+    customer_approved_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    customer_approval_note = sa.Column(sa.Text, nullable=True)
+    #: GST e-invoice details Finance records after the approval. Finance /
+    #: Admin / CEO only — never serialised for anyone else.
+    irn_number = sa.Column(sa.String(64), nullable=True)
+    ack_number = sa.Column(sa.String(32), nullable=True)
+    ack_date = sa.Column(sa.Date, nullable=True)
+    irn_recorded_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    irn_recorded_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
     __table_args__ = (sa.UniqueConstraint("timesheet_id", name="uq_invoice_timesheet"),)
 
     @property

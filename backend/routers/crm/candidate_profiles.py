@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, any_crm_role, gated_create, get_crm_db, page_params, role_required, gated_write, gated_write_action
+from crm_deps import CurrentUser, PageParams, any_crm_role, gated_create, get_crm_db, page_params, role_required, gated_write, gated_write_action, screener_or
 from routers.crm.candidates import _reject_impossible_ctc
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Customer,
@@ -38,7 +38,7 @@ from services.candidate_profiles import (
     customer_slots_text, fmt_slot_ist, latest_customer_slots, stamp_technical_submission,
 )
 from services.candidate_status import (
-    GROUPS, catalogue as candidate_status_catalogue, parse_phases, parse_status_keys,
+    GROUPS, archive_clause, archive_reasons, catalogue as candidate_status_catalogue, parse_phases, parse_status_keys,
     phase_counts, profile_ids_in_phase, profile_ids_with_status,
 )
 from services.candidates import candidate_search_clause
@@ -60,6 +60,8 @@ evaluation_roles = gated_write("profiles", "RMG", "TA", "Sales")
 OFFER_WRITE_ROLES = ("Sales", "Sales_Head", "HR")
 offer_roles = gated_write("profiles", *OFFER_WRITE_ROLES)
 rmg_roles = gated_write_action("profile.rmg_screening", "profiles")
+#: Archive / Restore (5 Oct 2026): RMG / GM and the Sales family.
+archive_gate = screener_or(gated_write("profiles", "RMG", "Sales", "Sales_Head"))
 #: Internal candidate → Sales, skipping L1 / L2 (Screening Desk, 25 Sep 2026).
 fast_track_gate = gated_write_action("profile.fast_track_internal", "profiles")
 #: Interview feedback is recorded by RMG (Admin/CEO are implicit in role_required).
@@ -218,6 +220,25 @@ def _id_csv(raw, field: str) -> list[int]:
         raise HTTPException(status_code=400, detail=f"{field} must be an id or a comma-separated list of ids")
 
 
+def _apply_bucket(stmt, bucket: str | None):
+    """`?bucket=` on the directory + its export: `active` (in pipeline) and
+    `rejected` (closed) leave out what is in Archive; `archive` lists only it
+    (archived by hand, or parked by its deal's hold — `archive_clause`)."""
+    if not bucket:
+        return stmt
+    bucket = bucket.strip().lower()
+    rejected_enums = [PipelineStatus(v) for v in sorted(REJECTED_BUCKET)]
+    if bucket == "archive":
+        return stmt.where(archive_clause())
+    if bucket == "rejected":
+        stmt = stmt.where(CandidateProfile.pipeline_status.in_(rejected_enums))
+    elif bucket == "active":
+        stmt = stmt.where(CandidateProfile.pipeline_status.not_in(rejected_enums))
+    else:
+        raise HTTPException(status_code=400, detail="bucket must be 'active', 'rejected' or 'archive'")
+    return stmt.where(sa.not_(archive_clause()))
+
+
 def _narrow_by_status(db: Session, stmt, status_key: str | None, phase: str | None = None):
     """Apply the `?status_key=` (derived candidate status) and `?phase=` (the
     stage it sits in — Sourcing … Onboarding, Closed) filters, both CSV.
@@ -346,15 +367,7 @@ def list_profiles(pp: PageParams = Depends(page_params),
         stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
     # The stage strip counts every stage, Closed included, whatever the bucket.
     pre_bucket = stmt
-    if bucket:
-        bucket = bucket.strip().lower()
-        rejected_enums = [PipelineStatus(v) for v in sorted(REJECTED_BUCKET)]
-        if bucket == "rejected":
-            stmt = stmt.where(CandidateProfile.pipeline_status.in_(rejected_enums))
-        elif bucket == "active":
-            stmt = stmt.where(CandidateProfile.pipeline_status.not_in(rejected_enums))
-        else:
-            raise HTTPException(status_code=400, detail="bucket must be 'active' or 'rejected'")
+    stmt = _apply_bucket(stmt, bucket)
 
     # Scope the list to the stages a role actually owns. Sales previously saw
     # every profile from Sourcing onward, including candidates still being
@@ -373,7 +386,12 @@ def list_profiles(pp: PageParams = Depends(page_params),
         if visible is not None:
             cstmt = cstmt.where(
                 CandidateProfile.pipeline_status.in_([PipelineStatus(v) for v in sorted(visible)]))
-        counts = phase_counts(db, _narrow_by_status(db, cstmt, status_key, None))
+        cstmt = _narrow_by_status(db, cstmt, status_key, None)
+        # Stage chips count what is NOT archived; "archive" counts the rest.
+        counts = phase_counts(db, cstmt.where(sa.not_(archive_clause())))
+        counts["archive"] = db.execute(
+            cstmt.where(archive_clause()).with_only_columns(sa.func.count(CandidateProfile.id))
+            .order_by(None)).scalar() or 0
     stmt = _narrow_by_status(db, stmt, status_key, phase)
     # ---- ordering -------------------------------------------------------
     levels = _parse_sort(sort)
@@ -400,7 +418,11 @@ def list_profiles(pp: PageParams = Depends(page_params),
     items, meta = paginate(db, stmt, pp.page, pp.limit)
     if counts is not None:
         meta = {**meta, "phase_counts": counts}
-    return envelope(data=enrich_profiles_list(db, items), meta=meta)
+    rows = enrich_profiles_list(db, items)
+    reasons = archive_reasons(db, [r.get("id") for r in rows])
+    for r in rows:
+        r["archived"] = reasons.get(r.get("id"))   # "manual" | "hold" | None
+    return envelope(data=rows, meta=meta)
 
 
 # NOTE (route order): these literal routes MUST stay above GET /{profile_id},
@@ -551,12 +573,7 @@ def export_profiles(format: str = "csv",
         stmt = stmt.where(CandidateProfile.opportunity_id.in_(
             select(Opportunity.id).where(Opportunity.customer_id == customer_id)))
     stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
-    if bucket:
-        rejected_enums = [PipelineStatus(v) for v in sorted(REJECTED_BUCKET)]
-        if bucket.strip().lower() == "rejected":
-            stmt = stmt.where(CandidateProfile.pipeline_status.in_(rejected_enums))
-        elif bucket.strip().lower() == "active":
-            stmt = stmt.where(CandidateProfile.pipeline_status.not_in(rejected_enums))
+    stmt = _apply_bucket(stmt, bucket)
     visible = visible_statuses_for(user)
     if visible is not None:
         stmt = stmt.where(
@@ -1266,10 +1283,10 @@ def archive_applied_candidate(
     profile_id: int,
     payload: ArchiveIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(rmg_roles),
+    user: CurrentUser = Depends(archive_gate),
 ):
-    """RMG / GM move a rejected / withdrawn candidate to the Applied Candidates
-    Archive tab (`archived: false` restores). Manual only — 30 Sep 2026 rule."""
+    """RMG / GM / Sales move a candidate to Archive (`archived: false` restores).
+    Any stage since 5 Oct 2026; a deal on hold parks its candidates on its own."""
     from services.candidate_profiles import set_applied_archive
 
     profile = get_profile_or_404(db, profile_id)

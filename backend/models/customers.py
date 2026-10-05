@@ -78,6 +78,9 @@ class CustomerBranch(Base):
     billing_frequency = sa.Column(sa.String(40), nullable=True)  # Weekly / Monthly / ...
     billing_cycle_start_day = sa.Column(sa.Integer, nullable=True)  # day of month 1..31
     billing_cycle_end_day = sa.Column(sa.Integer, nullable=True)
+    #: Invoice credit days for this branch — due date = invoice date + N (0120).
+    #: NULL = the PO's payment terms, else 30.
+    invoice_due_days = sa.Column(sa.Integer, nullable=True)
     is_max_billable_hours_per_day = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     max_billable_hours_per_day = sa.Column(sa.Numeric(5, 2), nullable=True)
     is_max_billable_hours_per_month = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())

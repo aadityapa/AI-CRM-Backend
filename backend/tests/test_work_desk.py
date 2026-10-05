@@ -154,7 +154,8 @@ def test_a_screener_gets_the_screening_tabs(db):
 
 
 def test_finance_gets_no_interview_tabs(db):
-    assert list(_tabs(db, FINANCE)) == ["fin_timesheets", "fin_proformas", "fin_invoices", "upcoming", "queues"]
+    assert list(_tabs(db, FINANCE)) == ["fin_timesheets", "fin_proformas", "fin_invoices",
+                                    "fin_customer_approved", "upcoming", "queues"]
 
 
 def test_one_broken_tab_never_blanks_the_desk(db, monkeypatch):

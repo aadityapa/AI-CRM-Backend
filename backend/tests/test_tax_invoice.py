@@ -464,3 +464,19 @@ def test_line_amount_override_and_plain_multiplication():
     assert ti.line_amount(ti.LineItem(billing_hours=10, rate_per_hour=5)) == 50
     assert ti.line_amount(ti.LineItem(billing_hours=10, rate_per_hour=5, amount_override=42.5)) == 42.5
     assert ti.line_amount({"billing_hours": 3, "rate_per_hour": 2, "amount_override": None}) == 6
+
+
+def test_word_export_survives_control_characters_and_fixes_its_columns():
+    """5 Oct 2026: a vertical tab pasted into an address made lxml raise a
+    ValueError — the app turned it into "Word export failed (400)"."""
+    import zipfile, io as _io
+    from services import tax_invoice as ti
+    from services.tax_invoice_docx import build_invoice_docx
+    inv = ti.Invoice(invoice_no="KR-1", invoice_date="01-10-2026",
+                     buyer=ti.Buyer(name="Acme\x00", address="Line 1\x0bLine 2"),
+                     items=[ti.LineItem(employee_name="A\x1f", billing_hours=1, rate_per_hour=10)],
+                     round_off=True)
+    blob = build_invoice_docx(inv)
+    xml = zipfile.ZipFile(_io.BytesIO(blob)).read("word/document.xml").decode()
+    assert "Line 1 Line 2" in xml
+    assert 'w:type="fixed"' in xml and "<w:gridCol" in xml

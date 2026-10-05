@@ -120,6 +120,9 @@ def world(monkeypatch):
         return 1
 
     monkeypatch.setattr(proforma, "notify_role", _role)
+    # 5 Oct 2026: the generated-invoice notice goes to the Sales Manager AND the Sales Head.
+    monkeypatch.setattr(proforma, "notify_roles",
+                        lambda db, names, title, *a, **kw: [_role(db, n, title, *a, **kw) for n in names])
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
@@ -198,7 +201,8 @@ def test_a_proforma_takes_no_money_until_finance_converts_it(world):
     assert D(str(po.balance_value)) == D("1000000") - D(str(inv.sub_total))
     assert D(str(inv.sub_total)) < D(str(inv.grand_total))
     assert body["due_date"] == "2026-11-02"                    # Net 45 from the proforma date
-    assert sent[-1]["role"] == "Sales Manager" and sent[-1]["event"] == "invoice.generated"
+    assert [x["role"] for x in sent[-2:]] == ["Sales Manager", "Sales_Head"]
+    assert sent[-1]["event"] == "invoice.generated"
 
     # Now it behaves like any tax invoice.
     r = client.post(f"/api/invoices/{inv.id}/convert", json={})
@@ -296,7 +300,8 @@ def test_roles_and_events_are_wired_for_the_new_flow():
     assert by_event["timesheet.submitted"]["default_roles"] == ["GM", "CEO"]
     assert by_event["invoice.proforma_ready"]["default_roles"] == ["Finance"]
     assert by_event["invoice.proforma_returned"]["default_roles"] == ["GM"]
-    assert by_event["invoice.generated"]["default_roles"] == ["Sales Manager"]
+    assert by_event["invoice.generated"]["default_roles"] == ["Sales Manager", "Sales_Head"]
+    assert by_event["invoice.customer_approved"]["default_roles"] == ["Finance"]
 
 
 def test_notifier_resolves_custom_role_members_without_touching_the_builtin_enum(world, monkeypatch):
@@ -338,3 +343,42 @@ def test_migration_0107_chains_after_0106():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod.revision == "0107" and mod.down_revision == "0106"
+
+
+def test_customer_approval_then_finance_records_the_irn(world):
+    """5 Oct 2026: original invoice → Sales Manager confirms the customer's
+    approval → Finance adds IRN + Ack No.; the IRN never reaches Sales."""
+    client, s, inv, po, proj, sent, as_user = world
+    irn = "f" * 64
+    assert client.post(f"/api/invoices/{inv.id}/customer-approval", json={}).status_code == 403  # Finance
+    as_user(3, "Balasaheb", "Sales", "Sales Manager")
+    r = client.post(f"/api/invoices/{inv.id}/customer-approval", json={})
+    assert r.status_code == 400                                   # still a Proforma
+    as_user(2, "fin", "Finance")
+    assert client.post(f"/api/invoices/{inv.id}/convert", json={}).status_code == 200
+
+    r = client.put(f"/api/invoices/{inv.id}/einvoice", json={"irn": irn, "ack_number": "112010036563310"})
+    assert r.status_code == 409                                   # not approved yet
+    assert r.json()["detail"].startswith("Waiting for the Sales Manager")
+
+    as_user(3, "Balasaheb", "Sales", "Sales Manager")
+    r = client.post(f"/api/invoices/{inv.id}/customer-approval", json={"note": "Mailed to AP on 4 Oct"})
+    assert r.status_code == 200, r.text
+    body = r.json()["data"]
+    assert body["customer_approval"]["approved"] and "einvoice" not in body
+    assert client.put(f"/api/invoices/{inv.id}/einvoice",
+                      json={"irn": irn, "ack_number": "112010036563310"}).status_code == 403
+
+    as_user(2, "fin", "Finance")
+    r = client.put(f"/api/invoices/{inv.id}/einvoice",
+                   json={"irn": irn, "ack_number": "112010036563310", "ack_date": "2026-10-05"})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["einvoice"]["irn"] == irn
+    rows = client.get("/api/invoices", params={"customer_approved": "true"}).json()["data"]
+    assert [x["id"] for x in rows] == [inv.id] and rows[0]["irn_recorded"] is True
+    assert client.get("/api/invoices", params={"customer_approved": "false"}).json()["data"] == []
+
+    as_user(3, "Balasaheb", "Sales", "Sales Manager")
+    detail = client.get(f"/api/invoices/{inv.id}").json()["data"]
+    assert "einvoice" not in detail and detail["customer_approval"]["can_withdraw"] is False
+    assert "irn_recorded" not in client.get("/api/invoices").json()["data"][0]

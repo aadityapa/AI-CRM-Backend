@@ -33,8 +33,8 @@ SELLER_STATE_CODE = "27"
 # here was a typo'd 2019 OPC number.
 SELLER_EMAIL = "karnex.singh@karnex.in"
 SELLER_CIN = "U72900RJ2018PTC638288"
-SELLER_PAN = "AAJCK2474BA"
-SELLER_GSTIN = "27AAJCK2474BA1ZL"
+SELLER_PAN = "AAHCK4749A"
+SELLER_GSTIN = "27AAHCK4749A1ZL"
 BANK_NAME = "HDFC Bank, Baner"
 BANK_NAME_SHORT = "HDFC Bank"
 BANK_ACC = "50200075368143"
@@ -313,6 +313,9 @@ class Invoice(BaseModel):
     kind: str = "Tax"
     #: Client-specific column choice (services/invoice_format.py); None = all.
     invoice_format: dict[str, bool] | None = None
+    #: Grand total rounded to the nearest rupee with a "Round Off" line (5 Oct
+    #: 2026). Mirrors `invoices.round_off IS NOT NULL`.
+    round_off: bool = False
 
     @property
     def is_proforma(self) -> bool:
@@ -427,6 +430,8 @@ class Totals(BaseModel):
     total: float
     amount_in_words: str
     tax_in_words: str
+    #: Rupee round-off added to sub-total + GST (None = not rounded).
+    round_off: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -579,13 +584,30 @@ def amount_in_words(amount: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def format_round_off(value: float | None) -> str:
+    """"+ INR 0.43" / "- INR 0.37" — the sign is the point of the line."""
+    v = float(value or 0)
+    return f"{'-' if v < 0 else '+'} {format_inr(abs(v))}"
+
+
+def round_to_rupee(amount) -> tuple:
+    """(exact to the paisa, nearest whole rupee) as Decimals, half up — the ONE
+    rounding rule for the invoice "Round Off" line (5 Oct 2026)."""
+    from decimal import Decimal, ROUND_HALF_UP
+
+    exact = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return exact, exact.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+
+
 def compute_totals(inv: Invoice | dict) -> Totals:
     if isinstance(inv, dict):
         items = inv.get("items") or []
         buyer = inv.get("buyer") or {}
+        rounded = bool(inv.get("round_off"))
     else:
         items = inv.items
         buyer = inv.buyer
+        rounded = bool(getattr(inv, "round_off", False))
 
     subtotal = sum(line_amount(it) for it in items)
     intra = is_intra_state(buyer)
@@ -594,7 +616,12 @@ def compute_totals(inv: Invoice | dict) -> Totals:
     igst = 0.0 if intra else subtotal * 0.18
     total_gst = cgst + sgst + igst
     total = subtotal + total_gst
+    round_off = None
+    if rounded:
+        exact, whole = round_to_rupee(total)
+        round_off, total = float(whole - exact), float(whole)
     return Totals(
+        round_off=round_off,
         subtotal=subtotal,
         intra=intra,
         cgst=cgst,
@@ -1210,6 +1237,7 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
         columns=columns,
         kind=str(getattr(invoice, "kind", None) or "Tax"),
         invoice_format=normalize_invoice_format(getattr(invoice, "invoice_format", None)),
+        round_off=getattr(invoice, "round_off", None) is not None,
         seller=seller,
         bank=bank_from_settings(db, customer_id),
         footer_text=(seller.get("declaration") or DEFAULT_FOOTER),
@@ -1253,6 +1281,8 @@ def _esc(s: Any) -> str:
 
 def render_invoice_html(inv: Invoice, totals: Totals | None = None) -> str:
     t = totals or compute_totals(inv)
+    round_off_row = (f'<tr><td class="lab">Round Off</td><td class="val">{_esc(format_round_off(t.round_off))}</td></tr>'
+                     if t.round_off is not None else "")
     logo = _file_uri(LOGO_PATH)
     seal = _file_uri(SEAL_PATH)
 
@@ -1522,6 +1552,7 @@ table.services th {{ font-size: {"7pt" if ncols > 6 else "8pt"}; line-height: 1.
         <tr><td class="lab">SGST @ 9%</td><td class="val">{_esc(format_inr(t.sgst))}</td></tr>
         <tr><td class="lab">IGST @ 18%</td><td class="val">{_esc(format_inr(t.igst))}</td></tr>
         <tr><td class="lab">Total GST Tax</td><td class="val">{_esc(format_inr(t.total_gst))}</td></tr>
+        {round_off_row}
         <tr class="grand"><td class="lab">GRAND TOTAL</td><td class="val">{_esc(format_inr(t.total))}</td></tr>
       </table>
     </div>
@@ -1749,6 +1780,7 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
         ["SGST @ 9%", format_inr(totals.sgst)],
         ["IGST @ 18%", format_inr(totals.igst)],
         ["Total GST Tax", format_inr(totals.total_gst)],
+        *([["Round Off", format_round_off(totals.round_off)]] if totals.round_off is not None else []),
         ["GRAND TOTAL", format_inr(totals.total)],
     ]
     lg = Table(left_gst, colWidths=[50 * mm, 40 * mm])

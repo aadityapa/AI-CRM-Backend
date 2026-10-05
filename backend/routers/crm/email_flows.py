@@ -137,8 +137,13 @@ EVENTS: list[dict] = [
     {"event": "invoice.generated",
      "label": "Original invoice generated",
      "description": "Sent when Finance generates the original (tax) invoice from a Proforma — "
-                    "the Sales Manager takes it from here.",
-     "default_roles": ["Sales Manager"]},
+                    "the Sales Manager / Sales Head sends it to the customer.",
+     "default_roles": ["Sales Manager", "Sales_Head"]},
+    {"event": "invoice.customer_approved",
+     "label": "Customer approved an invoice — add the IRN",
+     "description": "Sent when the Sales Manager / Sales Head confirms the customer accepted the original "
+                    "invoice unchanged — Finance records the e-invoice IRN and Acknowledgement No.",
+     "default_roles": ["Finance"]},
     {"event": "opportunity.submitted",
      "label": "Opportunity awaiting approval",
      "description": "Sent when an opportunity is created or resubmitted for Sales Head approval.",
@@ -966,18 +971,21 @@ def put_org_settings(body: OrgSettingsIn,
                      db: Session = Depends(get_crm_db),
                      user: CurrentUser = Depends(admin_only)):
     from models import AppSetting
-    from services.org_settings import KEYS, invalidate
+    from services.org_settings import KEYS, invalidate, normalize_value, validation_error
 
     unknown = [k for k in body.values if k not in KEYS]
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown setting(s): {', '.join(unknown)}")
+    values = {k: normalize_value(k, v) for k, v in body.values.items()}
+    bad = [err for k, v in values.items() if (err := validation_error(k, v))]
+    if bad:
+        raise HTTPException(status_code=400, detail="; ".join(bad))
     url = (body.values.get("email.public_base_url") or "").strip()
     if url and not url.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400,
                             detail="Public base URL must start with http:// or https://")
-    for key, value in body.values.items():
+    for key, value in values.items():
         row = db.get(AppSetting, key)
-        value = (value or "").strip()
         if row is None:
             if value:
                 db.add(AppSetting(key=key, value=value,

@@ -43,7 +43,7 @@ resolved by `paths._resolve_frontend_dir()` (`FRONTEND_DIR` env → `<repo>/fron
 **Working tree, 8 Sep 2026:** branch `main`, head **`dd61630`**, ~90 modified + 63 untracked paths,
 none committed. `git status` is dominated by CRLF churn — review with `git diff --ignore-all-space`.
 
-**Migration head is now 0118** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
+**Migration head is now 0120** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
 Deploying REQUIRES `alembic upgrade head` before serving traffic — the ORM maps columns from every
 one of them. Tests: **1034 pass**, 2 stale pins fail (`test_full_pipeline_flow::test_ai_l1_can_only_be_triggered_by_ta`,
 `test_pipeline_tail::test_no_other_stage_has_a_hidden_precondition`) plus the §9 known set.
@@ -2177,6 +2177,109 @@ attachments` with **`kind=customer_jd`** (`_add_customer_jd`) stores the file as
 (`opportunity_attachments`, kind customer_jd, folder `opportunity_attachments`) — where the opportunity form puts it and
 where `serialize_requirement` reads `customer_jd_attachments` — logs on both activity logs, never touches `rmg_jd_text`
 and starts no re-score. The opportunity's own attachment routes (Sales / Sales Head) are unchanged. Deploy: restart.
+
+**5 Oct 2026 — "Pending Approval" includes positions waiting for RMG; seller GSTIN / PAN corrected, migration 0119,
+head is now 0119 (`tests/test_pending_approval_tab.py`, 2):** two screenshot reports. (1) The Screening Desk listed two
+positions waiting for RMG approval; the Opportunities list showed them under **Active** and **Pending Approval** was empty —
+that tab only asked for the OPPORTUNITY's own `Pending_Sales_Head_Approval`. `services/requirements.
+awaiting_approval_clause()` = the deal awaits the Sales Head, OR it is Approved + New/Active with a requirement in
+`AWAITING_APPROVAL_STATUSES` (Pending_Sales_Head_Approval · Pending_Engineering_Review). `GET /api/opportunities` gains
+`awaiting_approval` (true = the clause, false = its negation); F-V2 sends true on Pending Approval and false on every stage
+tab, so each deal still lives in exactly ONE tab (a held deal stays in its hold tab). (2) The Tax Invoice printed
+"GSTIN AAHCK4749A / PAN 27AAHCK4749A1ZL" — the two Settings ▸ Invoice rows were saved into each other's boxes (the
+renderers were right). **0119** sets `invoice.seller_gstin` = 27AAHCK4749A1ZL and `invoice.seller_pan` = AAHCK4749A where
+the rows exist; the `org_settings` defaults and the `tax_invoice.SELLER_*` fallbacks now carry the same (they held a
+different, wrong pair). `org_settings.normalize_value` (upper-case) + `validation_error` (GSTIN 15-char pattern, PAN
+10-char) run in BOTH save routes (`PUT /api/org-settings`, `PUT /api/settings/{key}`), so a swapped pair is a 400 now; the
+generic route also invalidates the settings cache. Deploy: `alembic upgrade head`, restart.
+
+**5 Oct 2026 — Word export of the Tax Invoice fixed and redesigned (`tests/test_tax_invoice.py` +1; no
+migration):** reported — "Download Word" answered **400**. ⚠️ lxml refuses control characters (a vertical tab pasted
+into a buyer address from Word / Excel) with a `ValueError`, and `main._handle_value_error` turns ANY ValueError into a
+bare 400. `services/tax_invoice_docx._clean` now strips them from every string, and the route wraps the build: a
+failure is logged with its traceback and answered 500 with the reason (never the global 400). Layout rebuilt: every
+table is FIXED layout with an explicit `w:tblGrid` (`_fix_widths` — cell widths alone are a hint Word / LibreOffice
+auto-fit over, which is why the description column collapsed and the nested GST tables overflowed), invoice meta and
+bank details are borderless label/value tables (colons line up), cells vertically centred with even padding, a zebra
+service table with a repeating header row, GST summary + totals side by side ending in a navy **GRAND TOTAL** row,
+amount / tax in words side by side, centred footer link. Check a change by rendering: `soffice --headless --convert-to
+pdf` on the device.
+
+**5 Oct 2026 (later) — branch-wise invoice due days, invoice Round Off, held deals park candidates in Archive,
+migration 0120, head is now 0120 (`tests/test_round_off_and_due_days.py` 5, `test_applied_profile_only_rows` re-pinned
++1):** three screenshot asks. (1) **Due date per customer branch**: `customer_branches.invoice_due_days` (NULL = follow
+the PO, 0 = due on receipt, ≤ 365; in `_BranchBillingFields`, `BranchBillingPolicyIn`, `BRANCH_BILLING_POLICY_FIELDS`,
+`serialize_branch`). `services/proforma.invoice_credit_days(db, project_id, po)` → `(days, "branch"|"po"|"default")`:
+the project's branch, else the PO's billing branch, wins when set; then the PO's payment terms; then 30. Used by the
+Proforma raise (`generate-invoice`, replaces `po_credit_days` there) and `convert_to_tax_invoice`; `serialize_invoice`
+(detail) carries `credit_days` / `credit_days_source` so the editor re-derives the due date. (2) **Round Off**:
+`invoices.round_off` Numeric(6,2), **NULL = not rounded** (0.00 = rounded, already whole). `finance.apply_round_off(inv,
+enabled)` is THE rule — grand total = sub-total + GST to the nearest rupee (`tax_invoice.round_to_rupee`, half up), the
+difference stored as its own line, balance / payment status refreshed; ⚠️ GST and the sub-total never move and the PO is
+still drawn by the sub-total. `apply_invoice_gst_totals` re-applies it, so a recompute keeps the choice. Chosen by
+`GenerateInvoiceIn.round_off` (raise), `ConvertProformaIn.round_off` (convert; None = keep the Proforma's) and
+`InvoiceUpdate.round_off` on a PROFORMA only — on a Tax invoice it is a 400 ("chosen before the original invoice is
+generated"). Every renderer (HTML, reportlab, Word) prints a "Round Off" row before GRAND TOTAL
+(`format_round_off`); `serialize_invoice` excludes it from `stored_grand` and returns `gst.round_off`. (3) **Archive**:
+`candidate_status.archive_clause()` (SQL) = latest manual `APPLIED_ARCHIVED` row, OR the deal is On_Hold / Sales_Hold
+(`HOLD_STAGES`) and the candidacy is not settled (Joined / rejections stay put); `archive_reasons(db, ids)` →
+"manual" (wins) | "hold". `applied_buckets` / `status_counts` use it, so Applied Candidates' Archive tab and the
+Candidate Profiles list (`bucket=archive`, `_apply_bucket`; active / rejected exclude archived; `phase_counts.archive`;
+rows carry `archived`) agree. A held deal's candidates leave every login's live list and come back the moment Sales
+reactivates it — no rows written either way. ⚠️ `set_applied_archive` now archives ANY stage by hand (SUPERSEDES the
+30 Sep "closed only" rule); restoring a hold-parked candidacy is 409. Route gate `archive_gate =
+screener_or(gated_write("profiles", "RMG", "Sales", "Sales_Head"))`. Applied Candidates rows add `archive_reason`;
+`archivable` = has a profile and not archived. Deploy: `alembic upgrade head`, restart. Suite: 1,762 pass, 2 skipped.
+
+**5 Oct 2026 (night) — customer approval of a tax invoice + the e-invoice IRN, migration 0121, head is now 0121
+(`tests/test_invoice_customer_approval.py` 6, `test_proforma_flow` +1 / re-pinned, `test_work_desk` re-pinned):** user
+flow — Finance generates the original invoice → the Sales Manager / Sales Head sends it to the customer and, when the
+customer accepts it UNCHANGED, confirms that to Finance (a change goes through an invoice change request, never here) →
+Finance records the IRN + Acknowledgement No.; the IRN is Finance / Admin / CEO only. **0121** adds to `invoices`:
+`customer_approved_at` (indexed) / `_by` / `customer_approval_note`, `irn_number` / `ack_number` / `ack_date` /
+`irn_recorded_at` / `_by`. **`services/invoice_customer_approval.py`** is the one module: `may_confirm` (`CONFIRM_ROLES`
+Sales_Head + the "Sales Manager" custom role, + Admin/CEO — BY ROLE, case-insensitive; a template grant never widens it),
+`may_see_irn` (Finance + Admin/CEO), `confirm_customer_approval` (Tax only — a Proforma is 400; once only — 409; logs
+`INVOICE_CUSTOMER_APPROVED` on the source timesheet; notifies Finance, event **`invoice.customer_approved`** in
+`email_flows.EVENTS`, savepointed), `withdraw_customer_approval` (only before the IRN is in), `record_irn` (409 until the
+approval; `irn_error` PURE — IRN = 64 hex chars, Ack No. = 10–20 digits, ack date not in the future; re-saving corrects,
+logged), `payload(invoice, user, names)` → `customer_approval` for every reader and **`einvoice` ONLY for Finance /
+Admin / CEO** (every other login never receives the key). Routes (`routers/crm/finance.py`, all behind `INV_READ`, the
+role check in the service): `POST` / `DELETE /api/invoices/{id}/customer-approval {note?}`, `PUT
+/api/invoices/{id}/einvoice {irn, ack_number, ack_date?}`; `GET /api/invoices/{id}` carries both blocks
+(`_with_approval`); `GET /api/invoices?customer_approved=true|false` (Tax only; rows carry `customer_approved_at`, and
+`irn_recorded` / `ack_number` for Finance / Admin / CEO only — the IRN itself stays on the invoice page). The
+`invoice.generated` notice now goes to the Sales Manager AND the Sales Head (`notify_roles`) and tells them to confirm.
+Work desk: Finance's **`fin_customer_approved` "Customer approved invoices"** after Tax invoices issued (IRN pending, oldest
+approval first — the count — then IRN recorded in the last `FIN_IRN_DONE_DAYS`=30; sections "IRN to add" / "IRN
+recorded"); Sales Manager / Sales Head get **`inv_confirm` "Confirm with customer"** (Tax invoices of the last
+`CONFIRM_LOOKBACK_DAYS`=90 not yet confirmed; amber past `CONFIRM_WAIT_DAYS`=7). Admin / CEO keep `CEO_TABS` (they read
+the IRN on the invoice page and the Invoices list). Not printed on the invoice. Deploy: `alembic upgrade head`, restart.
+
+**6 Oct 2026 — ATS closer to the ATS Scoring page, one candidate line on Applied Candidates, billing filters on My
+Tasks (`tests/test_ats_facts_and_applicant_line.py` 6, `test_requirement_jd_skills` re-pinned; no migration):** three
+screenshot reports. (1) **A CV the ATS Scoring page rated 75 read 45.84 on Applied Candidates.** Three causes in
+`services/resumes.run_ats_scan`: it ignored what TA typed (a Naukri CV says "3y 2m", which `EXPERIENCE_RE` cannot read →
+0 experience points; the position's city counted only when the CV named it), it never read the CUSTOMER's JD (only the
+RMG JD), and the AI reviewer carried 40 %. Now: `candidate_facts(db, resume)` = the application's experience (else the
+candidate's) + every location given (current / preferred, application + candidate record) → `score_resume_against_
+requirement(..., candidate_facts=)` (typed experience wins over the CV's, `experience_source` application | resume;
+location matches on the CV OR a given location) and into the AI prompt (band, experience, locations; prompt reworded
+from "strict" to a recruiter's read); `ats_jd_text(db, req)` → (text, "rmg" | "customer") — the RMG JD (text + files),
+else the opportunity's `customer_jd` files (`_jd_files`; `has_ats_criteria` counts them); blend `KEYWORD_SHARE` 0.4 /
+`AI_SHARE` 0.6 (was 0.6 / 0.4). `ATS_SCORE_VERSION` = 2 is stamped on every breakdown; `ats_outdated(resume)` (Scored and
+older) is on every serialized resume, and `scan-all` re-scores Pending AND outdated rows (F-V2 "Re-score N (ATS
+updated)"). A customer JD added from the JD & skills card re-scores the position when it has no RMG JD. (2) **One
+candidate line**: rows read `application_details` only, so a Candidates-tab application (its resume row is built by
+`ensure_resume_for_profile` with no details) and an upload looked different. `availability_by_candidate` now also returns
+`facts` (experience · current / expected CTC in lakhs via `_lakhs` · city · preferred locations) and
+`_with_applicant_facts(row, avail)` fills every gap of a COPY (what the application typed wins) — applied with
+`_with_availability` to resume AND profile-only rows in ONE pass over the page. Edit applicant now also writes notice /
+current + expected CTC / experience to the candidate record (`slot_booking.copy_application_facts_to_candidate`, only
+the keys TA changed, a blank never erases) and an edited expected CTC to the profile (the budget check). (3) **Finance's
+billing items** (`work_desk.billing_chain`) carry `section` = customer, `employee` (Proformas / invoices through their
+timesheet, `employees_of`, one query) and `amount`; `_facets(..., employee=, amount=)`; Sales' invoice items carry
+`amount` too. Suite: 1,775 pass, 2 skipped.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

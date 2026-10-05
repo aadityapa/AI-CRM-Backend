@@ -9,6 +9,7 @@ GET  /api/invoices/{id}/tax-invoice.pdf
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -123,7 +124,11 @@ def crm_tax_invoice_docx(
     invoice = get_invoice_or_404(db, invoice_id)
     tax_inv = ti.map_crm_invoice_to_tax_invoice(
         db, invoice, share_base_url=str(request.base_url).rstrip("/"))
-    content = build_invoice_docx(tax_inv)
+    try:
+        content = build_invoice_docx(tax_inv)
+    except Exception as exc:  # never a bare 400 from the global ValueError handler
+        logging.getLogger(__name__).exception("Word export failed for invoice %s", invoice_id)
+        raise HTTPException(status_code=500, detail=f"Could not build the Word file: {exc}") from exc
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

@@ -148,6 +148,8 @@ class InvoiceUpdate(BaseModel):
     buyer_state_code: str | None = None
     #: Column choice on a PROFORMA only (Finance may correct it before converting).
     invoice_format: dict[str, bool] | None = None
+    #: Round the grand total to the rupee — PROFORMA only (5 Oct 2026).
+    round_off: bool | None = None
 
 
 class ConvertProformaIn(BaseModel):
@@ -156,6 +158,8 @@ class ConvertProformaIn(BaseModel):
     invoice_number: str | None = Field(default=None, max_length=64)
     #: Blank = keep the Proforma's date.
     invoice_date: date | None = None
+    #: Round off to the nearest rupee (5 Oct 2026). None = keep the Proforma's choice.
+    round_off: bool | None = None
 
 
 class PaymentIn(BaseModel):

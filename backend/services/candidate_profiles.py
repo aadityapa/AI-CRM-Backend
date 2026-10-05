@@ -2780,27 +2780,27 @@ def l1_verdict_recorded(db: Session, profile_id: int) -> bool:
 
 
 def set_applied_archive(db: Session, profile: CandidateProfile, archived: bool, user) -> bool:
-    """RMG / GM move a CLOSED candidacy to the Applied Candidates Archive tab,
-    or bring it back (30 Sep 2026, user rule: nothing is archived on its own).
+    """RMG / GM / Sales move a candidacy to Archive by hand, or bring it back.
 
-    Archiving a live candidacy is refused (409) — it has to be rejected /
-    withdrawn first. Idempotent: the same state again writes nothing and
-    returns False. Logged as APPLIED_ARCHIVED / APPLIED_RESTORED (the latest
-    wins). The caller commits.
+    Since 5 Oct 2026 any stage may be archived (user ask: "Sales will manually
+    move it to Archive"); the stored stage is untouched, so a restore lands it
+    exactly where it was. A candidacy parked by its deal's HOLD cannot be
+    restored by hand (409) — it returns when the opportunity is reactivated.
+    Idempotent: the same state again writes nothing and returns False. Logged as
+    APPLIED_ARCHIVED / APPLIED_RESTORED (the latest wins). The caller commits.
     """
     from services.candidate_status import (
-        ARCHIVED_ACTION, RESTORED_ACTION, archived_profile_ids,
+        ARCHIVED_ACTION, RESTORED_ACTION, archive_reasons,
     )
 
-    stage = profile.pipeline_status.value if hasattr(profile.pipeline_status, "value") \
-        else str(profile.pipeline_status or "")
-    if archived and stage not in REJECTED_BUCKET:
+    reason = archive_reasons(db, [profile.id]).get(profile.id)
+    if not archived and reason == "hold":
         raise HTTPException(status_code=409,
-                            detail="Only a rejected or withdrawn candidate can be archived.")
-    now = profile.id in archived_profile_ids(db, [profile.id])
+                            detail="This opportunity is on hold — the candidate comes back when it is reactivated.")
+    now = reason == "manual"
     if now == archived:
         return False
-    actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "RMG"
+    actor = getattr(user, "full_name", None) or getattr(user, "username", None) or "User"
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, getattr(user, "id", None),
                  ARCHIVED_ACTION if archived else RESTORED_ACTION,
                  f"{actor} {'moved the candidate to Archive' if archived else 'restored the candidate to Applied Candidates'}")

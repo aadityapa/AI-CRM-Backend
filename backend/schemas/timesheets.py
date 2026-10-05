@@ -28,6 +28,9 @@ class GenerateInvoiceIn(BaseModel):
     """
 
     po_id: int | None = None
+    #: Round the grand total to the nearest rupee with a "Round Off" line
+    #: (5 Oct 2026). False / omitted = the exact figure.
+    round_off: bool = False
     #: Invoice number typed in the Generate dialog (11 Sep 2026); blank = the
     #: next INV-YYYY-NNN. Must be unique.
     invoice_number: str | None = Field(default=None, max_length=64)

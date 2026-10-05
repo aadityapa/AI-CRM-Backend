@@ -32,14 +32,31 @@ logger = logging.getLogger("karnex.crm.ats")
 ATS_OPENAI_PURPOSE = "ats"
 
 
+#: How the final ATS score is blended when the AI review is available (6 Oct
+#: 2026, user report: a CV the ATS Scoring page rated 75 read 45.84 on Applied
+#: Candidates). The keyword score is literal — a JD phrase the CV words
+#: differently scores nothing — so the reviewer that reads the CV the way a
+#: recruiter does now carries the larger share; the keyword score stays as the
+#: evidence-backed floor.
+KEYWORD_SHARE = 0.4
+AI_SHARE = 0.6
+
+#: Bumped whenever the scoring rules change; a Scored row below it is
+#: `ats_outdated` and "Score N" on Applied Candidates re-scores it.
+ATS_SCORE_VERSION = 2
+
+
 def _ai_semantic_review(jd_text: str | None, mandatory: list[str], optional: list[str],
-                        resume_text: str) -> dict | None:
+                        resume_text: str, facts: dict | None = None,
+                        band: tuple | None = None) -> dict | None:
     """OpenAI semantic assessment of resume↔role fit (returns None when no key /
     on any failure — the deterministic score always stands on its own).
 
     Unlike keyword matching, this understands synonyms, related tech and context
     (e.g. 'AUTOSAR stack work' implies embedded C), so the final score reflects
-    real fit rather than literal word overlap."""
+    real fit rather than literal word overlap. The facts TA typed for this
+    application (experience, locations) are given to it, since a Naukri-style CV
+    often states neither in words."""
     try:
         from openai_client import get_openai_client, openai_key_configured
         if not openai_key_configured(ATS_OPENAI_PURPOSE):
@@ -53,13 +70,25 @@ def _ai_semantic_review(jd_text: str | None, mandatory: list[str], optional: lis
         import json as _json
         skills_line = ", ".join(mandatory) or "—"
         opt_line = ", ".join(optional) or "—"
+        facts = facts or {}
+        fact_lines = []
+        if band and (band[0] is not None or band[1] is not None):
+            fact_lines.append(f"Experience the role asks for: {band[0] if band[0] is not None else '—'}"
+                              f"–{band[1] if band[1] is not None else '—'} years")
+        if facts.get("experience_years") is not None:
+            fact_lines.append(f"Candidate's total experience (confirmed by the recruiter): "
+                              f"{facts['experience_years']} years")
+        if facts.get("locations"):
+            fact_lines.append("Candidate's current / preferred locations: " + ", ".join(facts["locations"]))
         prompt = (
-            "You are a strict technical recruiter. Assess how well the RESUME fits the ROLE.\n"
+            "You are an experienced technical recruiter screening a CV for a role.\n"
+            "Score how well the candidate matches the job, the way a recruiter would.\n"
             f"Required skills: {skills_line}\nNice-to-have skills: {opt_line}\n"
-            + (f"Job description:\n{(jd_text or '')[:4000]}\n" if (jd_text or '').strip() else "")
+            + ("\n".join(fact_lines) + "\n" if fact_lines else "")
+            + (f"Job description:\n{(jd_text or '')[:6000]}\n" if (jd_text or '').strip() else "")
             + f"\nRESUME:\n{resume_text[:9000]}\n\n"
-            "Consider synonyms, related technologies and actual project evidence — not just "
-            "literal keyword matches. Do not reward keyword stuffing. Return ONLY JSON: "
+            "Consider synonyms, related technologies, the domain and actual project evidence — "
+            "not just literal keyword matches. Do not reward keyword stuffing. Return ONLY JSON: "
             '{"match_percent": 0-100, "summary": "2-3 sentence fit assessment", '
             '"strengths": ["..."], "gaps": ["..."]}'
         )
@@ -111,6 +140,14 @@ def _val(v):
     return v.value if hasattr(v, "value") else v
 
 
+def ats_outdated(r: Resume) -> bool:
+    """A Scored row produced by older scoring rules (`ATS_SCORE_VERSION`)."""
+    if _val(r.ats_status) != AtsStatus.SCORED.value:
+        return False
+    version = (r.ats_score_breakdown or {}).get("score_version") if isinstance(r.ats_score_breakdown, dict) else None
+    return (version or 1) < ATS_SCORE_VERSION
+
+
 def serialize_resume(r: Resume) -> dict:
     return {
         "id": r.id,
@@ -127,6 +164,7 @@ def serialize_resume(r: Resume) -> dict:
         "ats_score": _num(r.ats_score),
         "ats_score_breakdown": r.ats_score_breakdown,
         "ats_status": _val(r.ats_status),
+        "ats_outdated": ats_outdated(r),
         "screened_by": r.screened_by,
         "ai_interview_status": _val(r.ai_interview_status),
         "ai_interview_scheduled_at": r.ai_interview_scheduled_at.isoformat() if r.ai_interview_scheduled_at else None,
@@ -511,6 +549,75 @@ def _texts_are_near_identical(a: str, b: str) -> bool:
     return len(wa & wb) / len(wa | wb) >= _JD_SELF_MATCH_THRESHOLD
 
 
+def _jd_files(db: Session, requirement: Requirement) -> tuple[list[str], list[str]]:
+    """(RMG JD file urls, the customer's JD file urls on the opportunity)."""
+    from models import OpportunityAttachment, RequirementAttachment
+
+    rmg = db.execute(select(RequirementAttachment.file_url).where(
+        RequirementAttachment.requirement_id == requirement.id,
+        RequirementAttachment.kind == "rmg_jd")).scalars().all()
+    customer = db.execute(select(OpportunityAttachment.file_url).where(
+        OpportunityAttachment.opportunity_id == requirement.opportunity_id,
+        OpportunityAttachment.kind == "customer_jd")).scalars().all() \
+        if requirement.opportunity_id else []
+    return list(rmg), list(customer)
+
+
+def ats_jd_text(db: Session, requirement: Requirement) -> tuple[str | None, str | None]:
+    """The JD a resume is scored against, and where it came from.
+
+    The RMG JD (text + Word / PDF files) when there is one; otherwise the
+    CUSTOMER's JD on the opportunity (6 Oct 2026, user report: the ATS Scoring
+    page scored a CV against the customer JD at 75 while Applied Candidates,
+    which only ever read the RMG JD, had nothing but the skill list to go on).
+    Returns (text, "rmg" | "customer") or (None, None)."""
+    rmg_files, customer_files = _jd_files(db, requirement)
+
+    def read(urls):
+        parts = []
+        for url in urls:
+            try:
+                parts.append(extract_resume_text(url))
+            except HTTPException:
+                continue
+        return parts
+
+    rmg = ([requirement.rmg_jd_text.strip()] if (requirement.rmg_jd_text or "").strip() else []) + read(rmg_files)
+    if "\n\n".join(rmg).strip():
+        return "\n\n".join(rmg).strip(), "rmg"
+    customer = "\n\n".join(read(customer_files)).strip()
+    return (customer, "customer") if customer else (None, None)
+
+
+def _years(value) -> float | None:
+    m = re.search(r"(\d+(?:\.\d+)?)", str(value or ""))
+    try:
+        years = float(m.group(1)) if m else None
+    except ValueError:
+        return None
+    return years if years is not None and 0 <= years <= 60 else None
+
+
+def candidate_facts(db: Session, resume: Resume) -> dict:
+    """What the recruiter recorded for this applicant (6 Oct 2026): the
+    experience typed on the application (else the candidate record's) and every
+    location they gave — current and preferred. Fed to the scorer and to the AI
+    reviewer, because a CV often states neither in words."""
+    details = resume.application_details or {}
+    cand = db.get(Candidate, resume.candidate_id) if resume.candidate_id else None
+    years = _years(resume.applicant_experience)
+    if years is None and cand is not None and cand.experience_years is not None:
+        years = float(cand.experience_years)
+    locations = []
+    for v in (details.get("current_location"), details.get("preferred_location"),
+              getattr(cand, "city", None), getattr(cand, "preferred_locations", None)):
+        for part in re.split(r"[,;/|]+", str(v or "")):
+            part = part.strip()
+            if part and part.lower() not in {x.lower() for x in locations}:
+                locations.append(part)
+    return {"experience_years": years, "locations": locations[:8]}
+
+
 def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id: int) -> dict:
     """Score a resume against its requirement; mutates the resume row (caller commits).
 
@@ -525,7 +632,6 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
       4. When an RMG JD is present (text and/or rmg_jd attachment), JD keyword
          overlap is included in the score and breakdown.
     """
-    from models import RequirementAttachment
     from services.ats_scoring import AtsConfigError, looks_like_resume, score_resume_against_requirement
 
     text = extract_resume_text(resume.resume_file_url)  # raises 422 on empty / image-only
@@ -559,21 +665,8 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
         loc = db.get(Location, requirement.location_id)
         city = loc.city if loc else None
 
-    jd_parts: list[str] = []
-    if (requirement.rmg_jd_text or "").strip():
-        jd_parts.append(requirement.rmg_jd_text.strip())
-    jd_atts = db.execute(
-        select(RequirementAttachment).where(
-            RequirementAttachment.requirement_id == requirement.id,
-            RequirementAttachment.kind == "rmg_jd",
-        )
-    ).scalars().all()
-    for att in jd_atts:
-        try:
-            jd_parts.append(extract_resume_text(att.file_url))
-        except HTTPException:
-            continue
-    jd_text = "\n\n".join(jd_parts).strip() or None
+    jd_text, jd_source = ats_jd_text(db, requirement)
+    facts = candidate_facts(db, resume)
 
     # Belt and braces: even if the JD sneaks past looks_like_resume, refuse to
     # score a document that IS the job description. Without this the candidate
@@ -595,6 +688,7 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
             _num(requirement.experience_min), _num(requirement.experience_max), city,
             jd_text=jd_text,
             weights=getattr(requirement, "ats_weights", None),
+            candidate_facts=facts,
         )
     except AtsConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -602,13 +696,16 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
     total = result["ats_score"]
     breakdown = result["breakdown"]
     breakdown["parse_confidence"] = "high" if signals["word_count"] >= 120 else "low"
+    breakdown["score_version"] = ATS_SCORE_VERSION
     if jd_text:
         breakdown["jd_text_preview"] = jd_text[:500]
+        breakdown["jd_source"] = jd_source
 
     # OpenAI semantic review — blends real understanding (synonyms, related tech,
     # project evidence) with the deterministic keyword score. Deterministic-only
     # when no key is configured or the call fails.
-    ai = _ai_semantic_review(jd_text, mandatory, optional, text)
+    ai = _ai_semantic_review(jd_text, mandatory, optional, text, facts,
+                             (_num(requirement.experience_min), _num(requirement.experience_max)))
     if ai is not None and ai.get("unavailable"):
         # Record the reason so the breakdown can say "keyword-only, because ..."
         breakdown["ai_review"] = ai
@@ -618,7 +715,7 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
         breakdown["score_details"] = details
     elif ai is not None:
         deterministic = float(total)
-        blended = round(0.6 * deterministic + 0.4 * ai["match_percent"], 2)
+        blended = round(KEYWORD_SHARE * deterministic + AI_SHARE * ai["match_percent"], 2)
         # Honest cap preserved: only a full required-skill match may reach 100.
         details = breakdown.get("score_details") or {}
         if not details.get("all_required_matched") and blended >= 100.0:
@@ -626,7 +723,8 @@ def run_ats_scan(db: Session, resume: Resume, requirement: Requirement, user_id:
         breakdown["ai_review"] = ai
         details["deterministic_score"] = deterministic
         details["ai_semantic_score"] = ai["match_percent"]
-        details["blend"] = "60% keyword/criteria + 40% AI semantic"
+        details["blend"] = (f"{round(KEYWORD_SHARE * 100)}% keyword/criteria + "
+                            f"{round(AI_SHARE * 100)}% AI semantic")
         breakdown["score_details"] = details
         total = blended
 
@@ -802,17 +900,15 @@ def rescore_requirement(db: Session, req: Requirement, user_id: int | None,
 
 
 def has_ats_criteria(db: Session, req: Requirement) -> bool:
-    """Is there anything to score against — a skill, the RMG JD text, or a JD file?"""
-    from models import RequirementAttachment
-
+    """Is there anything to score against — a skill, the RMG JD (text or file),
+    or the customer's JD on the opportunity?"""
     if (req.rmg_jd_text or "").strip():
         return True
     if db.execute(select(RequirementSkill.id)
                   .where(RequirementSkill.requirement_id == req.id).limit(1)).first():
         return True
-    return db.execute(select(RequirementAttachment.id).where(
-        RequirementAttachment.requirement_id == req.id,
-        RequirementAttachment.kind == "rmg_jd").limit(1)).first() is not None
+    rmg_files, customer_files = _jd_files(db, req)
+    return bool(rmg_files or customer_files)
 
 
 def rescore_requirement_in_background(requirement_id: int, user_id: int | None) -> None:

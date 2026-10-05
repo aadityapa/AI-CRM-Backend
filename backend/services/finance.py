@@ -342,11 +342,29 @@ def apply_invoice_gst_totals(invoice: Invoice, gst: dict) -> None:
     """Persist tax + grand from engine; refresh balance vs paid."""
     from decimal import ROUND_HALF_UP
 
-    tax_amount = Decimal(str(gst["total_gst"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    # Prefer sub_total column + tax so stored grand stays consistent with invoice.sub_total.
-    sub = Decimal(str(invoice.sub_total or 0))
-    grand_total = (sub + tax_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    invoice.tax_amount = tax_amount
+    invoice.tax_amount = Decimal(str(gst["total_gst"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    # A rounded invoice stays rounded when its figures are recomputed.
+    apply_round_off(invoice, getattr(invoice, "round_off", None) is not None)
+
+
+def apply_round_off(invoice: Invoice, enabled: bool) -> None:
+    """Set grand_total = sub_total + tax, rounded to the nearest rupee when
+    `enabled` (5 Oct 2026, Finance ask), and refresh balance / payment status.
+
+    The round-off is a line of its own (`invoice.round_off`, ±0.50 at most) —
+    GST and the sub-total are never touched, and a PO is still drawn by the
+    sub-total (`po_draw_amount`), so rounding moves only what the customer pays.
+    NULL = not rounded; 0.00 = rounded and already whole.
+    """
+    from decimal import ROUND_HALF_UP
+
+    exact, whole = ti.round_to_rupee(Decimal(str(invoice.sub_total or 0)) + Decimal(str(invoice.tax_amount or 0)))
+    if enabled:
+        invoice.round_off = whole - exact
+        grand_total = whole
+    else:
+        invoice.round_off = None
+        grand_total = exact
     invoice.grand_total = grand_total
     paid = Decimal(str(invoice.paid_amount or 0))
     balance = (grand_total - paid).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -927,6 +945,8 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         "sub_total": _num(invoice.sub_total),
         "tax_amount": _num(invoice.tax_amount),
         "grand_total": _num(invoice.grand_total),
+        # Rupee round-off inside grand_total (0120); null = not rounded.
+        "round_off": _num(invoice.round_off) if invoice.round_off is not None else None,
         "buyer_state_code": (invoice.buyer_state_code or None),
         "payment_status": _ev(invoice.payment_status),
         "paid_amount": _num(invoice.paid_amount),
@@ -965,6 +985,12 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
             opp = db.get(Opportunity, invoice.project.opportunity_id)
             project_type = _ev(opp.opp_type) if opp else None
         data["project_type"] = project_type
+        # The due-date rule (5 Oct 2026): the editor recomputes the due date from
+        # the invoice date with these days (branch → PO terms → 30).
+        if db is not None:
+            from services.proforma import invoice_credit_days
+            data["credit_days"], data["credit_days_source"] = invoice_credit_days(
+                db, invoice.project_id, invoice.po)
 
         # Qty/Rate column labels from the timesheet assignment's billing unit
         # (Hourly/Daily/Monthly/Yearly) — same helper the PDF uses, resolved at
@@ -1080,8 +1106,12 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
             items=_items_from_lines(invoice.lines),
             subtotal=_num(invoice.sub_total) or 0.0,
             stored_tax=_num(invoice.tax_amount),
-            stored_grand=_num(invoice.grand_total),
+            stored_grand=(_num(invoice.grand_total) or 0.0) - (_num(invoice.round_off) or 0.0),
         )
+        if invoice.round_off is not None:
+            # The on-screen sheet prints a "Round Off" line and the rounded total.
+            data["gst"]["round_off"] = _num(invoice.round_off)
+            data["gst"]["grand_total"] = _num(invoice.grand_total)
         # Mirror resolved code at top level so the invoice header can always show it.
         data["resolved_state_code"] = data["gst"].get("buyer_state_code") or None
         data["resolved_state_source"] = data["gst"].get("buyer_state_source") or None

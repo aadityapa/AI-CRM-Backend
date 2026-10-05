@@ -26,14 +26,14 @@ from schemas.timesheets import GenerateInvoiceIn, TimesheetCreate, TimesheetEntr
 from models.finance import InvoiceKind
 from services.crm_common import log_activity, next_sequence_number, paginate, save_upload, save_upload_hashed
 from services.finance import (
-    active_po_allocation_for_project, assert_po_allows_new_drawdown, ensure_po_covers,
+    active_po_allocation_for_project, apply_round_off, assert_po_allows_new_drawdown, ensure_po_covers,
     ensure_unique_invoice_number, po_draw_amount, resolve_or_create_po_allocation_for_project,
     karnex_gst_tax_and_grand, serialize_invoice,
 )
 from services.invoice_format import format_summary
 from services.notify import notify_employee, notify_role, notify_roles, notify_user
 from services.proforma import (
-    PROFORMA_PREFIX, customer_invoice_format, notify_proforma_ready, po_credit_days,
+    PROFORMA_PREFIX, customer_invoice_format, invoice_credit_days, notify_proforma_ready,
     replaceable_proforma, resolve_invoice_format,
 )
 from services.timesheets import (
@@ -1875,8 +1875,8 @@ def generate_invoice_from_timesheet(
     ensure_po_covers(po, po_draw_amount(sub_total))   # a PO covers the value before GST
 
     # The Proforma is dated the day the GM raises it; Finance may correct the
-    # date before converting. Due date = invoice date + credit days parsed
-    # from the PO's payment terms ("Net 30 Days" → 30); default 30.
+    # date before converting. Due date = invoice date + the branch's invoice
+    # credit days, else the PO's payment terms, else 30 (invoice_credit_days).
     invoice_dt = date.today()
     if returned is not None:
         # Reissue: the returned document goes, its number stays.
@@ -1898,7 +1898,7 @@ def generate_invoice_from_timesheet(
         project_id=ts.project_id,
         timesheet_id=ts.id,
         invoice_date=invoice_dt,
-        due_date=invoice_dt + timedelta(days=po_credit_days(po)),
+        due_date=invoice_dt + timedelta(days=invoice_credit_days(db, ts.project_id, po)[0]),
         sub_total=sub_total,
         tax_amount=tax_amount,
         grand_total=grand_total,
@@ -1907,6 +1907,8 @@ def generate_invoice_from_timesheet(
         payment_status=PaymentStatus.UNPAID,
         lines=line_rows,
     )
+    apply_round_off(invoice, bool(getattr(body, "round_off", False)))
+    grand_total = invoice.grand_total
     db.add(invoice)
     db.flush()
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PROFORMA_GENERATED",

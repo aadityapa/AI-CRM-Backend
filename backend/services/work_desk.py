@@ -126,6 +126,12 @@ TABS = {
                       "Proformas the GM raised — review, then generate the original tax invoice or return it."),
     "fin_invoices": ("Tax invoices issued",
                      "Original invoices generated in the last 30 days, with how much has been received."),
+    "fin_customer_approved": ("Customer approved invoices",
+                              "Invoices the customer accepted (confirmed by the Sales Manager / Sales Head) — "
+                              "add the e-invoice IRN and Acknowledgement No."),
+    "inv_confirm": ("Confirm with customer",
+                    "Original invoices Finance generated — send them to the customer and confirm their "
+                    "approval so Finance can add the IRN."),
     "upcoming": ("Upcoming", "Interviews, joinings, roll-offs and due dates in the next 7 days."),
     "queues": ("My queues", "Approvals and hand-offs waiting on you, by count."),
 }
@@ -153,7 +159,8 @@ def tab_link(key: str, *, screener: bool = False) -> str:
 #: `info` tabs are information (what is coming / what is done), never counted
 #: as "waiting on you".
 TAB_STAGE = {"fin_timesheets": ("Coming up", True), "fin_proformas": ("Your move", False),
-             "fin_invoices": ("Done", True),
+             "fin_invoices": ("Done", True), "fin_customer_approved": ("Your move", False),
+             "inv_confirm": ("Your move", False),
              "sales_submit": ("Your move", False), "sales_response": ("With the customer", False),
              "sales_decide": ("Your move", False), "sales_terms": ("Your move", False),
              "sales_approval": ("Your approval", False), "sales_waiting": ("Waiting", True),
@@ -729,7 +736,7 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
 
     def facets_of(inv, cname, pname):
         return dict(employee=emp_of_sheet.get(inv.timesheet_id or 0),
-                    **_facets(cname, pname, day=inv.invoice_date))
+                    **_facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
 
     pi_items, iv_items, due_items = [], [], []
     for inv in invoices:
@@ -1375,16 +1382,22 @@ def _age_days(dt, today) -> int | None:
     return (today - d).days
 
 
-def _facets(customer=None, project=None, year=None, month=None, *, day=None) -> dict:
+def _facets(customer=None, project=None, year=None, month=None, *, day=None,
+            employee=None, amount=None) -> dict:
     """The filter facets of a billing item (29 Sep 2026, user ask: "filters in
     every tab — customer wise, month wise, search"): the customer, the project
     and the month the work belongs to — a timesheet's PERIOD, an invoice's date
-    (never the day it was touched)."""
+    (never the day it was touched). 6 Oct 2026: the employee the sheet / invoice
+    is for and the invoice's amount (the "Largest first" sort), when known."""
     if day is not None:
         year, month = day.year, day.month
     out = {"customer": customer or None, "project": project or None}
     if year and month:
         out["month"] = f"{int(year):04d}-{int(month):02d}"
+    if employee:
+        out["employee"] = employee
+    if amount is not None:
+        out["amount"] = float(amount)
     return out
 
 
@@ -1433,7 +1446,17 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
         return _item(
             f"{key}:{ts.id}", f"{_employee_name(emp)} · {_month_label(ts.year, ts.month)}",
             " · ".join(x for x in (pname, cname) if x), chip=chip, tone=tone, when=_when(when),
-            path=f"timesheets/{ts.id}", action=action) | _facets(cname, pname, ts.year, ts.month)
+            path=f"timesheets/{ts.id}", action=action) | {"section": cname or "No customer"} \
+            | _facets(cname, pname, ts.year, ts.month, employee=_employee_name(emp))
+
+    def employees_of(invoices):
+        """The employee each invoice bills, through its timesheet — ONE query."""
+        sheet_ids = [i.timesheet_id for i in invoices if i.timesheet_id]
+        if not sheet_ids:
+            return {}
+        return {tsid: _employee_name(emp) for tsid, emp in db.execute(
+            select(Timesheet.id, Employee).join(Employee, Employee.id == Timesheet.employee_id)
+            .where(Timesheet.id.in_(sheet_ids))).all()}
 
     # 0 — submitted sheets: the approver's move (oldest first — they have waited longest).
     submitted = db.execute(
@@ -1475,45 +1498,144 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
     pis = db.execute(select(Invoice).where(Invoice.kind == proforma, Invoice.returned_at.is_(None))
                      .order_by(Invoice.id)).scalars().all()
     nm = names({i.project_id for i in pis})
+    emp_of = employees_of(pis)
     pi_chip, pi_action = words["proforma"]
     pi_items = []
     for inv in pis:
         pname, cname = nm.get(inv.project_id, ("Project", None))
+        who = emp_of.get(inv.timesheet_id or 0)
         age = _age_days(inv.invoice_date, today) or 0
         tone = "bad" if age > 2 * PROFORMA_WAIT_DAYS else "warn" if age > PROFORMA_WAIT_DAYS else "info"
         pi_items.append(_item(
             f"pi:{inv.id}", f"{inv.proforma_number or inv.invoice_number} · {rupees(inv.grand_total)}",
-            " · ".join(x for x in (cname, pname) if x) + (f" · waiting {age} day{'s' if age != 1 else ''}" if age else ""),
+            " · ".join(x for x in (cname, pname, who) if x) + (f" · waiting {age} day{'s' if age != 1 else ''}" if age else ""),
             chip=pi_chip, tone=tone, when=_when(inv.invoice_date),
-            path=f"invoices/{inv.id}", action=pi_action) | _facets(cname, pname, day=inv.invoice_date))
+            path=f"invoices/{inv.id}", action=pi_action) | {"section": cname or "No customer"}
+            | _facets(cname, pname, day=inv.invoice_date, employee=who, amount=inv.grand_total))
 
     # 3 — tax invoices issued in the window (done), newest first.
     cutoff = today - timedelta(days=FIN_ISSUED_DAYS)
     issued = db.execute(select(Invoice).where(Invoice.kind == tax, Invoice.invoice_date >= cutoff)
                         .order_by(Invoice.invoice_date.desc(), Invoice.id.desc())).scalars().all()
     nm = names({i.project_id for i in issued})
+    emp_of = employees_of(issued)
     iv_items = []
     for inv in issued:
         pname, cname = nm.get(inv.project_id, ("Project", None))
+        who = emp_of.get(inv.timesheet_id or 0)
         status = getattr(inv.payment_status, "value", inv.payment_status) or "Unpaid"
         paid = str(status).lower() == "paid"
         from_pi = f"from {inv.proforma_number}" if inv.proforma_number else None
         iv_items.append(_item(
             f"iv:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
-            " · ".join(x for x in (cname, pname, from_pi) if x),
+            " · ".join(x for x in (cname, pname, who, from_pi) if x),
             chip=str(status).replace("_", " "), tone="ok" if paid else "info",
             when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Open invoice")
-            | _facets(cname, pname, day=inv.invoice_date))
+            | {"section": cname or "No customer"}
+            | _facets(cname, pname, day=inv.invoice_date, employee=who, amount=inv.grand_total))
 
     return {"submitted": sub_items, "awaiting": ts_items, "proformas": pi_items, "issued": iv_items}
 
 
 def _finance_tabs(db: Session) -> list[dict]:
     """Finance's desk (29 Sep 2026, user ask): the timesheet → Proforma →
-    tax-invoice chain as three tabs (`billing_chain`, Finance's words)."""
+    tax-invoice chain as three tabs (`billing_chain`, Finance's words), then
+    the customer-approved invoices waiting for the IRN (5 Oct 2026)."""
     chain = billing_chain(db, audience="finance")
     return [_tab("fin_timesheets", chain["awaiting"]), _tab("fin_proformas", chain["proformas"]),
-            _tab("fin_invoices", chain["issued"])]
+            _tab("fin_invoices", chain["issued"]), _customer_approved_tab(db)]
+
+
+#: "Customer approved invoices" keeps an invoice whose IRN is in for this long.
+FIN_IRN_DONE_DAYS = 30
+#: "Confirm with customer" looks back this far (invoice date).
+CONFIRM_LOOKBACK_DAYS = 90
+#: An invoice waiting longer than this for the customer's approval turns amber, twice as long red.
+CONFIRM_WAIT_DAYS = 7
+
+
+def _invoice_names(db: Session, invoices) -> dict[int, tuple[str | None, str | None]]:
+    """project id → (project name, customer name) — ONE query."""
+    from models import Customer, Project
+
+    ids = {i.project_id for i in invoices if i.project_id}
+    if not ids:
+        return {}
+    return {pid: (pn, cn) for pid, pn, cn in db.execute(
+        select(Project.id, Project.name, Customer.name)
+        .outerjoin(Customer, Customer.id == Project.customer_id)
+        .where(Project.id.in_(ids))).all()}
+
+
+def _customer_approved_tab(db: Session) -> dict:
+    """Finance (5 Oct 2026): every customer-approved tax invoice still without
+    an IRN (oldest approval first — the count), then those whose IRN went in
+    during the last `FIN_IRN_DONE_DAYS` (done)."""
+    from datetime import timedelta
+
+    from models import Invoice
+    from models.finance import InvoiceKind
+
+    since = datetime.now(timezone.utc) - timedelta(days=FIN_IRN_DONE_DAYS)
+    pending = db.execute(select(Invoice).where(
+        Invoice.kind == InvoiceKind.TAX.value, Invoice.customer_approved_at.isnot(None),
+        Invoice.irn_number.is_(None)).order_by(Invoice.customer_approved_at.asc())).scalars().all()
+    done = db.execute(select(Invoice).where(
+        Invoice.kind == InvoiceKind.TAX.value, Invoice.customer_approved_at.isnot(None),
+        Invoice.irn_number.isnot(None), Invoice.irn_recorded_at >= since)
+        .order_by(Invoice.irn_recorded_at.desc())).scalars().all()
+    nm = _invoice_names(db, [*pending, *done])
+    now = datetime.now(timezone.utc)
+    items = []
+    for inv in pending:
+        pname, cname = nm.get(inv.project_id, (None, None))
+        at = inv.customer_approved_at
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        days = (now - at).days if at else 0
+        items.append(_item(
+            f"irn:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
+            " · ".join(x for x in (cname, pname, f"approved {days} d ago" if days else "approved today") if x),
+            chip="Add IRN", tone="bad" if days > 6 else "warn", when=_when(inv.customer_approved_at),
+            path=f"invoices/{inv.id}", action="Add IRN & Ack No.")
+            | {"section": "IRN to add"} | _facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
+    for inv in done:
+        pname, cname = nm.get(inv.project_id, (None, None))
+        items.append(_item(
+            f"irn:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
+            " · ".join(x for x in (cname, pname, f"Ack {inv.ack_number}" if inv.ack_number else None) if x),
+            chip="IRN recorded", tone="ok", when=_when(inv.irn_recorded_at),
+            path=f"invoices/{inv.id}", action="Open invoice")
+            | {"section": "IRN recorded"} | _facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
+    return _tab("fin_customer_approved", items, count=len(pending))
+
+
+def _customer_confirm_tab(db: Session) -> dict:
+    """Sales Manager / Sales Head (5 Oct 2026): original invoices of the last
+    `CONFIRM_LOOKBACK_DAYS` whose customer approval is not confirmed yet."""
+    from datetime import date, timedelta
+
+    from models import Invoice
+    from models.finance import InvoiceKind
+
+    today = date.today()
+    rows = db.execute(select(Invoice).where(
+        Invoice.kind == InvoiceKind.TAX.value, Invoice.customer_approved_at.is_(None),
+        Invoice.invoice_date >= today - timedelta(days=CONFIRM_LOOKBACK_DAYS))
+        .order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).scalars().all()
+    nm = _invoice_names(db, rows)
+    items = []
+    for inv in rows:
+        pname, cname = nm.get(inv.project_id, (None, None))
+        age = _age_days(inv.invoice_date, today) or 0
+        items.append(_item(
+            f"confirm:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
+            " · ".join(x for x in (cname, pname) if x),
+            chip=f"Issued {age} d ago" if age else "Issued today",
+            tone="bad" if age > 2 * CONFIRM_WAIT_DAYS else "warn" if age > CONFIRM_WAIT_DAYS else "info",
+            when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Confirm customer approval")
+            | {"section": cname or "No customer"} | _facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
+    return _tab("inv_confirm", items)
 
 
 # ---------------------------------------------------------- Admin / CEO desk
@@ -1612,6 +1734,9 @@ def desk(db: Session, user, *, max_items: int = MAX_ITEMS) -> dict:
         ("sales_billing", (lambda: _sales_billing_tabs(db, user, everyone=billing_everyone,
                                                        invoices_everyone=invoices_everyone)) if sales else None),
         ("sales_rung", (lambda: _sales_rung_tabs(db, user, rung)) if rung else None),
+        # 5 Oct 2026: the Sales Manager / Sales Head confirm the customer's
+        # approval of each original invoice (Finance adds the IRN next).
+        ("inv_confirm", (lambda: _customer_confirm_tab(db)) if _confirms_invoices(user) else None),
         ("hr", (lambda: _hr_tabs(db)) if "HR" in roles else None),
         ("ta", (lambda: _ta_tabs(db, user, owner_id)) if ta else None),
         ("screener", (lambda: _screener_tabs(db, user)) if screener else None),
@@ -1672,6 +1797,12 @@ def fill_facets(db: Session, tabs: list[dict]) -> None:
                 it["customer"] = names.get(it.get("profile_id")) or None
             if not it.get("month") and isinstance(it.get("when"), str) and len(it["when"]) >= 7:
                 it["month"] = it["when"][:7]
+
+
+def _confirms_invoices(user) -> bool:
+    from services.invoice_customer_approval import may_confirm
+
+    return may_confirm(user)
 
 
 def _may_convert(db: Session, user) -> bool:

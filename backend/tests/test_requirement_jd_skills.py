@@ -211,10 +211,15 @@ def test_a_customer_jd_added_from_the_card_lands_on_the_opportunity(db, monkeypa
 
     req = _req(db)
     monkeypatch.setattr(rr, "save_upload_hashed", lambda f, folder: (f"/api/crm-files/{folder}/c.pdf", "sha", 10))
+    started = []
+    monkeypatch.setattr("services.resumes.rescore_requirement_in_background",
+                        lambda rid, uid: started.append(rid))
     out = rr.add_requirement_attachment(
         req.id, file=UploadFile(filename="customer.pdf", file=io.BytesIO(b"%PDF")), kind="customer_jd",
         db=db, user=_rmg())
-    assert out["message"] == "Customer JD added" and out["data"]["kind"] == "customer_jd"
+    assert out["message"].startswith("Customer JD added") and out["data"]["kind"] == "customer_jd"
+    # 6 Oct 2026: with no RMG JD the ATS reads the customer's JD — the applicants are re-scored.
+    assert out["data"]["rescoring"] is True and started == [req.id]
     att = db.query(OpportunityAttachment).one()
     assert att.opportunity_id == req.opportunity_id and att.kind == "customer_jd"
     assert att.file_url.startswith("/api/crm-files/opportunity_attachments/")
