@@ -378,6 +378,21 @@ def test_rejected_candidates_are_archived_only_by_hand(db, monkeypatch):
         _list(db, req, bucket="bin")
 
 
+def test_a_profile_with_no_archive_row_stays_on_the_live_list(db):
+    """6 Oct 2026, production: Candidate Profiles read 0 after the deploy. The live
+    list is NOT(archive_clause()), and with no archive row the latest-action
+    subquery is NULL — NOT(NULL) is NULL, which dropped every profile. Pinned."""
+    from sqlalchemy import not_, select
+    from services.candidate_status import archive_clause
+
+    req = _req(db)
+    plain = _applicant(db, req, "Plain", screening=None)
+    db.commit()
+    live = db.execute(select(CandidateProfile.id).where(not_(archive_clause()))).scalars().all()
+    archived = db.execute(select(CandidateProfile.id).where(archive_clause())).scalars().all()
+    assert live == [plain.id] and archived == []
+
+
 def test_a_held_deal_parks_its_live_candidates_in_archive(db, monkeypatch):
     """5 Oct 2026: while the opportunity is on Customer / Sales Hold its live
     candidacies sit in Archive (reason "hold") and cannot be restored by hand;

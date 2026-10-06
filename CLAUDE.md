@@ -2281,6 +2281,31 @@ billing items** (`work_desk.billing_chain`) carry `section` = customer, `employe
 timesheet, `employees_of`, one query) and `amount`; `_facets(..., employee=, amount=)`; Sales' invoice items carry
 `amount` too. Suite: 1,775 pass, 2 skipped.
 
+**6 Oct 2026 (later) — Candidate Profiles read 0 after the deploy (`test_applied_profile_only_rows` +1; no
+migration):** ⚠️ SQL three-valued logic. The live / closed lists filter `NOT(archive_clause())`, and for a profile with no
+`APPLIED_ARCHIVED` / `APPLIED_RESTORED` row the latest-action subquery is NULL, so `NULL = 'APPLIED_ARCHIVED'` is NULL and
+`NOT(NULL)` is NULL — every such profile (i.e. nearly all) fell off the list. `archive_clause` now compares
+`COALESCE(latest, '')` and guards `opportunity_id IS NOT NULL`, so every branch is TRUE/FALSE. Pinned by
+`test_a_profile_with_no_archive_row_stays_on_the_live_list` (fails on the old shape). **Any SQL clause that is ever
+negated must never yield NULL.** Deploy: restart.
+
+**6 Oct 2026 (later still) — "Pending Approval" tab finally wired (no migration):** screenshot report — the Screening
+Desk listed C-2026-00098 / 00099 under "Positions to approve" while the Opportunities list showed them under Active and
+Pending Approval was empty. The 5 Oct server filter (`awaiting_approval`) existed but F-V2 never sent it (fixed there).
+`awaiting_approval_clause` now also guards `Requirement.opportunity_id IS NOT NULL` inside its IN subquery — the Active tab
+NEGATES the clause, and a NULL in an IN list would turn `NOT IN` into NULL (the same trap as the archive clause). Deploy:
+rebuild F-V2, restart.
+
+**6 Oct 2026 (night) — the onboarding & employee record is HR / Admin / CEO at Pre-Onboarding only
+(`tests/test_hr_edit_window.py` +2; no migration):** user rule — the "Onboarding & employee record" block exists only
+after the Sales Head approval and only HR and Admin / CEO fill it. `routers/crm/candidate_profiles.
+enforce_onboarding_record_owner` (after `enforce_hr_edit_window` in `PUT /api/candidate-profiles/{id}`):
+`ONBOARDING_RECORD_FIELDS` (employee_ref · offer_letter_reference · official_email · total_experience_years · department_id ·
+designation_id · karnex / customer onboarding dates) may CHANGE only for HR (by role) or Admin / CEO, and only at
+`Preboarding` (403 otherwise). A field re-posted with its stored value is not a change (`_same_value`), so an older client
+never fails. Relocation stays in Locations, outside the rule. F-V2 also drops the "CTC Approval" figure from the profile
+(header + Commercials); the column and the Sales Head approval flow are untouched. Deploy: restart.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 

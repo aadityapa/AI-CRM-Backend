@@ -110,9 +110,12 @@ def awaiting_approval_clause():
         and_(
             Opportunity.approval_status == OpportunityApprovalStatus.APPROVED,
             Opportunity.pipeline_stage.in_((PipelineStage.NEW, PipelineStage.ACTIVE)),
+            # NOT NULL guard: the Active tab NEGATES this clause, and a NULL in
+            # an IN list makes `NOT IN` NULL — every row would vanish.
             Opportunity.id.in_(
                 select(Requirement.opportunity_id)
-                .where(Requirement.status.in_(AWAITING_APPROVAL_STATUSES))),
+                .where(Requirement.status.in_(AWAITING_APPROVAL_STATUSES),
+                       Requirement.opportunity_id.is_not(None))),
         ),
     )
 

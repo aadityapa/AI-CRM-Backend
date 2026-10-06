@@ -885,21 +885,27 @@ def archive_clause():
     Candidate Profiles directory, its export and Applied Candidates, so a hold
     and a manual archive read the same everywhere. Correlated on CandidateProfile.
     """
-    from sqlalchemy import and_, or_, select
+    from sqlalchemy import and_, func, or_, select
     from models import (
         CandidateProfile as CP, CandidateProfileActivityLog as Log, Opportunity, PipelineStage,
     )
 
+    # ⚠️ Every branch must be TRUE or FALSE, never NULL: the live list uses
+    # NOT(archive_clause()), and NOT(NULL) is NULL — a profile with no archive
+    # row (the subquery is NULL) would vanish from EVERY list (6 Oct 2026: the
+    # Candidate Profiles page read 0 after deploy). Hence the COALESCE and the
+    # explicit IS NOT NULL on the opportunity.
     latest = (select(Log.action_type)
               .where(Log.profile_id == CP.id, Log.action_type.in_((ARCHIVED_ACTION, RESTORED_ACTION)))
               .order_by(Log.id.desc()).limit(1)
               .correlate(CP).scalar_subquery())
     held = and_(
+        CP.opportunity_id.is_not(None),
         CP.opportunity_id.in_(select(Opportunity.id).where(
             Opportunity.pipeline_stage.in_([PipelineStage(s) for s in HOLD_STAGES]))),
         CP.pipeline_status.not_in([PS(s) for s in sorted(_SETTLED)]),
     )
-    return or_(latest == ARCHIVED_ACTION, held)
+    return or_(func.coalesce(latest, "") == ARCHIVED_ACTION, held)
 
 
 def archive_reasons(db, profile_ids) -> dict[int, str]:

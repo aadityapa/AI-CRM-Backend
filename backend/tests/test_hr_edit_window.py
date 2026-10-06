@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models import PipelineStatus as PS  # noqa: E402
 from routers.crm.candidate_profiles import (  # noqa: E402
-    HR_EDITABLE_FIELDS, enforce_hr_edit_window,
+    HR_EDITABLE_FIELDS, enforce_hr_edit_window, enforce_onboarding_record_owner,
 )
 
 
@@ -68,6 +68,35 @@ def test_the_window_only_constrains_hr_only_users():
                            {"ctc_approval_amount": 1})
     enforce_hr_edit_window(_profile(PS.SOURCING), _user("HR", admin=True),
                            {"ctc_approval_amount": 1})
+
+
+def _stored(status, **values):
+    base = dict(employee_ref=None, offer_letter_reference=None, official_email=None,
+                total_experience_years=None, department_id=None, designation_id=None,
+                karnex_onboarding_date=None, customer_onboarding_date=None)
+    base.update(values)
+    return SimpleNamespace(id=42, pipeline_status=status, **base)
+
+
+def test_onboarding_record_is_hr_or_admin_at_preboarding_only():
+    """6 Oct 2026: filled after the Sales Head approval, at Pre-Onboarding, by HR / Admin / CEO."""
+    enforce_onboarding_record_owner(_stored(PS.PREBOARDING), _user("HR"), {"employee_ref": "310"})
+    enforce_onboarding_record_owner(_stored(PS.PREBOARDING), _user("Sales", admin=True), {"official_email": "a@karnex.in"})
+    for user in (_user("Sales"), _user("TA"), _user("RMG"), _user("GM")):
+        with pytest.raises(HTTPException) as err:
+            enforce_onboarding_record_owner(_stored(PS.PREBOARDING), user, {"employee_ref": "310"})
+        assert err.value.status_code == 403
+    for stage in (PS.SHORTLISTED, PS.HR_SCREENING, PS.JOINED):
+        with pytest.raises(HTTPException) as err:
+            enforce_onboarding_record_owner(_stored(stage), _user("HR"), {"employee_ref": "310"})
+        assert "Pre-Onboarding" in err.value.detail
+
+
+def test_an_unchanged_onboarding_field_is_not_a_change():
+    """An older client re-posting the form with the stored values must not fail."""
+    enforce_onboarding_record_owner(_stored(PS.SHORTLISTED, employee_ref="310", total_experience_years=3),
+                                    _user("Sales"), {"employee_ref": "310", "total_experience_years": 3.0,
+                                                     "current_ctc": 1})
 
 
 def test_the_field_list_is_the_onboarding_paperwork_and_nothing_else():

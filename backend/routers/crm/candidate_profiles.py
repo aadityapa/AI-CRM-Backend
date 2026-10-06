@@ -1635,6 +1635,46 @@ def enforce_hr_edit_window(profile, user: CurrentUser, updates: dict) -> None:
                    "The approval amount is Sales Head's decision.")
 
 
+#: The "Onboarding & employee record" block (6 Oct 2026, user rule): filled after the
+#: Sales Head approval, at Pre-Onboarding, by HR or Admin / CEO only — it becomes the
+#: Employees record at Joined. Relocation lives in Locations and is not part of it.
+ONBOARDING_RECORD_FIELDS = frozenset({
+    "employee_ref", "offer_letter_reference", "official_email", "total_experience_years",
+    "department_id", "designation_id", "karnex_onboarding_date", "customer_onboarding_date",
+})
+ONBOARDING_RECORD_STAGE = PipelineStatus.PREBOARDING.value
+
+
+def _same_value(old, new) -> bool:
+    if old is None or new is None:
+        return old is None and new is None
+    try:
+        return float(old) == float(new)
+    except (TypeError, ValueError):
+        pass
+    as_text = lambda v: v.isoformat() if hasattr(v, "isoformat") else str(v).strip()  # noqa: E731
+    return as_text(old) == as_text(new)
+
+
+def enforce_onboarding_record_owner(profile, user: CurrentUser, updates: dict) -> None:
+    """403 when anyone but HR / Admin / CEO changes the onboarding record, or when
+    it is changed outside Pre-Onboarding. A field sent with its stored value is not
+    a change (an older client re-posting the form must not fail)."""
+    changed = sorted(f for f in ONBOARDING_RECORD_FIELDS & set(updates)
+                     if not _same_value(getattr(profile, f, None), updates[f]))
+    if not changed:
+        return
+    if not (getattr(user, "is_admin", False) or "HR" in set(user.roles or ())):
+        raise HTTPException(status_code=403,
+                            detail="Only HR or Admin / CEO fill the onboarding & employee record.")
+    stage = _status_val(profile.pipeline_status)
+    if stage != ONBOARDING_RECORD_STAGE:
+        raise HTTPException(
+            status_code=403,
+            detail="The onboarding & employee record is filled at Pre-Onboarding, after the Sales Head "
+                   f"approval (currently {stage.replace('_', ' ')}).")
+
+
 @router.put("/{profile_id}")
 def update_profile(profile_id: int, payload: ProfileUpdate,
                    db: Session = Depends(get_crm_db),
@@ -1642,6 +1682,7 @@ def update_profile(profile_id: int, payload: ProfileUpdate,
     profile = get_profile_or_404(db, profile_id)
     updates = payload.model_dump(exclude_unset=True)
     enforce_hr_edit_window(profile, user, updates)
+    enforce_onboarding_record_owner(profile, user, updates)
     # Field-level template enforcement — the API twin of the greyed inputs.
     from services.access_templates import reject_view_only_fields
     reject_view_only_fields(db, user.id, set(user.roles), "profiles", updates, {
