@@ -266,6 +266,13 @@ EVENTS: list[dict] = [
                     "the customer's) when TA books a round from the Applied Candidates tab or the "
                     "Interviews tab. Roles here are the DEFAULT; the round decides the recipient.",
      "default_roles": []},
+    {"event": "interview.panel_assigned",
+     "label": "You are taking this interview — panel member notified",
+     "description": "Sent to the employee named as the interviewer of a Technical L1–L4 round, when "
+                    "their Employees record is linked to a login (by user link or official mailbox): "
+                    "the candidate, the time, the meeting link, and where to record the feedback "
+                    "(My Interviews). Only that person receives it.",
+     "default_roles": []},
     {"event": "candidate.customer_slots_proposed",
      "label": "Customer slots offered — TA schedules",
      "description": "Sent to the candidate's TAs (who applied them and who sent them for screening) when "
@@ -326,6 +333,12 @@ EVENTS: list[dict] = [
      "label": "AI L1 not cleared — needs a decision",
      "description": "Sent to everyone who screens (RMG · GM) when a candidate scores below the AI L1 "
                     "threshold: reject them, or take a manual L1 when the AI read looks wrong.",
+     "default_roles": ["RMG", "GM"]},
+    {"event": "ai_interview.rescheduled",
+     "label": "AI L1 rescheduled — fresh link sent",
+     "description": "Sent to everyone who screens (RMG · GM) when TA sends a candidate a new AI L1 "
+                    "link after one that was not attempted or not cleared, with the reason — so "
+                    "nobody acts on the old result meanwhile.",
      "default_roles": ["RMG", "GM"]},
     {"event": "interview.result_recorded",
      "label": "Interview done — result to review",
@@ -925,6 +938,9 @@ def save_action_permission(action: str, body: ActionPermissionIn,
     ap_invalidate()
     label = ACTIONS[action].label
     who = ", ".join(row.roles) if row.roles else "Admin/CEO only"
+    from services.access_audit import record as _audit
+    _audit(db, actor=user, action="approval.rule", subject_type="approval", subject_id=action,
+           subject_name=label, after={"roles": row.roles}, summary=f"'{label}' → {who}")
     return envelope(data={"action": action, "roles": row.roles},
                     message=f"'{label}' can now be done by: {who}")
 
@@ -943,6 +959,9 @@ def reset_action_permission(action: str, db: Session = Depends(get_crm_db),
         db.delete(row)
         db.commit()
         ap_invalidate()
+        from services.access_audit import record as _audit
+        _audit(db, actor=user, action="approval.rule", subject_type="approval", subject_id=action,
+               subject_name=action, summary=f"'{action}' reset to the default roles")
     return envelope(data={"action": action}, message="Permission reset to default")
 
 
@@ -1085,6 +1104,9 @@ def invite_user(body: InviteIn,
         custom_role_ids=body.custom_roles,
     )
     uid = int(created["id"])
+    from services.access_audit import record as _audit, snapshot as _snapshot
+    _audit(db, actor=user, action="user.invited", target_user_id=uid, after=_snapshot(db, uid),
+           summary=f"Invited {email}")
 
     # Set-password link via the existing single-use reset-token flow, but with
     # a longer window than a forgot-password (the invitee may open it tomorrow).

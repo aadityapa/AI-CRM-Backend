@@ -259,3 +259,90 @@ def test_recording_config_is_a_separate_path_from_the_token_route():
     paths = [getattr(r, "path", "") for r in main.app.routes]
     assert "/interview/recording/config" not in paths
     assert "/interview/recording-config" in paths
+
+
+# ------------------------------------------------------- screen stream (7 Oct 2026)
+
+
+def test_the_screen_stream_is_stored_finalized_and_served_beside_the_camera(local_store):
+    token = "tok-screen"
+    assert rec.store_chunk(token, 0, b"CAM0") == 4
+    assert rec.store_chunk(token, 1, b"CAM1") == 4
+    assert rec.store_chunk(token, 0, b"SCR0", "screen") == 4
+    # Separate key spaces: the camera keys are the ORIGINAL layout, so every
+    # recording made before this change keeps playing.
+    assert rec.part_key(token, 0) == rec.part_key(token, 0, "cam")
+    assert rec.part_key(token, 0, "screen") != rec.part_key(token, 0)
+    assert rec.final_key(token) == rec.final_key(token, "cam")
+    done = rec.finalize_all(token)
+    assert local_store.get(done["cam"].key) == b"CAM0CAM1"
+    assert local_store.get(done["screen"].key) == b"SCR0"
+    info = rec.recording_playback(token)
+    assert info["available"] is True and info["size_bytes"] == 8
+    assert info["screen"]["available"] is True and info["screen"]["size_bytes"] == 4
+    # Both streams carry a download link (the report page offers Camera / Screen downloads).
+    assert info["download_url"] and info["screen"]["download_url"]
+    # Both streams' parts go once both final objects exist.
+    assert rec.discard_parts(token) == 3
+
+
+def test_a_recording_without_a_screen_stream_still_plays(local_store):
+    """A phone, or a refused share prompt: the camera alone is the recording."""
+    token = "tok-cam-only"
+    rec.store_chunk(token, 0, b"CAM0")
+    done = rec.finalize_all(token)
+    assert done["cam"] is not None and done["screen"] is None
+    info = rec.recording_playback(token)
+    assert info["available"] is True
+    assert info["screen"] == {"available": False}
+
+
+def test_an_unknown_stream_name_falls_back_to_the_camera():
+    assert rec.normalize_stream("../x") == "cam"
+    assert rec.normalize_stream("SCREEN") == "screen"
+    assert rec.normalize_stream(None) == "cam"
+
+
+def test_live_manifest_carries_both_streams_with_their_own_cursors(local_store):
+    token = "tok-live-two"
+    for seq in range(3):
+        rec.store_chunk(token, seq, b"c")
+    rec.store_chunk(token, 0, b"s", "screen")
+    m = rec.live_manifest(token, after_seq=0, screen_after_seq=-1)
+    assert [p["seq"] for p in m["parts"]] == [1, 2]
+    assert m["next_after"] == 2
+    assert [p["seq"] for p in m["screen"]["parts"]] == [0]
+    assert m["screen"]["next_after"] == 0 and m["screen"]["recorded"] is True
+    quiet = rec.live_manifest("tok-nothing", after_seq=-1, screen_after_seq=-1)
+    assert quiet["screen"] == {"parts": [], "next_after": -1, "recorded": False}
+
+
+def test_part_bytes_reads_the_named_stream(local_store):
+    token = "tok-part-stream"
+    rec.store_chunk(token, 0, b"CAM", "cam")
+    rec.store_chunk(token, 0, b"SCR", "screen")
+    assert rec.part_bytes(token, 0) == b"CAM"
+    assert rec.part_bytes(token, 0, "screen") == b"SCR"
+    assert rec.part_bytes(token, 1, "screen") is None
+
+
+def test_the_screen_defaults_stay_cheap():
+    """~10 MB per 45-minute interview at the cap; a mostly static page is far
+    less. Readable text at 960x540 is the point, not motion."""
+    cfg = rec.recording_client_config()
+    assert cfg["screen_enabled"] is True
+    assert cfg["screen_fps"] <= 3
+    assert cfg["screen_bps"] * 45 * 60 / 8 <= 40 * 1024 * 1024
+
+
+def test_recording_routes_admit_report_readers(monkeypatch):
+    """7 Oct 2026 — the candidate report page shows the recording, so a Reports
+    reader (by role or template) may play it even without the Integrity tab."""
+    import main
+    src = __import__("inspect").getsource(main)
+    for route in ("interview_recording_playback", "interview_recording_live",
+                  "interview_recording_part", "interview_media"):
+        body = src.split(f"def {route}(")[1].split("\n@app.")[0]
+        assert "_recording_auth(request)" in body, route
+    auth_src = __import__("inspect").getsource(main._recording_auth)
+    assert "_integrity_auth(request)" in auth_src and "_require_interview_report_reader(request)" in auth_src

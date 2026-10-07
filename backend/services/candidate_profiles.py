@@ -753,13 +753,23 @@ def reject_on_round_verdict(db: Session, profile: CandidateProfile, kind: str, r
         current = _status_value(profile.pipeline_status)
         if current in TERMINAL_STATUSES:
             return None
+        # RMG's own L1 / L2 "No Hire" on a candidate still BEFORE RMG Review
+        # (7 Oct 2026, screenshot report): since the 28 Sep flow the profile
+        # stays at Sourcing / Technical Screening while RMG screens and runs the
+        # manual L1, so `RMG_Rejected` was "no rejection path" from there and
+        # the row kept offering Direct to Sales after a No Hire. The verdict IS
+        # RMG's decision — close it, the same direct hop `hand_off_to_rmg_review`
+        # takes into RMG Review.
+        legal = target in TRANSITION_MAP.get(current, []) or (
+            target == PS.RMG_REJECTED.value and current in _PRE_RMG_STAGES)
         # Reach a stage from which this rejection is a legal transition.
-        if target not in TRANSITION_MAP.get(current, []):
+        if not legal:
             stage_for = _ROUND_ADVANCES_TO.get(kind)
             if stage_for and current in _CUSTOMER_LADDER_ORDER and stage_for in _CUSTOMER_LADDER_ORDER:
                 advance_status_for_customer_round(db, profile, kind, feedback, user)
                 current = _status_value(profile.pipeline_status)
-        if target not in TRANSITION_MAP.get(current, []):
+                legal = target in TRANSITION_MAP.get(current, [])
+        if not legal:
             logger.info("round %s No Hire on profile %s at %s: no rejection path, left as is",
                         kind, profile.id, current)
             return None
@@ -849,6 +859,26 @@ def advance_on_hr_round_scheduled(db: Session, profile: CandidateProfile,
         return None
     return _auto_move(db, profile, PS.HR_INTERVIEWING.value, user,
                       "HR round scheduled" + (f" for {when}" if when else ""))
+
+
+def apply_round_verdict(db: Session, profile: CandidateProfile, event, user: CurrentUser,
+                        previous_result: str | None) -> str | None:
+    """Everything a saved round VERDICT sets in motion — ONE path for the
+    profile's feedback form, the Applied Candidates / Screening Desk dialogs
+    and the panel member's My Interviews page (7 Oct 2026): the screeners'
+    "Results to review" (+ their notice when someone else judged), then the
+    pipeline move the verdict proves — HR's verdict ends the HR stage, a
+    "No Hire" closes the candidacy at that round, anything else advances the
+    customer ladder. Returns the status the profile moved to, else None.
+    Caller commits. A round without a result is not a verdict: nothing moves."""
+    from services.rmg_tasks import record_round_result
+    record_round_result(db, profile, event, user, previous_result)
+    if not (event.result or "").strip():
+        return None
+    if event.kind == "HR_Interview":
+        return advance_on_hr_verdict(db, profile, event.result, event.feedback or "", user)
+    return (reject_on_round_verdict(db, profile, event.kind, event.result, event.feedback or "", user)
+            or advance_status_for_customer_round(db, profile, event.kind, event.feedback or "", user))
 
 
 def advance_on_hr_verdict(db: Session, profile: CandidateProfile, result: str,
@@ -1819,11 +1849,14 @@ def latest_ai_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[
         select(AiInterviewLink, Candidate.email)
         .join(Candidate, Candidate.id == AiInterviewLink.candidate_id, isouter=True)
         .where(AiInterviewLink.profile_id.in_(profile_ids))
-        # Completed first, then newest — so a finished interview always wins over
-        # a later-scheduled one that has not happened yet.
+        # NEWEST link wins (7 Oct 2026) — the same rule as `_ai_state_by_profile`
+        # and `enrich_resumes_with_ai`. It used to be "completed first", which
+        # meant a RESCHEDULED AI L1 (a fresh link after one that was not
+        # attempted) kept every screen on the old "Failed" until the new one
+        # finished — the opposite of what a reschedule means.
         .order_by(
             AiInterviewLink.profile_id.asc(),
-            AiInterviewLink.completed_at.desc().nullslast(),
+            AiInterviewLink.created_at.desc(),
             AiInterviewLink.id.desc(),
         )
     ).all()
@@ -1844,6 +1877,7 @@ def latest_ai_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[
             "ai_hr_decision_label": hr_decision_label(link.hr_decision),
             "ai_effective_result": link.effective_result,
             "ai_is_overridden": bool(link.hr_decision) and link.effective_result != link.result,
+            "ai_not_attempted": bool(link.not_attempted),
             "ai_interview_completed_at": (
                 link.completed_at.isoformat() if link.completed_at else None
             ),

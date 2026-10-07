@@ -973,8 +973,35 @@ def approvals_queue(db: Session, user: CurrentUser) -> dict:
     return {"can_approve": True, "items": items}
 
 
+def _live_positions(db: Session) -> list[tuple]:
+    """Every position TA sources today (7 Oct 2026): the LATEST requirement of each
+    opportunity in `TA_LIVE_STATUSES`, on a deal that is not parked or settled.
+    (requirement id, number, title, customer id, opportunity id, opp code, opp title)."""
+    from services.requirements import TA_LIVE_STATUSES
+    from models import PipelineStage
+
+    lr = _latest_requirement()
+    return db.execute(
+        select(Requirement.id, Requirement.req_number, Requirement.title, Opportunity.customer_id,
+               Opportunity.id, Opportunity.opp_id, Opportunity.title)
+        .join(lr, lr.c.requirement_id == Requirement.id)
+        .join(Opportunity, Opportunity.id == Requirement.opportunity_id)
+        .where(Requirement.status.in_(list(TA_LIVE_STATUSES)),
+               Opportunity.pipeline_stage.in_([PipelineStage.NEW, PipelineStage.ACTIVE]))
+    ).all()
+
+
 def _options(db: Session) -> dict:
-    """Filter dropdowns: everything that appears anywhere in the unfiltered desk."""
+    """Filter dropdowns (7 Oct 2026, user report: "the desk does not show every
+    opportunity and customer TA works on"): EVERY live position, its opportunity and
+    customer, and every active TA login — not only the ones that already have a
+    candidate on the desk. Each option carries `on_desk` (candidates on the desk
+    now) so the UI can group "With candidates" / "No candidates yet"; nothing is
+    ever filtered out of the list (the Revenue page's rule)."""
+    from collections import Counter
+
+    from services.requirement_assignments import ta_options
+
     joined, where = _base(DeskFilters(screening="all"), with_screening=False)
     sub = (joined.add_columns(Opportunity.customer_id.label("cid"),
                               CandidateProfile.ta_owner_id.label("ta"),
@@ -982,36 +1009,54 @@ def _options(db: Session) -> dict:
                               Opportunity.id.label("oid"),
                               Requirement.id.label("rid"))
            .where(*where).subquery())
-    cust_ids = {r[0] for r in db.execute(select(sub.c.cid).distinct()).all() if r[0]}
+    desk = db.execute(select(sub.c.cid, sub.c.ta, sub.c.ta_name, sub.c.oid, sub.c.rid)).all()
+    by_cust = Counter(r.cid for r in desk if r.cid)
+    by_opp = Counter(r.oid for r in desk if r.oid)
+    by_req = Counter(r.rid for r in desk if r.rid)
+    by_ta = Counter(r.ta for r in desk if r.ta)
+
+    live = _live_positions(db)
+    req_rows = {r[0]: r for r in live}
+    missing = set(by_req) - set(req_rows)          # a desk row on a position no longer live
+    if missing:
+        for r in db.execute(
+            select(Requirement.id, Requirement.req_number, Requirement.title, Opportunity.customer_id,
+                   Opportunity.id, Opportunity.opp_id, Opportunity.title)
+            .join(Opportunity, Opportunity.id == Requirement.opportunity_id)
+            .where(Requirement.id.in_(missing))
+        ).all():
+            req_rows[r[0]] = r
+    positions = sorted(
+        ({"id": rid, "label": f"{title} · {num}", "customer_id": cid, "opportunity_id": oid,
+          "on_desk": by_req.get(rid, 0)}
+         for rid, num, title, cid, oid, _code, _ot in req_rows.values()),
+        key=lambda p: p["label"].lower(),
+    )
+    opps: dict[int, dict] = {}
+    for _rid, _num, _title, cid, oid, code, otitle in req_rows.values():
+        opps.setdefault(oid, {"id": oid, "label": f"{code} — {otitle}", "customer_id": cid,
+                              "on_desk": by_opp.get(oid, 0)})
+    opportunities = sorted(opps.values(), key=lambda o: o["label"])
+    cust_ids = {r[3] for r in req_rows.values() if r[3]} | set(by_cust)
     customers = [
-        {"id": cid, "name": name}
+        {"id": cid, "name": name, "on_desk": by_cust.get(cid, 0)}
         for cid, name in db.execute(
             select(Customer.id, Customer.name).where(Customer.id.in_(cust_ids)).order_by(Customer.name)
         ).all()
     ] if cust_ids else []
-    tas = sorted(
-        ({"id": ta, "name": name or f"User #{ta}"}
-         for ta, name in db.execute(select(sub.c.ta, func.max(sub.c.ta_name))
-                                    .where(sub.c.ta.isnot(None)).group_by(sub.c.ta)).all()),
-        key=lambda t: t["name"].lower(),
-    )
-    opp_ids = {r[0] for r in db.execute(select(sub.c.oid).distinct()).all()}
-    opportunities = [
-        {"id": oid, "label": f"{code} — {title}", "customer_id": cid}
-        for oid, code, title, cid in db.execute(
-            select(Opportunity.id, Opportunity.opp_id, Opportunity.title, Opportunity.customer_id)
-            .where(Opportunity.id.in_(opp_ids)).order_by(Opportunity.opp_id)
-        ).all()
-    ] if opp_ids else []
-    req_ids = {r[0] for r in db.execute(select(sub.c.rid).distinct()).all() if r[0]}
-    positions = [
-        {"id": rid, "label": f"{title} · {num}", "customer_id": cid, "opportunity_id": oid}
-        for rid, num, title, cid, oid in db.execute(
-            select(Requirement.id, Requirement.req_number, Requirement.title, Requirement.customer_id,
-                   Requirement.opportunity_id).where(Requirement.id.in_(req_ids)).order_by(Requirement.title)
-        ).all()
-    ] if req_ids else []
-    return {"customers": customers, "ta_owners": tas, "opportunities": opportunities, "positions": positions}
+    tas: dict[int, dict] = {}
+    try:
+        with db.begin_nested():
+            for t in ta_options(db):
+                tas[t["id"]] = {"id": t["id"], "name": t["name"], "on_desk": by_ta.get(t["id"], 0)}
+    except Exception:  # noqa: BLE001 — the owners on the desk still list below
+        logger.warning("screening desk: TA list failed", exc_info=True)
+    for r in desk:
+        if r.ta and r.ta not in tas:
+            tas[r.ta] = {"id": r.ta, "name": r.ta_name or f"User #{r.ta}", "on_desk": by_ta.get(r.ta, 0)}
+    ta_owners = sorted(tas.values(), key=lambda t: t["name"].lower())
+    return {"customers": customers, "ta_owners": ta_owners, "opportunities": opportunities,
+            "positions": positions}
 
 
 # ------------------------------------------------------------------ auto ATS

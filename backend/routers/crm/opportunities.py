@@ -49,7 +49,7 @@ from schemas.opportunities import (
 from services.crm_common import log_activity, next_sequence_number, paginate
 from services.notify import notify_role, notify_roles, notify_user
 from services.opportunity_ctc import derive_ctc_row, normalize_tm_billing_details
-from services.requirements import positions_by_opportunity
+from services.requirements import approved_deals_clause, positions_by_opportunity, sees_unapproved_deals
 from services.opportunities import (
     STAGE_HOLDS_REQUIREMENT,
     STAGE_RESUMES_REQUIREMENT,
@@ -178,6 +178,9 @@ def list_opportunities(
     # Outer join so an opportunity without a customer row still lists; the
     # join exists for sorting/filtering by customer name.
     stmt = select(Opportunity).outerjoin(Customer, Customer.id == Opportunity.customer_id)
+    if not sees_unapproved_deals(user):
+        # RMG / GM / TA …: a deal still with the Sales Head is not theirs to see.
+        stmt = stmt.where(approved_deals_clause())
     if sourcing:
         from services.requirements import sourcing_opportunity_clause
         stmt = stmt.where(sourcing_opportunity_clause())
@@ -739,6 +742,9 @@ def get_opportunity(
     user: CurrentUser = Depends(read_opportunities),
 ):
     opp = get_opportunity_or_404(db, opportunity_id)
+    if opp.approval_status != OpportunityApprovalStatus.APPROVED and not sees_unapproved_deals(user):
+        # 404, not 403 — existence of a deal still with the Sales Head never leaks.
+        raise HTTPException(status_code=404, detail="Opportunity not found")
     data = serialize_opportunity(db, opp, detail=True)
     # Headcount of the spawned requirement (21 Sep 2026) — Sales works on THIS
     # page, so the positions panel and its RMG approval live here too.

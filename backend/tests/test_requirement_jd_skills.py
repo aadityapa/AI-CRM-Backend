@@ -127,6 +127,23 @@ def test_empty_payload_is_a_400(db):
     assert e.value.status_code == 400
 
 
+def test_a_skill_listed_twice_is_merged_not_refused(db):
+    """7 Oct 2026 — RMG added several skills and one appeared twice; the save was
+    refused. It is merged now: mandatory if any copy is, the higher level wins."""
+    req = _req(db)
+    ids = [s.id for s in db.query(Skill).order_by(Skill.name).all()]
+    set_requirement_jd_skills(
+        req.id,
+        JdSkillsIn(skills=[{"skill_id": ids[0], "min_rating": 2},
+                           {"skill_id": ids[1], "is_mandatory": True},
+                           {"skill_id": ids[0], "is_mandatory": True, "min_rating": 4}]),
+        db=db, user=_rmg(),
+    )
+    rows = {r.skill_id: r for r in db.query(RequirementSkill).filter_by(requirement_id=req.id).all()}
+    assert set(rows) == {ids[0], ids[1]}
+    assert rows[ids[0]].is_mandatory is True and rows[ids[0]].min_rating == 4
+
+
 def test_unknown_skill_is_a_400(db):
     req = _req(db)
     with pytest.raises(HTTPException) as e:

@@ -41,6 +41,8 @@ from models import (
     Opportunity, PipelineStatus, Requirement, RequirementStatus,
 )
 
+from services.report_links import ai_report_link
+
 logger = logging.getLogger("karnex.crm.rmg_tasks")
 PS = PipelineStatus
 
@@ -210,11 +212,15 @@ def unreviewed_results(db: Session, profile_ids=None, *, now: datetime | None = 
                CandidateProfileActivityLog.profile_id.in_(live_ids))).all()}
     out: dict[int, list[dict]] = {}
 
-    for link in db.execute(
+    links = db.execute(
         select(AiInterviewLink).where(AiInterviewLink.profile_id.in_(live_ids),
                                       AiInterviewLink.completed_at.isnot(None),
                                       AiInterviewLink.completed_at >= since)
-    ).scalars().all():
+    ).scalars().all()
+    cand_ids = {link.candidate_id for link in links if link.candidate_id}
+    emails = dict(db.execute(select(Candidate.id, Candidate.email)
+                             .where(Candidate.id.in_(cand_ids))).all()) if cand_ids else {}
+    for link in links:
         key = result_key("ai", link.id)
         if (link.profile_id, key) in reviewed:
             continue
@@ -223,6 +229,8 @@ def unreviewed_results(db: Session, profile_ids=None, *, now: datetime | None = 
             "key": key, "kind": "ai", "label": "AI L1", "result": link.effective_result,
             "score": score, "when": _iso(_aware(link.completed_at)), "by": "AI interview",
             "passed": link.effective_result in ("Passed", "Selected"),
+            # The interview's OWN report (Reports tab), not the profile.
+            "report_link": ai_report_link(emails.get(link.candidate_id), link.interview_record_id),
         })
 
     recorded = db.execute(

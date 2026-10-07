@@ -68,9 +68,9 @@ def _format_interview_turns_for_eval(
 
 def _min_substantive_answer_chars() -> int:
     try:
-        return max(8, min(160, int(os.getenv("INTERVIEW_MIN_ANSWER_CHARS", "22"))))
+        return max(8, min(160, int(os.getenv("INTERVIEW_MIN_ANSWER_CHARS", "10"))))
     except (TypeError, ValueError):
-        return 22
+        return 10
 
 
 _TRIVIAL_ANSWERS = frozenset(
@@ -215,7 +215,10 @@ def answer_is_incomplete(answer: str) -> tuple[bool, str]:
     # A numeric fact ("64 bytes", "8 nodes") is a substantive answer even when
     # terse, so don't treat short numeric answers as incomplete.
     has_number = any(ch.isdigit() for ch in a)
-    if len(words) < 4 and not has_number:
+    # Spoken L1 answers are often short and right ("insmod and rmmod", "kernel
+    # panic") — only a single word is too little to judge (6 Oct 2026, the
+    # screener's review: correct short answers were zeroed here).
+    if len(words) < 2 and not has_number:
         return True, "Incomplete answer — too few words to constitute an explanation."
     dangling = (
         " of",
@@ -641,12 +644,24 @@ def apply_quality_caps_to_per_question_row(row: dict, question: str, answer: str
         sc = 0.0
     relevance = compute_answer_relevance_score(q, a)
     out["relevance_score"] = round(relevance, 1)
-    if relevance < 30.0:
+    # The word-overlap relevance is only a proxy: a correct answer often shares
+    # NO word with the question ("what is program counter" → "stores the address
+    # of the next instruction"). It caps a score only when the model ALSO found
+    # the answer technically inaccurate (6 Oct 2026 — correct L1 answers were
+    # held at 20 % by this cap alone).
+    dims = out.get("dimension_scores") if isinstance(out.get("dimension_scores"), dict) else {}
+    try:
+        tech_acc = float(dims.get("technical_accuracy") or 0.0)
+    except (TypeError, ValueError):
+        tech_acc = 0.0
+    if tech_acc and tech_acc <= 10.0:
+        tech_acc *= 10.0
+    if relevance < 30.0 and tech_acc < 40.0:
         sc = min(sc, 2.0)
         if not out.get("weaknesses"):
             out["weaknesses"] = ["Answer is not sufficiently relevant to the question."]
-    if sc > 7.0 and not answer_has_technical_depth(a):
-        sc = min(sc, 6.5)
+    if sc > 7.5 and not answer_has_technical_depth(a):
+        sc = min(sc, 7.5)
         wk = list(out.get("weaknesses") or [])
         wk.append("Lacks sufficient depth, examples, or practical explanation for a high score.")
         out["weaknesses"] = [str(x)[:240] for x in wk if str(x).strip()][:3]
@@ -1329,12 +1344,31 @@ def _evaluate_per_question_chunk_openai_indexed(
         "You are an experienced hiring manager reviewing technical interview answers. "
         "For EACH item produce a professional assessment.\n"
         f"{role_line}"
-        "Step 1: Verify relevance to the question (off-topic answers score 0-2).\n"
+        "This is a SPOKEN L1 screening interview. Each answer is a speech-to-text transcript of what the "
+        "candidate said aloud, so answers are short and may contain transcription errors.\n"
+        "Step 0: Read every answer the way the candidate SAID it. Treat phonetic transcription errors as the "
+        "intended technical term and NEVER penalise them (e.g. 'ins mode' = insmod, 'RM mode' = rmmod, "
+        "'dmessage' = dmesg, 'mute ex' = mutex, 'I to C' = I2C). Do not mention them as mistakes.\n"
+        "Step 1: Verify relevance to the question (off-topic answers score 0-2). A correct answer is relevant "
+        "even when it shares no words with the question.\n"
         "Step 2: If the candidate merely repeats the question, rephrases the question, copies words "
         "from the question, or provides no meaningful technical explanation, assign score 0 and explain why.\n"
-        "Step 3: Evaluate technical correctness.\n"
-        "Step 4: Evaluate completeness (unfinished/partial sentences score 0-0.5).\n"
-        "Step 5: Evaluate practical knowledge and depth.\n"
+        "Step 3: Evaluate technical correctness FIRST — it decides the score band.\n"
+        "Step 4: Evaluate completeness against what the question actually asked (credit each part of a "
+        "multi-part question that was answered). Brevity alone is NOT a fault in a spoken screening.\n"
+        "Step 5: Evaluate practical knowledge and depth — depth only moves a correct answer from 6-7 up to "
+        "8-10; it never pulls a correct answer below 6.\n"
+        "Score bands (0-10), calibrate like an experienced L1 screener:\n"
+        "  9-10: correct, complete, with mechanism / reason / example.\n"
+        "  7-8: correct core answer with some supporting detail.\n"
+        "  6-7: correct core answer stated briefly (e.g. 'program counter stores the address of the next "
+        "instruction'; 'insmod to insert, rmmod to remove a kernel module').\n"
+        "  4-5: partially correct — the right idea or the right consequence without the reason, or some parts "
+        "of a multi-part question right (e.g. 'a mutex in an IRQ handler causes a kernel panic' — right "
+        "outcome, no mention of sleeping in atomic context; 'GDB, KGDB, dmesg' for debugging kernel panics).\n"
+        "  2-3: mostly wrong or very vague with one relevant element.\n"
+        "  0-1: wrong, off-topic, repeated the question, or no real answer.\n"
+        "List every correct element in correct_concepts — never leave it empty when the answer earned 4+.\n"
         f"{comm_step}"
         "Step 7: Never invent strengths — only list concepts the candidate actually explained correctly. "
         "If score is 0 or no real strengths, set correct_concepts to [] and strengths to "
@@ -1346,6 +1380,7 @@ def _evaluate_per_question_chunk_openai_indexed(
         "Weighted score formula (0-10, one decimal allowed):\n"
         f"{weight_line}"
         "Question repetition or keyword-only answers without explanation MUST score 0.\n"
+        "score and overall_rating MUST follow the score bands above.\n"
         "Return ONLY JSON with this schema per item:\n"
         "{\"items\":[{\"i\":N,\"score\":0,\"overall_rating\":0,\"summary\":\"2-4 line evaluation summary\","
         "\"correct_concepts\":[{\"topic\":\"\",\"explanation\":\"\"}],"
@@ -1364,8 +1399,9 @@ def _evaluate_per_question_chunk_openai_indexed(
         {
             "role": "system",
             "content": (
-                "You produce rigorous hiring-manager interview assessments. Reply ONLY valid JSON. "
-                "Be strict: if the candidate repeats or copies the question without explaining, score 0. "
+                "You produce fair, calibrated L1 screening assessments of SPOKEN answers. Reply ONLY valid JSON. "
+                "Credit what is technically correct even when it is brief or imperfectly transcribed; "
+                "if the candidate repeats or copies the question without explaining, score 0. "
                 "Never fabricate correct_concepts — only credit what was actually stated. "
                 "expected_answer must be written independently as an expert model response. "
                 "interview_feedback must reference the candidate's actual answer, not generic praise."
@@ -2141,10 +2177,13 @@ def evaluate_turn_with_model(
     )
     user_prompt = (
         f"Difficulty: {cur}. Skill: {sk}.\nQ: {q}\nA: {a}\n"
+        "The answer is a speech-to-text transcript of a spoken reply: read phonetic errors as the intended "
+        "term ('ins mode' = insmod, 'dmessage' = dmesg) and never penalise them or brevity.\n"
         "Step 1: Verify answer relevance to the question (reject off-topic answers).\n"
         "Step 2: If the candidate repeats or copies the question without explaining, score 0.\n"
         f"{step3}"
-        "If answer is off-topic, generic, incomplete, or question repetition, score <= 1 and next_difficulty=easy.\n"
+        "A correct core answer stated briefly scores 6-7; partially correct 4-5.\n"
+        "If answer is off-topic, wrong, or question repetition, score <= 1 and next_difficulty=easy.\n"
         "If answer is strong and concrete with examples, score >= 7 and next_difficulty=hard.\n"
         "JSON: {\"score\":0-10,\"feedback\":\"\",\"next_difficulty\":\"easy|medium|hard\",\"reason\":\"\"}"
     )

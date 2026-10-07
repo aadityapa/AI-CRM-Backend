@@ -115,6 +115,11 @@ TABS = {
     "hr_joining": ("Joining soon", "Candidates and employees starting in the next 30 days."),
     "hr_joined": ("Joined recently", "Employees who joined in the last 30 days — welcome, documents, induction."),
     "hr_exits": ("Exits & notice", "Employees serving notice — last working days in the next 60 days."),
+    # The panel member's own technical rounds (7 Oct 2026) — opens My Interviews.
+    "panel_feedback": ("My interview feedback",
+                       "Technical rounds you took that still need your verdict — record it on My Interviews."),
+    "panel_upcoming": ("My upcoming interviews",
+                       "Technical rounds booked with you as the interviewer — the CV and the AI interview are on My Interviews."),
     "hr_leave": ("Leave to approve", "Leave applications waiting for HR — approve or reject before the day comes."),
     "hr_records": ("Records to complete",
                    "Active employees missing what payroll and reports need — CTC, Emp ID, joining date, manager…"),
@@ -178,14 +183,19 @@ TAB_STAGE = {"fin_timesheets": ("Coming up", True), "fin_proformas": ("Your move
              "hr_leave": ("Your move", False), "hr_records": ("Your move", False),
              "hr_bench": ("To place", True), "hr_celebrations": ("Coming up", True),
              "hr_onboarding": ("Your move", False), "hr_joining": ("Coming up", True),
-             "hr_joined": ("Done", True), "hr_exits": ("Coming up", True)}
+             "hr_joined": ("Done", True), "hr_exits": ("Coming up", True),
+             "panel_feedback": ("Your move", False), "panel_upcoming": ("Coming up", True)}
+
+
+#: Tabs whose tile opens a page of its own rather than My Tasks.
+TAB_PAGE = {"panel_feedback": "my-interviews?scope=pending", "panel_upcoming": "my-interviews?scope=upcoming"}
 
 
 def _tab(key: str, items: list[dict], count: int | None = None) -> dict:
     label, hint = TABS[key]
     n = len(items) if count is None else count
     out = {"key": key, "label": label, "hint": hint, "count": n, "items": items,
-           "link": tab_link(key)}
+           "link": TAB_PAGE.get(key) or tab_link(key)}
     if key in TAB_STAGE:
         out["stage"], out["info"] = TAB_STAGE[key]
     return out
@@ -396,6 +406,34 @@ def _sourcing_tab(db: Session, user, owner_id: int | None) -> dict:
                            action="Release or decide" if held else "Technical Screening",
                            profile_id=p.id))
     return _tab("sourcing", items)
+
+
+def _panel_tabs(db: Session, user) -> list[dict]:
+    """The login's OWN technical rounds (`services.panel_interviews`): the ones
+    waiting for their verdict, then the ones booked ahead. Empty when nobody
+    linked an employee to this login — the tabs then do not appear."""
+    from services.panel_interviews import my_rounds
+
+    data = my_rounds(db, user, "all")
+    if not data["linked"]:
+        return []
+    out: list[dict] = []
+    for key, phase, action in (("panel_feedback", "pending", "Record feedback"),
+                               ("panel_upcoming", "upcoming", "Open")):
+        items = []
+        for r in data["rows"]:
+            if r["phase"] != phase:
+                continue
+            pos = r["position"]
+            items.append(_item(
+                f"panel:{r['id']}", r["candidate"]["name"],
+                f"{r['round_label']}" + (f" · {pos['opp_id']} — {pos['title']}" if pos.get("title") else ""),
+                chip=r["raw_when"] or ("Time not set" if not r["scheduled_at"] else None),
+                tone="warn" if phase == "pending" else "info", when=r["scheduled_at"],
+                path=f"my-interviews?focus={r['id']}", action=action, profile_id=r["profile_id"]))
+        if items or key == "panel_feedback":
+            out.append(_tab(key, items))
+    return out
 
 
 def _upcoming_tab(db: Session, user) -> dict:
@@ -1746,6 +1784,15 @@ def desk(db: Session, user, *, max_items: int = MAX_ITEMS) -> dict:
         ("upcoming", (lambda: _upcoming_tab(db, user)) if not no_generic else None),
         ("queues", (lambda: _queues_tab(db, user)) if not no_generic else None),
     ]
+    from services.panel_interviews import is_panel_only
+    if is_panel_only(user):
+        # A login holding only custom roles (the Interviewer logins, 7 Oct
+        # 2026): their day is their own rounds — nothing else is theirs.
+        builders = [("panel", lambda: _panel_tabs(db, user))]
+    else:
+        # Anyone linked to an Employees row and named as a panel member gets
+        # their own rounds beside their role's tabs.
+        builders.insert(1, ("panel", lambda: _panel_tabs(db, user)))
     if is_admin:
         # Admin / CEO: ONLY the decisions that are theirs (`CEO_TABS`). Every
         # other tab is some role's day and lives on THAT role's Dashboard

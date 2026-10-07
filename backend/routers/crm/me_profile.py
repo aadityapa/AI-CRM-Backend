@@ -232,5 +232,16 @@ def change_password(
         sa.text("UPDATE registration_data SET password_hash = :h, password_salt = :s WHERE id = :id"),
         {"h": new_hash, "s": "", "id": user.id},
     )
+    forced = bool(getattr(user, "must_change_password", False))
+    try:
+        # The forced change after an Admin/CEO reset is done (7 Oct 2026).
+        with db.begin_nested():
+            db.execute(sa.text("UPDATE registration_data SET must_change_password = FALSE WHERE id = :id"),
+                       {"id": user.id})
+    except Exception:  # noqa: BLE001 — a DB without the column has nothing to clear
+        pass
     db.commit()
+    from services.access_audit import record as audit_record
+    audit_record(db, actor=user, action="user.password_changed", target_user_id=user.id,
+                 summary="Password changed by the user" + (" (required after an admin reset)" if forced else ""))
     return envelope({"changed": True}, message="Password changed")

@@ -207,7 +207,8 @@ def test_manage_actions_keep_the_tab_edit_rule(db):
 def test_a_new_template_starts_from_its_role_tags_default_approvals(db):
     t = tpl_svc.create_template(db, {"name": "Default — Finance", "role": "Finance",
                                      "tab_access": {"invoices": "create"}})
-    assert set(t["action_access"]) == {"invoice.convert_proforma", "credit_note.approve"}
+    assert {"invoice.convert_proforma", "credit_note.approve"} == {a for a in t["action_access"] if ap.is_approval(a)}
+    assert "invoice.manage" in t["action_access"]          # 7 Oct 2026: the buttons too
     sales = tpl_svc.create_template(db, {"name": "Default — Sales", "role": "Sales",
                                          "tab_access": {"timesheets": "create"}})
     assert not any(a.startswith("timesheet.") for a in sales["action_access"])
@@ -223,7 +224,9 @@ def test_unknown_action_keys_are_dropped_and_the_role_tag_can_be_cleared(db):
 
 def test_the_registry_lists_every_approval_with_a_group():
     reg = ap.registry()
-    assert [r["key"] for r in reg] == list(ap.APPROVAL_ACTIONS)
+    assert [r["key"] for r in reg] == list(ap.ALL_ACTIONS)      # approvals + buttons (7 Oct 2026)
+    assert all(r["kind"] in (ap.APPROVAL, ap.MANAGE) for r in reg)
+    assert all(ap.ACTIONS[k].tab for k in ap.MANAGE_ACTIONS)     # every button names its tab
     assert all(r["group"] and r["label"] for r in reg)
     for key in ("timesheet.approve", "timesheet.reject", "timesheet.generate_invoice"):
         assert ap.ACTIONS[key].roles == ("GM",)

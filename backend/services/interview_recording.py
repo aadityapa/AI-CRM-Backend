@@ -1,4 +1,5 @@
-"""Whole-session interview recordings (22 Sep 2026; live view 23 Sep 2026).
+"""Whole-session interview recordings (22 Sep 2026; live view 23 Sep 2026;
+screen stream 7 Oct 2026).
 
 A continuous audio+video recording of the candidate for the whole interview,
 watchable from the Integrity tab WHILE it runs (a few seconds behind) and
@@ -29,6 +30,19 @@ both call it).
 which would delete the header chunk while the browser is still uploading — the
 final rebuild would then start mid-stream and be unplayable. The routes in
 ``main.py`` check the schedule's ``session_status`` before finalizing on demand.
+
+Two streams (7 Oct 2026)
+------------------------
+The camera is only half of what a reviewer wants: "which question was on the
+screen while they said that?" is the other half. So the candidate's browser
+also records its own SCREEN (``getDisplayMedia``, the interview tab, no audio)
+as a second, independent stream — ``STREAMS`` = ``cam`` (the original keys:
+``parts/`` → ``session.webm``, untouched so every recording made before this
+change still plays) and ``screen`` (``parts-screen/`` → ``screen.webm``). The
+two are uploaded, finalized and served side by side and the viewer plays them
+in lock-step; a session whose browser could not share the screen (a phone, a
+refused prompt) simply has no screen stream and the viewer shows the camera
+alone. Nothing about the camera stream depends on the screen stream.
 
 Size
 ----
@@ -80,6 +94,17 @@ MAX_CHUNKS = 4000
 #: on-demand finalize must leave these alone (see the module docstring).
 LIVE_SESSION_STATUSES = frozenset({"active", "verified", "pending", "scheduled"})
 
+#: The streams one interview may carry. ``cam`` keeps the original key layout.
+STREAMS = ("cam", "screen")
+_STREAM_PARTS = {"cam": "parts", "screen": "parts-screen"}
+_STREAM_FINAL = {"cam": "session.webm", "screen": "screen.webm"}
+
+
+def normalize_stream(stream: str | None) -> str:
+    """``cam`` unless the client named a known stream."""
+    value = str(stream or "cam").strip().lower()
+    return value if value in _STREAM_PARTS else "cam"
+
 
 def _int_env(name: str, default: int, *, low: int, high: int) -> int:
     try:
@@ -106,6 +131,15 @@ def recording_client_config() -> dict:
         "video_bps": _int_env("INTERVIEW_RECORDING_VIDEO_BPS", 52_000, low=16_000, high=1_000_000),
         "audio_bps": _int_env("INTERVIEW_RECORDING_AUDIO_BPS", 12_000, low=8_000, high=128_000),
         "max_chunk_bytes": MAX_CHUNK_BYTES,
+        # The screen stream (7 Oct 2026): a mostly static page at a low frame
+        # rate — 960x540 @ 2 fps capped at 100 kbps is readable text and ~10 MB
+        # for a 45-minute interview. Off = camera only, exactly as before.
+        "screen_enabled": str(os.getenv("INTERVIEW_SCREEN_RECORDING_ENABLED", "true")).strip().lower()
+        not in {"0", "false", "no", "off"},
+        "screen_width": _int_env("INTERVIEW_SCREEN_RECORDING_WIDTH", 960, low=320, high=1920),
+        "screen_height": _int_env("INTERVIEW_SCREEN_RECORDING_HEIGHT", 540, low=180, high=1080),
+        "screen_fps": _int_env("INTERVIEW_SCREEN_RECORDING_FPS", 2, low=1, high=15),
+        "screen_bps": _int_env("INTERVIEW_SCREEN_RECORDING_BPS", 100_000, low=32_000, high=2_000_000),
     }
 
 
@@ -129,12 +163,12 @@ def recording_base(invite_token: str) -> str:
     return build_key("recordings", _token(invite_token))
 
 
-def part_key(invite_token: str, seq: int) -> str:
-    return f"{recording_base(invite_token)}/parts/{int(seq):06d}.webm"
+def part_key(invite_token: str, seq: int, stream: str = "cam") -> str:
+    return f"{recording_base(invite_token)}/{_STREAM_PARTS[normalize_stream(stream)]}/{int(seq):06d}.webm"
 
 
-def final_key(invite_token: str) -> str:
-    return f"{recording_base(invite_token)}/session.webm"
+def final_key(invite_token: str, stream: str = "cam") -> str:
+    return f"{recording_base(invite_token)}/{_STREAM_FINAL[normalize_stream(stream)]}"
 
 
 @dataclass(frozen=True)
@@ -150,7 +184,7 @@ class RecordingResult:
 # --------------------------------------------------------------------------
 
 
-def store_chunk(invite_token: str, seq: int, data: bytes, ) -> int:
+def store_chunk(invite_token: str, seq: int, data: bytes, stream: str = "cam") -> int:
     """Persist one recorded chunk. Returns its size, or 0 when refused.
 
     Refusing is never fatal to the interview: the caller logs and carries on.
@@ -170,14 +204,14 @@ def store_chunk(invite_token: str, seq: int, data: bytes, ) -> int:
         return 0
     if seq < 0 or seq > MAX_CHUNKS:
         return 0
-    get_storage().put(part_key(token, seq), data, content_type=RECORDING_MIME)
+    get_storage().put(part_key(token, seq, stream), data, content_type=RECORDING_MIME)
     return len(data)
 
 
-def _part_keys(invite_token: str) -> list[str]:
-    """Every chunk we hold for this interview, in sequence order."""
+def _part_keys(invite_token: str, stream: str = "cam") -> list[str]:
+    """Every chunk we hold for this interview's stream, in sequence order."""
     store = get_storage()
-    prefix = f"{recording_base(invite_token)}/parts/"
+    prefix = f"{recording_base(invite_token)}/{_STREAM_PARTS[normalize_stream(stream)]}/"
     if isinstance(store, S3Storage):
         keys = store.list_keys(prefix)
     else:
@@ -198,8 +232,8 @@ def part_seq(key: str) -> int:
     return int(found.group(1)) if found else 0
 
 
-def finalize_from_parts(invite_token: str) -> RecordingResult | None:
-    """Join the uploaded chunks into one playable object.
+def finalize_from_parts(invite_token: str, stream: str = "cam") -> RecordingResult | None:
+    """Join the uploaded chunks of one stream into one playable object.
 
     Idempotent: calling it again on an already-finalized recording rebuilds the
     same object from the same parts. That matters because BOTH the normal
@@ -210,10 +244,10 @@ def finalize_from_parts(invite_token: str) -> RecordingResult | None:
     if not token:
         return None
     store = get_storage()
-    parts = _part_keys(token)
+    parts = _part_keys(token, stream)
     if not parts:
         return None
-    key = final_key(token)
+    key = final_key(token, stream)
     try:
         blob = b"".join(store.get(p) for p in parts)
     except Exception as exc:
@@ -232,13 +266,32 @@ def finalize_from_parts(invite_token: str) -> RecordingResult | None:
             "parts": len(parts),
             "bytes": len(blob),
             "backend": store.name,
+            "stream": normalize_stream(stream),
         },
     )
     return RecordingResult(key=key, size_bytes=len(blob), parts=len(parts), backend=store.name)
 
 
-def discard_parts(invite_token: str) -> int:
-    """Delete the chunk objects once a final recording exists.
+def finalize_all(invite_token: str) -> dict[str, RecordingResult | None]:
+    """`finalize_from_parts` for every stream — ``{"cam": …, "screen": …}``.
+    A stream that was never uploaded is ``None``; a failure in one stream
+    never stops the other (the camera must survive a broken screen stream)."""
+    out: dict[str, RecordingResult | None] = {}
+    for stream in STREAMS:
+        try:
+            out[stream] = finalize_from_parts(invite_token, stream)
+        except Exception as exc:
+            logger.warning(
+                "recording.finalize_failed: %s", exc,
+                extra={"event": "recording.finalize_failed", "stream": stream},
+            )
+            out[stream] = None
+    return out
+
+
+def discard_parts(invite_token: str, stream: str | None = None) -> int:
+    """Delete the chunk objects once a final recording exists (per stream —
+    every stream when ``stream`` is None).
 
     Called only AFTER `finalize_from_parts` succeeded, so the parts are
     redundant at that point — and leaving them doubles the storage bill.
@@ -247,12 +300,13 @@ def discard_parts(invite_token: str) -> int:
     if not token:
         return 0
     store = get_storage()
-    if not store.exists(final_key(token)):
-        return 0
     removed = 0
-    for key in _part_keys(token):
-        store.delete(key)
-        removed += 1
+    for name in (STREAMS if stream is None else (normalize_stream(stream),)):
+        if not store.exists(final_key(token, name)):
+            continue
+        for key in _part_keys(token, name):
+            store.delete(key)
+            removed += 1
     return removed
 
 
@@ -261,15 +315,17 @@ def discard_parts(invite_token: str) -> int:
 # --------------------------------------------------------------------------
 
 
-def live_manifest(invite_token: str, after_seq: int = -1) -> dict:
+def live_manifest(invite_token: str, after_seq: int = -1, screen_after_seq: int = -1) -> dict:
     """The chunks a live viewer has not seen yet.
 
     Returns ``{"live": True, "parts": [{"seq", "bytes"}], "next_after"}`` —
     the viewer fetches each part through ``part_bytes`` and appends it to its
     player, then polls again with ``next_after``. ``finalized`` flips to True
     once the session object exists, which is the viewer's cue to switch to the
-    ordinary player. Never raises: a storage outage is a paused stream, not a
-    broken page.
+    ordinary player. The screen stream rides along as ``screen`` (its own
+    ``parts`` / ``next_after``; ``recorded`` says whether the browser ever sent
+    one), so one poll serves both players. Never raises: a storage outage is a
+    paused stream, not a broken page.
     """
     token = _token(invite_token)
     if not token:
@@ -277,13 +333,23 @@ def live_manifest(invite_token: str, after_seq: int = -1) -> dict:
     try:
         store = get_storage()
         finalized = store.exists(final_key(token))
-        keys = [k for k in _part_keys(token) if part_seq(k) > int(after_seq)]
-        parts = [{"seq": part_seq(k), "bytes": store.size(k)} for k in keys]
+
+        def _new_parts(stream: str, after: int) -> list[dict]:
+            keys = [k for k in _part_keys(token, stream) if part_seq(k) > int(after)]
+            return [{"seq": part_seq(k), "bytes": store.size(k)} for k in keys]
+
+        parts = _new_parts("cam", after_seq)
+        screen_parts = _new_parts("screen", screen_after_seq)
         return {
             "live": True,
             "finalized": finalized,
             "parts": parts,
             "next_after": parts[-1]["seq"] if parts else int(after_seq),
+            "screen": {
+                "parts": screen_parts,
+                "next_after": screen_parts[-1]["seq"] if screen_parts else int(screen_after_seq),
+                "recorded": bool(screen_parts) or int(screen_after_seq) >= 0,
+            },
             "chunk_seconds": recording_client_config()["chunk_seconds"],
             "mime": RECORDING_MIME,
         }
@@ -295,13 +361,13 @@ def live_manifest(invite_token: str, after_seq: int = -1) -> dict:
         return {"live": False, "reason": "storage_error"}
 
 
-def part_bytes(invite_token: str, seq: int) -> bytes | None:
+def part_bytes(invite_token: str, seq: int, stream: str = "cam") -> bytes | None:
     """One uploaded chunk, or None when it does not exist."""
     token = _token(invite_token)
     if not token or seq < 0 or seq > MAX_CHUNKS:
         return None
     store = get_storage()
-    key = part_key(token, seq)
+    key = part_key(token, seq, stream)
     if not store.exists(key):
         return None
     return store.get(key)
@@ -319,7 +385,7 @@ def recording_playback(invite_token: str) -> dict:
         key = final_key(token)
         if store.exists(key):
             size = store.size(key)
-            return {
+            info = {
                 "available": True,
                 "url": store.url(key, ttl_s=url_ttl_seconds()),
                 "download_url": store.url(
@@ -329,7 +395,22 @@ def recording_playback(invite_token: str) -> dict:
                 "mime": RECORDING_MIME,
                 "backend": store.name,
                 "expires_in_s": url_ttl_seconds(),
+                # The screen stream (7 Oct 2026) — absent when the browser
+                # could not share it; the viewer then shows the camera alone.
+                "screen": {"available": False},
             }
+            screen_key = final_key(token, "screen")
+            if store.exists(screen_key):
+                info["screen"] = {
+                    "available": True,
+                    "url": store.url(screen_key, ttl_s=url_ttl_seconds()),
+                    "download_url": store.url(
+                        screen_key, ttl_s=url_ttl_seconds(), download_name=f"interview-{token[:12]}-screen.webm"
+                    ),
+                    "size_bytes": store.size(screen_key),
+                    "mime": RECORDING_MIME,
+                }
+            return info
         pending = len(_part_keys(token))
         if pending:
             return {"available": False, "reason": "not_finalized", "parts": pending}

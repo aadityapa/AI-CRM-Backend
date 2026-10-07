@@ -15,9 +15,8 @@ from sqlalchemy import extract, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, gated_create, get_crm_db, get_current_user, page_params,
-    role_required, gated_write)
-from crm_deps import gated_write
+    CurrentUser, PageParams, any_crm_role, gated_create, get_crm_db, page_params,
+    gated_write)
 from models import Customer, CustomerBranch, Holiday, HolidayName
 from schemas.common import envelope
 from schemas.leave import HolidayCreate, HolidayNameCreate, HolidayUpdate
@@ -64,7 +63,7 @@ def list_holiday_names(
     q: str | None = None,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(any_crm_role),
 ):
     stmt = select(HolidayName).where(HolidayName.is_active == is_active)
     if q:
@@ -106,7 +105,7 @@ def list_holidays(
     is_active: bool | None = None,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(any_crm_role),
 ):
     stmt = select(Holiday)
     status_key = (status or "").strip().lower()
@@ -207,7 +206,7 @@ def create_holiday(
 def get_holiday(
     holiday_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(any_crm_role),
 ):
     return envelope(data=holiday_out(_get_or_404(db, holiday_id)))
 

@@ -36,7 +36,9 @@ from services.candidate_profiles import (
     ta_decision as apply_ta_decision, send_for_screening, l1_verdict_recorded,
     upsert_skill_evaluations, visible_statuses_for,
     customer_slots_text, fmt_slot_ist, latest_customer_slots, stamp_technical_submission,
+    apply_round_verdict,
 )
+from services.panel_interviews import link_round_to_employee, notify_panel_member
 from services.candidate_status import (
     GROUPS, archive_clause, archive_reasons, catalogue as candidate_status_catalogue, parse_phases, parse_status_keys,
     phase_counts, profile_ids_in_phase, profile_ids_with_status,
@@ -61,7 +63,25 @@ OFFER_WRITE_ROLES = ("Sales", "Sales_Head", "HR")
 offer_roles = gated_write("profiles", *OFFER_WRITE_ROLES)
 rmg_roles = gated_write_action("profile.rmg_screening", "profiles")
 #: Archive / Restore (5 Oct 2026): RMG / GM and the Sales family.
-archive_gate = screener_or(gated_write("profiles", "RMG", "Sales", "Sales_Head"))
+#: TA joined 6 Oct 2026 — but a TA-only login archives CLOSED candidacies only
+#: (rejected / withdrawn, any stage), see `archive_closed_only`.
+archive_gate = screener_or(gated_write("profiles", "RMG", "Sales", "Sales_Head", "TA"))
+
+
+def archive_closed_only(db: Session, user) -> bool:
+    """True for a login whose Archive is limited to closed candidacies: holds TA
+    and none of RMG / Sales / Sales Head / Admin / CEO, and does not screen as RMG
+    (a GM keeps the any-stage Archive)."""
+    roles = set(getattr(user, "roles", None) or ())
+    if getattr(user, "is_admin", False) or "TA" not in roles:
+        return False
+    if roles & {"RMG", "Sales", "Sales_Head"}:
+        return False
+    from services.action_permissions import screens_as_rmg
+    try:
+        return not screens_as_rmg(db, user)
+    except Exception:
+        return True
 #: Internal candidate → Sales, skipping L1 / L2 (Screening Desk, 25 Sep 2026).
 fast_track_gate = gated_write_action("profile.fast_track_internal", "profiles")
 #: Interview feedback is recorded by RMG (Admin/CEO are implicit in role_required).
@@ -920,6 +940,10 @@ class L2FaceToFaceIn(BaseModel):
     #: scheduling, or — when TA schedules on their behalf — the RMG who asked.
     #: The round card and the candidate's invite both name them.
     interviewer: str | None = Field(default=None, max_length=200)
+    #: The panel member as an Employees row (7 Oct 2026) — links the round to
+    #: their login, so it shows on THEIR My Interviews page. The name is still
+    #: accepted alone (older clients) and matched to the one employee of that name.
+    employee_id: int | None = None
     #: "L1" (the manual replacement for the AI round) or "L2". Default keeps
     #: every pre-1-Sep-2026 caller on the L2 behaviour they were written for.
     round: str | None = Field(default="L2", max_length=4)
@@ -1021,6 +1045,107 @@ def skip_ai_l1(
                  if payload.request_manual_l1
                  else "AI L1 skipped — the candidate is now with RMG for review"),
     )
+
+
+class AiL1DecisionIn(BaseModel):
+    """RMG / GM's call on a FINISHED (or parked) AI L1 (7 Oct 2026, user ask)."""
+    decision: str = Field(pattern="^(proceed|hold|release)$")
+    note: str | None = Field(default=None, max_length=1000)
+
+
+#: The AI L1 result words that count as a pass — a recruiter's "Selected" override included.
+AI_L1_PASSED = ("Passed", "Selected")
+
+
+def latest_ai_link(db: Session, profile: CandidateProfile) -> AiInterviewLink | None:
+    return db.execute(
+        select(AiInterviewLink).where(AiInterviewLink.profile_id == profile.id)
+        .order_by(AiInterviewLink.created_at.desc(), AiInterviewLink.id.desc())
+    ).scalars().first()
+
+
+@router.post("/{profile_id}/ai-l1-decision")
+def ai_l1_decision(
+    profile_id: int,
+    payload: AiL1DecisionIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(rmg_roles),
+):
+    """What happens AFTER the AI L1 — the screener's call, from the row (7 Oct 2026).
+
+    Reported with screenshots: a candidate whose AI L1 FAILED (or whom a recruiter
+    put ON HOLD from the report page) sat at Technical Interview with no button
+    for RMG / GM — the ladder only opened for a pass. The AI verdict is advice,
+    not the decision:
+
+    * ``proceed`` — the screener overrides the AI (``hr_decision = selected``, the
+      AI's own verdict is kept beside it) and the candidate moves to RMG Review,
+      where the L2 / Submit to Sales / Reject buttons live. A reason of at least
+      5 characters is required when the AI said Failed — it is the only record of
+      why a failed interview was overruled.
+    * ``hold`` — parks the candidate (``hr_decision = on_hold``); the row reads
+      "On Hold" until released or decided.
+    * ``release`` — clears the hold; the AI's verdict stands again.
+
+    The manual-L1 and Direct-to-Sales alternatives keep their own routes
+    (``skip-ai-l1``, ``direct-to-sales``); a rejection goes through ``rmg-screening``.
+    """
+    from services.candidate_profiles import hand_off_to_rmg_review
+
+    profile = get_profile_or_404(db, profile_id)
+    link = latest_ai_link(db, profile)
+    if link is None:
+        raise HTTPException(status_code=409, detail="This candidate has no AI L1 interview yet.")
+    note = (payload.note or "").strip()
+    stage = getattr(profile.pipeline_status, "value", profile.pipeline_status)
+    ai_said = link.result or "Pending"
+    who = user.full_name or user.username
+    score = f" at {link.overall_score_percent}%" if link.overall_score_percent is not None else ""
+
+    if payload.decision == "proceed":
+        if stage not in (PipelineStatus.SOURCING.value, PipelineStatus.TECHNICAL_SCREENING.value):
+            raise HTTPException(status_code=409,
+                                detail=f"The candidate is already at {stage.replace('_', ' ')}.")
+        if ai_said == "Pending":
+            raise HTTPException(status_code=409,
+                                detail="The AI L1 has not finished yet — wait for the result, or "
+                                       "choose the manual L1 / Direct to Sales instead.")
+        if ai_said not in AI_L1_PASSED and len(note) < 5:
+            raise HTTPException(status_code=400,
+                                detail="Say why the AI result is being overruled (at least 5 characters).")
+        if link.hr_decision != "selected":
+            link.hr_decision = "selected"
+            link.hr_decision_by = who[:255]
+            link.hr_decision_at = datetime.now(timezone.utc)
+            log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                         "AI_INTERVIEW_DECISION",
+                         f"Interview marked Selected by {who} — AI verdict was {ai_said}{score}"
+                         + (f" — {note}" if note else ""))
+        hand_off_to_rmg_review(db, profile, user,
+                               f"AI L1 {ai_said.lower()} — RMG / GM decided to proceed"
+                               + (f" — {note}" if note else ""))
+        db.commit()
+        db.refresh(profile)
+        return envelope(data=profile_to_dict(profile),
+                        message="Proceeding — the candidate is with RMG for review: request the L2 "
+                                "or submit to Sales from the row")
+
+    wanted = "on_hold" if payload.decision == "hold" else None
+    if link.hr_decision != wanted:
+        link.hr_decision = wanted
+        link.hr_decision_by = who[:255] if wanted else None
+        link.hr_decision_at = datetime.now(timezone.utc) if wanted else None
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     "AI_INTERVIEW_DECISION",
+                     (f"Interview put On Hold by {who} — AI verdict was {ai_said}{score}"
+                      if wanted else
+                      f"AI interview hold released by {who} (AI verdict stands: {ai_said}{score})")
+                     + (f" — {note}" if note else ""))
+    db.commit()
+    db.refresh(profile)
+    return envelope(data=profile_to_dict(profile),
+                    message=("Candidate put on hold — decide later from this row"
+                             if wanted else "Hold released — the AI verdict stands"))
 
 
 @router.post("/{profile_id}/rmg-screening")
@@ -1289,7 +1414,15 @@ def archive_applied_candidate(
     Any stage since 5 Oct 2026; a deal on hold parks its candidates on its own."""
     from services.candidate_profiles import set_applied_archive
 
+    from services.candidate_profiles import REJECTED_BUCKET
+
     profile = get_profile_or_404(db, profile_id)
+    stage = getattr(profile.pipeline_status, "value", profile.pipeline_status)
+    rejected = (stage in {getattr(s, "value", s) for s in REJECTED_BUCKET}
+                or (profile.rmg_screening_status or "") == "Rejected")
+    if archive_closed_only(db, user) and not rejected:
+        raise HTTPException(status_code=403,
+                            detail="TA can archive only a rejected or withdrawn candidate.")
     changed = set_applied_archive(db, profile, payload.archived, user)
     db.commit()
     return envelope(data={"profile_id": profile.id, "archived": payload.archived, "changed": changed},
@@ -1436,7 +1569,7 @@ def schedule_l2_face_to_face(
             event_dt = read_as_ist(_dt.fromisoformat(when_raw))
         except ValueError:
             event_dt = None
-    db.add(InterviewEvent(
+    event = InterviewEvent(
         profile_id=profile.id,
         candidate_id=profile.candidate_id,
         kind=spec["kind"],
@@ -1449,7 +1582,15 @@ def schedule_l2_face_to_face(
         user_role=owner,
         status="Scheduled",
         created_by=user.id,
-    ))
+    )
+    # Link the round to the panel member's employee row (7 Oct 2026): the
+    # picked id, else the one employee of the typed / derived name. The
+    # display name then follows the employee record.
+    link_round_to_employee(db, event, payload.employee_id, interviewer)
+    interviewer = event.interviewer or interviewer
+    db.add(event)
+    db.flush()
+    notify_panel_member(db, profile, event, user)
 
     scheduled_by = "TA" if ("TA" in (user.roles or set()) and owner not in (user.roles or set())) else owner
     parts = [f"{rl} face-to-face round scheduled by {scheduled_by}"]
@@ -2722,11 +2863,13 @@ def create_interview_round(profile_id: int, payload: InterviewRoundIn,
     require_customer_meeting_link(values)
     event = InterviewEvent(profile_id=profile.id, candidate_id=profile.candidate_id,
                            created_by=user.id, **values)
+    # The panel member's login (7 Oct 2026): an older client sends the name
+    # only — link it to the ONE employee of that name so the round reaches
+    # their My Interviews page.
+    if not event.employee_id:
+        link_round_to_employee(db, event, None, event.interviewer)
     db.add(event)
     db.flush()
-    # A verdict saved with the round is an interview result (28 Sep 2026).
-    from services.rmg_tasks import record_round_result
-    record_round_result(db, profile, event, user, None)
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "INTERVIEW_ROUND_ADDED",
                  f"{round_label(event.kind)} recorded"
@@ -2735,21 +2878,10 @@ def create_interview_round(profile_id: int, payload: InterviewRoundIn,
     # SAVING CUSTOMER FEEDBACK *IS* THE STATUS CHANGE (user decision, 27 Aug
     # 2026). Only once a verdict exists — a round merely SCHEDULED (link
     # recorded, interview still to happen) must not move the pipeline.
-    moved = None
-    if event.result:
-        from services.candidate_profiles import (
-            advance_on_hr_verdict, advance_status_for_customer_round, reject_on_round_verdict,
-        )
-        if event.kind == "HR_Interview":
-            # HR's verdict ends the HR stage (3 Sep 2026): Hire or Not
-            # Recommend, the profile moves to Pre-Onboarding.
-            moved = advance_on_hr_verdict(db, profile, event.result, event.feedback or "", user)
-        else:
-            # "No Hire" closes the candidacy at this round (7 Sep 2026);
-            # anything else moves the stage the round proves.
-            moved = reject_on_round_verdict(db, profile, event.kind, event.result, event.feedback or "", user) \
-                or advance_status_for_customer_round(db, profile, event.kind, event.feedback or "", user)
-    else:
+    # `apply_round_verdict` is the ONE verdict path (results to review, HR's
+    # stage end, "No Hire" closes, the customer ladder advances).
+    moved = apply_round_verdict(db, profile, event, user, None)
+    if not event.result:
         # A SCHEDULED round (no verdict yet) with a time and a link is an
         # invitation — the candidate must receive it (2 Sep 2026 bug report:
         # customer L1/L2 links were recorded here and never reached anyone).
@@ -2798,6 +2930,9 @@ _ROUND_OWNER_ROLE: dict[str, str] = {
 
 
 def _notify_round_owner_scheduled(db: Session, profile, event, user: CurrentUser) -> None:
+    # The panel member themselves, when the round names an employee with a
+    # login (7 Oct 2026) — whatever role booked it.
+    notify_panel_member(db, profile, event, user)
     owner = _ROUND_OWNER_ROLE.get(event.kind or "")
     if not owner or owner in (user.roles or set()):
         return
@@ -2839,11 +2974,14 @@ def update_interview_round(profile_id: int, event_id: int, payload: InterviewRou
     _ensure_hr_verdict_is_hrs(user, values.get("kind") or event.kind, values)
     had_link = bool((event.meeting_link or "").strip())
     previous_result = event.result
+    previous_employee = event.employee_id
     for field, value in values.items():
         setattr(event, field, value)
-    # A new or changed verdict → "Results to review" + tell the screeners.
-    from services.rmg_tasks import record_round_result
-    record_round_result(db, profile, event, user, previous_result)
+    if "interviewer" in values and "employee_id" not in values:
+        # A typed name (older client) — link the ONE employee of that name.
+        link_round_to_employee(db, event, None, event.interviewer)
+    # A new or changed verdict → "Results to review" + tell the screeners,
+    # then the pipeline move it proves — the ONE verdict path.
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "INTERVIEW_ROUND_UPDATED",
                  f"{round_label(event.kind)} updated: {', '.join(sorted(values)) or 'none'}")
@@ -2854,16 +2992,10 @@ def update_interview_round(profile_id: int, event_id: int, payload: InterviewRou
             and event.scheduled_at is not None):
         _email_candidate_round_invite(db, profile, event, user)
         _notify_round_owner_scheduled(db, profile, event, user)
-    moved = None
-    if event.result:
-        from services.candidate_profiles import (
-            advance_on_hr_verdict, advance_status_for_customer_round, reject_on_round_verdict,
-        )
-        if event.kind == "HR_Interview":
-            moved = advance_on_hr_verdict(db, profile, event.result, event.feedback or "", user)
-        else:
-            moved = reject_on_round_verdict(db, profile, event.kind, event.result, event.feedback or "", user) \
-                or advance_status_for_customer_round(db, profile, event.kind, event.feedback or "", user)
+    elif event.employee_id and event.employee_id != previous_employee and not event.result:
+        # The panel changed on a round still to happen — the new person hears.
+        notify_panel_member(db, profile, event, user)
+    moved = apply_round_verdict(db, profile, event, user, previous_result)
     db.commit()
     db.refresh(event)
     return envelope(

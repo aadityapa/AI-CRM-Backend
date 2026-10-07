@@ -28,6 +28,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, get_crm_db, role_required
+import rate_limit as _rl
 from models import Requirement, RequirementActivityLog, RequirementStatus, Resume
 from schemas.common import envelope
 from services.crm_common import log_activity, save_upload_hashed
@@ -216,7 +217,9 @@ def apply_form(token: str, db: Session = Depends(get_crm_db)):
 
 # ---------------------------------------------------------------- public: submit
 @router.post("/api/apply/{token}")
+@_rl.limit("10/minute")   # public, unauthenticated upload (8.6); active wherever rate limits are on
 def submit_application(
+    request: Request,  # required by slowapi when the limiter is active
     token: str,
     candidate_name: str = Form(..., min_length=1, max_length=255),
     email: str = Form(..., max_length=255),

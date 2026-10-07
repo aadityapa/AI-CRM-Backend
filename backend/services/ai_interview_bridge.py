@@ -30,6 +30,7 @@ from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Opportunity,
     OpportunitySkill, PipelineStatus, Requirement, RequirementSkill, Resume, Skill,
     TemplateRequest,
+    TemplateRequestStatus,
 )
 from services.crm_common import get_app_setting, log_activity
 from services.notify import notify_role, notify_roles
@@ -187,6 +188,98 @@ def resolve_l1_template_job_id(
         _template_job_id_from_request(db, opportunity, requirement)
         or _matching_job_template_id(opportunity)
     )
+
+
+TEMPLATE_NOT_READY_CODE = "AI_TEMPLATE_NOT_READY"
+
+
+def _open_template_request(
+    db: Session,
+    opportunity: Opportunity | None,
+    requirement: Requirement | None,
+) -> TemplateRequest | None:
+    """The latest NOT cancelled template request of this requirement, else of
+    its opportunity (the one-per-opportunity rule, 1 Oct 2026)."""
+    cancelled = TemplateRequestStatus.CANCELLED
+    for col, value in (
+        (TemplateRequest.requirement_id, requirement.id if requirement is not None else None),
+        (TemplateRequest.opportunity_id, opportunity.id if opportunity is not None else None),
+    ):
+        if value is None:
+            continue
+        tr = db.execute(
+            select(TemplateRequest)
+            .where(col == value, TemplateRequest.status != cancelled)
+            .order_by(TemplateRequest.id.desc())
+        ).scalars().first()
+        if tr is not None:
+            return tr
+    return None
+
+
+def l1_template_status(
+    db: Session,
+    opportunity: Opportunity | None,
+    requirement: Requirement | None,
+) -> dict:
+    """Is the AI L1 runnable for this position — and if not, why and what next.
+
+    ONE answer for every place that starts an AI L1 (schedule from the profile,
+    Applied Candidates, the slot invite, My Tasks): the UI asks this BEFORE it
+    opens a scheduling form, and the routes refuse with the same reason.
+    `state`: ready · requested (a request waits for RMG) · missing (none raised).
+    """
+    job = resolve_l1_template_job_id(db, opportunity, requirement)
+    tr = _open_template_request(db, opportunity, requirement)
+    request = None
+    if tr is not None:
+        status = getattr(tr.status, "value", tr.status)
+        request = {
+            "id": tr.id,
+            "tr_number": tr.tr_number,
+            "status": status,
+            "requested_at": tr.created_at.isoformat() if getattr(tr, "created_at", None) else None,
+            "template_name": getattr(tr, "template_name", None),
+        }
+    if job:
+        state, reason = "ready", ""
+    elif request is not None:
+        state = "requested"
+        reason = (
+            f"The AI interview template is not ready yet. Template request {tr.tr_number} "
+            "is waiting for RMG to build and link the template. The AI L1 can be scheduled "
+            "as soon as RMG fulfils it."
+        )
+    else:
+        state = "missing"
+        reason = (
+            "The AI interview template is not ready. No template has been requested for this "
+            "opportunity yet — raise a Template Request so RMG can build it, then schedule the AI L1."
+        )
+    return {
+        "ready": bool(job),
+        "state": state,
+        "code": "" if job else TEMPLATE_NOT_READY_CODE,
+        "template_job_id": job or None,
+        "request": request,
+        "requirement_id": requirement.id if requirement is not None else None,
+        "opportunity_id": opportunity.id if opportunity is not None else None,
+        "reason": reason,
+    }
+
+
+def ensure_l1_template_ready(
+    db: Session,
+    opportunity: Opportunity | None,
+    requirement: Requirement | None,
+) -> None:
+    """400 with the status's reason when the AI L1 has no template. Every route
+    that schedules an AI L1 (or sends the slot invite that books one) calls it,
+    so a candidate is never sent into an interview with no questions."""
+    status = l1_template_status(db, opportunity, requirement)
+    if not status["ready"]:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=status["reason"])
 
 
 def schedule_l1_interview(
@@ -372,7 +465,6 @@ def _review_link(profile_id: int) -> str:
 
 def _applied_link(db, profile_id: int) -> str:
     """Applied Candidates row for the RMG review notification (8 Sep 2026)."""
-    from models import CandidateProfile
     from services.candidate_profiles import applied_candidates_link
     prof = db.get(CandidateProfile, profile_id)
     return applied_candidates_link(db, prof) if prof else f"/admin/?view=crm&p=profiles/{profile_id}"
@@ -411,12 +503,17 @@ def sync_completed_interview(record: dict) -> bool:
             # result, do nothing — otherwise every re-persist appended another
             # "AI INTERVIEW COMPLETED" activity entry and re-notified TA.
             record_id = str(record.get("id") or "")
+            # "Never happened" (no scored answer) is carried beside the verdict
+            # (migration 0126): the result stays "Failed" for every existing
+            # reader, the flag is what the rows and the reschedule button read.
+            not_attempted = bool(report.get("not_attempted")) and not passed
             already_synced = (
                 link.completed_at is not None
                 and record_id
                 and str(link.interview_record_id or "") == record_id
                 and link.overall_score_percent == pct
                 and link.result == ("Passed" if passed else "Failed")
+                and bool(link.not_attempted) == not_attempted
             )
             if already_synced:
                 return True
@@ -432,7 +529,9 @@ def sync_completed_interview(record: dict) -> bool:
             link.interview_record_id = str(record.get("id") or "") or link.interview_record_id
             link.overall_score_percent = pct
             link.result = new_result
+            link.not_attempted = not_attempted
             link.completed_at = datetime.now(timezone.utc)
+            outcome_word = "Not attempted" if not_attempted else new_result
 
             if link.resume_id:
                 resume = db.get(Resume, link.resume_id)
@@ -473,7 +572,7 @@ def sync_completed_interview(record: dict) -> bool:
                     db, CandidateProfileActivityLog, "profile_id", link.profile_id, link.scheduled_by,
                     "AI_INTERVIEW_COMPLETED",
                     f"AI L1 interview completed — score {pct if pct is not None else 'n/a'}% "
-                    f"({'Passed' if passed else 'Failed'}, threshold {threshold}%)",
+                    f"({outcome_word}, threshold {threshold}%)",
                 )
             if not announce:
                 db.commit()
@@ -486,18 +585,35 @@ def sync_completed_interview(record: dict) -> bool:
             # which says the same thing and what to do next.
             screeners = _screeners(db) if link.profile_id else set()
             ta_ids = [u for u in _candidate_tas(db, link.profile_id) if u not in screeners]
-            notify_roles(
-                db, [] if ta_ids else ["TA"],
-                f"AI interview completed: {cname}",
-                f"Score {pct if pct is not None else 'n/a'}% — {new_result}",
-                # Deep-link straight to the AI Interview tab — the score and the
-                # report are there, and landing on Overview makes the reader hunt
-                # for the thing the notification is about.
-                f"/admin/?view=crm&p=profiles/{link.profile_id}&tab=ai",
-                event="ai_interview.completed",
-                user_ids=ta_ids,
-                dedupe_prefix=f"ai_done:{link.id}:{new_result}",
-            )
+            if not_attempted:
+                # The candidate never answered a scored question — TA's move is
+                # to find out why and, once the candidate confirms they will sit
+                # it, send a fresh link from the Applied Candidates row.
+                notify_roles(
+                    db, [] if ta_ids else ["TA"],
+                    f"AI interview not attempted: {cname}",
+                    "The candidate did not answer any question (the link was opened late, the "
+                    "session dropped, or it was never started). Check with them and, once they "
+                    "confirm they will attempt it, use \"Reschedule AI L1\" on their row to send a "
+                    "new link.",
+                    _applied_link(db, link.profile_id),
+                    event="ai_interview.completed",
+                    user_ids=ta_ids,
+                    dedupe_prefix=f"ai_done:{link.id}:not_attempted",
+                )
+            else:
+                notify_roles(
+                    db, [] if ta_ids else ["TA"],
+                    f"AI interview completed: {cname}",
+                    f"Score {pct if pct is not None else 'n/a'}% — {new_result}",
+                    # Deep-link straight to the AI Interview tab — the score and the
+                    # report are there, and landing on Overview makes the reader hunt
+                    # for the thing the notification is about.
+                    f"/admin/?view=crm&p=profiles/{link.profile_id}&tab=ai",
+                    event="ai_interview.completed",
+                    user_ids=ta_ids,
+                    dedupe_prefix=f"ai_done:{link.id}:{new_result}",
+                )
 
             # PASSED L1 → hand off to RMG: auto-advance the profile to RMG_Review
             # (from Technical_Screening) and notify RMG to review the report and
@@ -539,13 +655,18 @@ def sync_completed_interview(record: dict) -> bool:
                 # take a manual L1 when the AI read looks wrong.
                 notify_role(
                     db, "RMG",
-                    f"AI L1 not cleared — decide on {cname}",
-                    f"Score {pct if pct is not None else 'n/a'}% (threshold {threshold}%). Review the "
-                    "report, then reject the candidate or take a manual L1 instead.",
+                    (f"AI L1 not attempted — {cname}" if not_attempted
+                     else f"AI L1 not cleared — decide on {cname}"),
+                    ("The candidate did not answer any question, so there is no verdict to read. "
+                     "TA is checking with them and will send a fresh link; you can also take a "
+                     "manual L1 or proceed without it."
+                     if not_attempted else
+                     f"Score {pct if pct is not None else 'n/a'}% (threshold {threshold}%). Review the "
+                     "report, then reject the candidate or take a manual L1 instead."),
                     _review_link(link.profile_id),
                     event="ai_interview.failed_review",
                     user_ids=screeners,
-                    dedupe_prefix=f"ai_review:{link.id}:Failed",
+                    dedupe_prefix=f"ai_review:{link.id}:{'not_attempted' if not_attempted else 'Failed'}",
                 )
             db.commit()
             return True

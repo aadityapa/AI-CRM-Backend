@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, get_crm_db, get_current_user, page_params, role_required,
+    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, role_required,
 )
 from models import Customer, CustomerBranch, CustomerLeavePolicy, LeaveCreditConcept, LeavePolicyType
 from schemas.common import envelope
@@ -98,7 +98,7 @@ def list_customer_leave_policies(
     is_active: bool = True,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(any_crm_role),
 ):
     stmt = select(CustomerLeavePolicy).where(CustomerLeavePolicy.is_active == is_active)
     if customer_id is not None:
@@ -152,7 +152,7 @@ def create_customer_leave_policy(
 def get_customer_leave_policy(
     policy_id: int,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(any_crm_role),
 ):
     return envelope(data=_policy_out(db, _get_or_404(db, policy_id)))
 

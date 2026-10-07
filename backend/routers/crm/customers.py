@@ -49,6 +49,7 @@ from services.customers import (
     serialize_branch,
     serialize_branch_policy,
     serialize_contact,
+    customer_ids_with_po,
     serialize_customer,
     serialize_documents,
     serialize_policy,
@@ -92,7 +93,9 @@ def list_customers(
     order_col = _SORTABLE.get(p.sort_by or "", Customer.id)
     stmt = stmt.order_by(order_col.asc() if p.sort_dir == "asc" else order_col.desc())
     items, meta = paginate(db, stmt, p.page, p.limit)
-    return envelope(data=[serialize_customer(c, db) for c in items], message="Customers fetched", meta=meta)
+    with_po = customer_ids_with_po(db, [c.id for c in items])   # one query, not one per row
+    return envelope(data=[serialize_customer(c, db, has_po=c.id in with_po) for c in items],
+                    message="Customers fetched", meta=meta)
 
 
 @router.post("")

@@ -109,7 +109,7 @@ DATASETS: tuple[Dataset, ...] = (
     Dataset("users", "Users & Access",
             "CRM users (no passwords), roles, profiles, access templates, action permissions, preferences",
             ("roles", "user_roles", "user_profiles", "access_templates",
-             "custom_roles", "user_custom_roles",
+             "custom_roles", "user_custom_roles", "user_access_log",
              "action_permissions", "user_table_preferences", "user_notify_prefs"),
             # registration_data is only a one-column FK stub in the ORM
             # (models/base.py) — read the real table through the inspector.

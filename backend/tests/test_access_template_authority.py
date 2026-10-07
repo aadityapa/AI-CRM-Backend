@@ -79,8 +79,10 @@ def test_every_tab_has_fields():
     field-controlled, so every grantable data tab must list its form fields."""
     # View-only pages have no form, so no field catalogue: dashboard, calendar,
     # finance-reports and payroll (the latter two added 25 Aug 2026).
-    NO_FORM = ("dashboard", "calendar", "emails", "activity-log", "finance-reports", "payroll")
-    no_fields = [k for k in TABS if k not in NO_FORM and not FIELDS_BY_TAB.get(k)]
+    # my-interviews (7 Oct 2026): the panel member's own rounds — one page, no form.
+    NO_FORM = ("dashboard", "calendar", "emails", "activity-log", "finance-reports", "payroll", "my-interviews")
+    # Interview Platform tabs (7 Oct 2026) are whole-page grants, no form either.
+    no_fields = [k for k in TABS if k not in NO_FORM and not k.startswith("iv:") and not FIELDS_BY_TAB.get(k)]
     assert no_fields == [], f"tabs missing field catalogues: {no_fields}"
 
 

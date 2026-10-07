@@ -287,6 +287,12 @@ def test_budget_flag_and_reply_round_trip(db):
     ("Customer_Interview", PS.CUSTOMER_INTERVIEW, PS.CUSTOMER_L1_REJECTED),
     ("Customer_L2", PS.L2_FEEDBACK, PS.CUSTOMER_L2_REJECTED),
     ("L1_Interview", PS.RMG_REVIEW, PS.RMG_REJECTED),
+    # RMG's L1 / L2 run while the profile still sits BEFORE RMG Review (28 Sep
+    # flow) — the No Hire closes it from there too (7 Oct 2026 report: the row
+    # kept offering Direct to Sales).
+    ("L1_Interview", PS.SOURCING, PS.RMG_REJECTED),
+    ("L1_Interview", PS.TECHNICAL_SCREENING, PS.RMG_REJECTED),
+    ("L2_F2F", PS.SOURCING, PS.RMG_REJECTED),
 ])
 def test_no_hire_on_a_round_closes_the_profile(db, kind, start, expect):
     """User report 7 Sep 2026: a customer L1 'No Hire' left the profile at

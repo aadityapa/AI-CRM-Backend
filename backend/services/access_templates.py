@@ -8,22 +8,26 @@ from __future__ import annotations
 
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import AccessTemplate, UserProfile
+from models import AccessTemplate, CustomRole, UserProfile
 from services import access_registry
 from services.users_admin import _decode_tab_access, get_field_access
 
 
 # ------------------------------------------------------------------ serialize
-def serialize_template(t: AccessTemplate) -> dict:
+def serialize_template(t: AccessTemplate, role_departments: dict[str, str] | None = None) -> dict:
+    from services.access_registry import department_of_role
     return {
         "id": t.id,
         "name": t.name,
         "description": t.description,
         "department_id": t.department_id,
         "role": t.role,
+        # Where the template sits on Access Control (7 Oct 2026): its role
+        # tag's department — built-in fixed, custom from the role's own field.
+        "role_department": department_of_role(t.role, (role_departments or {}).get(t.role or "")),
         "is_active": bool(t.is_active),
         "tab_access": t.tab_access or {},
         "field_access": t.field_access or {},
@@ -43,7 +47,19 @@ def get_template_or_404(db: Session, template_id: int) -> AccessTemplate:
 
 def list_templates(db: Session) -> list[dict]:
     rows = db.execute(select(AccessTemplate).order_by(AccessTemplate.name)).scalars().all()
-    return [serialize_template(t) for t in rows]
+    depts = {r.name: r.department for r in db.execute(select(CustomRole.name, CustomRole.department)).all()}
+    # How many logins each template is assigned to — ONE grouped query, so the
+    # Access Templates page can say "assigned to 4" without a fetch per card.
+    assigned = {tid: int(n) for tid, n in db.execute(
+        select(UserProfile.access_template_id, func.count(UserProfile.id))
+        .where(UserProfile.access_template_id.isnot(None))
+        .group_by(UserProfile.access_template_id)).all()}
+    out = []
+    for t in rows:
+        row = serialize_template(t, depts)
+        row["assigned_count"] = assigned.get(t.id, 0)
+        out.append(row)
+    return out
 
 
 def _strip_removed_keys(tab_access, field_access) -> tuple[dict, dict]:
@@ -70,9 +86,13 @@ def _strip_removed_keys(tab_access, field_access) -> tuple[dict, dict]:
     return tabs, fields
 
 
-def _clean_or_default(raw, role_name: str | None) -> list[str]:
-    from services.action_permissions import clean_action_list, default_actions_for_role
-    return clean_action_list(raw) if raw is not None else default_actions_for_role(role_name)
+def _clean_or_default(raw, role_name: str | None, tab_access: dict | None = None) -> list[str]:
+    """The list the template was given, else the role tag's defaults plus the
+    buttons its tab grants imply (7 Oct 2026: a list decides every button)."""
+    from services.action_permissions import clean_action_list, default_actions_for_role, implied_buttons
+    if raw is not None:
+        return clean_action_list(raw)
+    return clean_action_list(default_actions_for_role(role_name) + implied_buttons(tab_access))
 
 
 def _validate(tab_access, field_access) -> None:
@@ -101,7 +121,8 @@ def create_template(db: Session, payload: dict) -> dict:
         # A new template is always explicit: what was ticked, else the approvals
         # the role tag's code default grants (a "Finance" template converts
         # Proformas), else none.
-        action_access=_clean_or_default(payload.get("action_access"), payload.get("role")),
+        action_access=_clean_or_default(payload.get("action_access"), payload.get("role"),
+                                        payload.get("tab_access")),
     )
     db.add(t)
     db.commit()
@@ -241,7 +262,7 @@ def _custom_role_grants(db: Session, user_id: int):
     fields: dict[str, dict[str, str]] = {}
     actions: list[str] = []
     try:
-        from models.custom_roles import CustomRole, UserCustomRole
+        from models.custom_roles import UserCustomRole
         roles = db.execute(
             select(CustomRole)
             .join(UserCustomRole, UserCustomRole.custom_role_id == CustomRole.id)

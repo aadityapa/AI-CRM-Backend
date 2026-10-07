@@ -68,10 +68,29 @@ def _require_status(req: Requirement, allowed: tuple, action: str) -> None:
         )
 
 
+def merge_duplicate_skills(skills: list[RequirementSkillIn]) -> list[RequirementSkillIn]:
+    """One row per skill (7 Oct 2026): a skill listed twice is MERGED — mandatory
+    if any copy is, the higher required level wins — instead of refusing the
+    whole save. RMG / GM add many skills at once and a repeat is a slip, not an
+    error; `uq_req_skill` still makes the stored list unique. Order is kept."""
+    merged: dict[int, RequirementSkillIn] = {}
+    for s in skills:
+        prev = merged.get(s.skill_id)
+        if prev is None:
+            merged[s.skill_id] = s
+            continue
+        levels = [lv for lv in (prev.min_rating, s.min_rating) if lv is not None]
+        merged[s.skill_id] = RequirementSkillIn(
+            skill_id=s.skill_id,
+            is_mandatory=bool(prev.is_mandatory or s.is_mandatory),
+            min_rating=max(levels) if levels else None,
+        )
+    return list(merged.values())
+
+
 def _validated_skills(db: Session, skills: list[RequirementSkillIn]) -> list[RequirementSkillIn]:
+    skills = merge_duplicate_skills(skills)
     ids = [s.skill_id for s in skills]
-    if len(ids) != len(set(ids)):
-        raise HTTPException(status_code=400, detail="Duplicate skill_id in skills list")
     if ids:
         existing = set(db.execute(select(Skill.id).where(Skill.id.in_(ids))).scalars().all())
         missing = sorted(set(ids) - existing)

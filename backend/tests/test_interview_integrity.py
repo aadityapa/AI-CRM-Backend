@@ -65,6 +65,41 @@ def test_csv_export_neutralises_formulas_and_keeps_columns():
     assert lines[1].startswith("'=SUM(1)")
 
 
+def test_rows_carry_the_report_link_once_the_session_finished(monkeypatch):
+    """7 Oct 2026 — the Integrity tab's "Open candidate report" button: the
+    CRM link's record id wins, the progress row fills in for HR-run
+    interviews, and nothing links before the session finished."""
+    import main
+
+    schedule = [
+        {"invite_token": "tok-crm", "candidate_email": "A@x.in", "session_status": "completed", "violations_log": "[]"},
+        {"invite_token": "tok-hr", "candidate_email": "b@x.in", "session_status": "terminated", "violations_log": "[]"},
+        {"invite_token": "tok-live", "candidate_email": "c@x.in", "session_status": "active", "violations_log": "[]"},
+    ]
+    monkeypatch.setattr(main, "list_interview_integrity_logs", lambda *_a, **_k: schedule)
+    monkeypatch.setattr(main, "_dedupe_integrity_schedule_rows", lambda rows: rows)
+    monkeypatch.setattr(main, "_crm_links_for_tokens", lambda tokens: {"tok-crm": {"interview_record_id": "rec-crm"}})
+    monkeypatch.setattr(main, "interview_ids_by_invite",
+                        lambda *_a, **_k: {"tok-crm": "prog-crm", "tok-hr": "prog-hr", "tok-live": "prog-live"})
+    monkeypatch.setattr(main, "get_job_template", lambda *_a, **_k: None)
+
+    by = {r["invite_token"]: r for r in main._integrity_rows()}
+    assert by["tok-crm"]["report_link"] == "/admin/?view=candidateReport&cid=a%40x.in&iid=rec-crm"
+    assert by["tok-hr"]["report_link"] == "/admin/?view=candidateReport&cid=b%40x.in&iid=prog-hr"
+    assert by["tok-live"]["report_link"] is None and by["tok-live"]["interview_record_id"] == "prog-live"
+
+
+def test_interview_ids_by_invite_reads_two_columns_through_the_invite_index(tmp_path):
+    import auth_db
+
+    db = tmp_path / "legacy.db"
+    auth_db.init_auth_db(db)
+    auth_db.upsert_interview_progress(db, {"interview_id": "int-1", "invite_token": "tok-1", "status": "completed",
+                                           "questions": [], "answers": [], "meta": {}})
+    assert auth_db.interview_ids_by_invite(db, ["tok-1", "tok-none", ""]) == {"tok-1": "int-1"}
+    assert auth_db.interview_ids_by_invite(db, []) == {}
+
+
 def test_export_route_is_declared_before_the_token_route():
     """/interview/integrity-logs/export must not be captured by /{invite_token}."""
     import main

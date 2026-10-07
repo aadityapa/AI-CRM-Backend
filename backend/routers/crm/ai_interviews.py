@@ -24,8 +24,8 @@ from models import (
 from models.ai_links import hr_decision_label
 from schemas.common import envelope
 from services.ai_interview_bridge import (
-    ai_interview_autosend_enabled, describe_l1_template_gap,
-    resolve_l1_template_job_id, schedule_l1_interview,
+    ai_interview_autosend_enabled, ensure_l1_template_ready, l1_template_status,
+    schedule_l1_interview,
 )
 from services.candidate_comms import interview_link_message, notify_candidate
 from services.crm_common import log_activity, to_dict
@@ -56,6 +56,37 @@ class AiInterviewCreate(BaseModel):
     notes: str | None = None
     #: None = follow the AI_INTERVIEW_AUTOSEND default; True/False = explicit override.
     send_email: bool | None = None
+    #: Required when the profile already has a FINISHED AI L1 (not attempted /
+    #: failed / terminated): why a fresh link is being sent — "candidate
+    #: confirmed on the phone they will sit it on Thursday". Logged as
+    #: AI_INTERVIEW_RESCHEDULED beside the previous outcome (7 Oct 2026).
+    reschedule_note: str | None = None
+
+
+#: A reschedule note must say something (the same floor as a stage comment).
+MIN_RESCHEDULE_NOTE = 5
+
+
+def previous_finished_link(db: Session, profile_id: int) -> AiInterviewLink | None:
+    """The newest AI L1 of the profile that already ran (any result but Pending).
+
+    A new link over one of these is a RESCHEDULE: the old link worked once and
+    is closed, the candidate gets a fresh token, and the old verdict stays on
+    record. None when the profile never had an AI L1, or only a pending one."""
+    return db.execute(
+        select(AiInterviewLink)
+        .where(AiInterviewLink.profile_id == profile_id, AiInterviewLink.result != "Pending")
+        .order_by(AiInterviewLink.created_at.desc(), AiInterviewLink.id.desc())
+    ).scalars().first()
+
+
+def previous_outcome_words(link: AiInterviewLink) -> str:
+    """"Not attempted" · "Failed (42%)" · "Selected (override)" — for the log line."""
+    if link.not_attempted:
+        return "Not attempted"
+    score = f" ({link.overall_score_percent}%)" if link.overall_score_percent is not None else ""
+    eff = link.effective_result or link.result
+    return f"{eff}{score}" + (" (recruiter override)" if eff != link.result else "")
 
 
 class AiInterviewUpdate(BaseModel):
@@ -199,6 +230,17 @@ def _send_invite(db: Session, profile: CandidateProfile, candidate: Candidate,
                             candidate_id=candidate.id)
 
 
+@router.get("/{profile_id}/ai-template-status")
+def ai_template_status(profile_id: int, db: Session = Depends(get_crm_db),
+                       user: CurrentUser = Depends(gated_read("profiles", *VIEW_ROLES))):
+    """Is the AI L1 template ready for this candidate's position? Asked by every
+    "Schedule AI L1" button BEFORE it opens the form (6 Oct 2026, user ask)."""
+    profile = _profile_or_404(db, profile_id)
+    requirement = _requirement_for(db, profile)
+    opportunity = db.get(Opportunity, profile.opportunity_id)
+    return envelope(l1_template_status(db, opportunity, requirement))
+
+
 @router.get("/{profile_id}/ai-interviews")
 def list_ai_interviews(profile_id: int, request: Request, db: Session = Depends(get_crm_db),
                        user: CurrentUser = Depends(gated_read("profiles", *VIEW_ROLES))):
@@ -253,6 +295,41 @@ def ai_interview_summary(profile_id: int, link_id: int, db: Session = Depends(ge
     return envelope(data=data)
 
 
+#: Event the screeners hear on a reschedule (admin-editable in Email Flows).
+RESCHEDULED_EVENT = "ai_interview.rescheduled"
+
+
+def _record_reschedule(db: Session, profile: CandidateProfile, candidate: Candidate,
+                       previous: AiInterviewLink, when: str, note: str, user: CurrentUser) -> None:
+    """Activity row + a bell / mail to everyone who screens (never raises).
+
+    The row keeps the previous outcome beside the reason, so the history reads
+    "1st link → Not attempted → rescheduled by TA (why) → 2nd link → result".
+    """
+    outcome = previous_outcome_words(previous)
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                 "AI_INTERVIEW_RESCHEDULED",
+                 f"AI L1 rescheduled for {when or 'now'} — previous AI L1: {outcome}. {note}")
+    try:
+        with db.begin_nested():
+            from services.candidate_profiles import screening_notify_user_ids
+            from services.notify import notify_roles
+            cname = f"{candidate.first_name} {candidate.last_name or ''}".strip()
+            notify_roles(
+                db, ["RMG", "GM"],
+                f"AI L1 rescheduled: {cname}",
+                f"{user.full_name or user.username} sent a fresh AI L1 link"
+                f"{' for ' + when if when else ''}. Previous AI L1: {outcome}. {note}",
+                f"/admin/?view=crm&p=screening-desk&focus={profile.id}",
+                exclude_user_id=user.id,
+                event=RESCHEDULED_EVENT,
+                user_ids=screening_notify_user_ids(db),
+                dedupe_prefix=f"ai_resched:{profile.id}:{previous.id}",
+            )
+    except Exception:  # noqa: BLE001 — a notice must never undo a schedule
+        pass
+
+
 @router.post("/{profile_id}/ai-interviews")
 def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterviewCreate | None = None,
                          db: Session = Depends(get_crm_db),
@@ -279,6 +356,25 @@ def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterview
             detail="An AI interview is already pending for this profile — "
                    "reschedule or cancel it first",
         )
+    # A fresh link over a FINISHED one is a reschedule (7 Oct 2026, user flow:
+    # the candidate could not attempt the first link, confirmed they are ready,
+    # TA sends another). It needs a note — the history must say why the old
+    # verdict is being set aside — and the screeners are told so nobody acts on
+    # the old result meanwhile. A PASSED interview is never rescheduled.
+    previous = previous_finished_link(db, profile.id)
+    reschedule_note = (body.reschedule_note or "").strip()
+    if previous is not None:
+        if (previous.effective_result or previous.result) in ("Passed", "Selected"):
+            raise HTTPException(
+                status_code=409,
+                detail="The candidate already passed the AI L1 — there is nothing to reschedule",
+            )
+        if len(reschedule_note) < MIN_RESCHEDULE_NOTE:
+            raise HTTPException(
+                status_code=400,
+                detail="Say why a fresh AI L1 link is being sent — e.g. when the candidate "
+                       "confirmed they will attempt it (at least 5 characters)",
+            )
 
     # RMG screening gate (25 Aug 2026): server-side, so a greyed-out button in
     # the UI is a convenience, not the boundary.
@@ -295,11 +391,7 @@ def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterview
     # stuck on "Preparing your interview". The template is built by RMG from a
     # Template Request, so point the recruiter there.
     opportunity = db.get(Opportunity, profile.opportunity_id)
-    if not resolve_l1_template_job_id(db, opportunity, requirement):
-        raise HTTPException(
-            status_code=400,
-            detail=describe_l1_template_gap(db, opportunity, requirement),
-        )
+    ensure_l1_template_ready(db, opportunity, requirement)
     bridge = schedule_l1_interview(
         db, candidate, requirement, profile, scheduled_by=user.id,
         scheduled_at_local=body.scheduled_at,
@@ -317,6 +409,8 @@ def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterview
                  "AI_INTERVIEW_SCHEDULED",
                  f"AI L1 interview scheduled for {when or 'now'} "
                  f"(session {bridge.get('session_ref')})")
+    if previous is not None:
+        _record_reschedule(db, profile, candidate, previous, when, reschedule_note, user)
 
     should_send = ai_interview_autosend_enabled() if body.send_email is None else body.send_email
     notified = {"email": {"sent": False, "error": "not_requested"},

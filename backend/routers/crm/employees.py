@@ -13,8 +13,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, gated_create, gated_read, gated_write, get_crm_db,
-    page_params, role_required,
+    CurrentUser, PageParams, any_crm_role, gated_create, gated_read, gated_write, get_crm_db,
+    page_params,
 )
 from models import (
     Designation,
@@ -185,14 +185,15 @@ def list_employees(is_active: bool | None = None, department_id: int | None = No
 
 @router.get("/interviewer-names")
 def interviewer_names(db: Session = Depends(get_crm_db),
-                      user: CurrentUser = Depends(
-                          role_required("TA", "RMG", "HR", "Sales", "Sales_Head"))):
+                      user: CurrentUser = Depends(any_crm_role)):
     """Active employees, as a name picker for the interview-round forms.
 
     Deliberately NOT `EMP_READ` (1 Sep 2026): TA schedules the interview but has
     no Employees access, so the full list 403'd and the picker came back empty.
     This returns only what naming an interviewer needs — id, name, email,
     designation — never salary, address or any other employee field.
+    `any_crm_role` (7 Oct 2026): a GM / custom-role screener books rounds too
+    and the old role list 403'd them.
     """
     rows = db.execute(
         select(Employee).where(Employee.is_active.is_(True))

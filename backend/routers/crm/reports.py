@@ -8,7 +8,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, get_crm_db, role_required
+from crm_deps import CurrentUser, gated_read, get_crm_db, role_required
 from models import AppSetting
 from schemas.common import envelope
 from services import reports as svc
@@ -22,8 +22,11 @@ from services.crm_common import rows_to_csv
 
 router = APIRouter(prefix="/api/reports", tags=["CRM: Reports"])
 
-# Any CRM role may pull reports (Admin passes implicitly via role_required).
-ALL_CRM_ROLES = ("Sales", "Sales_Head", "RMG", "TA", "HR", "Finance")
+#: The three operational reports follow the Reports TAB (7 Oct 2026): an
+#: untemplated login of any CRM role reads them as before; a templated /
+#: custom-role login needs the `reports` grant (a GM has it, an Interviewer
+#: does not). The CEO revenue reports stay `role_required()`.
+REPORTS_READ = gated_read("reports")
 
 
 def _respond(rows: list[dict], format: str | None, filename: str):
@@ -32,32 +35,52 @@ def _respond(rows: list[dict], format: str | None, filename: str):
     return envelope(rows)
 
 
+def _window(date_from: date | None, date_to: date | None) -> None:
+    if date_from and date_to and date_to < date_from:
+        raise HTTPException(status_code=400, detail="'to' must not be before 'from'")
+
+
 @router.get("/opportunities")
 def opportunities_report(
     team: str | None = Query(None, description="Sales | RMG | TA (creator holds this role)"),
     status: str | None = Query(None, description="UI group (Active/On Hold/Rejected/Closed/Archived) or exact stage"),
+    customer_id: int | None = Query(None, ge=1),
+    date_from: date | None = Query(None, alias="from", description="Created on or after (YYYY-MM-DD)"),
+    date_to: date | None = Query(None, alias="to", description="Created on or before (YYYY-MM-DD)"),
     format: str | None = Query(None, description="csv for file download"),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required(*ALL_CRM_ROLES)),
+    user: CurrentUser = Depends(REPORTS_READ),
 ):
-    rows = svc.opportunities_report(db, team=team, status=status)
-    return _respond(rows, format, "opportunities_report.csv")
+    _window(date_from, date_to)
+    rows = svc.opportunities_report(db, team=team, status=status, customer_id=customer_id,
+                                    date_from=date_from, date_to=date_to)
+    if (format or "").strip().lower() == "csv":
+        return rows_to_csv([{k: v for k, v in r.items() if k != "customer_id"} for r in rows],
+                           "opportunities_report.csv")
+    return envelope(rows, meta={"summary": svc.opportunities_summary(rows)})
 
 
 @router.get("/candidate-profiles")
 def candidate_profiles_report(
-    team: str | None = Query(None, description="Sales | RMG | TA (profile creator via earliest activity log)"),
+    team: str | None = Query(None, description="Sales | RMG | TA (TA = the candidacy's owner)"),
     status: str | None = Query(None, description="UI group (Active/Rejected/Joined) or exact pipeline status"),
+    customer_id: int | None = Query(None, ge=1),
+    date_from: date | None = Query(None, alias="from", description="Applied on or after (YYYY-MM-DD)"),
+    date_to: date | None = Query(None, alias="to", description="Applied on or before (YYYY-MM-DD)"),
     format: str | None = Query(None, description="csv for file download"),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required(*ALL_CRM_ROLES)),
+    user: CurrentUser = Depends(REPORTS_READ),
 ):
-    rows = svc.candidate_profiles_report(db, team=team, status=status)
+    _window(date_from, date_to)
+    rows = svc.candidate_profiles_report(db, team=team, status=status, customer_id=customer_id,
+                                         date_from=date_from, date_to=date_to)
     if (format or "").strip().lower() == "csv":
         # A file gets the status WORDS, not the badge object.
-        rows = [{**{k: v for k, v in r.items() if k != "candidate_status"},
-                 "status": (r.get("candidate_status") or {}).get("label")} for r in rows]
-    return _respond(rows, format, "candidate_profiles_report.csv")
+        rows = [{**{k: v for k, v in r.items() if k not in ("candidate_status", "customer_id")},
+                 "status": (r.get("candidate_status") or {}).get("label"),
+                 "stage": ((r.get("candidate_status") or {}).get("stage") or {}).get("label")} for r in rows]
+        return rows_to_csv(rows, "candidate_profiles_report.csv")
+    return envelope(rows, meta={"summary": svc.candidate_profiles_summary(rows)})
 
 
 @router.get("/recruiter-productivity")
@@ -66,10 +89,16 @@ def recruiter_productivity_report(
     date_to: date | None = Query(None, alias="to", description="Range end (YYYY-MM-DD)"),
     format: str | None = Query(None, description="csv for file download"),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required(*ALL_CRM_ROLES)),
+    user: CurrentUser = Depends(REPORTS_READ),
 ):
-    rows = svc.recruiter_productivity_report(db, date_from=date_from, date_to=date_to)
-    return _respond(rows, format, "recruiter_productivity_report.csv")
+    _window(date_from, date_to)
+    rows, meta = svc.recruiter_productivity_report(db, date_from=date_from, date_to=date_to)
+    if (format or "").strip().lower() == "csv":
+        # The file reads like the table: names, not ids / flags.
+        hidden = {"user_id", "is_ta", "username"}
+        return rows_to_csv([{k: v for k, v in r.items() if k not in hidden} for r in rows],
+                           "recruiter_productivity_report.csv")
+    return envelope(rows, meta=meta)
 
 
 @router.get("/revenue")

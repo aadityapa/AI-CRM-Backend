@@ -237,7 +237,8 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
     from services.crm_common import log_activity as _log_activity
     prof_ids = {link.profile_id for link in latest.values() if link.profile_id}
     passed_profiles = {link.profile_id for link in latest.values()
-                       if link.profile_id and link.result == "Passed"}
+                       if link.profile_id
+                       and (link.effective_result or link.result) in ("Passed", "Selected")}
     status_by_profile: dict[int, str] = {}
     if prof_ids:
         healed = False
@@ -306,6 +307,7 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
         d["ai_hr_decision_label"] = hr_decision_label(link.hr_decision)
         d["ai_effective_result"] = link.effective_result
         d["ai_is_overridden"] = bool(link.hr_decision) and link.effective_result != link.result
+        d["ai_not_attempted"] = bool(link.not_attempted)
         d["ai_interview_record_id"] = link.interview_record_id
         d["profile_id"] = link.profile_id
         d["profile_pipeline_status"] = status_by_profile.get(link.profile_id)

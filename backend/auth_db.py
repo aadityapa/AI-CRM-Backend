@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 
@@ -26,6 +27,8 @@ from template_prompt import (
     sanitize_prompt_input,
 )
 from utils.interview_limits import clamp_count_mode_questions
+
+logger = logging.getLogger("karnex.auth_db")
 
 try:
     IST = ZoneInfo("Asia/Kolkata")
@@ -304,6 +307,11 @@ def _ensure_registration_columns_sqlite(conn: sqlite3.Connection) -> None:
     if "is_active" not in existing:
         cur.execute(
             "ALTER TABLE registration_data ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "must_change_password" not in existing:
+        # 7 Oct 2026: set by an Admin/CEO password reset, cleared by the user's
+        # own change — the next sign-in must set a password only they know.
+        cur.execute(
+            "ALTER TABLE registration_data ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
 
 
 def _ensure_registration_columns_postgres(conn) -> None:
@@ -312,6 +320,9 @@ def _ensure_registration_columns_postgres(conn) -> None:
         cur.execute(
             "ALTER TABLE registration_data "
             "ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE")
+        cur.execute(
+            "ALTER TABLE registration_data "
+            "ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
 
 
 def _ensure_job_templates_columns_sqlite(conn: sqlite3.Connection) -> None:
@@ -469,6 +480,29 @@ def _ensure_interview_progress_table_sqlite(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _ensure_interview_progress_columns_postgres(conn) -> None:
+    """7 Oct 2026: the recovery worker's bookkeeping. Nullable and additive —
+    `recovery_attempts` counts the passes that tried to finalize this row and
+    `last_recovery_at` is when the last one ran, so a row that cannot be
+    recovered is retried with backoff and then left alone (B2 in CLAUDE.md:
+    terminal rows with no final report used to be re-finalized every minute
+    for ever, in every worker). Legacy table, so the column grows by ALTER at
+    startup like `registration_data` and `ai_prompt_logs`."""
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE interview_progress ADD COLUMN IF NOT EXISTS recovery_attempts INTEGER")
+        cur.execute("ALTER TABLE interview_progress ADD COLUMN IF NOT EXISTS last_recovery_at TEXT")
+
+
+def _ensure_interview_progress_columns_sqlite(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(interview_progress)")
+    existing = {str(r[1]) for r in (cur.fetchall() or [])}
+    if "recovery_attempts" not in existing:
+        cur.execute("ALTER TABLE interview_progress ADD COLUMN recovery_attempts INTEGER")
+    if "last_recovery_at" not in existing:
+        cur.execute("ALTER TABLE interview_progress ADD COLUMN last_recovery_at TEXT")
 
 
 def _ensure_master_tables_postgres(conn) -> None:
@@ -712,6 +746,7 @@ def init_auth_db(db_target: DbTarget) -> None:
             _ensure_job_templates_columns_postgres(conn)
             _ensure_schedule_security_columns_postgres(conn)
             _ensure_interview_progress_table_postgres(conn)
+            _ensure_interview_progress_columns_postgres(conn)
             _ensure_master_tables_postgres(conn)
             _ensure_query_performance_indexes_postgres(conn)
             conn.commit()
@@ -846,6 +881,7 @@ def init_auth_db(db_target: DbTarget) -> None:
         _ensure_job_templates_columns_sqlite(conn)
         _ensure_schedule_security_columns_sqlite(conn)
         _ensure_interview_progress_table_sqlite(conn)
+        _ensure_interview_progress_columns_sqlite(conn)
         _ensure_master_tables_sqlite(conn)
         _ensure_query_performance_indexes_sqlite(conn)
         conn.commit()
@@ -2733,36 +2769,291 @@ def get_interview_progress_by_id(db_target: DbTarget, interview_id: str) -> dict
         )
 
 
-def list_recoverable_interview_progress(db_target: DbTarget, limit: int = 100) -> list[dict]:
+def interview_ids_by_invite(db_target: DbTarget, invite_tokens) -> dict[str, str]:
+    """invite_token -> interview_id for every token that has a progress row
+    (7 Oct 2026, the Integrity tab's "Open candidate report" button).
+
+    ONE slim query — two columns, never the JSON — through the invite index.
+    The interview id is the report's id (`interview_records.id`) on every path
+    that finalizes a session. Never raises: a token without a row is simply
+    absent from the map.
+    """
+    tokens = sorted({str(t).strip() for t in (invite_tokens or []) if str(t or "").strip()})
+    if not tokens:
+        return {}
+    rows: list = []
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT invite_token, interview_id FROM interview_progress WHERE invite_token = ANY(%s)",
+                        (tokens,),
+                    )
+                    rows = cur.fetchall()
+        else:
+            placeholders = ",".join("?" for _ in tokens)
+            with _connect_sqlite(Path(db_target)) as conn:
+                rows = conn.execute(
+                    f"SELECT invite_token, interview_id FROM interview_progress WHERE invite_token IN ({placeholders})",
+                    tokens,
+                ).fetchall()
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for token, interview_id in rows:
+        if token and interview_id:
+            out[str(token).strip()] = str(interview_id).strip()
+    return out
+
+
+# --- interview recovery (7 Oct 2026) ------------------------------------------
+# The worker in main.py used to `SELECT *` the 100 oldest rows every minute and
+# decide in Python; with the JSON columns that was ~3.7 MB per pass per worker
+# (~10 GB/day from RDS) and, because the same 100 stuck rows always came first,
+# anything newer was never looked at. The decision now lives in SQL, the
+# listing carries no JSON, and every attempt is counted so a row leaves the
+# recoverable set whether or not it could be finalized.
+RECOVERY_TERMINAL_STATUSES = ("submitting", "completed", "terminated", "abandoned", "partially_completed", "recovered")
+RECOVERY_LIVE_STATUSES = ("started", "in_progress")
+#: report_status values after which the recovery worker never touches a row again.
+RECOVERY_FINAL_REPORT_STATUSES = ("ready", "no_report_needed", "recovery_failed")
+INTERVIEW_RECOVERY_MAX_ATTEMPTS = 3
+#: minutes to wait after the 1st, 2nd, ... failed attempt before trying again.
+INTERVIEW_RECOVERY_BACKOFF_MIN = (10, 60, 360)
+INTERVIEW_RECOVERY_LOCK_KEY = 7_102_026_01  # pg_advisory_lock key, one per installation
+
+_RECOVERY_ACTIVITY_SQL = "COALESCE(NULLIF(last_activity_at, ''), NULLIF(updated_at_ist, ''), created_at_ist, '')"
+_RECOVERY_LIST_COLUMNS = (
+    "interview_id, invite_token, status, report_status, last_activity_at, updated_at_ist, created_at_ist, "
+    "recovery_attempts, last_recovery_at"
+)
+
+
+def _recovery_cutoffs(now: datetime | None, idle_min: int, stale_min: int, grace_min: int) -> dict[str, str]:
+    """ISO-8601 IST strings; the stored stamps are the same shape
+    (`_now_ist_parts()["ist_iso"]`), so a plain string comparison orders them."""
+    base = now or datetime.now(IST)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=IST)
+    base = base.astimezone(IST)
+    out = {
+        "idle": (base - timedelta(minutes=idle_min)).isoformat(),
+        "stale": (base - timedelta(minutes=stale_min)).isoformat(),
+        "grace": (base - timedelta(minutes=grace_min)).isoformat(),
+    }
+    for i, mins in enumerate(INTERVIEW_RECOVERY_BACKOFF_MIN):
+        out[f"backoff{i + 1}"] = (base - timedelta(minutes=mins)).isoformat()
+    return out
+
+
+def list_recoverable_interview_progress(
+    db_target: DbTarget,
+    limit: int = 100,
+    *,
+    now: datetime | None = None,
+    idle_min: int = 35,
+    stale_min: int = 60,
+    generating_grace_min: int = 10,
+    max_attempts: int = INTERVIEW_RECOVERY_MAX_ATTEMPTS,
+) -> list[dict]:
+    """The rows the recovery worker should look at, oldest activity first.
+
+    Returns only the columns the decision needs plus `has_answers` — never
+    `questions` / `answers` / `meta` / `payload`; load the full row with
+    `get_interview_progress_by_id` for a row that is actually recovered.
+
+    Recoverable = report not final AND under the attempt cap AND past the
+    backoff for its attempt count AND one of:
+      * a terminal status (unless its report is "generating" and the row moved
+        within the grace window — the submit request's background upgrade owns it);
+      * started / in_progress, idle for `idle_min` with at least one answer;
+      * started / in_progress, idle for `stale_min` regardless.
+    """
     cap = max(1, min(int(limit or 100), 1000))
-    statuses = ("started", "in_progress", "submitting", "terminated", "abandoned", "partially_completed")
+    cut = _recovery_cutoffs(now, idle_min, stale_min, generating_grace_min)
+    final = list(RECOVERY_FINAL_REPORT_STATUSES)
+    terminal = list(RECOVERY_TERMINAL_STATUSES)
+    live = list(RECOVERY_LIVE_STATUSES)
+    act = _RECOVERY_ACTIVITY_SQL
     if _is_postgres(db_target):
+        has_answers = "(jsonb_typeof(answers) = 'array' AND jsonb_array_length(answers) > 0)"
+        sql = f"""
+            SELECT {_RECOVERY_LIST_COLUMNS}, {has_answers} AS has_answers
+            FROM interview_progress
+            WHERE COALESCE(report_status, '') <> ALL(%s)
+              AND COALESCE(recovery_attempts, 0) < %s
+              AND (COALESCE(recovery_attempts, 0) = 0
+                   OR COALESCE(last_recovery_at, '') < CASE recovery_attempts WHEN 1 THEN %s WHEN 2 THEN %s ELSE %s END)
+              AND (
+                    (status = ANY(%s) AND NOT (COALESCE(report_status, '') = 'generating' AND {act} >= %s))
+                 OR (status = ANY(%s) AND {act} < %s AND {has_answers})
+                 OR (status = ANY(%s) AND {act} < %s)
+              )
+            ORDER BY {act} ASC
+            LIMIT %s
+        """
+        params = (
+            final, max_attempts, cut["backoff1"], cut["backoff2"], cut["backoff3"],
+            terminal, cut["grace"], live, cut["idle"], live, cut["stale"], cap,
+        )
         with _connect_postgres(str(db_target)) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM interview_progress
-                    WHERE status = ANY(%s) OR COALESCE(report_status, '') NOT IN ('ready', 'no_report_needed')
-                    ORDER BY COALESCE(NULLIF(last_activity_at, ''), updated_at_ist, created_at_ist) ASC
-                    LIMIT %s
-                    """,
-                    (list(statuses), cap),
-                )
+                cur.execute(sql, params)
                 rows = cur.fetchall() or []
     else:
-        placeholders = ",".join("?" for _ in statuses)
+        has_answers = ("(CASE WHEN json_valid(answers) AND json_type(answers) = 'array' "
+                       "THEN json_array_length(answers) ELSE 0 END > 0)")
+        ph = lambda seq: ",".join("?" for _ in seq)  # noqa: E731
+        sql = f"""
+            SELECT {_RECOVERY_LIST_COLUMNS}, {has_answers} AS has_answers
+            FROM interview_progress
+            WHERE COALESCE(report_status, '') NOT IN ({ph(final)})
+              AND COALESCE(recovery_attempts, 0) < ?
+              AND (COALESCE(recovery_attempts, 0) = 0
+                   OR COALESCE(last_recovery_at, '') < CASE recovery_attempts WHEN 1 THEN ? WHEN 2 THEN ? ELSE ? END)
+              AND (
+                    (status IN ({ph(terminal)}) AND NOT (COALESCE(report_status, '') = 'generating' AND {act} >= ?))
+                 OR (status IN ({ph(live)}) AND {act} < ? AND {has_answers})
+                 OR (status IN ({ph(live)}) AND {act} < ?)
+              )
+            ORDER BY {act} ASC
+            LIMIT ?
+        """
+        params = (
+            *final, max_attempts, cut["backoff1"], cut["backoff2"], cut["backoff3"],
+            *terminal, cut["grace"], *live, cut["idle"], *live, cut["stale"], cap,
+        )
         with _connect_sqlite(Path(db_target)) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                f"""
-                SELECT * FROM interview_progress
-                WHERE status IN ({placeholders}) OR COALESCE(report_status, '') NOT IN ('ready', 'no_report_needed')
-                ORDER BY COALESCE(NULLIF(last_activity_at, ''), updated_at_ist, created_at_ist) ASC
-                LIMIT ?
-                """,
-                (*statuses, cap),
-            ).fetchall()
-    return [r for r in (_normalize_interview_progress_row(row) for row in rows) if r]
+            rows = conn.execute(sql, params).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        data = dict(row)
+        data["has_answers"] = bool(data.get("has_answers"))
+        data["recovery_attempts"] = int(data.get("recovery_attempts") or 0)
+        out.append(data)
+    return out
+
+
+def record_interview_recovery_attempt(
+    db_target: DbTarget,
+    interview_id: str,
+    *,
+    succeeded: bool,
+    error: str = "",
+    max_attempts: int = INTERVIEW_RECOVERY_MAX_ATTEMPTS,
+) -> None:
+    """Count one recovery pass over a row so it leaves the recoverable set.
+
+    Success stamps `report_status = 'ready'` on THIS row (the finalize path
+    already wrote it when the session carried the same interview id; a legacy
+    row whose meta had none got its report under a fresh id and would
+    otherwise be finalized again). A failure bumps the counter; the attempt
+    that reaches `max_attempts` closes the row as `recovery_failed` with the
+    reason, so the worker stops and the row still says why."""
+    rid = str(interview_id or "").strip()
+    if not rid:
+        return
+    now = _now_ist_parts()["ist_iso"]
+    err = str(error or "")[:2000]
+    final = list(RECOVERY_FINAL_REPORT_STATUSES)
+    if _is_postgres(db_target):
+        if succeeded:
+            sql = """
+                UPDATE interview_progress
+                SET recovery_attempts = COALESCE(recovery_attempts, 0) + 1, last_recovery_at = %s, updated_at_ist = %s,
+                    report_status = CASE WHEN COALESCE(report_status, '') = ANY(%s) THEN report_status ELSE 'ready' END
+                WHERE interview_id = %s
+            """
+            params = (now, now, final, rid)
+        else:
+            sql = """
+                UPDATE interview_progress
+                SET recovery_attempts = COALESCE(recovery_attempts, 0) + 1, last_recovery_at = %s, updated_at_ist = %s,
+                    report_status = CASE WHEN COALESCE(recovery_attempts, 0) + 1 >= %s
+                                         AND NOT (COALESCE(report_status, '') = ANY(%s))
+                                         THEN 'recovery_failed' ELSE report_status END,
+                    report_error = CASE WHEN COALESCE(recovery_attempts, 0) + 1 >= %s THEN %s ELSE report_error END
+                WHERE interview_id = %s
+            """
+            params = (now, now, max_attempts, final, max_attempts, err, rid)
+        with _connect_postgres(str(db_target)) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+        return
+    ph = ",".join("?" for _ in final)
+    if succeeded:
+        sql = f"""
+            UPDATE interview_progress
+            SET recovery_attempts = COALESCE(recovery_attempts, 0) + 1, last_recovery_at = ?, updated_at_ist = ?,
+                report_status = CASE WHEN COALESCE(report_status, '') IN ({ph}) THEN report_status ELSE 'ready' END
+            WHERE interview_id = ?
+        """
+        params = (now, now, *final, rid)
+    else:
+        sql = f"""
+            UPDATE interview_progress
+            SET recovery_attempts = COALESCE(recovery_attempts, 0) + 1, last_recovery_at = ?, updated_at_ist = ?,
+                report_status = CASE WHEN COALESCE(recovery_attempts, 0) + 1 >= ?
+                                     AND COALESCE(report_status, '') NOT IN ({ph})
+                                     THEN 'recovery_failed' ELSE report_status END,
+                report_error = CASE WHEN COALESCE(recovery_attempts, 0) + 1 >= ? THEN ? ELSE report_error END
+            WHERE interview_id = ?
+        """
+        params = (now, now, max_attempts, *final, max_attempts, err, rid)
+    with _connect_sqlite(Path(db_target)) as conn:
+        conn.execute(sql, params)
+        conn.commit()
+
+
+class interview_recovery_lock:
+    """`with interview_recovery_lock(target) as held:` — on Postgres a session
+    advisory lock (`pg_try_advisory_lock`) on a DEDICATED, unpooled connection
+    that is closed on exit, which releases the lock even if the unlock itself
+    fails; `held` is False when another process holds it and the caller skips
+    the pass. SQLite (one process by definition) always yields True."""
+
+    def __init__(self, db_target: DbTarget):
+        self._target = db_target
+        self._conn = None
+
+    def __enter__(self) -> bool:
+        if not _is_postgres(self._target):
+            return True
+        try:
+            self._conn = psycopg2.connect(str(self._target))
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (INTERVIEW_RECOVERY_LOCK_KEY,))
+                row = cur.fetchone()
+            held = bool(row and row[0])
+            if not held:
+                self._close()
+            return held
+        except Exception:
+            # The lock is a courtesy between the two workers, never a gate on
+            # recovery itself: if the lock query fails, run the pass anyway.
+            self._close()
+            return True
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._conn is not None:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (INTERVIEW_RECOVERY_LOCK_KEY,))
+            except Exception:
+                pass
+            self._close()
+        return False
+
+    def _close(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def mark_interview_progress_report_status(
@@ -3296,6 +3587,53 @@ def consume_password_reset(db_target: DbTarget, token_hash: str) -> dict | None:
 def update_user_password(db_target: DbTarget, user_id: int, new_hash: str) -> None:
     """Persist a new (modern, self-describing) password hash; clears the legacy salt column."""
     _update_password_hash(db_target, user_id, new_hash)
+
+
+def set_must_change_password(db_target: DbTarget, user_id: int, value: bool) -> None:
+    """Flag (Admin/CEO reset) or clear (the user's own change) the forced password
+    change (7 Oct 2026). Best-effort: a database without the column — it is added
+    at startup — must never fail the password write that came before it."""
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE registration_data SET must_change_password = %s WHERE id = %s",
+                                (bool(value), int(user_id)))
+                conn.commit()
+        else:
+            with _connect_sqlite(Path(db_target)) as conn:
+                conn.execute("UPDATE registration_data SET must_change_password = ? WHERE id = ?",
+                             (1 if value else 0, int(user_id)))
+                conn.commit()
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.warning("must_change_password not updated for user %s", user_id, exc_info=True)
+
+
+def account_state(db_target: DbTarget, username: str) -> dict | None:
+    """`{id, is_active}` of a login by username, or None when it no longer exists —
+    what `/auth/refresh` re-reads so a deactivated or deleted account cannot extend
+    an old session (7 Oct 2026). Raises nothing the caller must handle: a lookup
+    failure returns `{"is_active": True}` (fail open — refresh is not the gate the
+    CRM relies on; `crm_deps.get_current_user` re-checks on every request)."""
+    uname = (username or "").strip().lower()
+    if not uname:
+        return None
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT id, COALESCE(is_active, TRUE) AS is_active FROM registration_data "
+                                "WHERE LOWER(username) = %s", (uname,))
+                    row = cur.fetchone()
+        else:
+            with _connect_sqlite(Path(db_target)) as conn:
+                row = conn.execute("SELECT id, COALESCE(is_active, 1) AS is_active FROM registration_data "
+                                   "WHERE LOWER(username) = ?", (uname,)).fetchone()
+    except Exception:  # noqa: BLE001 — see docstring
+        return {"id": None, "is_active": True}
+    if not row:
+        return None
+    return {"id": int(row["id"]), "is_active": bool(row["is_active"])}
 
 
 def upsert_interview_record_snapshot(db_target: DbTarget, record: dict) -> None:

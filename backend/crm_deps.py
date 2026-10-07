@@ -69,6 +69,8 @@ class CurrentUser:
     #: the roles the user actually HOLDS (built-in + custom names), before
     #: `role_implications` adds implied ones — what the UI prints as chips.
     held_roles: set[str] = field(default_factory=set)
+    #: an Admin/CEO reset is waiting for the user's own password (7 Oct 2026)
+    must_change_password: bool = False
 
     def has_any(self, *names: str) -> bool:
         return bool(self.roles.intersection(names))
@@ -81,6 +83,38 @@ class CurrentUser:
     @property
     def is_ceo(self) -> bool:
         return "CEO" in self.roles
+
+
+#: Paths a user who MUST change their password may still call: who am I, the
+#: change itself, my profile picture (the forced screen shows it) — nothing else.
+PASSWORD_CHANGE_ALLOWED_PATHS = frozenset({"/api/me", "/api/me/change-password", "/api/me/profile"})
+PASSWORD_CHANGE_REQUIRED = "PASSWORD_CHANGE_REQUIRED"
+
+#: Whether registration_data carries must_change_password (added at startup by
+#: auth_db): (known, has_column, probed_at). A failed probe is retried after
+#: MUST_CHANGE_REPROBE_S so one transient error never disables the check for good.
+_MUST_CHANGE_PROBE: dict = {"has": None, "at": 0.0}
+MUST_CHANGE_REPROBE_S = 300
+
+
+def _must_change_password(db: Session, user_id: int) -> bool:
+    """True when an Admin/CEO reset is waiting for the user's own password
+    (7 Oct 2026). A database without the column reads False, never fails."""
+    import time
+    probe = _MUST_CHANGE_PROBE
+    if probe["has"] is False and time.monotonic() - probe["at"] < MUST_CHANGE_REPROBE_S:
+        return False
+    try:
+        with db.begin_nested():
+            flag = db.execute(
+                sa.text("SELECT COALESCE(must_change_password, FALSE) FROM registration_data WHERE id = :i"),
+                {"i": user_id},
+            ).scalar()
+        probe["has"] = True
+        return bool(flag)
+    except Exception:  # noqa: BLE001 — pre-startup DB / test stub without the column
+        probe["has"], probe["at"] = False, time.monotonic()
+        return False
 
 
 def get_current_user(request: Request, db: Session = Depends(get_crm_db)) -> CurrentUser:
@@ -99,6 +133,12 @@ def get_current_user(request: Request, db: Session = Depends(get_crm_db)) -> Cur
         raise HTTPException(status_code=401, detail="Unknown user")
     if not row["is_active"]:
         raise HTTPException(status_code=403, detail="User is deactivated")
+    # Forced password change (7 Oct 2026): after an Admin/CEO reset, nothing but
+    # the change itself works until the user sets a password only they know.
+    must_change = _must_change_password(db, int(row["id"]))
+    if must_change and request.url.path.rstrip("/") not in PASSWORD_CHANGE_ALLOWED_PATHS:
+        raise HTTPException(status_code=403,
+                            detail=f"{PASSWORD_CHANGE_REQUIRED}: set a new password to continue.")
     role_rows = db.execute(
         select(Role.name).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == row["id"])
     ).scalars().all()
@@ -115,7 +155,7 @@ def get_current_user(request: Request, db: Session = Depends(get_crm_db)) -> Cur
     user = CurrentUser(
         id=row["id"], username=username,
         full_name=row["full_name"] or "", email=row["email"] or "", roles=roles,
-        held_roles=held,
+        held_roles=held, must_change_password=must_change,
     )
     # Outgoing mail triggered by this request is sent as this person
     # (services/actor_context.py).
@@ -177,6 +217,18 @@ def _roles_for_username(username: str) -> set[str] | None:
     Returns an empty set when the user exists but has no CRM role, and None when
     Postgres/CRM is unavailable (so callers can fall back to legacy behavior).
     """
+    found = _user_access_for_username(username)
+    return None if found is None else found[1]
+
+
+def _user_access_for_username(username: str, tab: str | None = None):
+    """`(user_id, roles, template_mode)` for a legacy Interview Platform call.
+
+    `template_mode` is the mode the user's Access Template / custom role / per-
+    user override grants on `tab` (None when unrestricted, "" when restricted
+    but the tab is not granted); it is only resolved when a tab is asked for.
+    None altogether when the CRM DB is unconfigured or the lookup fails.
+    """
     try:
         session: Session = get_session_factory()()
     except CrmNotConfiguredError:
@@ -187,11 +239,26 @@ def _roles_for_username(username: str) -> set[str] | None:
             {"u": username},
         ).first()
         if not row:
-            return set()
+            return 0, set(), None
+        uid = int(row[0])
         role_rows = session.execute(
-            select(Role.name).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == row[0])
+            select(Role.name).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == uid)
         ).scalars().all()
-        return {r.value if hasattr(r, "value") else str(r) for r in role_rows}
+        roles = {r.value if hasattr(r, "value") else str(r) for r in role_rows}
+        from services.role_implications import with_implied
+        roles = with_implied(roles | custom_role_names(session, uid))
+        template_mode = None
+        if tab and roles and not roles & {"Admin", "CEO"}:
+            from services.access_templates import effective_access
+            acc = effective_access(session, uid, roles)
+            tabs = acc.get("tabs", {}) if acc.get("visible_tabs") is not None else {}
+            # The template speaks for the Interview Platform only once it names
+            # at least one of its tabs (the shell's `ivTabAccess` rule): a
+            # template saved before those tabs were grantable keeps the role
+            # defaults it always had, instead of 403-ing every page on deploy.
+            if not acc.get("full") and any(k.startswith("iv:") for k in tabs):
+                template_mode = tabs.get(tab) or ""
+        return uid, roles, template_mode
     except Exception:
         # Never let an RBAC lookup failure take down a legacy interview endpoint.
         return None
@@ -199,7 +266,8 @@ def _roles_for_username(username: str) -> set[str] | None:
         session.close()
 
 
-def enforce_roles(request: Request, *allowed: str, allow_admin: bool = True) -> None:
+def enforce_roles(request: Request, *allowed: str, allow_admin: bool = True,
+                  tab: str | None = None, mode: str = "view") -> None:
     """Authorize the current bearer against CRM roles on Interview Platform routes.
 
     This is the backend twin of the frontend RBAC (src/lib/rbac.ts): it lets the
@@ -214,6 +282,14 @@ def enforce_roles(request: Request, *allowed: str, allow_admin: bool = True) -> 
       * the user has no CRM role assigned yet.
     This keeps existing HR logins working during and after RBAC rollout, while
     fully restricting users who DO have a scoped role (Sales, Finance, TA, ...).
+
+    `tab` (7 Oct 2026) names the Interview Platform tab the endpoint belongs to
+    (`access_registry.IV_TABS`, e.g. "iv:integrityLogs"). For a user whose
+    access comes from an Access Template / custom role / per-user override the
+    template is AUTHORITATIVE, exactly as `_gate` is for CRM routes: the tab
+    granted at `mode` passes whatever the role, and not granted is a 403 —
+    reported: Integrity ticked for an RMG in Edit Tab Access still 403'd here.
+    An unrestricted user keeps the role rule.
     """
     payload = _decode_bearer(request)
     if not payload:
@@ -221,12 +297,25 @@ def enforce_roles(request: Request, *allowed: str, allow_admin: bool = True) -> 
     username = str(payload.get("sub") or "")
     if not username:
         return
-    roles = _roles_for_username(username)
-    if roles is None:          # CRM unconfigured / lookup failed → legacy mode
+    found = _user_access_for_username(username, tab)
+    if found is None:          # CRM unconfigured / lookup failed → legacy mode
         return
+    _uid, roles, template_mode = found
     if not roles:              # no CRM role assigned → legacy mode (don't lock out)
         return
     allowed_set = set(allowed) | ({"Admin", "CEO"} if allow_admin else set())
+    if roles & {"Admin", "CEO"} & allowed_set:
+        return
+    if template_mode is not None:   # templated → the template alone decides
+        from services.access_registry import mode_satisfies
+        if mode_satisfies(template_mode or None, mode):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your access template does not grant the '{tab}' tab"
+                   + ("" if mode == "view" else f" at {mode} level")
+                   + " — ask Admin/CEO to enable it",
+        )
     if roles & allowed_set:
         return
     raise HTTPException(
@@ -439,6 +528,27 @@ def gated_write_action(action: str, tab: str, *default_roles: str, field: str | 
 
             _template_verdict(db, user, tab, "view", field=field)   # raises when the tab is not granted
             access = effective_access(db, user.id, set(user.roles))
+            if user_may(db, user, action, access):
+                return user
+            raise HTTPException(
+                status_code=403,
+                detail=f"You are not allowed to: {ACTIONS[action].label.lower()} — "
+                       "ask Admin/CEO to enable it in your access template or role",
+            )
+
+        # MANAGE buttons (7 Oct 2026): a template / custom role that has an
+        # action list CONFIGURED decides every button by that list (tab at
+        # view to reach the record, then the list — the approval rule); a
+        # template whose list was never set keeps the old rule, tab Edit is
+        # authoritative. Migration 0124 wrote every button a configured list
+        # already implied, so nothing changed on deploy.
+        from services.access_templates import effective_access
+        from services.action_permissions import ACTIONS, user_may
+
+        access = effective_access(db, user.id, set(user.roles))
+        if not access.get("full") and access.get("visible_tabs") is not None \
+                and access.get("actions") is not None:
+            _template_verdict(db, user, tab, "view", field=field)
             if user_may(db, user, action, access):
                 return user
             raise HTTPException(

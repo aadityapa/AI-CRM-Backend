@@ -159,6 +159,11 @@ STATUS_DEFS: list[StatusDef] = [
                  "The AI interview"),
     _d("ai_l1_review", "AI L1 – Under Review", WARN, "internal",
        "The AI interview is done; a recruiter put the result on hold / review.", _INTERNAL),
+    _d("ai_l1_not_attempted", "AI L1 – Not Attempted", WARN, "internal",
+       "The candidate did not answer any question — the link was opened late, the session "
+       "dropped, or it was never started. TA checks with them and sends a fresh link "
+       "(\"Reschedule AI L1\") once they confirm; RMG / GM may take a manual L1 instead.",
+       _INTERNAL | {PS.RMG_REJECTED.value}),
     *_round_defs("manual_l1", "Manual L1", "internal", set(_INTERNAL), {PS.RMG_REJECTED.value}, "RMG"),
     *_round_defs("manual_l2", "Manual L2", "internal", set(_INTERNAL), {PS.RMG_REJECTED.value}, "RMG"),
     _d("sales_review", "With Sales – Ready to Submit", INFO, "customer",
@@ -251,6 +256,9 @@ def stage_label(value: str | None) -> str:
 #: Round states. "held" = the interview happened, no verdict recorded yet.
 PENDING, SCHEDULED, HELD, PASSED, FAILED, REVIEW = (
     "pending", "scheduled", "held", "passed", "failed", "review")
+#: The AI L1 ran but no scored question was answered — "never happened", not
+#: "did badly" (`ai_interview_links.not_attempted`, 7 Oct 2026). TA reschedules.
+NOT_ATTEMPTED = "not_attempted"
 
 _PASS_RESULTS = {"hire", "strong hire", "leaning hire", "selected", "pass", "passed", "shortlisted"}
 _FAIL_RESULTS = {"no hire", "leaning no", "rejected", "reject", "fail", "failed", "not selected"}
@@ -275,13 +283,16 @@ def round_state(status: str | None, result: str | None, has_time: bool) -> str |
     return PENDING
 
 
-def ai_state(effective_result: str | None) -> str:
-    """AiInterviewLink.effective_result → round state."""
+def ai_state(effective_result: str | None, not_attempted: bool = False) -> str:
+    """AiInterviewLink.effective_result (+ its not_attempted flag) → round state.
+
+    A recruiter's override still wins: "Selected" over a not-attempted link is
+    a pass; the flag only refines a Failed / unreviewed verdict."""
     value = (effective_result or "").strip().lower()
     if value in {"passed", "selected"}:
         return PASSED
     if value in {"failed", "rejected"}:
-        return FAILED
+        return NOT_ATTEMPTED if not_attempted else FAILED
     if value in {"on hold", "pending review"}:
         return REVIEW
     return SCHEDULED
@@ -344,7 +355,7 @@ def _round_status(prefix: str, state: str) -> CandidateStatus:
         return _status(f"{prefix}_scheduled",
                        hint="Interview held — waiting for the verdict to be recorded.")
     suffix = {PENDING: "scheduled", SCHEDULED: "scheduled", PASSED: "passed",
-              FAILED: "failed", REVIEW: "review"}[state]
+              FAILED: "failed", REVIEW: "review", NOT_ATTEMPTED: "not_attempted"}[state]
     return _status(f"{prefix}_{suffix}")
 
 
@@ -549,7 +560,8 @@ _ROUNDS: dict[str, tuple[str, str]] = {
     "customer_l2": ("customer_l2", "Customer L2 Interview"),
 }
 _ROUND_STATES = {"pending": "Yet to Schedule", "scheduled": "Scheduled", "passed": "Passed",
-                 "failed": "Failed", "review": "Under Review", "shortlisted": "Yet to Schedule"}
+                 "failed": "Failed", "review": "Under Review", "shortlisted": "Yet to Schedule",
+                 "not_attempted": "Not Attempted"}
 #: Non-round statuses → (round key, name, state) for the Status column.
 _STATUS_ROUND: dict[str, tuple[str | None, str, str | None]] = {
     "sourcing": (None, "New Applicant", None),
@@ -668,15 +680,16 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
                 ta_closed[pid] = TA_CLOSE_ACTIONS[action]   # the latest wins
             else:
                 requested[pid].add(_REQUEST_TO_ROUND[action])
-        # Same precedence as latest_ai_interviews: completed first, then newest.
+        # Same precedence as latest_ai_interviews: the NEWEST link (a reschedule
+        # supersedes the old verdict; 7 Oct 2026).
         for link in db.execute(
             select(AiInterviewLink)
             .where(AiInterviewLink.profile_id.in_(chunk))
             .order_by(AiInterviewLink.profile_id,
-                      AiInterviewLink.completed_at.desc().nullslast(),
+                      AiInterviewLink.created_at.desc(),
                       AiInterviewLink.id.desc())
         ).scalars().all():
-            ai.setdefault(link.profile_id, ai_state(link.effective_result))
+            ai.setdefault(link.profile_id, ai_state(link.effective_result, bool(link.not_attempted)))
     return {
         pid: StatusFacts(
             pipeline_status=_value(base[pid].pipeline_status) or "",

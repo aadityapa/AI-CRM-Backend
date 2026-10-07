@@ -40,6 +40,7 @@ class Action(NamedTuple):
     roles: tuple[str, ...]      # code default; a saved row replaces it
     kind: str = MANAGE
     group: str = "Other"        # heading in the template / role editor
+    tab: str = ""               # the CRM tab the button lives on (manage actions)
 
 
 #: Every admin-editable action. A new gated_write_action() call site needs one
@@ -126,43 +127,47 @@ ACTIONS: dict[str, Action] = {
     "project_employee.manage": Action(
         "Map / edit project employees",
         "Map an employee onto a project and edit the mapping.",
-        ("Sales_Head", "HR", "Finance")),
+        ("Sales_Head", "HR", "Finance"), MANAGE, "Buttons", "project-employees"),
     "project_employee.rates": Action(
         "Edit commercial rates",
         "Add, edit or delete effective-dated billing rates.",
-        ("Sales_Head", "Finance", "HR", "RMG")),
+        ("Sales_Head", "Finance", "HR", "RMG"), MANAGE, "Buttons", "project-employees"),
     "po.manage": Action(
         "Create / edit purchase orders",
         "Create, edit and allocate purchase orders.",
-        ("Finance",)),
+        ("Finance",), MANAGE, "Buttons", "pos"),
     "invoice.manage": Action(
         "Create / edit invoices",
         "Create and edit invoices and payments.",
-        ("Finance",)),
+        ("Finance",), MANAGE, "Buttons", "invoices"),
     "invoice.revision.request": Action(
         "Request an invoice change",
         "Ask for a correction to a generated invoice (it goes for approval).",
-        ("Sales", "Finance", "Sales_Head")),
+        ("Sales", "Finance", "Sales_Head"), MANAGE, "Buttons", "invoices"),
     "candidate.email": Action(
         "Bulk-email suggested candidates",
         "Send the hiring-interest email to selected suggested candidates.",
-        ("TA", "Sales", "Sales_Head", "RMG")),
+        ("TA", "Sales", "Sales_Head", "RMG"), MANAGE, "Buttons", "candidates"),
     # Project close (25 Sep 2026): closing ends every assignment on the last
     # working day and moves the team to the bench — a delivery decision, so
     # Sales Head (owns the account), RMG (owns the bench) and HR (settles leave).
     "project.close": Action(
         "Close projects",
         "Set a project's last working day; the team moves to the bench after it.",
-        ("Sales_Head", "RMG", "HR")),
+        ("Sales_Head", "RMG", "HR"), MANAGE, "Buttons", "projects"),
     "requirement.positions.request": Action(
         "Request a position (headcount) change",
         "Ask to increase or reduce the number of positions on a requirement. "
         "The request goes to RMG for approval.",
-        ("Sales", "Sales_Head")),
+        ("Sales", "Sales_Head"), MANAGE, "Buttons", "requirements"),
 }
 
 #: The approval buttons, in editor order.
 APPROVAL_ACTIONS: tuple[str, ...] = tuple(k for k, a in ACTIONS.items() if a.kind == APPROVAL)
+#: Every button a template / custom role may grant (7 Oct 2026: the manage
+#: buttons too — user ask "Admin gives each button at template creation").
+ALL_ACTIONS: tuple[str, ...] = tuple(ACTIONS.keys())
+MANAGE_ACTIONS: tuple[str, ...] = tuple(k for k, a in ACTIONS.items() if a.kind == MANAGE)
 
 
 def is_approval(action: str) -> bool:
@@ -171,30 +176,42 @@ def is_approval(action: str) -> bool:
 
 
 def clean_action_list(raw) -> list[str]:
-    """Keep only known approval keys, de-duplicated, in registry order.
+    """Keep only known action keys, de-duplicated, in registry order.
     Unknown keys are dropped (like unknown tab keys) so an old template stays
     saveable after an action is renamed or removed."""
     wanted = {str(k) for k in (raw or [])}
-    return [k for k in APPROVAL_ACTIONS if k in wanted]
+    return [k for k in ALL_ACTIONS if k in wanted]
 
 
 def default_actions_for_role(role_name: str | None) -> list[str]:
-    """Approval actions whose CODE default names this role — used to seed a new
-    template / custom role and by the 0108 backfill."""
+    """Actions (approvals AND buttons) whose CODE default names this role —
+    used to seed a new template / custom role and by the 0108 / 0124 backfills."""
     if not role_name:
         return []
     # …including what the built-in roles it carries approve (29 Sep 2026: a
     # "Sales Manager" role approves what Sales and Sales Head approve).
     from services.role_implications import approval_default_roles
     names = approval_default_roles([role_name])
-    return [k for k in APPROVAL_ACTIONS if names & set(ACTIONS[k].roles)]
+    return [k for k in ALL_ACTIONS if names & set(ACTIONS[k].roles)]
+
+
+def implied_buttons(tab_access: dict | None) -> list[str]:
+    """The manage buttons a tab grant at Edit or better used to imply (the rule
+    before 7 Oct 2026) — what a new template's list starts with, and what
+    migration 0124 wrote into every list saved before."""
+    tabs = {}
+    for k, v in (tab_access or {}).items():
+        key = str(k or "")
+        tabs[key[4:] if key.startswith("crm:") else key] = v
+    return [k for k in MANAGE_ACTIONS if tabs.get(ACTIONS[k].tab) in ("edit", "create")]
 
 
 def registry() -> list[dict]:
-    """The Approvals section of the template / role editors."""
+    """The Approvals & buttons section of the template / role editors."""
     return [{"key": k, "label": ACTIONS[k].label, "description": ACTIONS[k].description,
-             "group": ACTIONS[k].group, "default_roles": list(ACTIONS[k].roles)}
-            for k in APPROVAL_ACTIONS]
+             "group": ACTIONS[k].group, "kind": ACTIONS[k].kind, "tab": ACTIONS[k].tab,
+             "default_roles": list(ACTIONS[k].roles)}
+            for k in ALL_ACTIONS]
 
 _TTL_SECONDS = 60.0
 _lock = threading.Lock()
@@ -270,6 +287,8 @@ def effective(db) -> list[dict]:
             "label": a.label,
             "description": a.description,
             "kind": a.kind,
+            "group": a.group,
+            "tab": a.tab,
             "default_roles": list(a.roles),
             "roles": [str(r) for r in saved] if saved is not None else list(a.roles),
             "customized": saved is not None,
@@ -388,8 +407,11 @@ def user_ids_who_may(db, action: str) -> set[int]:
 
 
 def allowed_approvals(db, user, access: dict | None = None) -> list[str]:
-    """Every approval action this user may perform (for /api/me)."""
+    """Every action (approval or button) this user may perform (for /api/me).
+    ⚠️ Manage buttons here follow the action list / role list only — a
+    templated user with NO configured list is judged by the tab's Edit grant at
+    the gate, which this does not model; the UI keeps `useCanAct` for those."""
     if access is None:
         from services.access_templates import effective_access
         access = effective_access(db, user.id, set(user.roles))
-    return [k for k in APPROVAL_ACTIONS if user_may(db, user, k, access)]
+    return [k for k in ALL_ACTIONS if user_may(db, user, k, access)]

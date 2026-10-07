@@ -40,12 +40,14 @@ def to_dict(instance) -> dict:
     return result
 
 
-def paginate(db: Session, stmt: Select, page: int, limit: int) -> tuple[list, dict]:
+def paginate(db: Session, stmt: Select, page: int, limit: int, *, scalars: bool = True) -> tuple[list, dict]:
     # Fetch one extra row: if page 1 comes back short, the count is simply the
     # number of rows we already have and the COUNT(*) can be skipped entirely.
     # That COUNT wrapped the full filtered statement (joins and all) and ran on
     # EVERY list request — on an 8k-row join it cost as much as the page itself.
-    rows = db.execute(stmt.offset((page - 1) * limit).limit(limit + 1)).scalars().all()
+    # `scalars=False` returns Row objects, for a statement that selects columns.
+    result = db.execute(stmt.offset((page - 1) * limit).limit(limit + 1))
+    rows = result.scalars().all() if scalars else result.all()
     has_more = len(rows) > limit
     items = rows[:limit]
     if page == 1 and not has_more:

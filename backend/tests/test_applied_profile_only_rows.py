@@ -454,3 +454,38 @@ def test_status_chips_narrow_both_kinds_of_row_and_rows_say_how_long_they_wait(d
     assert [r["candidate_name"] for r in rows] == ["Fresh"]
     assert rows[0]["waiting_days"] == 0 and rows[0]["waiting_since"]
     assert fresh.id  # the resume-backed row was matched through its profile
+
+
+def test_a_candidate_shows_once_and_a_profile_linked_ai_pass_opens_the_l2(db, monkeypatch):
+    """6 Oct 2026, user report (Likhith Nelaballi): the candidate was listed
+    twice — two resume rows — and the AI L1 done from the profile left both
+    rows offering AI L1 / Manual L1 with no L2, because the interview was linked
+    by PROFILE and the rows looked it up by resume. A GM / RMG "Selected" over a
+    low AI score is a pass too."""
+    import routers.crm.resumes as resumes_router
+    from models import AiInterviewLink
+
+    monkeypatch.setattr(resumes_router, "enrich_resumes_with_ai",
+                        lambda _db, items: [{"id": r.id, "candidate_id": r.candidate_id,
+                                             "candidate_name": r.candidate_name}
+                                            for r in items])
+    req = _req(db)
+    profile = _applicant(db, req, "Likhith", screening="Shortlisted", with_resume=True)
+    db.add(Resume(requirement_id=req.id, candidate_id=profile.candidate_id,
+                  candidate_name="Likhith", email="likhith@example.com",
+                  resume_file_url="/x/cv2.pdf"))
+    db.add(AiInterviewLink(invite_token="tok-l", candidate_id=profile.candidate_id,
+                           opportunity_id=req.opportunity_id, profile_id=profile.id,
+                           requirement_id=req.id, level="L1", result="Failed",
+                           overall_score_percent=41.0, hr_decision="selected",
+                           interview_record_id="rec-l"))
+    db.commit()
+
+    rows = [r for r in _list(db, req)["data"] if r.get("candidate_id") == profile.candidate_id]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["ai_overall_score_percent"] == 41.0
+    assert row["ai_effective_result"] == "Selected"
+    assert row["profile_pipeline_status"] == "RMG_Review"
+    db.refresh(profile)
+    assert profile.pipeline_status == PipelineStatus.RMG_REVIEW

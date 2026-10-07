@@ -525,3 +525,74 @@ def test_the_ai_report_link_is_url_encoded():
     from services.report_links import ai_report_link
     assert ai_report_link("A+b@X.com", 7) == "/admin/?view=candidateReport&cid=a%2Bb%40x.com&iid=7"
     assert ai_report_link("", 7) is None and ai_report_link("a@x.com", None) is None
+
+
+# ------------------------------------------------------------------ the repair reads little (7 Oct 2026)
+
+def test_repair_reads_no_json_bodies_unless_it_writes_an_estimate(tmp_path, monkeypatch):
+    """Both repairs used to `SELECT questions, answers, meta` over the whole
+    table at every startup; now the attribution stops at "no orphans" and the
+    estimate fetches the bodies of exactly the interviews it estimates."""
+    from auth_db import init_auth_db, upsert_interview_progress
+    from services import ai_cost_repair as repair
+    db = str(tmp_path / "auth.db")
+    init_auth_db(db)
+    pl.init_prompt_log_table(db)
+    qs = [{"question": "x" * 150}]
+    ans = [{"answer": " ".join(["word"] * 25)}]
+    upsert_interview_progress(db, {"interview_id": "OLD", "status": "completed", "questions": qs, "answers": ans,
+                                   "created_at_ist": "2026-09-23T11:00:00+05:30",
+                                   "finalized_at": "2026-09-23T11:30:00+05:30", "meta": {"job_title": "SW"}})
+    upsert_interview_progress(db, {"interview_id": "NEW", "status": "completed", "questions": qs, "answers": ans,
+                                   "created_at_ist": "2026-09-29T11:00:00+05:30",
+                                   "finalized_at": "2026-09-29T11:30:00+05:30"})
+    listed: list[dict] = []
+    bodies: list[str] = []
+    real_list, real_bodies = repair._interviews, repair._interview_bodies
+
+    def spy_list(cur, pg, **kw):
+        rows = real_list(cur, pg, **kw)
+        listed.append({"kw": kw, "rows": rows})
+        return rows
+
+    def spy_bodies(cur, pg, iid):
+        bodies.append(iid)
+        return real_bodies(cur, pg, iid)
+
+    monkeypatch.setattr(repair, "_interviews", spy_list)
+    monkeypatch.setattr(repair, "_interview_bodies", spy_bodies)
+
+    assert repair.attribute_orphan_calls(db) == 0
+    assert listed == []                                   # no orphans → interview_progress never read
+    assert repair.estimate_missing_audio(db) == 2
+    assert bodies == ["OLD"]                              # NEW is after the audio-logging date
+    assert len(listed) == 1 and listed[0]["kw"] == {"pre_audio": True}
+    (row,) = listed[0]["rows"]                            # the SQL already dropped NEW
+    assert row["interview_id"] == "OLD" and row["template"] == "SW"
+    for heavy in ("questions", "answers", "meta", "payload"):
+        assert heavy not in row
+    assert repair.estimate_missing_audio(db) == 0
+    assert bodies == ["OLD"]                              # already estimated → bodies not read again
+
+
+def test_repair_is_a_no_op_once_a_run_found_nothing_left(tmp_path, monkeypatch):
+    from auth_db import init_auth_db
+    from services import ai_cost_repair as repair
+    db = str(tmp_path / "auth.db")
+    init_auth_db(db)
+    pl.init_prompt_log_table(db)
+    monkeypatch.setattr(repair, "_DONE_IN_PROCESS", {})
+    monkeypatch.setattr(repair, "_marker_read", lambda: "")
+    written: list[str] = []
+    monkeypatch.setattr(repair, "_marker_write", lambda v: written.append(v) or True)
+    assert repair.repair_ai_costs(db) == {"attributed": 0, "estimated_rows": 0}
+    assert len(written) == 1 and written[0].startswith(repair._store_hash(db) + ":")
+    calls: list[str] = []
+    monkeypatch.setattr(repair, "attribute_orphan_calls", lambda t: calls.append("a") or 0)
+    assert repair.repair_ai_costs(db)["skipped"] is True
+    assert calls == []
+    # the stored marker alone (another process) is enough — and only for THIS store
+    monkeypatch.setattr(repair, "_DONE_IN_PROCESS", {})
+    monkeypatch.setattr(repair, "_marker_read", lambda: written[0])
+    assert repair.repair_done(db) is True
+    assert repair.repair_done(db + "-other") is False

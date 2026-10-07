@@ -54,6 +54,12 @@ EVENT_TYPES: dict[str, tuple[str, str, int, bool]] = {
     "clipboard": ("Copy / paste attempt", "clipboard", 6, True),
     "context_menu": ("Right-click menu", "clipboard", 2, False),
     "devtools": ("Developer tools attempt", "devtools", 12, True),
+    # screen share (7 Oct 2026) — the candidate stopped sharing the screen the
+    # recording captures; informational, the camera stream keeps recording.
+    "screen_share_stopped": ("Screen sharing stopped", "focus", 4, False),
+    # 7 Oct 2026 — why a recording has no screen half (not shared when the
+    # interview started, an unsupported browser, or the server has it off).
+    "screen_share_missing": ("Screen not recorded", "system", 0, False),
     # bookkeeping
     "termination": ("Terminated", "system", 0, False),
 }

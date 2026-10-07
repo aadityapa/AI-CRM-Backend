@@ -40,6 +40,15 @@ class AiInterviewLink(Base):
     hr_decision_by = sa.Column(sa.String(255), nullable=True)   # who (email/username)
     hr_decision_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
 
+    # --- Not attempted (migration 0126) ----------------------------------------
+    # The report already separates "did badly" from "never happened"
+    # (`services/interview_outcome`), but `result` only knows Pending / Passed /
+    # Failed, so a candidate who could not sit the interview at all read "Failed"
+    # on every CRM screen. This flag carries that distinction across; `result`
+    # stays "Failed" so every existing reader keeps working, and the screens
+    # that care print "Not attempted" and offer TA a reschedule.
+    not_attempted = sa.Column(sa.Boolean, nullable=False, server_default=sa.false(), default=False)
+
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     completed_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
 

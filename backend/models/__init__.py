@@ -60,3 +60,4 @@ from models.template_requests import TemplateRequest, TemplateRequestStatus  # n
 from models.access_templates import AccessTemplate  # noqa: F401
 from models.user_profiles import UserProfile  # noqa: F401
 from models.custom_roles import CustomRole, UserCustomRole  # noqa: F401
+from models.user_access_log import UserAccessLog  # noqa: F401

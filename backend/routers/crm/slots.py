@@ -25,7 +25,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, get_crm_db, role_required, gated_read, gated_write
+from crm_deps import CurrentUser, get_crm_db, gated_read, gated_write
+import rate_limit as _rl
 from models import (
     AiInterviewStatus, InterviewSlot, Requirement, RequirementActivityLog, Resume, SlotBooking,
 )
@@ -145,6 +146,12 @@ def list_slots(
         .order_by(InterviewSlot.slot_at.asc())
     ).scalars().all()
     return envelope([_serialize_slot(s) for s in slots])
+
+
+def _ensure_ai_template(db: Session, req) -> None:
+    from models import Opportunity
+    from services.ai_interview_bridge import ensure_l1_template_ready
+    ensure_l1_template_ready(db, db.get(Opportunity, req.opportunity_id), req)
 
 
 @router.post("/api/requirements/{requirement_id}/slots")
@@ -277,6 +284,8 @@ def slot_invite_preview(
     req = _requirement_or_404(db, resume.requirement_id)
     from services.requirements import ensure_not_on_hold
     ensure_not_on_hold(req)
+    # A booked slot schedules the AI L1 — no template, no invite (6 Oct 2026).
+    _ensure_ai_template(db, req)
     # Same RMG gate as the send — the preview must not promise what the send
     # will refuse.
     if resume.candidate_id is not None:
@@ -330,6 +339,8 @@ def send_slot_invite_manual(
     req = _requirement_or_404(db, resume.requirement_id)
     from services.requirements import ensure_not_on_hold
     ensure_not_on_hold(req)
+    # A booked slot schedules the AI L1 — no template, no invite (6 Oct 2026).
+    _ensure_ai_template(db, req)
     # RMG screening gate (25 Aug 2026): the slot invite leads straight to a
     # booked AI L1, so it is gated exactly like scheduling one.
     if resume.candidate_id is not None:
@@ -585,6 +596,7 @@ class ConfirmIn(BaseModel):
 
 
 @router.post("/api/book/{token}/confirm")
+@_rl.limit("10/minute")   # public: books a real AI interview + sends mail (8.6)
 def confirm_booking(
     token: str,
     payload: ConfirmIn,
@@ -781,7 +793,6 @@ def requirement_interview_history(
         .order_by(AiInterviewLink.created_at.desc(), AiInterviewLink.id.desc())
     ).scalars().all()
 
-    prof_ids = [p_id for p_id in {l.profile_id for l in links} if p_id]
     profiles = db.execute(
         select(CandidateProfile).where(CandidateProfile.opportunity_id == req.opportunity_id)
     ).scalars().all()

@@ -64,7 +64,9 @@ def test_ai_sync_announces_once_per_verdict_to_the_right_people():
     assert "if not announce:" in sync
     assert 'dedupe_prefix=f"ai_done:{link.id}:{new_result}"' in sync
     assert 'dedupe_prefix=f"ai_review:{link.id}:Passed"' in sync
-    assert 'dedupe_prefix=f"ai_review:{link.id}:Failed"' in sync
+    # Failed and Not attempted are two outcomes with two keys (7 Oct 2026).
+    assert 'dedupe_prefix=f"ai_review:{link.id}:{\'not_attempted\' if not_attempted else \'Failed\'}"' in sync
+    assert 'dedupe_prefix=f"ai_done:{link.id}:not_attempted"' in sync
     # The TA notice is addressed to the candidate's TAs, not the whole role.
     assert "_candidate_tas(db, link.profile_id)" in sync
     assert 'notify_role(\n                db, "TA"' not in sync

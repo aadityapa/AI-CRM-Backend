@@ -286,38 +286,144 @@ def set_tab_access(db: Session, user_id: int, tabs: list[str] | None,
     return _user_out(row, roles, _decode_tab_access(encoded))
 
 
-def list_users(db: Session, p: PageParams) -> tuple[list[dict], dict]:
+#: Status filter values on the Users tab.
+USER_STATUSES = ("active", "inactive", "no_role", "password_pending")
+
+
+def _role_user_ids(db: Session, role: str) -> set[int]:
+    """Users holding `role` — a built-in role name or a custom role name."""
+    member = next((m for m in RoleName if m.value == role), None)
+    if member is not None:
+        return set(db.execute(
+            select(UserRole.user_id).join(Role, Role.id == UserRole.role_id).where(Role.name == member)
+        ).scalars().all())
+    from models.custom_roles import CustomRole, UserCustomRole
+    return set(db.execute(
+        select(UserCustomRole.user_id).join(CustomRole, CustomRole.id == UserCustomRole.custom_role_id)
+        .where(sa.func.lower(CustomRole.name) == role.strip().lower())
+    ).scalars().all())
+
+
+def _users_with_any_role(db: Session) -> set[int]:
+    ids = set(db.execute(select(UserRole.user_id)).scalars().all())
+    from models.custom_roles import CustomRole, UserCustomRole
+    ids |= set(db.execute(
+        select(UserCustomRole.user_id).join(CustomRole, CustomRole.id == UserCustomRole.custom_role_id)
+        .where(CustomRole.is_active.is_(True))
+    ).scalars().all())
+    return ids
+
+
+def _optional_user_facts(db: Session, ids: list[int]) -> tuple[dict[int, str], set[int]]:
+    """Last successful sign-in (ISO, from login_data) and who must change their
+    password — both best-effort: a table / column that is not there reads empty."""
+    last: dict[int, str] = {}
+    pending: set[int] = set()
+    if not ids:
+        return last, pending
+    try:
+        with db.begin_nested():
+            for uid, at in db.execute(sa.text(
+                "SELECT user_id, MAX(login_at_ist) FROM login_data WHERE success = 1 AND user_id IN :ids "
+                "GROUP BY user_id").bindparams(sa.bindparam("ids", expanding=True)), {"ids": ids}).all():
+                if uid is not None and at:
+                    last[int(uid)] = str(at)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with db.begin_nested():
+            pending = {int(i) for i in db.execute(sa.text(
+                "SELECT id FROM registration_data WHERE COALESCE(must_change_password, FALSE) AND id IN :ids"
+            ).bindparams(sa.bindparam("ids", expanding=True)), {"ids": ids}).scalars().all()}
+    except Exception:  # noqa: BLE001
+        pass
+    return last, pending
+
+
+def _password_pending_ids(db: Session) -> set[int] | None:
+    try:
+        with db.begin_nested():
+            return {int(i) for i in db.execute(sa.text(
+                "SELECT id FROM registration_data WHERE COALESCE(must_change_password, FALSE)")).scalars().all()}
+    except Exception:  # noqa: BLE001 — column not there yet
+        return None
+
+
+def list_users(db: Session, p: PageParams, *, status: str | None = None,
+               role: str | None = None) -> tuple[list[dict], dict]:
+    """Application logins (legacy role = hr), newest-id order kept stable.
+
+    Filters (7 Oct 2026): `status` active · inactive · no_role · password_pending,
+    `role` = a built-in or custom role name. `meta.counts` gives the header tiles
+    over the WHOLE list (search applied, filters not), so the numbers never move
+    when a chip is clicked."""
+    if status and status not in USER_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of {', '.join(USER_STATUSES)}")
     # Users tab manages application login accounts only (legacy role = hr).
     # Candidate interview accounts stay out of Admin/CEO user management.
-    clauses = ["LOWER(role) = 'hr'"]
+    base = ["LOWER(role) = 'hr'"]
     params: dict = {}
     if p.search:
-        clauses.append("(LOWER(username) LIKE :like OR LOWER(email) LIKE :like)")
+        base.append("(LOWER(username) LIKE :like OR LOWER(email) LIKE :like OR LOWER(full_name) LIKE :like)")
         params["like"] = f"%{p.search.lower()}%"
-    where = "WHERE " + " AND ".join(clauses)
-    total = db.execute(
-        sa.text(f"SELECT COUNT(*) FROM registration_data {where}"), params
-    ).scalar() or 0
-    rows = db.execute(
-        sa.text(
-            "SELECT id, full_name, email, username, role, "
-            "COALESCE(is_active, TRUE) AS is_active "
-            f"FROM registration_data {where} ORDER BY id ASC "
-            "LIMIT :limit OFFSET :offset"
-        ),
-        {**params, "limit": p.limit, "offset": p.offset},
+    all_rows = db.execute(
+        sa.text(f"SELECT id, COALESCE(is_active, TRUE) AS is_active FROM registration_data WHERE {' AND '.join(base)}"),
+        params,
     ).mappings().all()
+    with_role = _users_with_any_role(db)
+    pending_all = _password_pending_ids(db) or set()
+    every = [int(r["id"]) for r in all_rows]
+    active_ids = {int(r["id"]) for r in all_rows if r["is_active"]}
+    counts = {
+        "total": len(every),
+        "active": len(active_ids),
+        "inactive": len(every) - len(active_ids),
+        "no_role": len([i for i in every if i not in with_role]),
+        "password_pending": len([i for i in every if i in pending_all]),
+    }
+    keep = set(every)
+    if status == "active":
+        keep &= active_ids
+    elif status == "inactive":
+        keep -= active_ids
+    elif status == "no_role":
+        keep -= with_role
+    elif status == "password_pending":
+        keep &= pending_all
+    if role:
+        keep &= _role_user_ids(db, role)
+    ordered = [i for i in every if i in keep]
+    ordered.sort()
+    total = len(ordered)
+    page_ids = ordered[p.offset:p.offset + p.limit]
+    rows = []
+    if page_ids:
+        rows = db.execute(
+            sa.text(
+                "SELECT id, full_name, email, username, role, "
+                "COALESCE(is_active, TRUE) AS is_active "
+                "FROM registration_data WHERE id IN :ids ORDER BY id ASC"
+            ).bindparams(sa.bindparam("ids", expanding=True)),
+            {"ids": page_ids},
+        ).mappings().all()
     ids = [r["id"] for r in rows]
     roles = _roles_map(db, ids)
     tabs = _tab_access_map(db, ids)
     templates = _template_map(db, ids)
     from services.custom_roles import custom_roles_by_user
     customs = custom_roles_by_user(db, ids)
-    users = [_user_out(dict(r), roles.get(r["id"], []), tabs.get(r["id"]), templates.get(r["id"]),
-                       custom_roles=customs.get(r["id"], []))
-             for r in rows]
+    last_login, pending = _optional_user_facts(db, ids)
+    linked = set(db.execute(select(Employee.user_id).where(Employee.user_id.in_(ids or [-1]))).scalars().all())
+    users = []
+    for r in rows:
+        out = _user_out(dict(r), roles.get(r["id"], []), tabs.get(r["id"]), templates.get(r["id"]),
+                        custom_roles=customs.get(r["id"], []))
+        out["last_login"] = last_login.get(r["id"])
+        out["must_change_password"] = r["id"] in pending
+        out["has_employee"] = r["id"] in linked
+        users.append(out)
     pages = (total + p.limit - 1) // p.limit if p.limit else 1
-    meta = {"page": p.page, "limit": p.limit, "total": total, "pages": pages}
+    meta = {"page": p.page, "limit": p.limit, "total": total, "pages": pages, "counts": counts}
     return users, meta
 
 
@@ -357,7 +463,7 @@ def create_user(db: Session, full_name: str, email: str, username: str,
 
 
 def replace_roles(db: Session, user_id: int, role_names: list[str],
-                  custom_role_ids: list[int] | None = None) -> dict:
+                  custom_role_ids: list[int] | None = None, actor_id: int | None = None) -> dict:
     """Replace the built-in roles and — when `custom_role_ids` is given — the
     custom roles too, in ONE save (the Edit Roles dialog lists both). `None`
     leaves the custom set untouched so older callers keep their behaviour."""
@@ -365,6 +471,8 @@ def replace_roles(db: Session, user_id: int, role_names: list[str],
 
     row = _require_user_row(db, user_id)
     members = [_role_member(n) for n in dict.fromkeys(role_names or [])]
+    if not ({m.value for m in members} & ADMIN_ROLE_NAMES):
+        guard_admin_removal(db, user_id, actor_id, "remove the Admin / CEO role from")
     db.execute(delete(UserRole).where(UserRole.user_id == user_id))
     for member in members:
         role = _get_or_create_role(db, member)
@@ -387,8 +495,19 @@ def replace_roles(db: Session, user_id: int, role_names: list[str],
                      custom_roles=customs)
 
 
-def set_user_active(db: Session, user_id: int, active: bool) -> dict:
+def set_user_active(db: Session, user_id: int, active: bool, actor_id: int | None = None,
+                    reason: str | None = None) -> dict:
+    """(De)activate a login. Deactivating needs a reason (≥ MIN_REASON chars — it is
+    the audit trail's answer to "why can't X sign in?"), never yourself, never the
+    last active Admin / CEO (7 Oct 2026)."""
     _require_user_row(db, user_id)
+    if not active:
+        if actor_id is not None and int(actor_id) == int(user_id):
+            raise HTTPException(status_code=400, detail="You cannot deactivate your own account.")
+        if len((reason or "").strip()) < MIN_REASON:
+            raise HTTPException(status_code=400,
+                                detail=f"Give a reason for deactivating (at least {MIN_REASON} characters).")
+        guard_admin_removal(db, user_id, None, "deactivate")
     db.execute(
         sa.text("UPDATE registration_data SET is_active = :a WHERE id = :i"),
         {"a": active, "i": user_id},
@@ -399,78 +518,123 @@ def set_user_active(db: Session, user_id: int, active: bool) -> dict:
 
 
 def _table_has_column(db: Session, table: str, column: str) -> bool:
-    return bool(
-        db.execute(
-            sa.text(
-                "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = :t AND column_name = :c"
-            ),
-            {"t": table, "c": column},
-        ).scalar()
-    )
+    """Does `table.column` exist? information_schema on Postgres, the SQLAlchemy
+    inspector elsewhere (SQLite has no information_schema)."""
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        return bool(
+            db.execute(
+                sa.text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ),
+                {"t": table, "c": column},
+            ).scalar()
+        )
+    try:
+        return any(col["name"] == column for col in sa.inspect(db.connection()).get_columns(table))
+    except Exception:  # noqa: BLE001 — no such table
+        return False
 
 
-def _detach_user_refs(db: Session, user_id: int, reassign_to: int) -> None:
-    """Clear/reassign FK refs so Admin/CEO can hard-delete login accounts."""
-    nullable = [
-        ("candidate_profiles", "ta_owner_id"),
-        ("timesheets", "approved_by"),
-        ("timesheet_uploads", "uploaded_by"),
-        ("interview_events", "created_by"),
-        ("leave_applications", "decided_by"),
-        ("requirements", "sales_head_approved_by"),
-        ("requirements", "engineering_reviewed_by"),
-        ("requirement_documents", "uploaded_by"),
-        ("resumes", "screened_by"),
-        ("ai_interview_links", "scheduled_by"),
-        ("invoices", "approved_by"),
-        ("opportunity_documents", "uploaded_by"),
-        ("opportunities", "sales_head_approved_by"),
-        ("template_requests", "fulfilled_by"),
-        ("template_requests", "prepared_by"),
-        ("employees", "user_id"),
-    ]
-    owned = [
-        ("user_roles", "user_id"),
-        ("user_profiles", "user_id"),
-        ("notifications", "user_id"),
-        ("user_table_preferences", "user_id"),
-        ("timesheet_drafts", "user_id"),
-        ("requirement_watchers", "user_id"),
-        ("opportunity_watchers", "user_id"),
-        ("invoice_watchers", "user_id"),
-        ("login_history", "user_id"),
-    ]
-    reassign = [
-        ("requirements", "created_by"),
-        ("requirement_comments", "posted_by"),
-        ("opportunities", "created_by"),
-        ("invoices", "created_by"),
-        ("template_requests", "requested_by"),
-    ]
-    for table, col in nullable:
-        if _table_has_column(db, table, col):
-            db.execute(
-                sa.text(f"UPDATE {table} SET {col} = NULL WHERE {col} = :i"),
-                {"i": user_id},
-            )
-    for table, col in owned:
-        if _table_has_column(db, table, col):
-            db.execute(sa.text(f"DELETE FROM {table} WHERE {col} = :i"), {"i": user_id})
-    for table, col in reassign:
-        if _table_has_column(db, table, col):
-            db.execute(
-                sa.text(f"UPDATE {table} SET {col} = :new WHERE {col} = :old"),
-                {"new": reassign_to, "old": user_id},
-            )
+#: Rows that belong to the LOGIN itself — removed with the account. Anything else
+#: pointing at the user is HISTORY (they created / approved / owned something).
+_OWNED_REFS: tuple[tuple[str, str], ...] = (
+    ("user_roles", "user_id"), ("user_profiles", "user_id"), ("user_custom_roles", "user_id"),
+    ("notifications", "user_id"), ("user_table_preferences", "user_id"), ("user_notify_prefs", "user_id"),
+    ("timesheet_drafts", "user_id"), ("requirement_watchers", "user_id"), ("opportunity_watchers", "user_id"),
+    ("invoice_watchers", "user_id"), ("login_history", "user_id"), ("login_data", "user_id"),
+    ("password_reset_tokens", "user_id"), ("requirement_ta_assignments", "user_id"),
+)
+#: The person's record survives the login: the link is cleared, never the employee.
+_UNLINK_REFS: tuple[tuple[str, str], ...] = (("employees", "user_id"),)
+
+#: References that are history even where no FK constraint exists (activity logs
+#: carry plain user ids) — counted on every dialect.
+_HISTORY_REFS: tuple[tuple[str, str, str], ...] = (
+    ("opportunities", "created_by", "opportunities created"),
+    ("requirements", "created_by", "positions raised"),
+    ("invoices", "created_by", "invoices created"),
+    ("timesheets", "approved_by", "timesheets approved"),
+    ("candidate_profiles", "ta_owner_id", "candidates owned"),
+    ("interview_events", "created_by", "interview rounds"),
+    ("leave_applications", "decided_by", "leave decisions"),
+    ("requirements", "engineering_reviewed_by", "RMG approvals"),
+    ("opportunities", "sales_head_approved_by", "Sales Head approvals"),
+    ("ai_interview_links", "scheduled_by", "AI interviews scheduled"),
+    ("opportunity_activity_log", "user_id", "opportunity activity"),
+    ("requirement_activity_log", "user_id", "position activity"),
+    ("candidate_profile_activity_log", "user_id", "candidate activity"),
+    ("po_activity_log", "user_id", "purchase-order activity"),
+    ("timesheet_activity_log", "user_id", "timesheet activity"),
+)
+
+
+def _fk_refs_postgres(db: Session) -> list[tuple[str, str]]:
+    """Every (table, column) with a FOREIGN KEY to registration_data (Postgres)."""
+    try:
+        with db.begin_nested():
+            rows = db.execute(sa.text(
+                "SELECT c.conrelid::regclass::text AS tbl, a.attname AS col "
+                "FROM pg_constraint c "
+                "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) "
+                "WHERE c.contype = 'f' AND c.confrelid = 'registration_data'::regclass"
+            )).all()
+        return [(str(t).split(".")[-1].strip('"'), str(c)) for t, c in rows]
+    except Exception:  # noqa: BLE001 — discovery is a bonus over the static list
+        return []
+
+
+def user_history(db: Session, user_id: int) -> list[dict]:
+    """What this login did that other records point at — `[{label, count}]`, biggest
+    first. Empty = the account can be deleted without rewriting anybody's history."""
+    owned = set(_OWNED_REFS) | set(_UNLINK_REFS)
+    refs: dict[tuple[str, str], str] = {(t, c): label for t, c, label in _HISTORY_REFS}
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        for t, c in _fk_refs_postgres(db):
+            if (t, c) not in owned and (t, c) not in refs:
+                refs[(t, c)] = t.replace("_", " ")
+    out: list[dict] = []
+    for (table, col), label in refs.items():
+        if not _table_has_column(db, table, col):
+            continue
+        try:
+            with db.begin_nested():
+                n = db.execute(sa.text(f"SELECT COUNT(*) FROM {table} WHERE {col} = :i"),  # noqa: S608 — constants
+                               {"i": user_id}).scalar() or 0
+        except Exception:  # noqa: BLE001
+            continue
+        if n:
+            out.append({"label": label, "count": int(n)})
+    return sorted(out, key=lambda r: -r["count"])
 
 
 def delete_user(db: Session, user_id: int, actor_id: int) -> dict:
-    """Hard-delete a login account. Admin/CEO: detach/reassign FKs first."""
+    """Delete a login that has NO history (7 Oct 2026).
+
+    The old path blanked every "approved by" and handed the person's opportunities,
+    positions and invoices to the admin who clicked Delete — rewriting who owned
+    and signed off what (and the Sales scoping / revenue split that reads it). An
+    account that did anything is now DEACTIVATED, never deleted: 409 lists what it
+    did. A mistaken / unused account still deletes cleanly."""
     row = _require_user_row(db, user_id)
     if user_id == actor_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account.")
-    _detach_user_refs(db, user_id, reassign_to=actor_id)
+    guard_admin_removal(db, user_id, None, "delete")
+    history = user_history(db, user_id)
+    if history:
+        what = ", ".join(f"{h['count']} {h['label']}" for h in history[:4])
+        raise HTTPException(
+            status_code=409,
+            detail=(f"{row.get('full_name') or row.get('username')} has history ({what}) — deleting would "
+                    "rewrite who created and approved those records. Deactivate the account instead; "
+                    "a deactivated account cannot sign in."),
+        )
+    for table, col in _OWNED_REFS:
+        if _table_has_column(db, table, col):
+            db.execute(sa.text(f"DELETE FROM {table} WHERE {col} = :i"), {"i": user_id})  # noqa: S608
+    for table, col in _UNLINK_REFS:
+        if _table_has_column(db, table, col):
+            db.execute(sa.text(f"UPDATE {table} SET {col} = NULL WHERE {col} = :i"), {"i": user_id})  # noqa: S608
     try:
         db.execute(sa.text("DELETE FROM registration_data WHERE id = :i"), {"i": user_id})
         db.commit()
@@ -478,12 +642,94 @@ def delete_user(db: Session, user_id: int, actor_id: int) -> dict:
         db.rollback()
         raise HTTPException(
             status_code=409,
-            detail=(
-                "This user is still referenced by other records and cannot be deleted. "
-                "Deactivate the user instead — deactivated accounts cannot log in."
-            ),
+            detail=("This user is still referenced by other records and cannot be deleted. "
+                    "Deactivate the user instead — deactivated accounts cannot sign in."),
         )
-    return {"id": user_id, "username": row["username"]}
+    return {"id": user_id, "username": row["username"], "full_name": row.get("full_name") or ""}
+
+
+# ------------------------------------------------------------ guards (7 Oct 2026)
+
+ADMIN_ROLE_NAMES = frozenset({"Admin", "CEO"})
+#: Minimum length of a deactivation reason.
+MIN_REASON = 5
+
+
+def active_admin_ids(db: Session) -> set[int]:
+    """Active logins holding the built-in Admin or CEO role."""
+    rows = db.execute(
+        select(UserRole.user_id, Role.name).join(Role, Role.id == UserRole.role_id)
+    ).all()
+    ids = {uid for uid, name in rows
+           if (name.value if hasattr(name, "value") else str(name)) in ADMIN_ROLE_NAMES}
+    if not ids:
+        return set()
+    active = db.execute(sa.text(
+        "SELECT id FROM registration_data WHERE COALESCE(is_active, TRUE) AND id IN :ids"
+    ).bindparams(sa.bindparam("ids", expanding=True)), {"ids": sorted(ids)}).scalars().all()
+    return {int(i) for i in active}
+
+
+def guard_admin_removal(db: Session, user_id: int, actor_id: int | None, what: str) -> None:
+    """Refuse to take the last active Admin / CEO out (and your own admin role away).
+
+    `what` completes "You cannot … yourself" / "… the last active Admin / CEO".
+    Only relevant when the user currently IS an active admin."""
+    admins = active_admin_ids(db)
+    if int(user_id) not in admins:
+        return
+    if actor_id is not None and int(actor_id) == int(user_id):
+        raise HTTPException(status_code=400,
+                            detail="You cannot remove your own Admin / CEO role — ask another Admin.")
+    if len(admins) <= 1:
+        raise HTTPException(status_code=400,
+                            detail=f"You cannot {what} the last active Admin / CEO — nobody could manage "
+                                   "access afterwards. Make someone else Admin first.")
+
+
+def open_work(db: Session, user_id: int) -> list[dict]:
+    """Live work still pointing at this person — shown before deactivating so it can
+    be handed over (a warning only; nothing is reassigned). `[{key, label, count, hint}]`."""
+    from models import (
+        CandidateProfile, Opportunity, PipelineStage, PipelineStatus, Requirement, RequirementStatus,
+    )
+    from services.candidate_profiles import REJECTED_BUCKET
+    closed_profile = [PipelineStatus(s) for s in REJECTED_BUCKET] + [PipelineStatus.JOINED]
+    out: list[dict] = []
+
+    def _add(key: str, label: str, hint: str, stmt) -> None:
+        try:
+            with db.begin_nested():
+                n = db.execute(stmt).scalar() or 0
+        except Exception:  # noqa: BLE001 — one missing table must not hide the rest
+            return
+        if n:
+            out.append({"key": key, "label": label, "count": int(n), "hint": hint})
+
+    from sqlalchemy import func as _f
+    _add("candidates", "Candidates they own as TA",
+         "Reassign the TA owner so the candidates' notices reach someone.",
+         select(_f.count()).select_from(CandidateProfile).where(
+             CandidateProfile.ta_owner_id == user_id,
+             _f.coalesce(CandidateProfile.is_hidden, False).is_(False),
+             CandidateProfile.pipeline_status.notin_(closed_profile)))
+    try:
+        from models.requirements import RequirementTaAssignment
+        live = [RequirementStatus.OPEN_FOR_SOURCING, RequirementStatus.POSTED_ON_PORTALS,
+                RequirementStatus.IN_PROGRESS, RequirementStatus.PENDING_ENGINEERING_REVIEW]
+        _add("positions", "Positions assigned to them",
+             "Change the sourcing team on these positions.",
+             select(_f.count()).select_from(RequirementTaAssignment)
+             .join(Requirement, Requirement.id == RequirementTaAssignment.requirement_id)
+             .where(RequirementTaAssignment.user_id == user_id, Requirement.status.in_(live)))
+    except ImportError:
+        pass
+    _add("deals", "Open opportunities they raised",
+         "Another Sales owner should pick these up.",
+         select(_f.count()).select_from(Opportunity).where(
+             Opportunity.created_by == user_id,
+             Opportunity.pipeline_stage.in_([PipelineStage.NEW, PipelineStage.ACTIVE])))
+    return out
 
 
 def toggle_portal_access(db: Session, user_id: int) -> dict:
@@ -541,6 +787,9 @@ def reset_password(db: Session, user_id: int, new_password: str | None, actor_id
     except pwh.PasswordPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     update_user_password(_legacy_db_target(), int(row["id"]), pwh.hash_password(password))
+    # The next sign-in must set a password only the user knows (7 Oct 2026).
+    from auth_db import set_must_change_password
+    set_must_change_password(_legacy_db_target(), int(row["id"]), True)
     return {
         "id": int(row["id"]),
         "username": row["username"] or "",

@@ -21,12 +21,25 @@ the 28 Sep deploy that started itemising interviews:
 
 Both run at startup (background) and from the daily `prompt_log_retention` job,
 are idempotent, never raise, and touch only rows they can prove.
+
+7 Oct 2026 — this module used to read EVERY `interview_progress` row with its
+`questions` / `answers` / `meta` JSON on every run (each worker's startup and
+the nightly job), a full-table scan of the heaviest columns to repair a ledger
+that was repaired weeks ago. Now: the attribution reads the orphan calls
+FIRST and stops when there are none; interview rows are read slim (no JSON,
+the template name extracted in SQL); the audio estimate reads `questions` /
+`answers` only for the pre-`AUDIO_LOGGED_SINCE` interviews that still lack
+them; and a run that finds nothing to do records `ai.cost_repair_done` in the
+CRM `app_settings` (value `<store hash>:<date>`), after which `repair_ai_costs`
+is a no-op for that store. Delete that row (Settings ▸ Settings KV) to force
+a full re-run.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from prompt_logger import _connect, _is_postgres
 
@@ -124,18 +137,62 @@ def _json(raw):
 
 # ------------------------------------------------------------------ DB work
 
-def _interviews(cur) -> list[dict]:
-    cur.execute(
-        "SELECT interview_id, candidate_name, candidate_email, status, created_at_ist, "
-        "finalized_at, last_activity_at, questions, answers, meta FROM interview_progress")
+#: Slim interview columns — never the JSON bodies.
+_SLIM = "interview_id, candidate_name, candidate_email, status, created_at_ist, finalized_at, last_activity_at"
+
+
+def _template_sql(pg: bool) -> str:
+    """`meta.job_title` pulled out in SQL so `meta` itself never travels."""
+    if pg:
+        return "meta->>'job_title'"
+    return "CASE WHEN json_valid(meta) THEN json_extract(meta, '$.job_title') END"
+
+
+def _interview_call_clause() -> str:
+    """`call_type` starts with one of INTERVIEW_CALL_PREFIXES — spelled with
+    SUBSTR, never LIKE: psycopg2 reads a bare `%` as a parameter marker."""
+    return "(" + " OR ".join(
+        f"SUBSTR(call_type, 1, {len(p)}) = '{p}'" for p in INTERVIEW_CALL_PREFIXES) + ")"
+
+
+def _interviews(cur, pg: bool, *, created_before: str | None = None, pre_audio: bool = False) -> list[dict]:
+    """Slim interview rows (+ `template`), optionally bounded. No JSON columns."""
+    where: list[str] = []
+    params: list = []
+    ph = "%s" if pg else "?"
+    if created_before:
+        where.append(f"created_at_ist <= {ph}")
+        params.append(created_before)
+    if pre_audio:
+        where.append(f"SUBSTR(created_at_ist, 1, 10) < {ph}")
+        params.append(AUDIO_LOGGED_SINCE)
+        fin = ", ".join([ph] * len(FINISHED))
+        where.append(f"(COALESCE(finalized_at, '') <> '' OR LOWER(COALESCE(status, '')) IN ({fin}))")
+        params.extend(sorted(FINISHED))
+    sql = f"SELECT {_SLIM}, {_template_sql(pg)} AS template FROM interview_progress"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    cur.execute(sql, tuple(params))
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _interview_bodies(cur, pg: bool, interview_id: str) -> tuple[list, list]:
+    """`questions` / `answers` of ONE interview — read only when an estimate is written."""
+    ph = "%s" if pg else "?"
+    cur.execute(f"SELECT questions, answers FROM interview_progress WHERE interview_id = {ph}", (interview_id,))
+    row = cur.fetchone()
+    if not row:
+        return [], []
+    return _json(row[0]), _json(row[1])
+
+
 def attribute_orphan_calls(db_target: str) -> int:
     """Give each unattributed interview-kind call its interview, when exactly
-    one session window holds it. Returns rows updated."""
-    ph = "%s" if _is_postgres(db_target) else "?"
+    one session window holds it. Returns rows updated. Reads the orphans
+    first and touches `interview_progress` only when there are some."""
+    pg = _is_postgres(db_target)
+    ph = "%s" if pg else "?"
     updated = 0
     try:
         conn = _connect(db_target)
@@ -143,30 +200,30 @@ def attribute_orphan_calls(db_target: str) -> int:
         return 0
     try:
         cur = conn.cursor()
-        interviews = _interviews(cur)
+        cur.execute(
+            "SELECT id, call_type, created_at_ist FROM ai_prompt_logs "
+            f"WHERE (interview_id IS NULL OR interview_id = '') AND {_interview_call_clause()}")
+        orphans = [(row_id, str(ct or ""), parse_ist(at)) for row_id, ct, at in cur.fetchall()]
+        orphans = [o for o in orphans if o[2] is not None]
+        if not orphans:
+            return 0
+        # Only a session that started before the last orphan (plus the pad) can hold one.
+        latest = max(o[2] for o in orphans) + WINDOW_BEFORE
         windows: list[tuple[str, datetime, datetime]] = []
         facts: dict[str, dict] = {}
-        for iv in interviews:
+        for iv in _interviews(cur, pg, created_before=latest.replace(tzinfo=IST).isoformat()):
             w = session_window(iv.get("created_at_ist"), iv.get("finalized_at"), iv.get("last_activity_at"))
             if w:
                 windows.append((str(iv["interview_id"]), w[0], w[1]))
-                meta = _json(iv.get("meta")) if not isinstance(iv.get("meta"), dict) else iv["meta"]
                 facts[str(iv["interview_id"])] = {
                     "name": str(iv.get("candidate_name") or ""),
                     "email": str(iv.get("candidate_email") or "").lower(),
-                    "template": str((meta or {}).get("job_title") or "") if isinstance(meta, dict) else "",
+                    "template": str(iv.get("template") or ""),
                 }
         if not windows:
             return 0
-        cur.execute(
-            "SELECT id, call_type, created_at_ist FROM ai_prompt_logs "
-            "WHERE interview_id IS NULL OR interview_id = ''")
-        for row_id, call_type, at in cur.fetchall():
-            ct = str(call_type or "")
-            if not ct.startswith(INTERVIEW_CALL_PREFIXES):
-                continue
-            t = parse_ist(at)
-            iid = match_interview(t, windows) if t else None
+        for row_id, _ct, t in orphans:
+            iid = match_interview(t, windows)
             if not iid:
                 continue
             f = facts[iid]
@@ -195,7 +252,8 @@ def estimate_missing_audio(db_target: str, since: str = AUDIO_LOGGED_SINCE) -> i
     has no audio rows. Returns rows inserted."""
     from services.ai_pricing import estimate_cost_usd
 
-    ph = "%s" if _is_postgres(db_target) else "?"
+    pg = _is_postgres(db_target)
+    ph = "%s" if pg else "?"
     inserted = 0
     try:
         conn = _connect(db_target)
@@ -208,16 +266,17 @@ def estimate_missing_audio(db_target: str, since: str = AUDIO_LOGGED_SINCE) -> i
             "AND (call_type = 'tts' OR SUBSTR(call_type, 1, 4) = 'tts_' "
             "OR call_type = 'transcribe' OR SUBSTR(call_type, 1, 11) = 'transcribe_')")
         has_audio = {str(r[0]) for r in cur.fetchall()}
-        for iv in _interviews(cur):
+        # Slim rows, already narrowed in SQL to finished pre-`since` interviews.
+        for iv in _interviews(cur, pg, pre_audio=since == AUDIO_LOGGED_SINCE):
             iid = str(iv["interview_id"])
             created = parse_ist(iv.get("created_at_ist"))
             status = str(iv.get("status") or "").strip().lower()
             finished = bool(str(iv.get("finalized_at") or "").strip()) or status in FINISHED
             if iid in has_audio or created is None or not finished or created.date().isoformat() >= since:
                 continue
-            tts_s, stt_s, chars = audio_estimate(_json(iv.get("questions")), _json(iv.get("answers")))
-            meta = iv.get("meta") if isinstance(iv.get("meta"), dict) else _json(iv.get("meta"))
-            template = str(meta.get("job_title") or "") if isinstance(meta, dict) else ""
+            # The JSON bodies travel only for an interview that still needs its estimate.
+            tts_s, stt_s, chars = audio_estimate(*_interview_bodies(cur, pg, iid))
+            template = str(iv.get("template") or "")
             for kind, model, seconds, tokens in (
                 ("tts", "gpt-4o-mini-tts", tts_s, (chars + 3) // 4),
                 ("transcribe", "gpt-4o-mini-transcribe", stt_s, 0),
@@ -253,12 +312,79 @@ def estimate_missing_audio(db_target: str, since: str = AUDIO_LOGGED_SINCE) -> i
     return inserted
 
 
+# ------------------------------------------------------------------ completion marker
+
+#: CRM `app_settings` key; value is `<store hash>:<ISO date>` of the run that found nothing left.
+REPAIR_DONE_KEY = "ai.cost_repair_done"
+_DONE_IN_PROCESS: dict[str, str] = {}
+
+
+def _store_hash(db_target: str) -> str:
+    return hashlib.sha1(str(db_target or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _marker_read() -> str:
+    """The stored marker, or "" — never raises (no CRM DB in the legacy tests)."""
+    try:
+        from sqlalchemy import text
+
+        from crm_db import get_session_factory
+
+        session = get_session_factory()()
+        try:
+            row = session.execute(text("SELECT value FROM app_settings WHERE key = :k"),
+                                  {"k": REPAIR_DONE_KEY}).first()
+            return str(row[0] or "") if row else ""
+        finally:
+            session.close()
+    except Exception:
+        return ""
+
+
+def _marker_write(value: str) -> bool:
+    try:
+        from sqlalchemy import text
+
+        from crm_db import get_session_factory
+
+        session = get_session_factory()()
+        try:
+            with session.begin():
+                session.execute(text(
+                    "INSERT INTO app_settings (key, value, description) VALUES (:k, :v, :d) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"),
+                    {"k": REPAIR_DONE_KEY, "v": value,
+                     "d": "AI cost ledger repair finished (delete this row to run it again)"})
+            return True
+        finally:
+            session.close()
+    except Exception as exc:
+        logger.debug("cost repair marker not written: %s", exc)
+        return False
+
+
+def repair_done(db_target: str) -> bool:
+    """True once a run on THIS store found nothing left to repair."""
+    h = _store_hash(db_target)
+    if _DONE_IN_PROCESS.get(h):
+        return True
+    return _marker_read().startswith(h + ":")
+
+
 def repair_ai_costs(db_target: str) -> dict:
-    """Both repairs, in order (attribution first, so the audio check sees it)."""
+    """Both repairs, in order (attribution first, so the audio check sees it).
+    A no-op once a run found nothing to do (`repair_done`)."""
     if not db_target:
         return {"attributed": 0, "estimated_rows": 0}
+    if repair_done(db_target):
+        return {"attributed": 0, "estimated_rows": 0, "skipped": True}
     out = {"attributed": attribute_orphan_calls(db_target),
            "estimated_rows": estimate_missing_audio(db_target)}
     if out["attributed"] or out["estimated_rows"]:
         logger.info("AI cost ledger repaired: %s", out)
+    else:
+        marker = f"{_store_hash(db_target)}:{date.today().isoformat()}"
+        _DONE_IN_PROCESS[_store_hash(db_target)] = marker
+        if _marker_write(marker):
+            logger.info("AI cost ledger repair complete — recorded %s", REPAIR_DONE_KEY)
     return out

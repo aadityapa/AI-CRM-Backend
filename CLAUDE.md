@@ -2306,6 +2306,395 @@ designation_id · karnex / customer onboarding dates) may CHANGE only for HR (by
 never fails. Relocation stays in Locations, outside the rule. F-V2 also drops the "CTC Approval" figure from the profile
 (header + Commercials); the column and the Sales Head approval flow are untouched. Deploy: restart.
 
+**7 Oct 2026 — the bell feed made light + a stale dashboard build can no longer be served, migration 0122, head is
+now 0122 (`tests/test_notification_feed.py`, 3):** (1) `GET /api/notifications` (polled every 30 s from every open tab)
+selected whole ORM rows (full `message` Text — email bodies), ran a `COUNT(*)` over the user's ENTIRE history via
+`paginate` and an unread count, through single-column indexes. Now: `since_id` returns only rows newer than the client's
+newest (usually none); no total unless `with_total=true`; `message` clipped in SQL to `MESSAGE_PREVIEW_CHARS`=400
+(`_FEED_COLUMNS`). `services.crm_common.paginate(..., scalars=False)` serves column selects. **0122** adds
+`ix_notifications_user_feed` (user_id, created_at DESC, id DESC) and the partial `ix_notifications_user_unread` (user_id)
+WHERE NOT is_read (`IF NOT EXISTS`). (2) `main._admin_dashboard_assets_ok` now also requires every `/admin/assets/…` file
+the built `index.html` names to exist (`_ADMIN_ASSET_REF_RE`); a stale index (F-V2's `dist/index.html` used to be tracked
+in git, so a pull could bring an old one back) used to pass the "contains /admin/assets/" check, skip the rebuild and serve
+a blank dashboard — it now triggers the startup build and logs "dist is stale". F-V2 untracked `dist/` the same day.
+Deploy: `python -m alembic upgrade head`, restart.
+
+**7 Oct 2026 (later) — unapproved deals are Sales' only; Applied Candidates = the Screening Desk; desk filters list
+everything (`tests/test_unapproved_deal_visibility.py`, 4; no migration):** screenshot report — RMG / GM saw C-2026-00102 /
+00103 (Pending Sales Head approval) on their Opportunities list. `services/requirements.sees_unapproved_deals(user)` (Sales ·
+Sales Head (· the Sales Manager, implied Sales) · Admin / CEO) + `approved_deals_clause()`; `GET /api/opportunities` adds the
+clause for everyone else and `GET /api/opportunities/{id}` answers 404 for an unapproved deal (existence never leaks). The
+Pending Approval tab therefore shows RMG / GM only the positions waiting for THEIR review. Applied Candidates rows now carry
+the desk's per-candidate facts — `routers/crm/resumes._with_screening_extras` (three batched queries, savepointed,
+best-effort): `direct_to_sales_block`, `internal_employee` + `fast_track_block` (`screening_desk.internal_matches`),
+`new_results` (`rmg_tasks.unreviewed_results`). `screening_desk._options` lists EVERY live position / opportunity /
+customer (`_live_positions`: latest requirement per New / Active deal in `TA_LIVE_STATUSES`) and every active TA, each with
+`on_desk` (candidates on the desk now), merged with desk rows. Deploy: restart.
+
+**7 Oct 2026 (night) — Access Control step 1: audit log, safe delete, admin guards, forced password change,
+migration 0123, head is now 0123 (`tests/test_access_safety.py` 13, `test_requirement_jd_skills` +1):** (1) **Audit log** —
+`user_access_log` (`models/user_access_log.py`; NO FK on the user columns so history outlives the account; names
+snapshotted) written ONLY by `services/access_audit.record(...)` (savepoint, never raises; passwords never logged;
+`snapshot(db, uid)` = roles · custom roles · template · tab exceptions · active, `describe()` diffs two). Wired into every
+access change: Users routes (create · roles · tab-access · access-source · activate · deactivate · reset-password ·
+portal-access · delete), invite (`email_flows`), Access Templates (assign · create · edit · delete), Roles (create · edit
+· delete · per-member add/remove) and approval rules (Action Permissions save / reset); the user's own password change
+logs `user.password_changed`. `GET /api/users/access-log?user_id=&group=access|account|security|roles&search=` (Admin/CEO,
+declared BEFORE every `/users/{user_id}` route). Table added to `data_backup.DATASETS["users"]`. (2) **Delete never rewrites
+history** — the old `_detach_user_refs` blanked approvers and REASSIGNED opportunities / positions / invoices to the
+deleting admin (changing Sales scoping and the revenue owner split); gone. `users_admin.user_history(db, uid)` counts
+`_HISTORY_REFS` (+ every FK to `registration_data` discovered via `pg_constraint` on Postgres, minus `_OWNED_REFS` /
+`_UNLINK_REFS`); any history → **409** "deactivate instead" naming what they did. Only a history-free account deletes
+(owned rows removed, `employees.user_id` unlinked). `_table_has_column` uses the SQLAlchemy inspector off Postgres.
+(3) **Guards** (server, not UI): `guard_admin_removal` — never your own Admin/CEO role, never the last ACTIVE Admin/CEO
+(`active_admin_ids`) — in `replace_roles(actor_id=)`, `set_user_active`, `delete_user`; deactivate refuses yourself and
+needs a reason ≥ `MIN_REASON`=5 (`POST …/deactivate {reason}`, `DeactivateIn`). `GET /api/users/{id}/open-work` →
+`{open_work: [candidates owned · positions assigned · open deals], history}` (warning only; nothing reassigned).
+(4) **Forced password change** — `registration_data.must_change_password` (added at startup by
+`auth_db._ensure_registration_columns_*`, both dialects); set by an Admin/CEO reset (`auth_db.set_must_change_password`),
+cleared by `/api/me/change-password` and the email reset. ⚠️ `crm_deps.get_current_user` answers **403
+`PASSWORD_CHANGE_REQUIRED`** on every CRM path except `PASSWORD_CHANGE_ALLOWED_PATHS` (`/api/me`, `/api/me/change-password`,
+`/api/me/profile`); the column probe is cached per process and re-tried after `MUST_CHANGE_REPROBE_S`=300 on failure.
+`CurrentUser.must_change_password`; `/api/me.must_change_password`. (5) **`/auth/refresh` re-reads the account**
+(`auth_db.account_state`) — a deactivated / deleted login can no longer extend an old session. (6) `GET /api/users` takes
+`status` (active · inactive · no_role · password_pending) and `role` (built-in or custom name), searches full name too,
+and returns `meta.counts` (whole list, filters not applied) plus per row `last_login` (MAX successful `login_data`),
+`must_change_password`, `has_employee`. (7) **JD & skills**: a skill listed twice is MERGED
+(`requirements.merge_duplicate_skills`: mandatory if any copy is, higher level wins) instead of 400 "Duplicate skill_id".
+Deploy: `python -m alembic upgrade head`, restart (the startup ALTER adds the password flag). Suite: 1,799 pass, 2 skipped.
+
+**6 Oct 2026 — Applied Candidates: one row per candidate, profile-linked AI L1 reaches the row
+(`test_applied_profile_only_rows` +1; no migration):** screenshot report — Likhith Nelaballi listed twice, both rows
+offering AI L1 / Manual L1 although the AI L1 was done, and no L2. (1) `GET /api/requirements/{id}/resumes` keeps the
+NEWEST resume per candidate on the requirement (`_latest_resume_ids`; rows with no candidate untouched). (2) The resume
+enrichment found AI links by `resume_id` only; one scheduled from the profile / desk (or on an older resume) is linked by
+`profile_id` — `_with_profile_ai` fills the row's `ai_*` fields from `_ai_state_by_profile` and
+`heal_ai_passed_to_review` moves a passed candidate from Sourcing / Technical_Screening to RMG_Review (where RMG asks for
+the L2). (3) ⚠️ A pass is `AI_L1_PASS` = Passed OR the recruiter's "Selected" override (`effective_result`) — the heal
+used the raw AI result, so a GM / RMG pass over a low score never opened the L2; same fix in
+`services/resumes.enrich_resumes_with_ai`. Deploy: restart.
+
+**7 Oct 2026 (late) — "Open report" opens the AI report; a project-wide sweep before the AI-interview work
+(`test_rmg_tasks` re-pinned; no migration):** (1) `rmg_tasks.unreviewed_results` AI rows carry **`report_link`**
+(`report_links.ai_report_link`, candidate emails in ONE query) — the Screening Desk / Applied Candidates "Open report"
+opens THAT interview's report page, not the profile. `main._screens_as_rmg_for_request` lets a screener whose access
+is a custom role / template (GM) read the report endpoints (`_require_interview_report_reader`); F-V2 admits them to
+the `candidateReport` view. (2) Sweep of the §10 list — **fixed**: 8.1 (credit-note reads → `CN_READ =
+gated_read("invoices", Finance, Sales_Head, Sales)`; holiday + leave-policy reads → `any_crm_role`), 8.4 (customer
+list `has_po` via `services/customers.customer_ids_with_po`, one query per page — `serialize_customer(..., has_po=)`),
+8.6 (`@_rl.limit("10/minute")` on `POST /api/apply/{token}` and `POST /api/book/{token}/confirm`; active wherever rate
+limits are on), unused imports / a dead local in `holidays.py` / `slots.py`. **Already fixed before:** A4, 8.5, B1
+(routers/admin.py is gone), P0, F14/P3 thresholds, `crm:calendar`. **Still open, left for the AI-interview phase:**
+A1/A2/A3 (invite login trusts `session_status`; `/verify` re-binds a device while `verified`; no access key = email
+only), A5 (`/report` returns the latest session of anyone), A9 (`/proctor/*` no ownership, client-chosen report
+key), A10 (auth failures as HTTP 200), B2 (terminal sessions re-finalised forever unless `ready`), C1–C3 (`/next`,
+`/submit`, `/setup` without `session_lock`). **Still open, need a decision:** D (two security-header middlewares;
+outer always sends HSTS), E (CORS any-IPv4 fallback when `CORS_ALLOW_ORIGINS` unset — set it in production), 8.3
+(manual invoice `sub_total` overrides the line sum), 8.9 (masters: non-admins may create, never edit), P2 (appraisal
+cycles `int()` vs the client's `Math.round`). Suite: 1,799 pass, 2 skipped.
+
+**6 Oct 2026 — AI L1 scores spoken answers on correctness, not length (`tests/test_spoken_answer_scoring.py`, 4;
+no migration):** screener review — correct short answers ("program counter stores the address of the next instruction",
+"insmod / rmmod" transcribed "ins mode / RM mode", "GDB, KGDB, dmesg") scored 0–20 %. `ai.py`: (1) the per-question
+prompt (`_evaluate_per_question_chunk_openai_indexed`) now says the answers are speech-to-text transcripts (phonetic errors
+read as the intended term, never penalised), correctness decides the band, brevity is not a fault, and carries explicit
+bands (correct-brief 6-7 · partial 4-5 · wrong 0-1) with the reported answers as calibration examples; the adaptive
+`evaluate_turn_with_model` prompt got the same lines. (2) `apply_quality_caps_to_per_question_row`: the word-overlap
+relevance cap (≤ 2.0 under 30) applies only when the model's `technical_accuracy` is also < 40 — a correct answer often
+shares no word with the question; the no-depth ceiling is 7.5 (was 6.5). (3) `answer_is_incomplete` needs < 2 words (was
+< 4) and `INTERVIEW_MIN_ANSWER_CHARS` defaults to 10 (was 22). ⚠️ Applies to reports generated from now on; existing
+reports keep their stored scores. Deploy: restart.
+
+**6 Oct 2026 — re-score a finished AI interview (`tests/test_interview_rescore.py`, 3; no migration):** the scoring
+recalibration above only reached NEW reports. `main.rescore_interview_record(interview_id, by)` re-runs
+`_evaluate_and_store_report` on the session saved in `interview_progress` (ValueError → "transcript not available" when
+none), re-applies HR's per-question exclusions, keeps `final_status` / `finalization_reason` / `hr_decision` and the
+original dates, stamps `report.rescored_at` / `rescored_by` / `previous_score {overall_score, recommendation,
+overall_fitment}`, upserts, and `_persist_hr_record_mirror` re-syncs the CRM link score / verdict. `POST
+/hr/candidates/{cid}/interviews/{iid}/rescore` starts it in a thread (`_RESCORE_STATE`, per process — single worker),
+`GET` the same path reports running / done / failed; both behind `_require_interview_report_reader`. F-V2: "Re-score"
+button + "Re-scored · was N%" chip on the candidate report page (`api/index.rescoreInterview`, polls every 4 s).
+
+**6 Oct 2026 — no AI L1 without a template, on EVERY path (`tests/test_ai_template_status.py`, 5; no migration):**
+screenshot report — a position with no template request and no RMG template still let TA open Schedule AI L1. The
+profile route already refused AFTER the form; the resume-row route (`/api/resumes/{id}/schedule-ai-interview`) and the
+slot invite (preview + send — a booked slot schedules the AI L1) did not check at all, so a candidate could be sent into
+an interview with no questions. `services/ai_interview_bridge.l1_template_status(db, opp, req)` → `{ready, state
+ready|requested|missing, code AI_TEMPLATE_NOT_READY, template_job_id, request {id, tr_number, status, requested_at} (latest
+NOT cancelled, requirement then opportunity), requirement_id, opportunity_id, reason}`; `ensure_l1_template_ready` raises
+400 with that reason and is called by all four routes (pinned by a source scan). Status reads: `GET
+/api/candidate-profiles/{id}/ai-template-status` (`gated_read("profiles", *VIEW_ROLES)`) and `GET
+/api/requirements/{id}/ai-template-status` (`screener_or(gated_read("requirements", TA, RMG, Sales, Sales_Head))`). The
+old `describe_l1_template_gap` stays but is no longer used by the routes. Deploy: restart.
+
+**6 Oct 2026 — TA may Archive a rejected / withdrawn candidate (`tests/test_ta_archive.py`, 3; no migration):**
+`archive_gate` now admits TA; `routers/crm/candidate_profiles.archive_closed_only(db, user)` — a TA holding none of
+RMG / Sales / Sales Head / Admin / CEO and not screening as RMG — limits that login to candidacies in `REJECTED_BUCKET`
+(403 otherwise). RMG / GM / Sales keep the any-stage Archive. Applied Candidates rows carry `closed`. Later: a candidate RMG / GM REJECTED AT SCREENING (`rmg_screening_status = "Rejected"`) also counts — the stage stays Sourcing / Technical Screening, so `REJECTED_BUCKET` alone missed them.
+
+**7 Oct 2026 (night) — ONE template decides every tab and every button, Interview Platform included, migration 0124,
+head is now 0124 (`tests/test_template_tabs_and_buttons.py` 10, `test_approval_permissions` + `test_access_template_authority`
+re-pinned):** reported with a screenshot — an RMG test login was given the Integrity tab in Edit Tab Access and still got 403:
+the menu followed the grant, the route (`_integrity_auth`) hard-coded TA / HR. User rule: "Admin can give access of all tabs,
+each button, each field, all set at template creation." (1) **Interview Platform tabs are registry tabs** —
+`access_registry.IV_TABS` (`iv:dashboard` · `iv:templates` · `iv:candidates` (Reports) · `iv:ats` · `iv:integrityLogs`) join
+`TABS`; `IV_TAB_DEFAULT_ROLES` mirrors F-V2 `INTERVIEW_VIEW_ROLES`; `registry()` tabs carry `group` ("Interview Platform" |
+"CRM") + `default_roles`; `is_iv_tab` / `iv_tabs_for_roles`. AI Costs and Question Bank are deliberately NOT grantable
+(Admin/CEO only). `_strip_removed_keys` keeps iv keys; `validate_access` still refuses `crm:`-prefixed keys. (2) **The legacy
+gates read the template**: `crm_deps._user_access_for_username(username, tab)` → `(uid, roles, template_mode)` — roles =
+built-in ∪ custom roles (implied), `template_mode` = the template's mode for that tab ONLY when the user is restricted AND
+the template names at least one `iv:` key (the shell's "≥ 1 iv key makes the template speak for the platform" rule, now the
+same server-side); `enforce_roles(request, *allowed, tab=, mode=)`: Admin/CEO pass; templated → `mode_satisfies(template_mode,
+mode)` else 403 "Your access template does not grant the '<tab>' tab …"; untemplated → the role rule as before.
+`main._enforce_crm_roles(..., tab=, mode=)` passes it through — Reports delete `iv:candidates` edit · template management /
+authoring `iv:templates` edit (read: view) · HR Setup `iv:dashboard` edit · Integrity `iv:integrityLogs`;
+`_require_interview_report_reader(request, tab="iv:candidates")`; `/ats/score`, `/ats/score/upload`, `/candidates/ranked` →
+`iv:ats`. A per-user override iv key lands in `effective_access.tabs` as "create", so Edit Tab Access now works too.
+(3) **Manage buttons are in the Approvals list**: `Action` gains `tab`; the 8 MANAGE actions name the CRM tab their gate
+reads (`project_employee.manage/rates` → project-employees, `po.manage` → pos, `invoice.manage` + `invoice.revision.request`
+→ invoices, `candidate.email` → candidates, `project.close` → projects, `requirement.positions.request` → requirements);
+`ALL_ACTIONS` / `MANAGE_ACTIONS`; `clean_action_list` keeps any known key; `registry()` lists every action with `kind` + `tab`;
+`implied_buttons(tab_access)` = the manage buttons a tab Edit/Create grant implies. `gated_write_action` MANAGE branch: a
+templated user with a CONFIGURED `action_access` list → tab at view + `user_may` (403 "You are not allowed to: <label>");
+a NULL list keeps the old "tab Edit is authoritative" rule. `access_templates._clean_or_default(raw, role, tab_access)` and
+`custom_roles.create` seed a never-configured list with `default_actions_for_role(role) + implied_buttons(tabs)` — so a
+new template starts with exactly what the gate allowed before. ⚠️ `allowed_approvals` (`/api/me.approvals`) now lists manage
+buttons too, but the UI's manage buttons still key off `useCanAct(tab,"edit")` — a template that removes a button while
+keeping tab Edit shows the button and the server refuses it. **0124** backfills: every non-NULL `action_access` on
+`access_templates` / `custom_roles` gains the manage buttons its Edit grants imply (`_BUTTON_TABS` snapshot), and every
+template naming no `iv:` key gets `{iv tab: view}` for the role tag ∪ its members' built-in roles (`_IV_TAB_ROLES` snapshot) —
+nothing changes on deploy; downgrade no-op. ⚠️ Both maps are snapshots: a new manage action or iv tab needs its own
+backfill. F-V2: the template / role editor shows an INTERVIEW PLATFORM module and "Approvals & buttons" (see that repo's
+notes). Deploy: `python -m alembic upgrade head`, restart, rebuild F-V2; then tick Interview Integrity / Reports / ATS on the
+RMG and GM templates (custom roles: Access Control ▸ Roles, same matrix). Suite: 1,809 pass, 2 skipped.
+
+**7 Oct 2026 — after the AI L1, the screener decides (`tests/test_ai_l1_decision.py`, 3; no migration):** screenshot
+report — a candidate whose AI L1 FAILED, or whom a recruiter put ON HOLD from the report page, sat at Technical Interview
+with no button for RMG / GM: the ladder only opened on a pass (`heal_ai_passed_to_review`). The AI verdict is advice.
+`POST /api/candidate-profiles/{id}/ai-l1-decision {decision: proceed|hold|release, note}` (`rmg_roles`;
+`routers/crm/candidate_profiles.ai_l1_decision`, `latest_ai_link`): **proceed** = `link.hr_decision = selected` (the AI's
+own `result` is KEPT beside it, logged `AI_INTERVIEW_DECISION`) + `hand_off_to_rmg_review` → RMG_Review, where Request L2 /
+Submit to Sales / Reject live; a reason ≥ 5 is required when the AI said Failed (`AI_L1_PASSED` = Passed · Selected need
+none); 409 past the pre-review stages or while the AI is still Pending. **hold** / **release** toggle `hr_decision =
+on_hold` / None without moving the stage. The alternatives keep their routes: `skip-ai-l1` (manual L1 instead — works
+with an AI link in place), `direct-to-sales`, `rmg-screening` Rejected. F-V2: the Applied Candidates row (see that
+repo's notes).
+
+**7 Oct 2026 (late night) — camera + SCREEN recording, one viewer on the report page and the Integrity tab;
+RMG / GM open Reports · ATS · Integrity by default (`tests/test_session_recording.py` now 27,
+`test_template_tabs_and_buttons` +2, `test_interview_integrity` unchanged; no new migration — 0124 edited in place):**
+three screenshot asks. (1) **Two streams** (`services/interview_recording.py`): `STREAMS = ("cam", "screen")`;
+`cam` keeps the ORIGINAL keys (`parts/` → `session.webm`) so every recording made before this change still plays;
+`screen` lives under `parts-screen/` → `screen.webm`. `store_chunk / _part_keys / finalize_from_parts / part_bytes /
+part_key / final_key` take `stream=` (`normalize_stream`: anything unknown → cam), `finalize_all(token)` joins both (a
+failure in one never stops the other), `discard_parts(token, stream=None)` sweeps every stream whose final exists,
+`live_manifest(token, after_seq, screen_after_seq)` adds `screen: {parts, next_after, recorded}` so ONE poll feeds both
+players, `recording_playback` adds `screen: {available, url, size_bytes}` (`{available: False}` when the browser never
+shared one — a phone, a refused prompt). `recording_client_config` gains `screen_enabled` (`INTERVIEW_SCREEN_RECORDING_
+ENABLED`), `screen_width/height/fps/bps` (960×540 @ 2 fps, 100 kbps cap ≈ 10 MB per 45 min; env-tunable like the camera).
+Routes (`main.py`): `POST /interview/recording/chunk` takes `stream` (Form, default cam; the "recording" stamp on the
+schedule row fires on cam seq 0 only); `_finalize_session_recording` → `finalize_all` (the schedule row tracks the
+CAMERA file — the screen file is found in storage); `…/live?after=&screen_after=`; `…/part/{seq}?stream=`.
+⚠️ **`_recording_auth`** = `_integrity_auth` OR `_require_interview_report_reader` — the recording now sits on the
+candidate report page, so a Reports reader (by role or template) plays it without the Integrity tab; playback / live /
+part / `interview/media` all use it (pinned by a source scan). `interview_integrity.EVENT_TYPES` gains
+`screen_share_stopped` (focus family, 4, informational) — the candidate pressed the browser's "Stop sharing". F-V2:
+`screen_share.js` (the Device Check asks for the share, mandatory where `getDisplayMedia` exists), `session_recorder.js`
+(a second MediaRecorder on a CLONE of the shared track), `components/interview-recording/RecordingViewer.tsx` (camera |
+screen side by side, ±15 / ±30 s, no download) — see that repo's notes. (2) **RMG / GM on the Interview Platform**:
+`access_registry.IV_TAB_DEFAULT_ROLES["iv:integrityLogs"]` += RMG; new `IV_ROLE_ALIASES = {"gm": ("RMG",)}` read by
+`iv_tabs_for_roles` (a GM-tagged template / the GM role seeds RMG's tabs); `_integrity_auth` admits RMG by role;
+**0124** (still unreleased, edited in place) mirrors both snapshots and adds `_backfill_custom_role_iv_tabs` — a custom
+role naming no `iv:` key gets the tabs of the built-in role it acts as (GM → RMG's Dashboard · Templates · Reports · ATS ·
+Integrity), so the GM login sees them on deploy without a hand-made grant. (3) **Warm-up answer under Question 1**
+(`candidate.js`, `interview_whisper_segments.js`, `interview_auto_advance.js`; `app.js?v=36`): three late-result paths
+wrote the END of "introduce yourself" into Q1 — the warm-up recorder's `onstop` transcribing after the turn moved
+(`recorderTurnSeq`), a Silero segment still at `/candidate/transcribe` when the next question loaded (`_generation` in the
+segment queue, bumped by `resetWhisperSegments`), and the auto-advance segment callback (`_turnSeq`). Each is now stamped
+with its turn and discarded when it comes back late. Deploy: `python -m alembic upgrade head` (0124), restart, rebuild
+F-V2; candidates on the next interview see a new **Screen share** tile on the Device Check. Suite: 1,822 pass, 2 skipped.
+
+**7 Oct 2026 — app ↔ database traffic cut (migration 0125, head is now 0125; `tests/test_interview_recovery_traffic.py`
+11, `test_notification_feed` +1, `test_ai_interview_costs` +2):** production pulled **~8.7 GB/day from RDS** (cross-AZ,
+`db.t4g.micro`); the operator's brief asked for < 1 GB/day with no user-visible change. Four causes, four fixes.
+(1) ⚠️ **The interview recovery worker was ~90 % of it (B2)**: `list_recoverable_interview_progress` did `SELECT *`
+(the `questions` / `answers` / `meta` / `payload` JSON ≈ 3.7 MB per 100 rows) over the 100 OLDEST rows every 60 s in BOTH
+app processes, and `_should_recover_progress` said yes to every terminal row whose report was not `ready` — the same 206
+stuck rows for ever, anything newer than the first 100 never looked at. Now: `interview_progress` gains nullable
+`recovery_attempts` + `last_recovery_at` (legacy table → ALTER at startup, `_ensure_interview_progress_columns_*`, both
+dialects); **the decision is in the WHERE clause** (not a final report · under `INTERVIEW_RECOVERY_MAX_ATTEMPTS`=3 ·
+past the backoff `INTERVIEW_RECOVERY_BACKOFF_MIN`=(10, 60, 360) · and terminal-not-in-the-10-min-generating-grace, or
+live + 35 min idle with answers, or live + 60 min idle — ISO-IST strings compare as strings, the Python
+`_should_recover_progress` is now its twin and only re-checks the clock); the listing returns
+`_RECOVERY_LIST_COLUMNS` + a `has_answers` flag (`jsonb_array_length` / `json_array_length`) — **never the JSON**; the
+full row is read with `get_interview_progress_by_id` only for a row that is finalized; **every touched row is counted**
+by `record_interview_recovery_attempt` — success closes it `ready` on THIS row (a legacy row whose meta had no
+interview id got its report under a fresh id and would have been finalized again), the attempt that reaches the cap
+closes it `recovery_failed` with the reason in `report_error`; `RECOVERY_FINAL_REPORT_STATUSES` = ready ·
+no_report_needed · recovery_failed. `INTERVIEW_RECOVERY_WORKER=false` turns the loop off in a process (mirrors
+`EMAIL_OUTBOX_WORKER`), each pass takes `pg_try_advisory_lock(INTERVIEW_RECOVERY_LOCK_KEY)` on a dedicated unpooled
+connection (`auth_db.interview_recovery_lock`; SQLite always holds it; a lock failure runs the pass anyway), and
+`INTERVIEW_RECOVERY_INTERVAL_SEC` defaults to **300** (was 60). Both dialects were run for real (the Postgres branch
+against Postgres 16, lock included). (2) **The bell**: 0122's indexes + `since_id` were already in; new
+`GET /api/notifications/summary` → `{unread_count, latest_id}` (two index lookups; declared before any future
+`/{id}` GET). F-V2 polls IT every 60 s from a VISIBLE tab only and fetches the list only when `latest_id` moved (see that
+repo's notes). (3) **`services/ai_cost_repair.py`** read every `interview_progress` row WITH its JSON at every worker
+startup and in the nightly `prompt_log_retention` job: now the attribution reads the orphan calls first and never
+touches `interview_progress` when there are none (prefix test spelled with `SUBSTR`, never `LIKE` — psycopg2 and `%`);
+interview rows are read slim with `meta->>'job_title'` / `json_extract` in SQL; the audio estimate narrows to finished
+pre-28-Sep interviews in SQL and reads `questions` / `answers` per interview only when it writes the estimate; and a run
+that finds nothing records **`ai.cost_repair_done`** (`<store hash>:<date>`) in CRM `app_settings` — `repair_ai_costs`
+is a no-op after that (delete the row to force a re-run; an in-process dict covers a box with no CRM DB). (4) **0125**
+`CREATE EXTENSION IF NOT EXISTS pg_stat_statements` on its own AUTOCOMMIT connection, skipped on SQLite, a missing
+permission logged and swallowed; downgrade keeps it. Read it with
+`SELECT calls, rows, shared_blks_read, shared_blks_hit, round(total_exec_time::numeric,1) AS ms, left(query,120) AS q
+FROM pg_stat_statements ORDER BY rows DESC LIMIT 15;` (swap `rows` for `shared_blks_read` for the disk side; `SELECT
+pg_stat_statements_reset();` to start a window). **Deploy:** `karnex-alembic upgrade head` (0125) → add
+`INTERVIEW_RECOVERY_WORKER=false` to `/etc/karnex/worker2.env` → `sudo karnex-rolling-restart` → restart nginx; the
+startup ALTER adds the two columns. First pass after deploy loads the ~200 stuck rows ONCE (most settle as `ready` from
+the report already on file), then `interview_progress.seq_tup_read` stays flat. Acceptance: DB→app < 40 MB/h with one
+user active (`ss -tni '( dport = :5432 )'`), `notifications.idx_tup_fetch` ≈ 2 rows per poll per tab. Suite: 1,851 pass,
+2 skipped.
+
+**7 Oct 2026 (later still) — the screen stream gets a `download_url` (`test_session_recording` re-pinned, 27):**
+the report page now offers Camera / Screen downloads in the recording's transport (F-V2 `CLAUDE.md`).
+`recording_playback` already carried `download_url` for the camera file (S3: presigned with
+`Content-Disposition: attachment`; local: the same `/interview/media/…` path — the client has the blob); the
+`screen` block now carries its own (`interview-<token12>-screen.webm`). Nothing else changed server-side.
+
+**7 Oct 2026 (night) — `screen_share_missing` integrity event (`test_interview_integrity` + `test_session_recording`
+33 pass; no migration):** `interview_integrity.EVENT_TYPES` gains `screen_share_missing` ("Screen not recorded",
+family `system`, penalty 0, informational) — the candidate runtime posts it with the REASON whenever the recording
+starts camera-only (F-V2 `CLAUDE.md`), so the Integrity timeline says why a report page shows no screen half. The
+question voice now in the recording is entirely client-side (`recording_mix.js`); the chunk / finalize / playback
+routes are unchanged.
+
+**7 Oct 2026 (night, later) — Integrity rows carry the report link (`tests/test_interview_integrity.py` +2; no
+migration):** screenshot ask — a "candidate report" button on the Integrity tab that opens the page with the questions
+AND the recording. `_integrity_rows` now emits `interview_record_id` + **`report_link`** (`report_links.ai_report_link`):
+the CRM link's `interview_record_id` wins (`_crm_links_for_tokens` carries it), else the session's progress row through
+the new `auth_db.interview_ids_by_invite(db_target, tokens)` — ONE two-column query via the invite index, never the JSON
+(the DB-traffic brief). `report_link` is `None` until `session_status` is completed / terminated — the report page would
+answer "not found" before that. F-V2: the row's **Report** button + the open row's two-column layout (see that repo's notes).
+
+**7 Oct 2026 (night) — Recruiter Productivity report rebuilt (`tests/test_recruiter_productivity.py` 5; no
+migration):** screenshot ask — "the Reports tab must be accurate so a TA's productivity can be shown in a meeting".
+⚠️ The old `services/reports.recruiter_productivity_report` was not a number anyone could defend: "Resumes uploaded"
+was `resumes.screened_by` (whoever ran the ATS — RMG as often as the uploader), "Shortlisted" was the ATS status,
+"Profiles created" was the EARLIEST activity-log row (the Zoho import credited the importing admin with 628), and
+"Per-day avg" divided by every calendar day since the first resume on record. Now `recruiter_productivity_report(db,
+from, to)` → `(rows, meta)`: every figure is attributed by the column the application stamps for that act and counted
+INSIDE the window — `candidates_added` (`candidates.created_by_id`), `applied` (`ta_owner_id`, dated `applied_on` else
+`created_at`), `opening_emails` (`OPENING_MAIL_SENT` rows), `sent_for_screening` (`SENT_FOR_SCREENING` rows, distinct
+candidacy — a resend is one send), `interviews_scheduled` (AI links `scheduled_by` + `L1/L2/HR_FACE_TO_FACE` +
+`AI_L1_SCHEDULED` / `AI_INTERVIEW_SCHEDULED` / `SLOT_INVITE_SENT` + `INTERVIEW_ROUND_ADDED` rows WITHOUT a verdict —
+"<round> recorded — <result>" is feedback, not a booking), `rmg_shortlisted` (the TA's candidacies, `rmg_screening_at`),
+`submitted_to_sales` / `to_customer` (`sales_submission_date` / `customer_submission_date`), `selected` · `joined` ·
+`rejected` (the `STATUS_CHANGE` row's target — `_STATUS_CHANGE_RE`, `REJECTED_BUCKET`), `days_active` (distinct IST
+days with a sourcing act), `per_day_avg` = applied ÷ **working days** (Mon–Fri, `working_days()`). Rows = every TA-role
+login (zeros included) + anyone else with attributed work (`is_ta: false`); `meta` = `{window {from, to,
+explicit_from}, working_days, columns [{key, label, group, hint}]}` — `PRODUCTIVITY_COLUMNS` is the ONE definition
+list the UI prints as tooltips and the "How each column is counted" panel. ⚠️ Window predicates compare timestamps
+against IST-midnight datetimes (`_in_window`), never `CAST(ts AS DATE)` — that is a number on SQLite. With no `from`
+the window opens on the first active day. The router answers `envelope(rows, meta=)`; CSV drops `user_id / is_ta /
+username`; `to < from` → 400. **Candidate Profiles report**: `team=TA` now filters by `ta_owner_id` (the earliest
+activity row credited whoever touched the profile first) and rows carry `customer` · `ta_owner` · `applied_on`.
+F-V2: `crm/pages/reports/RecruiterProductivity.tsx` (see that repo's notes).
+
+**7 Oct 2026 (night) — "Not attempted" ≠ "Failed", and TA reschedules the AI L1, migration 0126, head is now
+0126 (`tests/test_ai_l1_reschedule.py` 5, `test_duplicate_notifications` re-pinned):** user flow — TA sends the AI
+L1 link, the candidate cannot attempt it, the profile reads "Failed"; once the candidate confirms they are ready, TA
+sends another link. (1) **`ai_interview_links.not_attempted`** (0126, BOOLEAN NOT NULL DEFAULT FALSE): the report
+already said "Not Attempted" (`interview_outcome.apply_not_attempted`, no scored answer) but the link only knew
+Pending / Passed / Failed, so every CRM screen printed Failed. `sync_completed_interview` sets the flag from
+`report["not_attempted"]` (`result` STAYS "Failed" — every existing reader keeps working; `already_synced` includes
+the flag so a backfilled report re-syncs once); the TA notice becomes "AI interview not attempted: X" (links to the
+Applied Candidates row, dedupe `ai_done:<link>:not_attempted`), the screeners' `ai_interview.failed_review` says "not
+attempted — TA is sending a fresh link" (dedupe `ai_review:<link>:not_attempted`). Every AI-state payload carries
+**`ai_not_attempted`** (`latest_ai_interviews`, `_ai_state_by_profile`, `enrich_resumes_with_ai`). `candidate_status`:
+state `NOT_ATTEMPTED`, `ai_state(effective_result, not_attempted)` (a recruiter's Selected override still wins),
+status **`ai_l1_not_attempted` "AI L1 – Not Attempted"** (WARN, `_INTERNAL` + RMG_Rejected), round state
+"Not Attempted". (2) ⚠️ **The NEWEST AI link wins everywhere** — `latest_ai_interviews` and `load_facts` used
+"completed first, then newest", which meant a rescheduled AI L1 kept every screen on the old Failed until the new one
+finished; both now order `created_at DESC, id DESC` like the other two readers. (3) **Reschedule = a new link with a
+note**: `POST /api/candidate-profiles/{id}/ai-interviews` always allowed a second link once the old one was not
+Pending; it now treats one over a FINISHED link as a reschedule — `AiInterviewCreate.reschedule_note` (≥
+`MIN_RESCHEDULE_NOTE`=5, 400 otherwise; `previous_finished_link`), **409 over a pass** (Passed, or Selected by
+override — `previous_outcome_words`), activity `AI_INTERVIEW_RESCHEDULED` ("… previous AI L1: Not attempted ·
+<note>"), bell + mail to every screener (event **`ai_interview.rescheduled`**, RMG + GM, in `email_flows.EVENTS`,
+`screening_notify_user_ids`, dedupe `ai_resched:<profile>:<old link>`, savepointed — a notice never undoes a
+schedule). The old link stays on record (links work once; `GET …/ai-interviews` lists both), nothing is deleted.
+Also removed a re-import of `CandidateProfile` inside `ai_interview_bridge._applied_link`. F-V2: the row's
+"Not attempted" chip + **Reschedule AI L1** (see that repo's notes). Deploy: `python -m alembic upgrade head`
+(0126), restart; interviews finished BEFORE the deploy keep reading Failed until their report is saved again
+(a Re-score does it).
+
+**7 Oct 2026 (night, later) — RMG's "No Hire" on the L1 / L2 closes a candidate still before RMG Review, migration
+0127, head is now 0127 (`test_hr_tail_and_budget_hold` +3 cases):** screenshot report — two rows at Technical Interview
+with "L1: No Hire" still offered **Direct to Sales**. Since the 28 Sep flow the profile stays at Sourcing /
+Technical_Screening while RMG screens and runs the manual L1, and `reject_on_round_verdict` only knew
+`RMG_Review -> RMG_Rejected` (`_STAGE_REJECTIONS`), so from a pre-review stage it logged "no rejection path, left as
+is" — the verdict sat on the round and the candidacy stayed live, Direct to Sales included. Now `RMG_Rejected` is legal
+from `_PRE_RMG_STAGES` too (the same direct hop `hand_off_to_rmg_review` takes INTO review); the activity row, the
+workflow stamp and the TA notice are unchanged. **0127** repairs the rows already left behind (Postgres only): a live
+profile at Sourcing / Technical_Screening / RMG_Review whose LATEST held `L1_Interview` / `L2_F2F` round reads "No Hire"
+→ `RMG_Rejected` + the `STATUS_CHANGE` row, attributed to the round's recorder. F-V2 needs nothing: a closed row already
+renders View profile + Archive and the "Rejected — <who> · <date>" box in the Status cell; the Screening Desk drops it
+(`DESK_STAGES`). Deploy: `python -m alembic upgrade head` (0126 + 0127), restart.
+
+**7 Oct 2026 (night, access) — Interviewer logins + My Interviews, roles department-wise, the Users-tab rule panels,
+Reports with the list's figures, migrations 0128 + 0129, head is now 0129 (`tests/test_panel_interviews.py` 6,
+`tests/test_operational_reports.py` 3, `test_rmg_tasks` + `test_access_template_authority` re-pinned):** user ask —
+"eight more logins for the people who take the interviews; each sees ONLY the candidates whose interview they took and
+records that round's feedback, nothing else; divide the roles department-wise; redesign Roles / Access Templates /
+Settings / Reports / Action permissions / Email flows". (1) **`services/panel_interviews.py`** is the panel member's
+module. The link between a round and a login is the EMPLOYEE the scheduler picked — `interview_events.employee_id` →
+`employees.user_id`, else the official mailbox (`employees.email` == the login's email, case-insensitive):
+`my_employee_ids(db, user)` / `panel_user_ids(db, employee_id)` are the two directions, `employee_by_name` matches a
+typed name to the ONE active employee of that name (never a guess), `link_round_to_employee(db, event, employee_id,
+typed_name)` sets it. `PANEL_ROUND_KINDS` = L1–L4 (user decision: the customer's rounds stay with Sales, the HR round
+with HR). Readers `my_rounds(db, user, scope)` (pending · upcoming · done · all, `phase_of` PURE, counts per phase,
+`linked=False` when no employee row is the login), `round_detail` (+ the position's skills, `my_other_rounds` on the
+same candidacy), `ai_summary_for_round` (the profile card's `summarize_interview_record` shape, served without the
+Candidate Profiles tab); writer `record_panel_feedback` (five-step scale, feedback ≥ `MIN_FEEDBACK_CHARS`=5, stamps
+Completed + `user_role "Interviewer"`). ⚠️ **Scope is the employee link, never a tab grant**: someone else's round
+answers **404**, so eight logins share one role and still see only their own candidates. **`routers/crm/my_interviews.py`**
+(`_MODULES` += it): `GET /api/my-interviews?scope=` · `GET …/{id}` · `GET …/{id}/ai-summary` · `PUT …/{id}/feedback
+{result, feedback}` behind `gated_read/write("my-interviews")` — the new registry tab `my-interviews` ("My Interviews
+(panel feedback)"; no form, listed in `test_every_tab_has_fields`'s NO_FORM). (2) **`candidate_profiles.apply_round_verdict
+(db, profile, event, user, previous_result)` is the ONE verdict path** — `record_round_result` (results to review + the
+screeners' notice), then HR's stage end / `reject_on_round_verdict` / the customer ladder — used by `create_interview_round`,
+`update_interview_round` AND the panel route, so a "No Hire" from My Interviews closes the candidacy exactly like RMG's form.
+`L2FaceToFaceIn.employee_id` (the F-V2 picker sends it; a name alone is matched by `employee_by_name`); both round routes
+link a typed name the same way. **`notify_panel_member`** (event **`interview.panel_assigned`**, in `email_flows.EVENTS`,
+bell + mail "You are taking the L1 - Interview: X on <when>" → `my-interviews?focus=<round>`, dedupe per round + login,
+never to whoever booked it) runs from `_notify_round_owner_scheduled`, the l2-face-to-face path and on an interviewer
+change; the feedback-due reminder (`interview_followups`) now also reaches the panel member (`employee_id` on the item →
+`panel_user_ids`). `GET /api/employees/interviewer-names` is `any_crm_role` (a GM booking a round 403'd). (3) **Work desk**:
+`_panel_tabs` → `panel_feedback` (held, no verdict — "Your move") · `panel_upcoming` (info), items `panel:<round id>` →
+`my-interviews?focus=`, tiles open `my-interviews?scope=` (`TAB_PAGE`); `is_panel_only(user)` (no built-in role) gets
+those tabs ALONE, everyone else gets them beside their own when linked. (4) **0128** seeds the custom role
+**"Interviewer"** (`tab_access {"my-interviews": "edit"}`, no approvals; skipped when a role of that name exists) and
+backfills `interview_events.employee_id` for technical rounds whose typed `interviewer` names exactly one active employee
+(Postgres). To onboard a panel member: Employees record with the official mailbox (or `employees.user_id`) → Users ▸
+Create user with that email + the Interviewer role → done; F-V2 lands such a login on My Interviews. (5) **Departments**
+(`access_registry.DEPARTMENTS` leadership · sales · recruitment · engineering · panel · hr · finance · other,
+`BUILTIN_ROLE_DEPARTMENT` fixed, `guess_department(name)` PURE, `department_of_role`; `registry()` carries `departments`
++ `builtin_departments`): **0129** adds `custom_roles.department` and places existing roles by their name ONCE (a frozen
+copy of the hints — "Sales Manager" → sales, "GM" → engineering, "Interviewer" → panel); `custom_roles.serialize` /
+`create_role` / `update_role` carry it (`_clean_department`: unknown key → 400, blank → the guess); `access_templates.
+serialize_template` adds `role_department` (the role tag's) and the list adds `assigned_count` (one grouped query).
+(6) **Action permissions payload** (`action_permissions.effective`) carries `group` + `tab`. (7) **Reports**:
+`opportunities_report` rows gain `created_by` (NAME — only the username was shown), `approval_status`, `positions_total /
+open / joined` + `position_status` from the SAME `positions_by_opportunity` the list reads, `customer_id`; filters
+`customer_id`, `from` / `to` (created_at); `candidate_profiles_report` gains `opp_id`, `candidate_email`, `customer_id`,
+the applied-on window (falls back to `created_at` when `applied_on` is NULL — two predicates OR'd, a DATE and a timestamp);
+PURE `opportunities_summary` / `candidate_profiles_summary` in `meta.summary`; the CSVs carry the derived status + stage
+WORDS. ⚠️ The three operational reports are now **`REPORTS_READ = gated_read("reports")`** (a templated / custom-role login
+needs the Reports tab — GM has it, Interviewer does not); the CEO reports stay `role_required()`. Deploy: `python -m
+alembic upgrade head` (0128 + 0129), restart, rebuild F-V2; in Access Control ▸ Roles the Interviewer role is waiting under
+Interview Panel. Suite: 1,874 pass, 2 skipped.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 
@@ -2695,7 +3084,7 @@ docker compose up -d --build       # monolith + postgres on :2020
 docker compose --profile cache up -d   # + redis (used only by rate limiting)
 
 # Migrations
-cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0097
+cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0129
 
 # Tests — run from backend/, no live DB needed
 cd backend && python -m pytest -q
@@ -2756,7 +3145,7 @@ Ordered roughly by severity. Everything here is evidenced at a file:line.
 | **A10** | Auth failures return **HTTP 200** with `{"error": …}` (`/auth/login` `:6889`, `/auth/register` `:6839`). |
 | **A11** | `/auth/refresh` never re-reads the user — deactivation and role changes don't take effect until the current token expires. |
 | **B1** | 🔴 **`GET /api/prompt-logs/export` is unreachable** — declared at `routers/admin.py:215`, *after* `GET /api/prompt-logs/{log_id}` at `:194`. Every request binds `log_id="export"` → 404. The frontend calls it (`F-V2 src/api/promptLogs.ts:117`); **the export button is broken**. One-line fix: move it above. |
-| **B2** | `_should_recover_progress` (`main.py:2272`) returns **`True`** for terminal statuses (`completed`, `terminated`, `abandoned`, …); the only escape is `report_status == "ready"`. Any finished interview whose report never reached `ready` is re-finalised **every recovery interval, forever**. |
+| **B2** | ✅ **CLOSED 7 Oct 2026** — see the dated note. *Was:* `_should_recover_progress` returned `True` for every terminal status whose report was not `ready`, so a finished interview with no final report was re-finalised every interval, forever (and read in full, in both workers). Recovery now terminates (`recovery_attempts` cap, `recovery_failed`), the filter is in SQL and the listing carries no JSON. |
 | **B3** | `INTERVIEW_SAFE_MODE` does not disable all OpenAI calls. It is read at `main.py:1423, 5839, 6059` and `question_service.py:228` only. `_evaluate_and_store_report` calls the skill and communication rubrics unconditionally; `/candidate/tts` and `/candidate/transcribe` never check it. |
 | **C1–C3** | `/submit` (`:4023`), `/next` (`:3140`) and `/setup` (`:2982`) mutate `sessions[sk]` with **no `session_lock`**, concurrently with a locked `/answer`. `/submit` pops the session outside the lock. |
 | **C4** | `_proctor_sessions` counters are read-modify-write with no guard (`:6455`), unlike the three cache locks elsewhere in the file. |
@@ -2868,7 +3257,7 @@ Ordered roughly by severity. Everything here is evidenced at a file:line.
 4. **8.1** — gate the seven bare-`get_current_user` reads.
 5. **8.6** — rate-limit the two public POSTs; add an expiry claim to the apply token.
 6. **B1** — move `/api/prompt-logs/export` above `/{log_id}` (one line, restores a broken button).
-7. **B2** — exclude terminal statuses from `_should_recover_progress`.
+7. ~~**B2** — exclude terminal statuses from `_should_recover_progress`.~~ ✅ done 7 Oct 2026.
 8. **D** — delete the dead security-headers middleware at `main.py:2678`.
 9. **C1–C3** — put `/next`, `/submit`, `/setup` under `session_lock`, or hide the session behind a typed
    façade that acquires it.

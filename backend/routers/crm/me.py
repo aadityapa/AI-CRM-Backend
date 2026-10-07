@@ -89,6 +89,9 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
         "access": access,
         # ["timesheet.approve", ...] — every approval action this user may do.
         "approvals": approvals,
+        # An Admin/CEO reset is waiting for the user's own password (7 Oct 2026):
+        # the dashboard shows ONLY the change-password screen until it is done.
+        "must_change_password": bool(getattr(user, "must_change_password", False)),
     })
 
 

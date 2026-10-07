@@ -283,7 +283,18 @@ def serialize_documents(db: Session, docs: list) -> list[dict]:
     ]
 
 
-def serialize_customer(customer: Customer, db: Session | None = None, detail: bool = False) -> dict:
+def customer_ids_with_po(db: Session, customer_ids) -> set[int]:
+    """Which of these customers have any PO — ONE query for a whole list page."""
+    from models import PurchaseOrder
+    ids = [int(i) for i in set(customer_ids) if i]
+    if not ids:
+        return set()
+    return {cid for (cid,) in db.query(PurchaseOrder.customer_id)
+            .filter(PurchaseOrder.customer_id.in_(ids)).distinct().all()}
+
+
+def serialize_customer(customer: Customer, db: Session | None = None, detail: bool = False,
+                       has_po: bool | None = None) -> dict:
     data = {
         "id": customer.id,
         "name": customer.name,
@@ -299,7 +310,9 @@ def serialize_customer(customer: Customer, db: Session | None = None, detail: bo
         "created_at": customer.created_at.isoformat() if customer.created_at else None,
         "updated_at": customer.updated_at.isoformat() if customer.updated_at else None,
     }
-    if db is not None:
+    if has_po is not None:
+        data["has_po"] = has_po
+    elif db is not None:
         # Customer Type rule: NN = new (no PO yet); once the customer has any PO,
         # only EN (existing, new domain/branch) or EE (existing) are allowed.
         from models import PurchaseOrder

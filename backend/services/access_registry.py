@@ -69,7 +69,58 @@ TABS: dict[str, str] = {
     "requirements": "Requirements (Sourcing)",
     "finance-reports": "Finance Reports",
     "payroll": "Payroll",
+    # 7 Oct 2026 — the panel member's own technical rounds (CV · AI interview ·
+    # feedback form), scoped to the rounds whose employee IS the login. The
+    # seeded "Interviewer" custom role grants this tab and nothing else.
+    "my-interviews": "My Interviews (panel feedback)",
 }
+
+# ------------------------------------------------------------------ Interview Platform tabs
+# 7 Oct 2026 — the Interview Platform's top-nav tabs are grantable too, so ONE
+# template decides everything a login sees (user ask: "Admin can give access of
+# all tabs, each button, each field, at the time the template is created").
+# Keys carry the `iv:` prefix the React shell already uses for per-user
+# overrides. AI Costs and the Question Bank stay Admin/CEO-only on the server
+# (`role_required()`), so they are deliberately NOT grantable — a tab that
+# would 403 on open is worse than no tab.
+IV_TABS: dict[str, str] = {
+    "iv:dashboard": "Interview Dashboard",
+    "iv:templates": "Interview Templates",
+    "iv:candidates": "Interview Reports",
+    "iv:ats": "ATS Scoring",
+    "iv:integrityLogs": "Interview Integrity",
+}
+#: The roles each Interview Platform tab opens for by DEFAULT — the mirror of
+#: `lib/rbac.ts INTERVIEW_VIEW_ROLES`. Used to seed a new template from its role
+#: tag and by migration 0124 to backfill templates created before the tabs
+#: were grantable (so nothing changes for them on deploy).
+IV_TAB_DEFAULT_ROLES: dict[str, tuple[str, ...]] = {
+    "iv:dashboard": ("TA", "HR", "RMG"),
+    "iv:templates": ("RMG",),
+    "iv:candidates": ("TA", "HR", "RMG"),
+    "iv:ats": ("TA", "HR", "RMG"),
+    "iv:integrityLogs": ("TA", "HR", "RMG"),
+}
+#: Custom roles that act as a built-in role on the Interview Platform (user
+#: decision 7 Oct 2026: RMG and the GM get Reports · ATS · Integrity). Keyed by
+#: lower-cased role name; `iv_tabs_for_roles` reads it through `IV_ROLE_ALIASES`.
+IV_ROLE_ALIASES: dict[str, tuple[str, ...]] = {"gm": ("RMG",)}
+TABS.update(IV_TABS)
+
+
+def is_iv_tab(key: str) -> bool:
+    return str(key or "").startswith("iv:")
+
+
+def iv_tabs_for_roles(roles) -> dict[str, str]:
+    """`{iv tab: "view"}` for the tabs these roles open by default (custom
+    role names are mapped through `IV_ROLE_ALIASES`)."""
+    names: set[str] = set()
+    for r in roles or ():
+        names.add(str(r))
+        names.update(IV_ROLE_ALIASES.get(str(r).strip().lower(), ()))
+    return {k: "view" for k, allowed in IV_TAB_DEFAULT_ROLES.items() if names & set(allowed)}
+
 
 # ------------------------------------------------------------------ fields per tab
 # tab_key -> { field_key: label }. The primary form fields of each page — what a
@@ -243,6 +294,61 @@ FIELDS_BY_TAB["opportunities"].update({
 })
 
 
+# ------------------------------------------------------------------ departments
+# 7 Oct 2026 — roles are shown DEPARTMENT-WISE on Access Control (user ask: "we
+# need to divide this department wise, more logins are coming"). A built-in
+# role's department is fixed here; a custom role carries its own
+# (`custom_roles.department`, one of these keys, "other" when unknown); an
+# Access Template follows its role tag. Pure data — the pages group by it.
+DEPARTMENTS: tuple[tuple[str, str], ...] = (
+    ("leadership", "Leadership"),
+    ("sales", "Sales"),
+    ("recruitment", "Recruitment (TA)"),
+    ("engineering", "Engineering / RMG"),
+    ("panel", "Interview Panel"),
+    ("hr", "HR"),
+    ("finance", "Finance"),
+    ("other", "Other"),
+)
+DEPARTMENT_KEYS: tuple[str, ...] = tuple(k for k, _ in DEPARTMENTS)
+BUILTIN_ROLE_DEPARTMENT: dict[str, str] = {
+    "CEO": "leadership", "Admin": "leadership",
+    "Sales": "sales", "Sales_Head": "sales",
+    "TA": "recruitment", "RMG": "engineering",
+    "HR": "hr", "Finance": "finance",
+}
+#: Words in a custom role's name that say which department it belongs to —
+#: used ONCE by migration 0129 to place the roles that exist today, and by
+#: the editor as the suggested default for a new name. PURE.
+_DEPARTMENT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("panel", ("interview", "panel")),
+    ("sales", ("sales", "account", "bd", "business")),
+    ("recruitment", ("recruit", "talent", "sourcing", " ta")),
+    ("engineering", ("rmg", "engineer", "gm", "delivery", "tech")),
+    ("hr", ("hr", "people", "onboard")),
+    ("finance", ("finance", "account", "billing", "invoice")),
+    ("leadership", ("ceo", "director", "head", "chief", "founder", "admin")),
+)
+
+
+def guess_department(name: str | None) -> str:
+    """The department a role NAME suggests, else "other". Case-insensitive,
+    first hint wins ("Sales Head" → sales, not leadership)."""
+    low = f" {str(name or '').strip().lower()} "
+    for key, words in _DEPARTMENT_HINTS:
+        if any(w in low for w in words):
+            return key
+    return "other"
+
+
+def department_of_role(name: str | None, custom_department: str | None = None) -> str:
+    """A built-in role's fixed department, else the custom role's own (cleaned)."""
+    if name in BUILTIN_ROLE_DEPARTMENT:
+        return BUILTIN_ROLE_DEPARTMENT[name]
+    key = str(custom_department or "").strip().lower()
+    return key if key in DEPARTMENT_KEYS else "other"
+
+
 def tab_keys() -> list[str]:
     return list(TABS.keys())
 
@@ -264,9 +370,13 @@ def registry() -> dict:
     return {
         "modes": list(MODES),
         "field_modes": list(FIELD_MODES),
+        "departments": [{"key": k, "label": v} for k, v in DEPARTMENTS],
+        "builtin_departments": dict(BUILTIN_ROLE_DEPARTMENT),
         "tabs": [
-            {"key": k, "label": v, "fields": [{"key": fk, "label": fl}
-                                              for fk, fl in FIELDS_BY_TAB.get(k, {}).items()]}
+            {"key": k, "label": v,
+             "group": "Interview Platform" if is_iv_tab(k) else "CRM",
+             "default_roles": list(IV_TAB_DEFAULT_ROLES.get(k, ())),
+             "fields": [{"key": fk, "label": fl} for fk, fl in FIELDS_BY_TAB.get(k, {}).items()]}
             for k, v in TABS.items()
         ],
     }

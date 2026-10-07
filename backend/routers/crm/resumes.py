@@ -15,11 +15,11 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, gated_write, screener_or,
+    CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, gated_read, gated_write, screener_or,
 )
 from models import (
     AiInterviewStatus, AtsStatus, Candidate, CandidateProfile,
-    CandidateProfileActivityLog, PipelineStatus, Requirement,
+    CandidateProfileActivityLog, Opportunity, PipelineStatus, Requirement,
     RequirementActivityLog, RequirementStatus, Resume,
 )
 
@@ -1025,6 +1025,12 @@ def list_resumes(
     else:
         stmt = stmt.where(or_(Resume.duplicate_dismissed.is_(None),
                               Resume.duplicate_dismissed.is_(False)))
+    # ONE row per candidate (6 Oct 2026, user report: the same candidate listed
+    # twice after a second CV was uploaded / built for them). The candidacy is
+    # one thing; the newest resume row of each candidate on this requirement
+    # stands for it. Rows with no candidate (legacy) are kept as they are.
+    stmt = stmt.where(or_(Resume.candidate_id.is_(None), Resume.id.in_(
+        _latest_resume_ids(req.id, dismissed))))
     pstmt = select(CandidateProfile).where(CandidateProfile.opportunity_id == req.opportunity_id)
     # Live / Archive (30 Sep 2026): a rejected or withdrawn candidacy leaves
     # Applied Candidates for the Archive tab. Resolved on the opportunity's
@@ -1159,6 +1165,7 @@ def list_resumes(
         row.update(budget_fit(expected, req.budget_ctc_max))
         if pid:
             row.update(rounds.get(pid, {}))
+    _with_profile_ai(db, data)
 
     # Interleave the profile-only rows back into their date position — the two
     # kinds of row are one list to the recruiter, so "newest first" has to hold
@@ -1200,9 +1207,47 @@ def list_resumes(
         row["archived"] = bool(pid and pid in archived_set)
         row["archive_reason"] = reasons.get(pid) if row["archived"] else None
         row["archivable"] = bool(pid and not row["archived"])
+        row["closed"] = bool(pid and stage in _CLOSED)
         row["closed_note"] = notes.get(pid) if pid and stage in _CLOSED else None
         row["opening_mail"] = opening.get(pid) if pid else None
+    _with_screening_extras(db, page_rows)
     return envelope(page_rows, meta=meta)
+
+
+def _with_screening_extras(db: Session, rows: list[dict]) -> None:
+    """What the Screening Desk prints per candidate, on Applied Candidates too
+    (7 Oct 2026, user ask: "GM / RMG do everything from Applied Candidates"):
+    `direct_to_sales_block`, `internal_employee` + `fast_track_block` and
+    `new_results` (finished interviews no screener has marked reviewed).
+    Three batched queries for the page; best-effort — a failure leaves the
+    keys unset and the buttons hidden, never a 500."""
+    from services.rmg_tasks import unreviewed_results
+    from services.screening_desk import direct_to_sales_block, fast_track_block, internal_matches
+    pids = sorted({r["profile_id"] for r in rows if r.get("profile_id")})
+    if not pids:
+        return
+    try:
+        with db.begin_nested():
+            pairs = db.execute(
+                select(CandidateProfile, Candidate)
+                .join(Candidate, Candidate.id == CandidateProfile.candidate_id)
+                .where(CandidateProfile.id.in_(pids))
+            ).all()
+            profiles = {p.id: p for p, _ in pairs}
+            internal = internal_matches(db, [(p, c) for p, c in pairs])
+            results = unreviewed_results(db, pids)
+    except Exception:  # noqa: BLE001 — extras only; the list must load
+        logger.exception("screening extras for Applied Candidates failed")
+        return
+    for row in rows:
+        profile = profiles.get(row.get("profile_id"))
+        if profile is None:
+            continue
+        emp = internal.get(profile.id)
+        row["direct_to_sales_block"] = direct_to_sales_block(profile)
+        row["internal_employee"] = emp
+        row["fast_track_block"] = fast_track_block(profile, emp) if emp else None
+        row["new_results"] = results.get(profile.id) or []
 
 
 def _narrow_to_profiles(stmt, profile_ids: set[int]):
@@ -1260,6 +1305,79 @@ def _last_activity_by_candidate(db: Session, opportunity_id: int) -> dict[int, d
         logger.warning("activity ordering failed for opportunity %s", opportunity_id, exc_info=True)
         return {}
     return {cid: ts for cid, ts in rows if cid and ts}
+
+
+#: An AI L1 counts as PASSED on the AI verdict or a recruiter's "Selected"
+#: override (6 Oct 2026: a GM / RMG pass over a low score opens the L2).
+AI_L1_PASS = ("Passed", "Selected")
+
+
+def _latest_resume_ids(requirement_id: int, dismissed: bool):
+    """SELECT of the newest resume id per candidate on a requirement (same
+    dismissed filter as the list), so a candidate shows ONCE."""
+    sub = select(sa.func.max(Resume.id)).where(
+        Resume.requirement_id == requirement_id, Resume.candidate_id.isnot(None))
+    if dismissed:
+        sub = sub.where(Resume.duplicate_dismissed.is_(True))
+    else:
+        sub = sub.where(or_(Resume.duplicate_dismissed.is_(None),
+                            Resume.duplicate_dismissed.is_(False)))
+    return sub.group_by(Resume.candidate_id)
+
+
+def _with_profile_ai(db: Session, data: list[dict]) -> None:
+    """AI L1 facts for resume rows whose interview is linked by PROFILE.
+
+    The resume enrichment finds an AI interview through `resume_id`; one
+    scheduled from the profile, the Screening Desk or on an older resume row of
+    the same candidate is linked by `profile_id` only — the row then read "no
+    AI interview" and kept offering AI L1 / Manual L1 after the interview was
+    done, with no L2 (6 Oct 2026, user report). The same facts are filled from
+    the profile, and a PASSED verdict (the recruiter's decision included —
+    `effective_result`) hands the candidate to RMG review like the resume
+    path does, which is where the L2 is asked for.
+    """
+    want = [row.get("profile_id") for row in data
+            if row.get("profile_id") and row.get("ai_interview_result") is None]
+    if not want:
+        return
+    by_profile = _ai_state_by_profile(db, want)
+    passed: dict[int, list[dict]] = {}
+    for row in data:
+        pid = row.get("profile_id")
+        state = by_profile.get(pid) if pid else None
+        if not state or state.get("ai_interview_result") is None or row.get("ai_interview_result") is not None:
+            continue
+        for k, v in state.items():
+            if k.startswith("ai_"):
+                row[k] = v
+        if (state.get("ai_effective_result") or state.get("ai_interview_result")) in AI_L1_PASS:
+            passed.setdefault(pid, []).append(row)
+    heal_ai_passed_to_review(db, passed)
+
+
+def heal_ai_passed_to_review(db: Session, rows_by_profile: dict[int, list[dict]]) -> None:
+    """Move a profile whose AI L1 PASSED out of Sourcing / Technical_Screening
+    to RMG_Review (savepoint; best-effort) and update its rows on the page."""
+    if not rows_by_profile:
+        return
+    try:
+        with db.begin_nested():
+            for profile in db.execute(select(CandidateProfile).where(
+                    CandidateProfile.id.in_(list(rows_by_profile)))).scalars().all():
+                here = getattr(profile.pipeline_status, "value", profile.pipeline_status)
+                if here not in (PipelineStatus.SOURCING.value, PipelineStatus.TECHNICAL_SCREENING.value):
+                    continue
+                profile.pipeline_status = PipelineStatus.RMG_REVIEW
+                log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, None,
+                             "STATUS_CHANGE",
+                             f"{here} -> RMG_Review: AI L1 passed — auto-forwarded for RMG review")
+                for row in rows_by_profile[profile.id]:
+                    row["profile_pipeline_status"] = PipelineStatus.RMG_REVIEW.value
+        db.commit()
+    except Exception:  # pragma: no cover — the list must still load
+        db.rollback()
+        logger.warning("AI-passed RMG hand-off heal failed", exc_info=True)
 
 
 def _paginate_merged(db: Session, stmt, extra: list[dict], page: int, limit: int,
@@ -1362,7 +1480,7 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
         healed = False
         for profile, _cand in rows:
             state = ai_by_profile.get(profile.id) or {}
-            passed = (state.get("ai_effective_result") or state.get("ai_interview_result")) == "Passed"
+            passed = (state.get("ai_effective_result") or state.get("ai_interview_result")) in AI_L1_PASS
             here = getattr(profile.pipeline_status, "value", profile.pipeline_status)
             if passed and here in (PipelineStatus.SOURCING.value,
                                    PipelineStatus.TECHNICAL_SCREENING.value):
@@ -1574,6 +1692,7 @@ def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]
                     "ai_hr_decision_label": hr_decision_label(link.hr_decision),
                     "ai_effective_result": link.effective_result,
                     "ai_is_overridden": bool(link.hr_decision) and link.effective_result != link.result,
+                    "ai_not_attempted": bool(link.not_attempted),
                     "ai_interview_record_id": link.interview_record_id,
                     "ai_report_link": ai_report_link(email, link.interview_record_id),
                     "ai_interview_scheduled_at": (
@@ -1909,6 +2028,19 @@ class ScheduleAiInterviewIn(BaseModel):
         raise HTTPException(status_code=400, detail="scheduled_at must be YYYY-MM-DD HH:MM (IST)")
 
 
+@router.get("/api/requirements/{requirement_id}/ai-template-status")
+def requirement_ai_template_status(
+    requirement_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(screener_or(gated_read("requirements", "TA", "RMG", "Sales", "Sales_Head"))),
+):
+    """The AI L1 template state of a position (ready · requested · missing) —
+    Applied Candidates asks it before Schedule AI L1 / Slot invite."""
+    from services.ai_interview_bridge import l1_template_status
+    req = get_requirement_or_404(db, requirement_id)
+    return envelope(l1_template_status(db, db.get(Opportunity, req.opportunity_id), req))
+
+
 @router.post("/api/resumes/{resume_id}/schedule-ai-interview")
 def schedule_ai_interview(
     resume_id: int,
@@ -1941,6 +2073,10 @@ def schedule_ai_interview(
     blocked = rmg_screening_blocks_l1(profile)
     if blocked:
         raise HTTPException(status_code=400, detail=blocked)
+
+    # No template = no questions: refuse before anything is created (6 Oct 2026).
+    from services.ai_interview_bridge import ensure_l1_template_ready
+    ensure_l1_template_ready(db, db.get(Opportunity, req.opportunity_id), req)
 
     from services.ist import read_as_ist
     when_stamp = body.stamp() if body is not None else None

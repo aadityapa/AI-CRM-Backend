@@ -15,9 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
-    CurrentUser, PageParams, get_crm_db, get_current_user, gated_write_action, page_params,
+    CurrentUser, PageParams, gated_read, get_crm_db, gated_write_action, page_params,
     role_required,
 )
+
+# Reads follow the Invoices tab (8.1: these were open to any login, even one with no CRM role).
+CN_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
 from models import CreditNote, CreditNoteLine
 from schemas.common import envelope
 from schemas.finance import CreditNoteCreate, CreditNoteSettleIn
@@ -113,7 +116,7 @@ def create_credit_note(body: CreditNoteCreate, db: Session = Depends(get_crm_db)
 def list_credit_notes(invoice_id: int | None = None, status: str | None = None,
                       pp: PageParams = Depends(page_params),
                       db: Session = Depends(get_crm_db),
-                      user: CurrentUser = Depends(get_current_user)):
+                      user: CurrentUser = Depends(CN_READ)):
     stmt = select(CreditNote)
     if invoice_id is not None:
         stmt = stmt.where(CreditNote.invoice_id == invoice_id)
@@ -128,7 +131,7 @@ def list_credit_notes(invoice_id: int | None = None, status: str | None = None,
 
 @router.get("/{credit_note_id}")
 def get_credit_note(credit_note_id: int, db: Session = Depends(get_crm_db),
-                    user: CurrentUser = Depends(get_current_user)):
+                    user: CurrentUser = Depends(CN_READ)):
     note = get_credit_note_or_404(db, credit_note_id)
     return envelope(serialize_credit_note(note, detail=True, db=db))
 

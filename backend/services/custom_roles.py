@@ -57,6 +57,15 @@ def _clean_grants(tab_access, field_access) -> tuple[dict, dict]:
     return tabs, fields
 
 
+def _clean_department(value, name: str) -> str:
+    """A known department key, else the one the name suggests (7 Oct 2026)."""
+    key = str(value or "").strip().lower()
+    if key and key not in access_registry.DEPARTMENT_KEYS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown department '{value}'. One of: {', '.join(access_registry.DEPARTMENT_KEYS)}")
+    return key or access_registry.guess_department(name)
+
+
 def role_actions(role: CustomRole) -> list[str]:
     """Effective approval list of one role (same rule `effective_access` uses)."""
     from services.action_permissions import clean_action_list, default_actions_for_role
@@ -93,6 +102,7 @@ def serialize(role: CustomRole, members: int = 0) -> dict:
         # The approvals this role grants. NULL (never configured) resolves to
         # the approvals whose code default names the role — shown as such.
         "action_access": role_actions(role),
+        "department": access_registry.department_of_role(role.name, getattr(role, "department", None)),
         "members_count": members,
         "builtin": False,
         "created_at": role.created_at.isoformat() if role.created_at else None,
@@ -112,6 +122,7 @@ def list_roles(db: Session) -> dict:
     }
     builtin = [
         {"name": r.value, "label": BUILTIN_LABELS.get(r.value, r.value), "builtin": True,
+         "department": access_registry.department_of_role(r.value),
          "members_count": builtin_counts.get(r.value, 0),
          "description": "Built-in role — permissions come from the product's role rules and any Access Template."}
         for r in RoleName
@@ -124,13 +135,16 @@ def list_roles(db: Session) -> dict:
 def create_role(db: Session, payload: dict, actor_id: int | None) -> dict:
     name = validate_name(payload.get("name", ""), db=db)
     tabs, fields = _clean_grants(payload.get("tab_access"), payload.get("field_access"))
-    from services.action_permissions import clean_action_list, default_actions_for_role
+    from services.action_permissions import clean_action_list, default_actions_for_role, implied_buttons
     raw_actions = payload.get("action_access")
+    # No list given: the name's defaults plus the buttons the tab grants imply
+    # (7 Oct 2026 — a saved list decides every button, approvals and manage).
     role = CustomRole(name=name, description=(payload.get("description") or "").strip() or None,
                       is_active=bool(payload.get("is_active", True)),
+                      department=_clean_department(payload.get("department"), name),
                       tab_access=tabs, field_access=fields, created_by=actor_id,
                       action_access=(clean_action_list(raw_actions) if raw_actions is not None
-                                     else default_actions_for_role(name)))
+                                     else clean_action_list(default_actions_for_role(name) + implied_buttons(tabs))))
     db.add(role)
     db.commit()
     db.refresh(role)
@@ -145,6 +159,8 @@ def update_role(db: Session, role_id: int, payload: dict) -> dict:
         role.description = (payload.get("description") or "").strip() or None
     if "is_active" in payload and payload["is_active"] is not None:
         role.is_active = bool(payload["is_active"])
+    if payload.get("department") is not None:
+        role.department = _clean_department(payload["department"], role.name)
     if "tab_access" in payload or "field_access" in payload:
         tabs, fields = _clean_grants(
             payload.get("tab_access", role.tab_access), payload.get("field_access", role.field_access))

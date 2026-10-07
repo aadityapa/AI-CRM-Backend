@@ -67,3 +67,8 @@ class PasswordResetIn(BaseModel):
 class AccessSourceIn(BaseModel):
     kind: str = "default"          # default | template | role
     id: int | None = None
+
+
+class DeactivateIn(BaseModel):
+    # Why the account is being switched off — kept in the access audit log.
+    reason: str = ""

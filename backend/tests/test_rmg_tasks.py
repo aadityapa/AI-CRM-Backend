@@ -151,7 +151,8 @@ def test_feedback_items_carry_the_position_round_and_interviewer_facets(db):
 def test_a_finished_ai_l1_waits_in_results_until_marked_reviewed(db):
     p = _profile(db, "Asha", screening="Shortlisted")
     db.add(AiInterviewLink(invite_token="t-a", candidate_id=p.candidate_id, opportunity_id=p.opportunity_id,
-                           profile_id=p.id, result="Passed", overall_score_percent=78.4, completed_at=NOW))
+                           profile_id=p.id, result="Passed", overall_score_percent=78.4, completed_at=NOW,
+                           interview_record_id="9"))
     old = _profile(db, "Old", screening="Shortlisted")
     db.add(AiInterviewLink(invite_token="t-o", candidate_id=old.candidate_id, opportunity_id=old.opportunity_id,
                            profile_id=old.id, result="Passed", completed_at=NOW - timedelta(days=60)))
@@ -165,6 +166,8 @@ def test_a_finished_ai_l1_waits_in_results_until_marked_reviewed(db):
     row = next(r for r in rows if r["profile_id"] == p.id)
     assert [(r["label"], r["result"]) for r in row["new_results"]] == [("AI L1", "Passed")]
     assert row["new_results"][0]["key"].startswith("ai:")
+    # "Open report" opens THIS interview's report (Reports tab), not the profile.
+    assert row["new_results"][0]["report_link"] == "/admin/?view=candidateReport&cid=asha%40mail.com&iid=9"
     assert rt.mark_reviewed(db, p, RMG) == 1
     assert _cats(db)["results"]["count"] == 0
     assert rt.mark_reviewed(db, p, RMG) == 0                          # idempotent
@@ -242,7 +245,10 @@ def test_the_new_endpoints_sit_behind_the_desk_gate_and_the_routes_record_result
         body = src.split(route, 1)[1].split("@router.", 1)[0]
         assert "Depends(desk_gate)" in body, route
     cp = (BACKEND / "routers" / "crm" / "candidate_profiles.py").read_text(encoding="utf-8")
-    assert cp.count("record_round_result(db, profile, event, user,") == 2   # create + update
+    # create + update both run the ONE verdict path (7 Oct 2026), which records the result.
+    assert cp.count("apply_round_verdict(db, profile, event, user,") == 2
+    svc = (BACKEND / "services" / "candidate_profiles.py").read_text(encoding="utf-8")
+    assert "record_round_result(db, profile, event, user, previous_result)" in svc.split("def apply_round_verdict", 1)[1]
     bridge = (BACKEND / "services" / "ai_interview_bridge.py").read_text(encoding="utf-8")
     assert bridge.count("_review_link(link.profile_id)") == 2
     flows = (BACKEND / "routers" / "crm" / "email_flows.py").read_text(encoding="utf-8")

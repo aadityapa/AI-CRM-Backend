@@ -106,11 +106,16 @@ from auth_db import (
     get_database_snapshot,
     get_interview_record_payload,
     get_interview_progress_by_invite,
+    get_interview_progress_by_id,
+    interview_ids_by_invite,
     get_hr_candidate_decision,
     get_schedule_by_token,
     increment_schedule_login_attempts,
     init_auth_db,
     list_recoverable_interview_progress,
+    record_interview_recovery_attempt,
+    interview_recovery_lock,
+    RECOVERY_FINAL_REPORT_STATUSES,
     list_hr_candidate_decisions,
     recent_questions_for_job_template,
     list_interview_records_for_candidate,
@@ -128,6 +133,8 @@ from auth_db import (
     create_password_reset,
     consume_password_reset,
     update_user_password,
+    set_must_change_password,
+    account_state,
     set_hr_candidate_decision,
     upsert_master_value,
     update_interview_hr_status,
@@ -153,6 +160,7 @@ from hr.service import (
 from candidate.service import next_question_payload
 from ats import AtsWeights, ats_score, ats_score_llm, list_job_configs
 from services.interview.question_service import generate_mode_aware_questions
+from services.report_links import ai_report_link
 from utils.interview_limits import (
     MAX_COUNT_MODE_QUESTIONS,
     clamp_count_mode_questions,
@@ -474,16 +482,33 @@ def _admin_dashboard_dist_path() -> Path:
     return FRONTEND_DIR / "admin-dashboard" / "dist"
 
 
+_ADMIN_ASSET_REF_RE = re.compile(r'(?:src|href)="/admin/(assets/[^"?#]+)"')
+
+
 def _admin_dashboard_assets_ok() -> bool:
-    """Dist must exist and be built with Vite base /admin/ (see frontend/admin-dashboard/vite.config.ts)."""
-    idx = _admin_dashboard_dist_path() / "index.html"
+    """Dist must exist, be built with Vite base /admin/ (see frontend/admin-dashboard/vite.config.ts)
+    AND every hashed bundle its index.html names must be on disk.
+
+    The last check matters (7 Oct 2026): a stale ``dist/index.html`` (it used to be tracked in git, so a
+    pull could bring back an old one) names bundles that no longer exist — the old "contains
+    /admin/assets/" test passed, no rebuild ran, and the dashboard loaded blank."""
+    dist = _admin_dashboard_dist_path()
+    idx = dist / "index.html"
     if not idx.is_file():
         return False
     try:
         text = idx.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return "/admin/assets/" in text
+    refs = _ADMIN_ASSET_REF_RE.findall(text)
+    if not refs:
+        return False
+    missing = [r for r in refs if not (dist / r).is_file()]
+    if missing:
+        logger.warning("Admin dashboard dist is stale: index.html names %d missing file(s), e.g. %s",
+                       len(missing), missing[0])
+        return False
+    return True
 
 
 def _try_build_admin_dashboard() -> bool:
@@ -1780,8 +1805,32 @@ def _require_user(request: Request, allowed_roles: set[str] | None = None):
 _REPORT_READER_CRM_ROLES = {"TA", "HR", "RMG", "Admin", "CEO"}
 
 
-def _require_interview_report_reader(request: Request):
+def _screens_as_rmg_for_request(request: Request) -> bool:
+    """True when the bearer may take the RMG screening decision (built-in RMG,
+    or a template / custom role holding the approval — e.g. GM). Never raises."""
+    try:
+        from crm_db import get_session_factory
+        from crm_deps import get_current_user
+        from services.action_permissions import screens_as_rmg
+        session = get_session_factory()()
+    except Exception:
+        return False
+    try:
+        return bool(screens_as_rmg(session, get_current_user(request, session)))
+    except Exception:
+        return False
+    finally:
+        session.close()
+
+
+def _require_interview_report_reader(request: Request, tab: str = "iv:candidates"):
     """Auth for CRM-facing interview report / candidate-interview reads.
+
+    `tab` (7 Oct 2026) is the Interview Platform tab the endpoint belongs to —
+    Reports by default, ATS for the scoring routes. A login whose Access
+    Template names any Interview Platform tab is judged by that template
+    ALONE (granted → in, not granted → 403, whatever the role), the same rule
+    `enforce_roles(tab=)` applies; everyone else keeps the role rule below.
 
     The report pages live in the CRM, but the endpoints behind them were written
     for the legacy Interview Platform and gated on the legacy ``role == 'hr'``.
@@ -1799,13 +1848,26 @@ def _require_interview_report_reader(request: Request):
     if err:
         return None, err
     try:
-        from crm_deps import _roles_for_username
-        crm_roles = _roles_for_username(str(payload.get("sub") or ""))
+        from crm_deps import _user_access_for_username
+        found = _user_access_for_username(str(payload.get("sub") or ""), tab)
     except Exception:
-        crm_roles = None
-    if crm_roles:  # user has CRM roles → must include a report-reader role
-        if crm_roles & _REPORT_READER_CRM_ROLES:
+        found = None
+    crm_roles = None if found is None else found[1]
+    template_mode = None if found is None else found[2]
+    if crm_roles and crm_roles & {"Admin", "CEO"}:
+        return payload, None
+    if crm_roles and template_mode is not None:        # templated → the template decides
+        if template_mode:
             return payload, None
+        return None, JSONResponse({"error": f"Your access template does not grant the '{tab}' tab."},
+                                  status_code=403)
+    if crm_roles and crm_roles & _REPORT_READER_CRM_ROLES:
+        return payload, None
+    # A screener whose access is a custom role / template (GM) reviews AI results
+    # from the Screening Desk — the report page is part of that job.
+    if crm_roles is not None and _screens_as_rmg_for_request(request):
+        return payload, None
+    if crm_roles:
         return None, JSONResponse({"error": "Forbidden for this role."}, status_code=403)
     # No CRM role (or CRM unavailable) → fall back to legacy: allow only 'hr'.
     if str(payload.get("role", "")).lower() == "hr":
@@ -1848,7 +1910,7 @@ def _push_decision_to_crm(*, decision, actor, interview_record_id=None,
         logging.getLogger(__name__).warning("CRM decision mirror failed: %s", exc)
 
 
-def _enforce_crm_roles(request: Request, *allowed: str) -> None:
+def _enforce_crm_roles(request: Request, *allowed: str, tab: str | None = None, mode: str = "view") -> None:
     """Apply Karnex CRM role-based access to a legacy Interview Platform endpoint.
 
     Mirrors the frontend RBAC (frontend admin-dashboard src/lib/rbac.ts). Raises
@@ -1861,7 +1923,7 @@ def _enforce_crm_roles(request: Request, *allowed: str) -> None:
         from crm_deps import enforce_roles
     except Exception:
         return
-    enforce_roles(request, *allowed)
+    enforce_roles(request, *allowed, tab=tab, mode=mode)
 
 
 def _parse_cors_origins() -> list[str]:
@@ -2401,24 +2463,32 @@ def _parse_progress_activity(raw: str) -> datetime | None:
 
 
 def _should_recover_progress(row: dict, now: datetime) -> bool:
-    if str(row.get("report_status") or "").strip().lower() == "ready":
+    """Python twin of the WHERE clause in `auth_db.list_recoverable_interview_progress`
+    (7 Oct 2026): the listing already excludes what this refuses, so for a listed
+    row it only re-checks against the clock of THIS pass. A slim row carries
+    `has_answers`; a full row (tests, older callers) still has `answers`."""
+    report_status = str(row.get("report_status") or "").strip().lower()
+    if report_status in RECOVERY_FINAL_REPORT_STATUSES:
         return False
     status = str(row.get("status") or "").strip().lower()
-    answers = row.get("answers") if isinstance(row.get("answers"), list) else []
+    if "has_answers" in row:
+        has_answers = bool(row.get("has_answers"))
+    else:
+        has_answers = bool(row.get("answers")) if isinstance(row.get("answers"), list) else False
     last = _parse_progress_activity(str(row.get("last_activity_at") or row.get("updated_at_ist") or row.get("created_at_ist") or ""))
     idle_seconds = (now - last).total_seconds() if last else float("inf")
     if status in {"submitting", "completed", "terminated", "abandoned", "partially_completed", "recovered"}:
         # A row the fast-finalize path just wrote (report "generating") is being
         # upgraded by the submit request's background task — racing it from
         # here produced duplicate finalizations (15 Sep 2026). Give it 10 min.
-        if str(row.get("report_status") or "").strip().lower() == "generating" and idle_seconds < 10 * 60:
+        if report_status == "generating" and idle_seconds < 10 * 60:
             return False
         return True
     recovery_idle_sec = max(30 * 60, min(45 * 60, int(os.getenv("INTERVIEW_RECOVERY_IDLE_MIN", "35") or "35") * 60))
     # Active/in-progress rows with recent activity are not recoverable yet.
     if status in {"started", "in_progress"} and last and idle_seconds < recovery_idle_sec:
         return False
-    if answers and idle_seconds >= recovery_idle_sec:
+    if has_answers and idle_seconds >= recovery_idle_sec:
         return True
     if status in {"started", "in_progress"} and idle_seconds >= 60 * 60:
         return True
@@ -2426,19 +2496,27 @@ def _should_recover_progress(row: dict, now: datetime) -> bool:
 
 
 def _recover_interviews_once(limit: int = 100) -> int:
+    """One recovery pass. The listing is slim (no JSON columns) and already
+    filtered in SQL; the full row is loaded only for a row that is finalized,
+    and EVERY row touched is counted (`record_interview_recovery_attempt`) so
+    it cannot be selected for ever — success closes it as `ready`, the third
+    failure as `recovery_failed`."""
     recovered = 0
     now = datetime.now(IST)
     try:
-        rows = list_recoverable_interview_progress(AUTH_DB_TARGET, limit=limit)
+        rows = list_recoverable_interview_progress(AUTH_DB_TARGET, limit=limit, now=now)
     except Exception as exc:
         logger.warning("interview.recovery.scan_failed: %s", exc, exc_info=True)
         return 0
     for row in rows:
+        rid = str(row.get("interview_id") or "").strip()
         try:
             if not _should_recover_progress(row, now):
                 continue
-            sess = _session_from_progress(row)
+            full = get_interview_progress_by_id(AUTH_DB_TARGET, rid) if rid else None
+            sess = _session_from_progress(full)
             if not sess:
+                record_interview_recovery_attempt(AUTH_DB_TARGET, rid, succeeded=False, error="no session payload")
                 continue
             status = str(row.get("status") or "").strip().lower()
             answers = sess.get("answers") or []
@@ -2452,7 +2530,8 @@ def _recover_interviews_once(limit: int = 100) -> int:
                 final_status = "abandoned"
                 reason = "abandoned_without_answers"
             out = _finalize_interview_snapshot(sess, reason=reason, final_status=final_status)
-            token = str((sess.get("meta", {}) or {}).get("invite_token") or row.get("invite_token") or "").strip()
+            record_interview_recovery_attempt(AUTH_DB_TARGET, rid, succeeded=True)
+            token = str((sess.get("meta", {}) or {}).get("invite_token") or (full or {}).get("invite_token") or row.get("invite_token") or "").strip()
             if token:
                 sessions.pop(f"inv:{token}", None)
             recovered += 1
@@ -2460,7 +2539,7 @@ def _recover_interviews_once(limit: int = 100) -> int:
                 "interview.recovery.finalized",
                 extra={
                     "event": "interview.recovery.finalized",
-                    "interview_id": row.get("interview_id", ""),
+                    "interview_id": rid,
                     "invite_token": _invite_token_tag(token),
                     "final_status": final_status,
                     "report_ready": bool(out.get("report_ready")),
@@ -2470,20 +2549,45 @@ def _recover_interviews_once(limit: int = 100) -> int:
             logger.warning(
                 "interview.recovery.row_failed: %s",
                 exc,
-                extra={"event": "interview.recovery.row_failed", "interview_id": row.get("interview_id", "")},
+                extra={"event": "interview.recovery.row_failed", "interview_id": rid},
                 exc_info=True,
             )
+            try:
+                record_interview_recovery_attempt(AUTH_DB_TARGET, rid, succeeded=False, error=str(exc))
+            except Exception:
+                logger.warning("interview.recovery.attempt_record_failed", extra={"interview_id": rid}, exc_info=True)
     return recovered
+
+
+def _recovery_worker_enabled() -> bool:
+    """INTERVIEW_RECOVERY_WORKER=false turns the loop off in a process (the
+    second app instance behind nginx sets it, like EMAIL_OUTBOX_WORKER)."""
+    raw = (os.getenv("INTERVIEW_RECOVERY_WORKER") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _recovery_worker_interval_sec() -> int:
+    # 300 s by default (was 60): recovery targets sessions idle for 35+ minutes,
+    # so a 5-minute cadence loses nothing and costs a fifth of the scans.
+    return max(30, min(3600, int(os.getenv("INTERVIEW_RECOVERY_INTERVAL_SEC", "300") or "300")))
 
 
 _RECOVERY_WORKER_STARTED = False
 
 
 def _recovery_worker_loop() -> None:
-    interval = max(30, min(600, int(os.getenv("INTERVIEW_RECOVERY_INTERVAL_SEC", "60") or "60")))
+    interval = _recovery_worker_interval_sec()
     while True:
         try:
-            _recover_interviews_once(limit=100)
+            # One process at a time: a session advisory lock on Postgres, so even
+            # two instances that both left the env gate on cannot scan together.
+            with interview_recovery_lock(AUTH_DB_TARGET) as held:
+                if held:
+                    _recover_interviews_once(limit=100)
+                else:
+                    logger.debug("interview.recovery.skipped_locked")
         except Exception as exc:
             logger.warning("interview.recovery.loop_failed: %s", exc, exc_info=True)
         time.sleep(interval)
@@ -2564,6 +2668,9 @@ def _start_interview_recovery_worker() -> None:
             logger.critical(msg, extra={"event": "startup.multi_worker_refused", "workers": workers})
             raise RuntimeError(msg)
     if _RECOVERY_WORKER_STARTED:
+        return
+    if not _recovery_worker_enabled():
+        logger.info("interview.recovery.worker_disabled", extra={"event": "interview.recovery.worker_disabled"})
         return
     _RECOVERY_WORKER_STARTED = True
     t = threading.Thread(target=_recovery_worker_loop, daemon=True, name="interview-recovery")
@@ -5582,6 +5689,137 @@ def hr_candidate_strengths_weaknesses(request: Request, candidate_id: str, inter
     return {"analysis": analysis, "cached": cached}
 
 
+# ---------------------------------------------------------------- re-score
+# 6 Oct 2026 (screener review): the scoring of spoken answers was recalibrated
+# (ai.py), and reports already generated keep their stored scores. A reviewer can
+# re-run the WHOLE evaluation of one finished interview from its saved transcript:
+# same pipeline as submit (`_evaluate_and_store_report`), HR's question exclusions
+# re-applied, the CRM link re-synced. Runs in a thread (a 40-question interview
+# takes a minute); the state is per process (one worker — see §6).
+_RESCORE_STATE: dict[str, dict] = {}
+_RESCORE_LOCK = threading.Lock()
+
+
+def _record_for_candidate(candidate_id: str, interview_id: str):
+    rec = get_interview_record_payload(AUTH_DB_TARGET, interview_id)
+    if not rec:
+        rec = find_hr_record(load_hr_records(DATA_FILE), interview_id)
+    if not rec:
+        return None, JSONResponse({"error": "Interview record not found."}, status_code=404)
+    cid = (candidate_id or "").strip().lower()
+    profile = rec.get("candidate_profile") or {}
+    rec_email = str(rec.get("candidate_email") or profile.get("email") or "").strip().lower()
+    rec_name = str(rec.get("candidate_name") or profile.get("name") or "").strip().lower()
+    if cid and cid not in {rec_email, rec_name}:
+        return None, JSONResponse({"error": "Interview does not belong to this candidate."}, status_code=403)
+    return rec, None
+
+
+def _headline(report: dict | None) -> dict:
+    report = report if isinstance(report, dict) else {}
+    return {
+        "overall_score": report.get("overall_score"),
+        "recommendation": report.get("recommendation"),
+        "overall_fitment": report.get("overall_fitment"),
+    }
+
+
+def rescore_interview_record(interview_id: str, rescored_by: str = "") -> dict:
+    """Re-evaluate one finished interview from its saved session. Returns
+    {previous, current}. Raises ValueError when the transcript is not available."""
+    from utils.score_exclusion import exclude_question_from_score, per_question_rows
+
+    old = get_interview_record_payload(AUTH_DB_TARGET, interview_id) or {}
+    progress = get_interview_progress_by_id(AUTH_DB_TARGET, interview_id)
+    session = _session_from_progress(progress)
+    if not session or not (session.get("answers") or []):
+        raise ValueError("The saved transcript of this interview is not available, so it cannot be re-scored.")
+    old_report = old.get("report") if isinstance(old.get("report"), dict) else {}
+    exclusions = [
+        (int(r.get("question_index") or 0), str(r.get("excluded_by") or ""), str(r.get("excluded_reason") or ""))
+        for r in per_question_rows(old_report) if r.get("excluded_from_score")
+    ]
+    meta = session.setdefault("meta", {})
+    meta["interview_id"] = interview_id
+    if old.get("final_status"):
+        meta["final_status"] = old.get("final_status")
+    if old.get("finalization_reason"):
+        meta["finalization_reason"] = old.get("finalization_reason")
+    _result, _ist, record = _evaluate_and_store_report(session)
+    report = record.get("report") if isinstance(record.get("report"), dict) else {}
+    for qidx, by, reason in exclusions:
+        if qidx < 1:
+            continue
+        try:
+            report = exclude_question_from_score(
+                report, list(record.get("questions") or []), list(record.get("answers") or []),
+                question_index=qidx, excluded_by=by or "HR Manager", reason=reason)
+        except ValueError:
+            continue
+    report["rescored_at"] = _now_ist_parts()["ist_iso"]
+    report["rescored_by"] = rescored_by or ""
+    report["previous_score"] = _headline(old_report)
+    record["report"] = report
+    for key in ("final_status", "finalization_reason", "hr_decision", "status"):
+        if old.get(key) and not record.get(key):
+            record[key] = old[key]
+    record["report_status"] = "ready"
+    upsert_interview_record_snapshot(AUTH_DB_TARGET, record)
+    _persist_hr_record_mirror(record)      # also re-syncs the CRM link score / verdict
+    invalidate_hr_dashboard_cache()
+    return {"previous": _headline(old_report), "current": _headline(report)}
+
+
+def _run_rescore(interview_id: str, by: str) -> None:
+    try:
+        out = rescore_interview_record(interview_id, by)
+        state = {"status": "done", **out}
+    except ValueError as exc:
+        state = {"status": "failed", "error": str(exc)}
+    except Exception as exc:  # pragma: no cover — logged, reported to the page
+        logger.warning("interview re-score failed for %s", interview_id, exc_info=True)
+        state = {"status": "failed", "error": f"Re-scoring failed: {exc}"}
+    state["finished_at"] = _now_ist_parts()["ist_iso"]
+    with _RESCORE_LOCK:
+        _RESCORE_STATE[interview_id] = state
+
+
+@app.post("/hr/candidates/{candidate_id}/interviews/{interview_id}/rescore")
+def hr_rescore_interview(request: Request, candidate_id: str, interview_id: str):
+    """Start re-scoring one finished interview with the current scoring rules."""
+    payload, auth_err = _require_interview_report_reader(request)
+    if auth_err:
+        return auth_err
+    rec, err = _record_for_candidate(candidate_id, interview_id)
+    if err:
+        return err
+    with _RESCORE_LOCK:
+        if (_RESCORE_STATE.get(interview_id) or {}).get("status") == "running":
+            return {"status": "running", "message": "Re-scoring is already running for this interview."}
+        _RESCORE_STATE[interview_id] = {"status": "running", "started_at": _now_ist_parts()["ist_iso"],
+                                         "previous": _headline(rec.get("report"))}
+    by = str(payload.get("name") or payload.get("full_name") or payload.get("sub") or "").strip()
+    threading.Thread(target=_run_rescore, args=(interview_id, by), daemon=True,
+                     name="interview-rescore").start()
+    return {"status": "running", "message": "Re-scoring started — it takes about a minute."}
+
+
+@app.get("/hr/candidates/{candidate_id}/interviews/{interview_id}/rescore")
+def hr_rescore_interview_status(request: Request, candidate_id: str, interview_id: str):
+    _, auth_err = _require_interview_report_reader(request)
+    if auth_err:
+        return auth_err
+    rec, err = _record_for_candidate(candidate_id, interview_id)
+    if err:
+        return err
+    with _RESCORE_LOCK:
+        state = dict(_RESCORE_STATE.get(interview_id) or {"status": "idle"})
+    report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
+    state["rescored_at"] = report.get("rescored_at")
+    state["current_score"] = _headline(report)
+    return state
+
+
 @app.patch("/hr/candidates/{candidate_id}/interviews/{interview_id}/per-question/{question_index}/score-exclusion")
 async def hr_exclude_question_from_score(
     request: Request,
@@ -5760,7 +5998,7 @@ def hr_candidate_delete(request: Request, candidate_id: str):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "TA", "HR")  # Reports (destructive): Admin/TA/HR
+    _enforce_crm_roles(request, "TA", "HR", tab="iv:candidates", mode="edit")  # Reports (destructive): Admin/TA/HR
 
     cid = (candidate_id or "").strip().lower()
     if not cid:
@@ -5978,7 +6216,7 @@ async def job_config(
     user_payload, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG")  # Template management: Admin/RMG
+    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template management: Admin/RMG
     weights_obj = {}
     try:
         weights_obj = json.loads(weights) if (weights or "").strip() else {}
@@ -6171,7 +6409,7 @@ async def template_sample_questions(
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG")  # Template authoring: Admin/RMG
+    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template authoring: Admin/RMG
     required_list = [s.strip().lower() for s in str(requiredSkills or "").split(",") if s.strip()]
     optional_list = [s.strip().lower() for s in str(optionalSkills or "").split(",") if s.strip()]
     if not required_list:
@@ -6365,7 +6603,7 @@ async def template_prompt_preview(
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG")  # Template authoring: Admin/RMG
+    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template authoring: Admin/RMG
     mode = normalize_interview_mode(interviewMode)
     ctx = build_template_prompt_context(
         role=jobTitle,
@@ -6429,7 +6667,7 @@ async def template_test_prompt(
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG")  # Template authoring: Admin/RMG
+    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template authoring: Admin/RMG
     required_list = [s.strip().lower() for s in str(requiredSkills or "").split(",") if s.strip()]
     optional_list = [s.strip().lower() for s in str(optionalSkills or "").split(",") if s.strip()]
     skills = []
@@ -6548,7 +6786,7 @@ def job_config_get(request: Request, jobId: str):
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "TA", "HR", "RMG")  # Template read: Admin/TA/HR/RMG
+    _enforce_crm_roles(request, "TA", "HR", "RMG", tab="iv:templates")  # Template read: Admin/TA/HR/RMG
     job = get_job_template(AUTH_DB_TARGET, jobId)
     if not job:
         return JSONResponse({"error": "Template not found."}, status_code=404)
@@ -6560,7 +6798,7 @@ def job_config_delete(request: Request, jobId: str):
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG")  # Template management: Admin/RMG
+    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template management: Admin/RMG
     ok = delete_job_template(AUTH_DB_TARGET, jobId)
     if not ok:
         return JSONResponse({"error": "Template not found."}, status_code=404)
@@ -6582,7 +6820,7 @@ async def ats_score_api(
     interviewAnswers: str = Form(""),
     weights: str = Form(""),
 ):
-    _, auth_err = _require_interview_report_reader(request)
+    _, auth_err = _require_interview_report_reader(request, tab="iv:ats")
     if auth_err:
         return auth_err
 
@@ -6642,7 +6880,7 @@ async def ats_score_upload(
     cv_file: UploadFile = File(...),
     model: str = Form("gpt-4o-mini"),
 ):
-    _, auth_err = _require_interview_report_reader(request)
+    _, auth_err = _require_interview_report_reader(request, tab="iv:ats")
     if auth_err:
         return auth_err
     jd_text = await _extract_text_from_upload(jd_file, model, False)
@@ -6673,7 +6911,7 @@ async def ats_score_upload(
 
 @app.get("/candidates/ranked")
 def candidates_ranked(request: Request, jobId: str = "", limit: int = 200):
-    _, auth_err = _require_interview_report_reader(request)
+    _, auth_err = _require_interview_report_reader(request, tab="iv:ats")
     if auth_err:
         return auth_err
     cfg = get_job_template(AUTH_DB_TARGET, jobId) if (jobId or "").strip() else None
@@ -7301,6 +7539,11 @@ def auth_refresh(request: Request):
         return JSONResponse(status_code=401, content={"error": "Session expired. Please login again."})
     if payload.get("invite_token"):
         return JSONResponse(status_code=403, content={"error": "Interview sessions cannot be extended."})
+    # Re-read the account (7 Oct 2026): a deactivated or deleted login must not
+    # extend an old session — it used to refresh from the stale token's claims.
+    state = account_state(AUTH_DB_TARGET, str(payload.get("sub") or ""))
+    if state is None or not state.get("is_active", True):
+        return JSONResponse(status_code=401, content={"error": "This account is no longer active. Please contact an Admin."})
     user = {
         "username": payload.get("sub", ""),
         "role": payload.get("role", ""),
@@ -7382,6 +7625,8 @@ def auth_reset_password(
     if not row:
         return JSONResponse({"error": "Invalid or expired reset link"}, status_code=400)
     update_user_password(AUTH_DB_TARGET, int(row["user_id"]), pwh.hash_password(new_password))
+    # A password the user chose themselves ends any forced change (7 Oct 2026).
+    set_must_change_password(AUTH_DB_TARGET, int(row["user_id"]), False)
     logger.info(
         "auth.password_reset.success",
         extra={"event": "auth.password_reset.success", "user_id": int(row["user_id"])},
@@ -7435,7 +7680,7 @@ def hr_schedule_interview(
     payload, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "TA", "HR")  # HR Setup / scheduling: Admin/TA/HR
+    _enforce_crm_roles(request, "TA", "HR", tab="iv:dashboard", mode="edit")  # HR Setup / scheduling: Admin/TA/HR
     skill_list = [s.strip().lower() for s in str(final_skills or "").split(",") if s.strip()]
     transcript_toggle_raw = enable_transcript_input if str(enable_transcript_input).strip() else show_spoken_text
     job_row = get_job_template(AUTH_DB_TARGET, str(jobId or "").strip()) if str(jobId or "").strip() else None
@@ -8284,6 +8529,7 @@ def _crm_links_for_tokens(tokens: list[str]) -> dict[str, dict]:
                     "ai_score": float(lk.overall_score_percent) if lk.overall_score_percent is not None else None,
                     "ai_result": lk.result,
                     "level": lk.level,
+                    "interview_record_id": lk.interview_record_id or None,
                 }
     except Exception:
         logger.warning("integrity.crm_enrich_failed", extra={"event": "integrity.crm_enrich_failed"})
@@ -8342,7 +8588,12 @@ def _integrity_rows() -> list[dict]:
         })
     # Cross-row signal: one device / IP used for several candidates.
     shared = shared_device_flags(items)
-    crm = _crm_links_for_tokens([i["invite_token"] for i in items if i.get("invite_token")])
+    tokens = [i["invite_token"] for i in items if i.get("invite_token")]
+    crm = _crm_links_for_tokens(tokens)
+    # The report page's id: the CRM link's record id when the interview was
+    # scheduled from the CRM, else the session's progress row (HR-run
+    # interviews) — one slim query for the whole list (7 Oct 2026).
+    progress_ids = interview_ids_by_invite(AUTH_DB_TARGET, tokens)
     for it in items:
         it["shared_with"] = shared.get(it["invite_token"], [])
         if it["shared_with"]:
@@ -8351,6 +8602,12 @@ def _integrity_rows() -> list[dict]:
         it.setdefault("customer_name", "")
         it.setdefault("requirement_title", it.get("template_name") or "")
         it.setdefault("profile_id", None)
+        record_id = it.get("interview_record_id") or progress_ids.get(it["invite_token"])
+        it["interview_record_id"] = record_id or None
+        # A report exists only once the session finished (completed or
+        # terminated); before that the page would answer "not found".
+        finished = it["session_status"] in {"completed", "terminated"}
+        it["report_link"] = ai_report_link(it.get("candidate_email"), record_id) if finished else None
         it.pop("events", None)  # the list stays light; /integrity-logs/{token} has the timeline
     return items
 
@@ -8390,8 +8647,22 @@ def _integrity_auth(request: Request):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "TA", "HR")  # Integrity: Admin/CEO/TA/HR (RMG excluded)
+    _enforce_crm_roles(request, "TA", "HR", "RMG", tab="iv:integrityLogs")  # Integrity: Admin/CEO/TA/HR/RMG by role; a template may grant it to anyone
     return None
+
+
+def _recording_auth(request: Request):
+    """Who may watch a session recording (7 Oct 2026): the Integrity tab's
+    readers OR the report readers — the candidate report page shows the same
+    recording beside the verdict, and a reviewer with Reports but not Integrity
+    must still be able to play it. Either gate passing is enough."""
+    try:
+        if _integrity_auth(request) is None:
+            return None
+    except HTTPException:
+        pass
+    _, err = _require_interview_report_reader(request)
+    return err
 
 
 @app.get("/interview/integrity-logs")
@@ -8491,7 +8762,7 @@ def _recording_detail(invite_token: str, session_status: str) -> dict:
         if info.get("reason") == "not_finalized":
             _finalize_session_recording(invite_token)
             info = recording_playback(invite_token)
-        return info
+        return {**info, "session_status": str(session_status or "pending")}
     except Exception:
         return {"available": False, "reason": "storage_error"}
 
@@ -8536,15 +8807,18 @@ async def interview_recording_chunk(
     request: Request,
     seq: str = Form("0"),
     chunk: UploadFile | None = File(None),
+    stream: str = Form("cam"),
 ):
-    """Accept one ~15-second slice of the candidate's session recording.
+    """Accept one ~15-second slice of the candidate's session recording —
+    the camera (`stream=cam`, the default) or the screen (`stream=screen`,
+    7 Oct 2026); each stream has its own sequence.
 
     Deliberately forgiving. This endpoint can fail for a dozen boring reasons
     (a storage blip, an oversized chunk, a duplicated sequence) and NONE of
     them may interrupt the interview, so every failure answers 200 with a
     status the client simply logs. The candidate runtime never blocks on it.
     """
-    from services.interview_recording import recording_enabled, store_chunk
+    from services.interview_recording import normalize_stream, recording_enabled, store_chunk
 
     payload, auth_err = _require_user(request, {"candidate", "hr"})
     if auth_err:
@@ -8559,9 +8833,10 @@ async def interview_recording_chunk(
         index = int(str(seq or "0").strip() or 0)
     except (TypeError, ValueError):
         index = 0
+    which = normalize_stream(stream)
     try:
         raw = await chunk.read()
-        written = store_chunk(token, index, raw)
+        written = store_chunk(token, index, raw, which)
     except Exception as exc:
         logger.warning(
             "recording.chunk_store_failed: %s", exc,
@@ -8569,8 +8844,8 @@ async def interview_recording_chunk(
         )
         return {"status": "error"}
     if not written:
-        return {"status": "rejected", "seq": index}
-    if index == 0:
+        return {"status": "rejected", "seq": index, "stream": which}
+    if index == 0 and which == "cam":
         # The first chunk is what makes the interview WATCHABLE live. Stamp the
         # schedule row so the Integrity list can say so without touching
         # storage per row; `_finalize_session_recording` overwrites it later.
@@ -8579,7 +8854,7 @@ async def interview_recording_chunk(
             invalidate_integrity_logs_cache()
         except Exception:
             pass
-    return {"status": "stored", "seq": index, "bytes": written}
+    return {"status": "stored", "seq": index, "bytes": written, "stream": which}
 
 
 def _finalize_session_recording(invite_token: str) -> dict:
@@ -8592,21 +8867,17 @@ def _finalize_session_recording(invite_token: str) -> dict:
     from services.interview_recording import (
         RECORDING_MIME,
         discard_parts,
-        finalize_from_parts,
+        finalize_all,
         recording_enabled,
     )
 
     token = str(invite_token or "").strip()
     if not token or not recording_enabled():
         return {"status": "skipped"}
-    try:
-        result = finalize_from_parts(token)
-    except Exception as exc:
-        logger.warning(
-            "recording.finalize_failed: %s", exc,
-            extra={"event": "recording.finalize_failed"},
-        )
-        result = None
+    # Both streams (7 Oct 2026); the schedule row tracks the CAMERA file — the
+    # screen file is found in storage by `recording_playback`.
+    finalized = finalize_all(token)
+    result = finalized.get("cam")
     if not result:
         try:
             update_schedule_field(AUTH_DB_TARGET, token, recording_status="missing")
@@ -8632,7 +8903,9 @@ def _finalize_session_recording(invite_token: str) -> dict:
     except Exception:
         pass
     invalidate_integrity_logs_cache()
-    return {"status": "ready", "bytes": result.size_bytes, "parts": result.parts}
+    screen = finalized.get("screen")
+    return {"status": "ready", "bytes": result.size_bytes, "parts": result.parts,
+            "screen_bytes": screen.size_bytes if screen else 0}
 
 
 @app.post("/interview/recording/complete")
@@ -8656,7 +8929,7 @@ def interview_recording_playback(request: Request, invite_token: str):
     crash, a closed laptop — the chunks are still there, so finalize on demand
     rather than telling the reviewer there is no recording.
     """
-    err = _integrity_auth(request)
+    err = _recording_auth(request)
     if err:
         return err
     token = _recording_route_token(invite_token)
@@ -8671,7 +8944,7 @@ def _recording_route_token(invite_token: str) -> str:
 
 
 @app.get("/interview/recording/{invite_token}/live")
-def interview_recording_live(request: Request, invite_token: str, after: int = -1):
+def interview_recording_live(request: Request, invite_token: str, after: int = -1, screen_after: int = -1):
     """Live view (23 Sep 2026): the chunks uploaded since `after`.
 
     The Integrity tab polls this every few seconds while the interview runs and
@@ -8682,20 +8955,20 @@ def interview_recording_live(request: Request, invite_token: str, after: int = -
     """
     from services.interview_recording import live_manifest
 
-    err = _integrity_auth(request)
+    err = _recording_auth(request)
     if err:
         return err
     token = _recording_route_token(invite_token)
     if not token:
         return JSONResponse({"error": "Recording not found"}, status_code=404)
     rec = get_schedule_by_token(AUTH_DB_TARGET, token) or {}
-    info = live_manifest(token, after_seq=int(after))
+    info = live_manifest(token, after_seq=int(after), screen_after_seq=int(screen_after))
     info["session_status"] = str(rec.get("session_status") or "pending")
     return info
 
 
 @app.get("/interview/recording/{invite_token}/part/{seq}")
-def interview_recording_part(request: Request, invite_token: str, seq: int):
+def interview_recording_part(request: Request, invite_token: str, seq: int, stream: str = "cam"):
     """One uploaded chunk, served through the app for BOTH drivers.
 
     Live parts go through here rather than via presigned URLs on purpose: the
@@ -8706,12 +8979,12 @@ def interview_recording_part(request: Request, invite_token: str, seq: int):
     """
     from services.interview_recording import RECORDING_MIME, part_bytes
 
-    err = _integrity_auth(request)
+    err = _recording_auth(request)
     if err:
         return err
     token = _recording_route_token(invite_token)
     try:
-        raw = part_bytes(token, int(seq)) if token else None
+        raw = part_bytes(token, int(seq), stream) if token else None
     except Exception:
         raw = None
     if not raw:
@@ -8733,7 +9006,7 @@ def interview_media(request: Request, key: str):
     """
     from services.media_storage import get_storage
 
-    err = _integrity_auth(request)
+    err = _recording_auth(request)
     if err:
         return err
     store = get_storage()

@@ -127,6 +127,25 @@ def recruiter_only(user) -> bool:
     if getattr(user, "is_admin", False):
         return False
     return "TA" in user.roles and not user.has_any("Sales", "Sales_Head", "RMG")
+
+
+def sees_unapproved_deals(user) -> bool:
+    """Who may see an opportunity the Sales Head has NOT approved yet (pending or
+    rejected) — 7 Oct 2026, user report: RMG / GM saw C-2026-00102 / 00103 while
+    they still waited for the Sales Head. Until that approval the deal is the Sales
+    side's business only: Sales (incl. the Sales Manager, who implies Sales), the
+    Sales Head and Admin / CEO. RMG / GM / TA / HR / Finance see it once approved."""
+    if getattr(user, "is_admin", False):
+        return True
+    return bool(user.has_any("Sales", "Sales_Head"))
+
+
+def approved_deals_clause():
+    """SQL twin of `not sees_unapproved_deals`: only Sales-Head-approved deals."""
+    from models import Opportunity, OpportunityApprovalStatus
+    return Opportunity.approval_status == OpportunityApprovalStatus.APPROVED
+
+
 def ensure_not_on_hold(req) -> None:
     """400 when the requirement is held — new sourcing activity is paused.
     Used by uploads, slot invites and AI-L1 scheduling; candidates already

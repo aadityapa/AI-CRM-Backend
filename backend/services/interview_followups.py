@@ -138,6 +138,7 @@ def feedback_due(db: Session, *, now: datetime | None = None, areas: set[str] | 
             "area": area,
             "area_label": AREAS[area],
             "interviewer": ev.interviewer,
+            "employee_id": ev.employee_id,
             "ta_owner_id": profile.ta_owner_id,
             "ta_owner_name": profile.ta_owner_name,
         })
@@ -208,8 +209,13 @@ def run_feedback_due_reminders(db: Session, *, now: datetime | None = None) -> d
     screeners = screening_notify_user_ids(db) if any(i["area"] == SCREENING for i in items) else set()
     roles = {SCREENING: ["RMG"], HR: ["HR"], SALES: list(CUSTOMER_ROUND_ROLES)}
     sent = 0
+    from services.panel_interviews import panel_user_ids
     for it in items:
         extra = screeners if it["area"] == SCREENING else None
+        if it["area"] == SCREENING and it.get("employee_id"):
+            # The panel member themselves (7 Oct 2026) — the login behind the
+            # round's employee hears it on their My Interviews page too.
+            extra = set(extra or ()) | set(panel_user_ids(db, it["employee_id"]))
         if it["area"] == SALES:
             profile = db.get(CandidateProfile, it["profile_id"])
             extra = set(ta_user_ids(db, profile)) if profile is not None else None
