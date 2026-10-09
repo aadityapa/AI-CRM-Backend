@@ -81,6 +81,10 @@ def share_links(invoice_id: int, invoice_number: str | None, *, base_url: str = 
         "view_url": f"{root}/view",
         "data_url": root,
         "pdf_url": f"{root}/pdf",
+        # The e-invoice (8 Oct 2026): the invoice WITH its IRN / Ack No. /
+        # Ack Date — only answers once Finance recorded them (404 before).
+        "einvoice_url": f"{root}/einvoice",
+        "einvoice_pdf_url": f"{root}/einvoice/pdf",
     }
     raw = ""
     try:

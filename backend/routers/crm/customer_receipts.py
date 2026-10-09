@@ -26,11 +26,13 @@ from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, PageParams, gated_read, gated_write_action, get_crm_db, page_params
 from models import (
-    Customer, CustomerReceipt, Employee, Invoice, InvoicePayment, Project, ProjectEmployee, Timesheet,
+    Customer, CustomerReceipt, Employee, Invoice, InvoicePayment, Project, Timesheet,
 )
+from models.finance import InvoiceKind
 from schemas.common import envelope
 from services import tax
 from services.crm_common import paginate
+from services.invoice_customer_approval import payment_block
 
 router = APIRouter(prefix="/api/customer-receipts", tags=["customer-receipts"])
 
@@ -87,6 +89,9 @@ def _invoice_brief(db: Session, invoices: list[Invoice]) -> list[dict]:
         "paid_amount": float(i.paid_amount or 0),
         "balance_amount": float(i.balance_amount or 0),
         "payment_status": getattr(i.payment_status, "value", i.payment_status),
+        # Why money cannot be put on it yet — approval / IRN (8 Oct 2026); None = open.
+        "payment_block": payment_block(i),
+        "irn_recorded": bool(i.irn_number),
     } for i in invoices]
 
 
@@ -123,7 +128,7 @@ def invoice_options(customer_id: int, include_paid: bool = False,
     if db.get(Customer, customer_id) is None:
         raise HTTPException(status_code=404, detail="Customer not found")
     stmt = (select(Invoice).join(Project, Project.id == Invoice.project_id)
-            .where(Project.customer_id == customer_id))
+            .where(Project.customer_id == customer_id, Invoice.kind != InvoiceKind.PROFORMA.value))
     if not include_paid:
         stmt = stmt.where(Invoice.balance_amount > 0)
     invoices = db.execute(stmt.order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).scalars().all()
@@ -203,6 +208,13 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         if missing:
             raise HTTPException(status_code=400,
                                 detail=f"Invoice(s) {sorted(missing)} do not belong to {customer.name}")
+        # Money is recorded against the e-invoice (8 Oct 2026): customer approval
+        # + IRN first — the same rule as Record Payment on the invoice.
+        waiting = [i.invoice_number or f"#{i.id}" for i in invoices if payment_block(i)]
+        if waiting:
+            raise HTTPException(status_code=409,
+                                detail=f"Not open for payment yet (customer approval / IRN pending): "
+                                       f"{', '.join(waiting)}")
     plan, left = allocate(body.amount, invoices)
     receipt = CustomerReceipt(
         customer_id=body.customer_id, received_date=body.received_date, amount=_d(body.amount),

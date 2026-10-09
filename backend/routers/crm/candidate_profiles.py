@@ -29,7 +29,7 @@ from schemas.candidate_profiles import (
 from schemas.common import envelope
 from services.action_permissions import screens_as_rmg
 from services.candidate_profiles import (
-    applied_candidates_link,
+    allowed_next_statuses_for_user, applied_candidates_link,
     REJECTED_BUCKET, user_may_transition_from, backfill_profile_commercials, compute_hike_percent, enrich_profiles_list,
     get_profile_or_404, interview_event_to_dict, interview_events_for_profile,
     offer_to_dict, perform_transition, profile_detail, profile_to_dict,
@@ -309,6 +309,10 @@ def list_profiles(pp: PageParams = Depends(page_params),
                   applied_from: date | None = None,
                   applied_to: date | None = None,
                   submitted_by: str | None = None,
+                  #: Each row carries the moves THIS login may make (`allowed_next_statuses`)
+                  #: and the pending terms (`offer`) — the opportunity's Applicants tab acts
+                  #: from the list (8 Oct 2026, user ask), exactly like the profile page.
+                  with_actions: bool = False,
                   db: Session = Depends(get_crm_db),
                   user: CurrentUser = Depends(any_crm_role)):
     stmt = select(CandidateProfile)
@@ -442,6 +446,16 @@ def list_profiles(pp: PageParams = Depends(page_params),
     reasons = archive_reasons(db, [r.get("id") for r in rows])
     for r in rows:
         r["archived"] = reasons.get(r.get("id"))   # "manual" | "hold" | None
+    if with_actions and items:
+        from services.work_desk import pending_offers
+        offers = pending_offers(db, [p.id for p in items])
+        by_id = {p.id: p for p in items}
+        for r in rows:
+            p = by_id.get(r.get("id"))
+            if p is None:
+                continue
+            r["allowed_next_statuses"] = allowed_next_statuses_for_user(p.pipeline_status, user, p, db)
+            r["offer"] = offers.get(p.id)
     return envelope(data=rows, meta=meta)
 
 
@@ -712,6 +726,23 @@ def export_profiles(format: str = "csv",
 def create_profile(payload: ProfileCreate,
                    db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(create_profiles_gate)):
+    profile, missing = create_profile_core(db, payload, user)
+    db.commit()
+    db.refresh(profile)
+    msg = "Candidate profile created"
+    if missing:
+        msg += f" — please add the {' and '.join(missing)}"
+    return envelope(data=profile_to_dict(profile), message=msg)
+
+
+def create_profile_core(db: Session, payload: ProfileCreate, user: CurrentUser,
+                        *, resume_version=None) -> tuple[CandidateProfile, list[str]]:
+    """Apply a candidate to an opportunity — every rule of the Apply button, no
+    commit. Shared by `POST /api/candidate-profiles` and the multi-apply of
+    the resume library (9 Oct 2026), so the two can never disagree.
+    `resume_version` (a `CandidateResume`) is the resume TA chose for this
+    position: the application's resume row is built from it and the ATS scores
+    THAT version. Raises HTTPException exactly as the route does."""
     if not db.get(Candidate, payload.candidate_id):
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not db.get(Opportunity, payload.opportunity_id):
@@ -784,6 +815,9 @@ def create_profile(payload: ProfileCreate,
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                  "CREATED",
                  f"Candidate profile created (status Sourcing) by {user.full_name or user.username}")
+    if resume_version is not None:
+        from services.candidate_resumes import attach_version_to_profile
+        attach_version_to_profile(db, profile, resume_version, user)
     # ATS runs by itself, as on an upload (28 Sep 2026) — best-effort, never
     # fails the apply (`services/resumes.auto_score_profile`).
     from services.resumes import auto_score_profile
@@ -794,12 +828,7 @@ def create_profile(payload: ProfileCreate,
     # Candidate Location / Preferred Location blank → remind the TA who added it (29 Sep 2026).
     from services.slot_booking import remind_missing_location
     missing = remind_missing_location(db, profile, user.id)
-    db.commit()
-    db.refresh(profile)
-    msg = "Candidate profile created"
-    if missing:
-        msg += f" — please add the {' and '.join(missing)}"
-    return envelope(data=profile_to_dict(profile), message=msg)
+    return profile, missing
 
 
 @router.get("/{profile_id}")

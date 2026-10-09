@@ -49,6 +49,14 @@ class AiInterviewLink(Base):
     # that care print "Not attempted" and offer TA a reschedule.
     not_attempted = sa.Column(sa.Boolean, nullable=False, server_default=sa.false(), default=False)
 
+    # Voided (8 Oct 2026, migration 0130): the interview ran on the WRONG
+    # template (or is otherwise not a fair test of this role), so its verdict —
+    # even a pass — must not count. Set when TA / RMG send a fresh link with
+    # `void_previous`; the old link stays on record, labelled, never deleted.
+    voided_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    voided_by = sa.Column(sa.Integer, nullable=True)
+    voided_reason = sa.Column(sa.Text, nullable=True)
+
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     completed_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
 

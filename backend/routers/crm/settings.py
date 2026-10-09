@@ -66,7 +66,9 @@ def upsert_setting(key: str, payload: SettingValueIn,
     key = (key or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="Setting key must not be empty")
-    from services.org_settings import invalidate, normalize_value, validation_error
+    from services.org_settings import (
+        AUDITED_KEYS, audit_changes, invalidate, normalize_value, stored_values, validation_error,
+    )
 
     value = normalize_value(key, payload.value or "")
     if err := validation_error(key, value):
@@ -82,6 +84,7 @@ def upsert_setting(key: str, payload: SettingValueIn,
             raise HTTPException(status_code=400,
                                 detail=f"{PASS_THRESHOLD_KEY} must be between 0 and 100")
 
+    before = stored_values(db, [key]) if key in AUDITED_KEYS else {}
     setting = db.get(AppSetting, key)
     if setting is None:
         setting = AppSetting(key=key, value=value, description=payload.description)
@@ -92,6 +95,8 @@ def upsert_setting(key: str, payload: SettingValueIn,
         if payload.description is not None:
             setting.description = payload.description
         action = "updated"
+    if key in AUDITED_KEYS:
+        audit_changes(db, user, before, {key: value})
     db.commit()
     invalidate()
     return envelope(data=SettingOut.model_validate(setting).model_dump(),

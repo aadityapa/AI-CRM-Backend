@@ -25,7 +25,7 @@ import threading
 from collections import OrderedDict, deque
 from functools import lru_cache
 
-from fastapi import BackgroundTasks, Body, FastAPI, File, Form, Request, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
@@ -80,7 +80,6 @@ from config import (
     APP_TITLE,
     CORS_DEFAULT_ORIGINS,
     IMAGE_EXTENSIONS,
-    OPENAI_CHAT_MODELS,
     REPORT_CODE,
     SESSION_ID,
     TEXT_EXTENSIONS,
@@ -160,6 +159,8 @@ from hr.service import (
 from candidate.service import next_question_payload
 from ats import AtsWeights, ats_score, ats_score_llm, list_job_configs
 from services.interview.question_service import generate_mode_aware_questions
+from services.interview import conversation as interview_conversation
+from services import ai_models
 from services.report_links import ai_report_link
 from utils.interview_limits import (
     MAX_COUNT_MODE_QUESTIONS,
@@ -947,6 +948,18 @@ def _build_answer_response(session: dict, *, is_skipped_answer: bool) -> dict:
     }
 
 
+def _resolve_interview_model(cfg: object) -> str:
+    """The model a NEW interview session runs on (9 Oct 2026: one switch).
+
+    The server decides — `ai_models.interview_model()` (Settings ▸ AI engine →
+    `INTERVIEW_OPENAI_MODEL` → gpt-4o-mini). A model stored in a schedule's
+    config counts only when the config also says `"model_locked": true`; no UI
+    sets that today (schedules used to store the HR form's hard-wired
+    "gpt-4o-mini", which kept HR-run and older invites off the configured
+    model). A session keeps the model it started with (`meta["model"]`)."""
+    return ai_models.resolve_session_model(cfg if isinstance(cfg, dict) else {})
+
+
 def _pack_invite_config_into_notes(notes: str, cfg: dict) -> str:
     clean_notes = (notes or "").strip()
     payload = {
@@ -959,7 +972,10 @@ def _pack_invite_config_into_notes(notes: str, cfg: dict) -> str:
         "mic_always_on": bool(cfg.get("mic_always_on", False)),
         "show_spoken_text": bool(cfg.get("enable_transcript_input", cfg.get("show_spoken_text", False))),
         "enable_transcript_input": bool(cfg.get("enable_transcript_input", cfg.get("show_spoken_text", False))),
-        "model": str(cfg.get("model") or "gpt-4o-mini").strip() or "gpt-4o-mini",
+        # The server picks the model when the session starts (ai_models); a stored
+        # value counts only with model_locked, which no form sets today.
+        "model": str(cfg.get("model") or "").strip() if cfg.get("model_locked") is True else "",
+        "model_locked": cfg.get("model_locked") is True,
         "job_id": str(cfg.get("job_id") or cfg.get("jobId") or "").strip(),
     }
     marker = "__KARNEX_CFG__:"
@@ -1502,7 +1518,7 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         )
 
     has_ai = openai_key_configured("question")
-    selected_model = str(invite_cfg.get("model") or (os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini")).strip()
+    selected_model = _resolve_interview_model(invite_cfg)
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
     followup_mode_on = _adaptive_followup_enabled() and bool(invite_cfg.get("followup_mode", False))
     difficulty = str(invite_cfg.get("difficulty") or (os.getenv("INTERVIEW_DIFFICULTY") or "medium")).strip().lower() or "medium"
@@ -1769,6 +1785,8 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         stamp_time_warning_settings(sessions[skey]["meta"], weights)
         stamp_auto_advance_settings(sessions[skey]["meta"], weights)
         stamp_template_settings(sessions[skey]["meta"], weights)
+        interview_conversation.stamp_conversation_settings(
+            sessions[skey]["meta"], weights, customer_name=str((job or {}).get("customerName") or ""))
         stamp_introduction_question_types(sessions[skey]["meta"], warmup_indices)
         record_generated_questions_batch(
             sessions[skey],
@@ -2074,10 +2092,13 @@ def _invite_access_state(record: dict) -> dict:
     }
 
 
-def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
+def _evaluate_and_store_report(session: dict, *, evaluation_model: str | None = None) -> tuple[dict, dict, dict]:
+    """Score a finished session and store the report. `evaluation_model`
+    overrides the session's model for the SCORING only (re-score uses the model
+    configured now); the report records which model scored it."""
     set_interview_context(**_interview_log_context(session))
-    model = session.get("meta", {}).get("model", "gpt-4o-mini")
     meta = session.get("meta", {}) or {}
+    model = (evaluation_model or "").strip() or str(meta.get("model") or ai_models.interview_model())
     jd_skills = meta.get("jd_skills", [])
     has_ai_key = openai_key_configured("eval")
     raw_q = list(session.get("questions") or [])
@@ -2135,6 +2156,10 @@ def _evaluate_and_store_report(session: dict) -> tuple[dict, dict, dict]:
         assess_communication=assess_communication,
     )
     result["evaluation_scope"] = scope_meta
+    result["evaluation_model"] = model
+    if meta.get("fast_bootstrap"):
+        # Login fell back to generic questions (the prewarm was not ready).
+        result["questions_generic"] = True
     result = apply_decimal_scores_to_report(result)
     result = _attach_boundary_question_to_report(session, result)
     result = attach_strengths_weaknesses_analysis(
@@ -2593,6 +2618,74 @@ def _recovery_worker_loop() -> None:
         time.sleep(interval)
 
 
+#: Stale active interviews found by a page load, finalized by the background pass.
+_STALE_FINALIZE_QUEUE: set[str] = set()
+_ASYNC_RECOVERY_GUARD = threading.Lock()
+_ASYNC_RECOVERY_RUNNING = False
+
+
+def _finalize_stale_active_token(token: str) -> None:
+    """Finalize one interview left "active" past its time limit (a full report
+    evaluation — seconds to a minute on a reasoning model). Background only."""
+    skey = f"inv:{token}"
+    sess = sessions.get(skey) or _session_from_progress(get_interview_progress_by_invite(AUTH_DB_TARGET, token))
+    if not sess:
+        return
+    if not (sess.get("answers") or []):
+        _append_pending_answer_on_submit(
+            sess,
+            "[Interview auto-closed after time limit/inactivity without a submitted response.]",
+        )
+    out = _finalize_interview_snapshot(sess, reason="stale_active_recovery", final_status="recovered")
+    sessions.pop(skey, None)
+    invalidate_hr_dashboard_cache()
+    logger.info(
+        "interview.invite.stale_active.autofinalized",
+        extra={
+            "event": "interview.invite.stale_active.autofinalized",
+            "invite_token": _invite_token_tag(token),
+            "answers_count": len(sess.get("answers") or []),
+            "report_ready": bool(out.get("report_ready")),
+        },
+    )
+
+
+def _kick_recovery_async() -> bool:
+    """Page loads START recovery and return at once (9 Oct 2026). One background
+    pass at a time, under the same advisory lock as the 5-minute worker: it
+    finalizes the stale interviews the page found plus a recovery batch. A row
+    updates on the next refresh. Returns whether a pass was started."""
+    global _ASYNC_RECOVERY_RUNNING
+    with _ASYNC_RECOVERY_GUARD:
+        if _ASYNC_RECOVERY_RUNNING:
+            return False
+        _ASYNC_RECOVERY_RUNNING = True
+
+    def _run() -> None:
+        global _ASYNC_RECOVERY_RUNNING
+        try:
+            with interview_recovery_lock(AUTH_DB_TARGET) as held:
+                if not held:
+                    return
+                with _ASYNC_RECOVERY_GUARD:
+                    tokens = sorted(_STALE_FINALIZE_QUEUE)
+                    _STALE_FINALIZE_QUEUE.clear()
+                for token in tokens:
+                    try:
+                        _finalize_stale_active_token(token)
+                    except Exception:
+                        logger.warning("interview.stale_active.finalize_failed", exc_info=True)
+                _recover_interviews_once(limit=50)
+        except Exception as exc:
+            logger.warning("interview.recovery.async_failed: %s", exc, exc_info=True)
+        finally:
+            with _ASYNC_RECOVERY_GUARD:
+                _ASYNC_RECOVERY_RUNNING = False
+
+    threading.Thread(target=_run, daemon=True, name="interview-recovery-kick").start()
+    return True
+
+
 app = FastAPI(title=APP_TITLE)
 
 # Rate limiting must be wired up BEFORE any @_rl.limit(...) decorator below is
@@ -2989,6 +3082,7 @@ async def setup(
     num_q: int = Form(...),
     model: str = Form(""),
     custom_model: str = Form(""),
+    model_locked: str = Form("false"),
     safe_mode: str = Form("false"),
     followup_mode: str = Form("false"),
     interview_mode: str = Form(""),
@@ -3010,7 +3104,13 @@ async def setup(
     setup_session_key = _session_key_from_payload(payload)
     has_ai = openai_key_configured("question")
 
-    selected_model = (custom_model or model).strip() or "gpt-4o-mini"
+    # The server decides the model (ai_models); the form's value counts only
+    # when the caller locks it — the HR form used to send a hard-wired
+    # "gpt-4o-mini", which kept HR-run interviews off the configured model.
+    selected_model = _resolve_interview_model({
+        "model": (custom_model or model).strip(),
+        "model_locked": str(model_locked).strip().lower() in {"1", "true", "yes", "on"},
+    })
     safe_mode_on = str(safe_mode).strip().lower() in {"1", "true", "yes", "on"}
     followup_mode_on = _adaptive_followup_enabled() and str(followup_mode).strip().lower() in {
         "1",
@@ -3032,12 +3132,12 @@ async def setup(
     cv_text = cv.strip()
 
     if jd_file is not None:
-        jd_text = await _extract_text_from_upload(jd_file, selected_model, safe_mode_on)
+        jd_text = await _extract_text_from_upload(jd_file, safe_mode_on)
         if jd_text.startswith("__ERR__"):
             return {"error": jd_text.replace("__ERR__", "", 1)}
 
     if cv_file is not None:
-        cv_text = await _extract_text_from_upload(cv_file, selected_model, safe_mode_on)
+        cv_text = await _extract_text_from_upload(cv_file, safe_mode_on)
         if cv_text.startswith("__ERR__"):
             return {"error": cv_text.replace("__ERR__", "", 1)}
 
@@ -3323,6 +3423,9 @@ async def setup(
     stamp_time_warning_settings(sessions[setup_session_key]["meta"], weights_for_suite)
     stamp_auto_advance_settings(sessions[setup_session_key]["meta"], weights_for_suite)
     stamp_template_settings(sessions[setup_session_key]["meta"], weights_for_suite)
+    interview_conversation.stamp_conversation_settings(
+        sessions[setup_session_key]["meta"], weights_for_suite,
+        customer_name=str((job_cfg_row or {}).get("customerName") or ""))
     stamp_introduction_question_types(sessions[setup_session_key]["meta"], warmup_indices)
     record_generated_questions_batch(
         sessions[setup_session_key],
@@ -3370,7 +3473,7 @@ async def extract_skills(
     cv: str = Form(""),
     jd_file: UploadFile | None = File(None),
     cv_file: UploadFile | None = File(None),
-    model: str = Form("gpt-4o-mini"),
+    model: str = Form(""),
     custom_model: str = Form(""),
     safe_mode: str = Form("false"),
     candidate_name: str = Form(""),
@@ -3381,19 +3484,18 @@ async def extract_skills(
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    selected_model = (custom_model or model).strip() or "gpt-4o-mini"
     safe_mode_on = str(safe_mode).strip().lower() in {"1", "true", "yes", "on"}
 
     jd_text = jd.strip()
     cv_text = cv.strip()
 
     if jd_file is not None:
-        jd_text = await _extract_text_from_upload(jd_file, selected_model, safe_mode_on)
+        jd_text = await _extract_text_from_upload(jd_file, safe_mode_on)
         if jd_text.startswith("__ERR__"):
             return {"error": jd_text.replace("__ERR__", "", 1)}
 
     if cv_file is not None:
-        cv_text = await _extract_text_from_upload(cv_file, selected_model, safe_mode_on)
+        cv_text = await _extract_text_from_upload(cv_file, safe_mode_on)
         if cv_text.startswith("__ERR__"):
             return {"error": cv_text.replace("__ERR__", "", 1)}
 
@@ -3486,6 +3588,148 @@ def next_question(request: Request):
     if not s.get("finalizing") and int(s.get("current", 0) or 0) >= len(s.get("questions") or []):
         _expand_time_mode_pool(s)
     return next_question_payload(s)
+
+
+def _live_session_for_candidate(request: Request):
+    """(session, error_response) for the candidate conversation endpoints — the
+    same auth, device binding and progress recovery `/answer` uses."""
+    payload, auth_err = _require_user(request, {"hr", "candidate"})
+    if auth_err:
+        return None, auth_err
+    device_err = _enforce_invite_device_binding(request, payload)
+    if device_err:
+        return None, device_err
+    sk = _session_key_from_payload(payload)
+    s = sessions.get(sk)
+    if not s:
+        invite_token_from_token = str((payload or {}).get("invite_token") or "").strip()
+        recovered = get_interview_progress_by_invite(AUTH_DB_TARGET, invite_token_from_token) if invite_token_from_token else None
+        s = _session_from_progress(recovered)
+        if s:
+            sessions[sk] = s
+    if not s:
+        return None, JSONResponse({"error": "No active session.", "code": "no_session"}, status_code=404)
+    set_interview_context(**_interview_log_context(s))
+    return s, None
+
+
+@app.post("/candidate/conversation/clarify")
+@_rl.limit("20/minute")
+def candidate_conversation_clarify(request: Request, mode: str = Form("repeat")):
+    """C (9 Oct 2026): the candidate asked to hear the current question again
+    ("repeat") or in other words ("clarify"). The question is the SERVER's —
+    the client cannot ask for an arbitrary text to be read out. Logged on the
+    session meta so the report can show it; never scored."""
+    s, err = _live_session_for_candidate(request)
+    if err:
+        return err
+    meta = s.setdefault("meta", {})
+    if not interview_conversation.conversation_of(meta)["clarify"]:
+        return JSONResponse({"error": "Not enabled for this interview.", "code": "disabled"}, status_code=403)
+    if s.get("finalizing") or s.get("completed"):
+        return JSONResponse({"error": "The interview has finished.", "code": "finished"}, status_code=409)
+    idx = int(s.get("current") or 0)
+    questions = s.get("questions") or []
+    if idx >= len(questions):
+        return JSONResponse({"error": "No question to repeat.", "code": "no_question"}, status_code=409)
+    mode_clean = "clarify" if str(mode or "").strip().lower() == "clarify" else "repeat"
+    log = meta.setdefault("clarifications", [])
+    used = sum(1 for x in log if isinstance(x, dict) and int(x.get("index", -1)) == idx)
+    if used >= interview_conversation.MAX_CLARIFY_PER_QUESTION:
+        return {"text": "", "mode": mode_clean, "limit_reached": True,
+                "message": "The question has already been repeated — please answer as best you can."}
+    question = str(questions[idx] or "")
+    text = interview_conversation.clarify_text(meta, question, mode_clean)
+    log.append({"index": idx, "mode": mode_clean, "at_utc": datetime.now(timezone.utc).isoformat()})
+    _persist_interview_progress(s, status=_progress_status_for_session(s))
+    return {"text": text, "mode": mode_clean, "question_index": idx,
+            "remaining": max(0, interview_conversation.MAX_CLARIFY_PER_QUESTION - used - 1)}
+
+
+@app.post("/candidate/conversation/closing")
+@_rl.limit("12/minute")
+def candidate_conversation_closing(request: Request, question: str = Form("")):
+    """E (9 Oct 2026): after the last question the candidate may ask about the
+    role. Answered from the role description only; kept on the session for the
+    report; never scored. Allowed only once the questions are done."""
+    s, err = _live_session_for_candidate(request)
+    if err:
+        return err
+    meta = s.setdefault("meta", {})
+    if not interview_conversation.conversation_of(meta)["closing_qa"]:
+        return JSONResponse({"error": "Not enabled for this interview.", "code": "disabled"}, status_code=403)
+    if s.get("submitted"):
+        return JSONResponse({"error": "The interview has been submitted.", "code": "finished"}, status_code=409)
+    done = bool(s.get("completed")) or int(s.get("current") or 0) >= len(s.get("questions") or [])
+    if not done:
+        return JSONResponse({"error": "Questions about the role come at the end.", "code": "not_finished"},
+                            status_code=409)
+    asked = [x for x in (meta.get("closing_qa") or []) if isinstance(x, dict)]
+    if len(asked) >= interview_conversation.MAX_CLOSING_QUESTIONS:
+        return {"answer": interview_conversation.CLOSING_GOODBYE, "remaining": 0, "limit_reached": True}
+    q = " ".join(str(question or "").split()).strip()
+    if not q:
+        return JSONResponse({"error": "Please say or type your question.", "code": "empty"}, status_code=400)
+    answer = interview_conversation.answer_closing_question(meta, q)
+    asked.append({"question": q[:600], "answer": answer, "at_utc": datetime.now(timezone.utc).isoformat()})
+    meta["closing_qa"] = asked
+    _persist_interview_progress(s, status=_progress_status_for_session(s))
+    return {"answer": answer, "remaining": max(0, interview_conversation.MAX_CLOSING_QUESTIONS - len(asked))}
+
+
+@app.post("/candidate/realtime/session")
+@_rl.limit("10/minute")
+def candidate_realtime_session(request: Request):
+    """F (9 Oct 2026): mint a short-lived client secret so the candidate's
+    browser can open the live voice call directly with OpenAI. Our key never
+    leaves the server. 503 → the browser uses the standard voice instead."""
+    from services.interview import realtime_voice
+
+    s, err = _live_session_for_candidate(request)
+    if err:
+        return err
+    meta = s.setdefault("meta", {})
+    if not interview_conversation.is_live_voice(meta):
+        return JSONResponse({"error": "Live voice is not enabled for this interview.", "code": "disabled"},
+                            status_code=403)
+    if s.get("finalizing") or s.get("submitted"):
+        return JSONResponse({"error": "The interview has finished.", "code": "finished"}, status_code=409)
+    try:
+        minted = realtime_voice.mint_client_secret(meta)
+    except realtime_voice.RealtimeUnavailable as exc:
+        logger.warning("interview.realtime.unavailable", extra={"event": "interview.realtime.unavailable",
+                                                                "reason": str(exc)[:200]})
+        return JSONResponse({"error": str(exc), "code": "realtime_unavailable"}, status_code=503)
+    meta["realtime_model"] = minted["model"]
+    meta["realtime_sessions"] = int(meta.get("realtime_sessions") or 0) + 1
+    _persist_interview_progress(s, status=_progress_status_for_session(s))
+    return minted
+
+
+@app.post("/candidate/realtime/usage")
+@_rl.limit("120/minute")
+async def candidate_realtime_usage(request: Request):
+    """The browser forwards each live voice response's `usage`, so the call is
+    priced on the AI Costs ledger like every other AI call."""
+    from services.interview import realtime_voice
+
+    s, err = _live_session_for_candidate(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    usages = body.get("usages") if isinstance(body, dict) else None
+    if not isinstance(usages, list):
+        usages = [body.get("usage")] if isinstance(body, dict) else []
+    total = 0.0
+    for usage in usages[:50]:
+        try:
+            total += realtime_voice.log_usage(s.get("meta") or {}, usage)
+        except Exception:
+            logger.exception("interview.realtime.usage_log_failed")
+    return {"status": "ok", "logged": len(usages[:50]), "cost_usd": round(total, 6)}
 
 
 _speech_log = logging.getLogger("karnex.interview.speech")
@@ -3778,6 +4022,111 @@ def _replace_question_slot(session: dict, index: int, new_question: str) -> None
             pass
 
 
+def _inline_ai_timeout_s() -> float:
+    """Deadline for a model call the candidate waits on inside /answer."""
+    try:
+        return max(1.0, min(30.0, float(os.getenv("INTERVIEW_INLINE_AI_TIMEOUT_S", "6"))))
+    except (TypeError, ValueError):
+        return 6.0
+
+
+def _bounded_ai_call(fn, *, label: str, timeout_s: float):
+    """Run one model call under a hard deadline (9 Oct 2026). Returns its
+    result, or None on timeout / error — the caller always has a fallback.
+    The interview log context lives in a ContextVar, which a pool thread does
+    not inherit, so it is copied across (same pattern as conversation._chat_json)."""
+    import concurrent.futures
+    import contextvars
+
+    ctx = contextvars.copy_context()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(ctx.run, fn).result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        logger.warning("interview.inline_ai.timeout", extra={"event": "interview.inline_ai.timeout",
+                                                            "call": label, "timeout_s": timeout_s})
+        return None
+    except Exception as exc:
+        logger.warning("interview.inline_ai.failed %s: %s", label, str(exc)[:200])
+        return None
+    finally:
+        pool.shutdown(wait=False)
+
+
+def _apply_conversation_turn(
+    session: dict,
+    *,
+    previous_question: str,
+    answer: str,
+    answered_index: int,
+    is_warmup: bool,
+    is_skipped: bool,
+    idx_next: int,
+) -> bool:
+    """The conversation's half of a turn (9 Oct 2026): maybe insert ONE follow-up
+    as the next question, and prepare the spoken lead-in for whatever comes next.
+    Returns True when a follow-up was inserted. Never raises — a failure here
+    costs the conversation its polish, never the candidate their turn."""
+    conv = interview_conversation
+    meta = session.setdefault("meta", {})
+    try:
+        cfg = conv.conversation_of(meta)
+        from candidate.service import interview_elapsed_seconds, interview_time_limit_seconds
+
+        limit = interview_time_limit_seconds(session)
+        time_left = (limit - interview_elapsed_seconds(session)) if limit else None
+        kind = conv.followup_kind_wanted(
+            meta, answered_index=answered_index, answer=answer, is_warmup=is_warmup,
+            is_skipped=is_skipped, time_left_s=time_left,
+        )
+        # Live voice speaks its own acknowledgements; only the standard voice
+        # needs a prepared lead-in.
+        want_lead = cfg["acknowledge"] and cfg["voice_mode"] != conv.VOICE_LIVE
+        lead_in = None
+        if want_lead and is_warmup:
+            lead_in = conv.WARMUP_LEAD_IN
+        elif want_lead and is_skipped:
+            lead_in = conv.SKIP_LEAD_IN
+        model_lead = want_lead and not is_warmup and not is_skipped
+        follow_up = None
+        if model_lead or kind:
+            questions = list(session.get("questions") or [])
+            answers = list(session.get("answers") or [])
+            recent = "\n\n".join(
+                f"Q: {questions[i]}\nA: {answers[i]}"
+                for i in range(max(0, answered_index - 2), answered_index)
+                if i < len(questions) and i < len(answers) and not is_warmup_index(meta, i)
+            )
+            plan = conv.plan_turn(
+                meta, question=previous_question, answer=answer, recent_transcript=recent,
+                want_lead_in=model_lead, followup_kind=kind, avoid=questions, seed=answered_index,
+            )
+            if model_lead:
+                lead_in = plan.get("lead_in")
+            follow_up = plan.get("follow_up")
+        inserted = False
+        if follow_up and not question_too_similar(follow_up, list(session.get("questions") or [])):
+            inserted = conv.insert_followup(session, idx_next, follow_up)
+        from services.tts_prewarm import prewarm_tts
+
+        conv.set_lead_in(meta, idx_next, lead_in or "")
+        for text in ([lead_in] if lead_in else []) + ([follow_up] if inserted else []):
+            try:
+                prewarm_tts(text)
+            except Exception:
+                pass
+        if inserted:
+            logger.info(
+                "interview.conversation.followup_inserted",
+                extra={"event": "interview.conversation.followup_inserted", "kind": kind,
+                       "index": idx_next, "inserted_total": conv.followups_inserted(meta)},
+            )
+        return inserted
+    except Exception:
+        logger.exception("interview.conversation.turn_failed")
+        return False
+
+
 def _schedule_turn_evaluation(session: dict, previous_question: str, answer_text: str) -> None:
     """Run per-turn OpenAI evaluation off the /answer critical path."""
 
@@ -3791,6 +4140,11 @@ def _schedule_turn_evaluation(session: dict, previous_question: str, answer_text
 
 
 def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: str) -> None:
+    """Per-turn evaluation (background thread). The model call runs OUTSIDE the
+    session lock (9 Oct 2026): /answer holds the same lock for its whole body,
+    and on a reasoning model the call takes 3-5 s, so a quick next answer or skip
+    used to wait behind it. Inputs are read under the lock; the result is written
+    under the lock only while the session is still on the same turn."""
     sk = _session_key_from_session(session)
     set_interview_context(**_interview_log_context(session))
     with session_lock(sk):
@@ -3799,24 +4153,33 @@ def _apply_turn_evaluation(session: dict, previous_question: str, answer_text: s
             return
         if not openai_key_configured("eval"):
             return
-        jd_skills = meta.get("jd_skills", []) or []
+        jd_skills = list(meta.get("jd_skills", []) or [])
         focus = detect_skill_from_question(previous_question, jd_skills) or (jd_skills[0] if jd_skills else "technical")
         cur = str(meta.get("session_difficulty") or meta.get("difficulty", "medium")).lower()
         if cur not in ("easy", "medium", "hard"):
             cur = "medium"
-        try:
-            ev = evaluate_turn_with_model(
-                previous_question,
-                answer_text,
-                focus,
-                cur,
-                model=meta.get("model", "gpt-4o-mini"),
-                assess_communication=bool(meta.get("communication_required", True)),
-            )
-        except Exception:
+        model = str(meta.get("model") or ai_models.interview_model())
+        assess_communication = bool(meta.get("communication_required", True))
+        answered_at_read = len(session.get("answers") or [])
+    try:
+        ev = evaluate_turn_with_model(
+            previous_question,
+            answer_text,
+            focus,
+            cur,
+            model=model,
+            assess_communication=assess_communication,
+        )
+    except Exception:
+        return
+    if not ev:
+        return
+    with session_lock(sk):
+        if session.get("finalizing") or session.get("completed"):
             return
-        if not ev:
-            return
+        if len(session.get("answers") or []) != answered_at_read:
+            return  # the candidate moved on; this result belongs to a past turn
+        meta = session.get("meta", {})
         meta["last_turn_score"] = ev.get("score")
         meta["last_turn_feedback"] = (ev.get("feedback") or "")[:500]
         meta["last_turn_reason"] = (ev.get("reason") or "")[:300]
@@ -3838,57 +4201,141 @@ def _parse_client_turn(raw: str) -> int | None:
     return value if value >= 0 else None
 
 
-def _expand_time_mode_pool(session: dict) -> None:
+#: Sessions with a background question top-up in flight (one at a time each).
+_POOL_TOPUP_RUNNING: set[str] = set()
+_POOL_TOPUP_GUARD = threading.Lock()
+#: A top-up starts when this many (or fewer) unasked questions remain.
+_POOL_LOW_WATER = 8
+
+
+def _pool_sync_timeout_s() -> float:
+    """Deadline for generating questions while the candidate waits (pool empty).
+    Must stay below the client's 30 s /next abort."""
+    try:
+        return max(3.0, min(28.0, float(os.getenv("INTERVIEW_POOL_SYNC_TIMEOUT_S", "20"))))
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def _time_pool_need(session: dict) -> int:
+    """How many questions a timed interview's rolling pool should get now (0 = none)."""
     meta = session.get("meta", {})
     if str(meta.get("question_source") or "") == "manual":
-        return
+        return 0
     if str(meta.get("timing_mode") or "") != "time":
-        return
+        return 0
     if not openai_key_configured("question") or meta.get("safe_mode", True):
-        return
-    qs = list(session.get("questions") or [])
+        return 0
+    qs = session.get("questions") or []
     cur = int(session.get("current", 0))
     max_pool = max(20, min(60, int(os.getenv("TIME_MODE_POOL_MAX", "50") or "50")))
-    if len(qs) >= max_pool:
-        return
-    if len(qs) - cur > 8:
-        return
-    need = min(10, max_pool + 2 - len(qs))
-    if need <= 0:
-        return
-    avoid = list(qs)
-    avoid_hist = build_question_avoid_history(
+    if len(qs) >= max_pool or len(qs) - cur > _POOL_LOW_WATER:
+        return 0
+    return max(0, min(10, max_pool + 2 - len(qs)))
+
+
+def _pool_generation_inputs(session: dict, need: int) -> dict:
+    """Everything the generator needs, copied so it can run without the lock."""
+    meta = session.get("meta", {})
+    avoid = list(session.get("questions") or [])
+    avoid.extend(build_question_avoid_history(
         global_recent=recently_asked_questions(80),
         session_asked=meta.get("asked_questions") or [],
-    )
-    avoid.extend(avoid_hist)
-    lvl = str(meta.get("session_difficulty") or meta.get("difficulty", "medium"))
-    try:
-        more = _generate_interview_questions(
-            interview_mode=str(meta.get("interview_mode") or "technical"),
-            jd_text=meta.get("jd_text", "") or "",
-            cv_text="",
-            difficulty=lvl,
-            n=need,
-            model=meta.get("model", "gpt-4o-mini"),
-            skills=meta.get("jd_skills", []),
-            coach_hints=coach_hints_text(),
-            experience=str(meta.get("candidate_experience", "")),
-            role=str(meta.get("job_title") or ""),
-            tech_stack=str(meta.get("intelligence_tech_stack") or ""),
-            template_prompt=str(meta.get("template_prompt") or ""),
-            avoid_history=avoid,
-            variety_seed=str(meta.get("question_seed") or ""),
-        )
-    except Exception:
-        more = []
+    ))
+    return {
+        "interview_mode": str(meta.get("interview_mode") or "technical"),
+        "jd_text": meta.get("jd_text", "") or "",
+        "cv_text": "",
+        "difficulty": str(meta.get("session_difficulty") or meta.get("difficulty", "medium")),
+        "n": need,
+        "model": str(meta.get("model") or ai_models.interview_model()),
+        "skills": list(meta.get("jd_skills", []) or []),
+        "coach_hints": coach_hints_text(),
+        "experience": str(meta.get("candidate_experience", "")),
+        "role": str(meta.get("job_title") or ""),
+        "tech_stack": str(meta.get("intelligence_tech_stack") or ""),
+        "template_prompt": str(meta.get("template_prompt") or ""),
+        "avoid_history": avoid,
+        "variety_seed": str(meta.get("question_seed") or ""),
+    }
+
+
+def _append_pool_questions(session: dict, more: list, avoid: list) -> int:
+    """Append the new questions that are not too similar to what is there."""
+    qs = list(session.get("questions") or [])
+    avoid = list(avoid) + qs
+    added = 0
     for q in more or []:
         t = (q or "").strip()
         if not t or question_too_similar(t, avoid):
             continue
         avoid.append(t)
         qs.append(t)
+        added += 1
     session["questions"] = qs
+    return added
+
+
+def _expand_time_mode_pool(session: dict) -> str | None:
+    """Keep a timed interview's rolling question pool topped up (9 Oct 2026).
+
+    With 8 or fewer unasked questions left a BACKGROUND top-up starts (one per
+    session at a time): the model call runs outside the session lock and the
+    questions are appended under it — on a reasoning model a top-up takes
+    10-30 s, which used to sit inside /answer. Only when the pool is truly empty
+    is it generated while the candidate waits, under a deadline, with the
+    template fallback on timeout so the interview never ends with time left
+    (16 Sep 2026 rule). Returns "background" | "sync" | None for the timing log."""
+    need = _time_pool_need(session)
+    if need <= 0:
+        return None
+    inputs = _pool_generation_inputs(session, need)
+    if int(session.get("current", 0)) < len(session.get("questions") or []):
+        _start_pool_topup(session, inputs)
+        return "background"
+    more = _bounded_ai_call(
+        lambda: _generate_interview_questions(**inputs),
+        label="time_pool_sync",
+        timeout_s=_pool_sync_timeout_s(),
+    ) or []
+    added = _append_pool_questions(session, more, inputs["avoid_history"])
+    if not added:
+        meta = session.get("meta", {})
+        fallback = generate_questions_fallback(
+            str(meta.get("jd_text") or ""), "", inputs["difficulty"], need,
+            required_skills=inputs["skills"] or None,
+        )
+        _append_pool_questions(session, fallback, inputs["avoid_history"])
+    return "sync"
+
+
+def _start_pool_topup(session: dict, inputs: dict) -> None:
+    sk = _session_key_from_session(session)
+    with _POOL_TOPUP_GUARD:
+        if sk in _POOL_TOPUP_RUNNING:
+            return
+        _POOL_TOPUP_RUNNING.add(sk)
+    import contextvars
+
+    ctx = contextvars.copy_context()
+
+    def _run() -> None:
+        try:
+            try:
+                more = _generate_interview_questions(**inputs)
+            except Exception:
+                logger.warning("interview.pool_topup.failed", exc_info=True)
+                return
+            with session_lock(sk):
+                if session.get("finalizing") or session.get("completed"):
+                    return
+                if _append_pool_questions(session, more or [], inputs["avoid_history"]):
+                    _persist_interview_progress(session, status="in_progress")
+        finally:
+            with _POOL_TOPUP_GUARD:
+                _POOL_TOPUP_RUNNING.discard(sk)
+
+    threading.Thread(target=lambda: ctx.run(_run), daemon=True, name=f"pool-topup-{sk[:16]}").start()
 
 
 def _record_skipped_turn(
@@ -3962,7 +4409,12 @@ def answer(
     if device_err:
         return device_err
     sk = _session_key_from_payload(payload)
+    # Per-request timing (9 Oct 2026): nginx logs no request time, so /answer
+    # writes one `interview.answer.timing` line with the in-path model calls.
+    answer_t0 = time.perf_counter()
+    answer_timing: dict = {}
     with session_lock(sk):
+        answer_timing["lock_wait_ms"] = int((time.perf_counter() - answer_t0) * 1000)
         s = sessions.get(sk)
         if not s:
             invite_token_from_token = str((payload or {}).get("invite_token") or "").strip()
@@ -4187,8 +4639,26 @@ def answer(
                         extra={"index": idx_next + 1, "skill": missing_skills[0], "question": replacement[:180]},
                     )
 
+        # Two-way conversation (9 Oct 2026) — opt-in per template. A follow-up is
+        # INSERTED as the next question (the plan is never cut) and the spoken
+        # lead-in for the next question is prepared. Off → nothing runs here.
+        conv_followup_inserted = False
+        if interview_conversation.conversation_of(meta)["enabled"] and not s.get("finalizing"):
+            _conv_t0 = time.perf_counter()
+            conv_followup_inserted = _apply_conversation_turn(
+                s,
+                previous_question=previous_question,
+                answer=ans_clean,
+                answered_index=turn_index,
+                is_warmup=is_warmup_turn,
+                is_skipped=is_skipped_answer,
+                idx_next=idx_next,
+            )
+            answer_timing["conversation_ms"] = int((time.perf_counter() - _conv_t0) * 1000)
+
         if (
             not is_manual_session
+            and not conv_followup_inserted
             and not is_warmup_turn
             and not is_skipped_answer
             and not s.get("finalizing")
@@ -4205,21 +4675,27 @@ def answer(
             recent_transcript = "\n\n".join(qa_lines)
             follow_q = ""
             if not meta.get("safe_mode", True):
-                try:
-                    follow_q = generate_followup_with_model(
+                # The candidate waits on this call: the fast model, under a
+                # hard deadline; on timeout the fallback below runs (9 Oct 2026).
+                _fq_hints = "\n".join(
+                    [x for x in [coach_hints_text(), str(meta.get("template_prompt") or "")] if str(x or "").strip()]
+                )[:5000]
+                _fq_t0 = time.perf_counter()
+                follow_q = _bounded_ai_call(
+                    lambda: generate_followup_with_model(
                         jd=str(meta.get("jd_text", "")),
                         jd_skills=followup_skills,
                         previous_question=previous_question,
                         previous_answer=ans_clean,
-                        model=str(meta.get("model", "gpt-4o-mini")),
+                        model=ai_models.fast_interview_model(str(meta.get("model") or "")),
                         recent_transcript=recent_transcript,
                         avoid_questions=prior_qs,
-                        coach_hints="\n".join(
-                            [x for x in [coach_hints_text(), str(meta.get("template_prompt") or "")] if str(x or "").strip()]
-                        )[:5000],
-                    )
-                except Exception:
-                    follow_q = ""
+                        coach_hints=_fq_hints,
+                    ),
+                    label="adaptive_next_question",
+                    timeout_s=_inline_ai_timeout_s(),
+                ) or ""
+                answer_timing["followup_ms"] = int((time.perf_counter() - _fq_t0) * 1000)
             if not follow_q or question_too_similar(follow_q, prior_qs):
                 follow_q = generate_followup_fallback(
                     followup_skills,
@@ -4234,6 +4710,7 @@ def answer(
 
         if (
             _adaptive_followup_enabled()
+            and not conv_followup_inserted
             and not is_warmup_turn
             and not is_skipped_answer
             and not s.get("finalizing")
@@ -4245,7 +4722,7 @@ def answer(
             anchor_skill = detect_skill_from_question(previous_question, jd_skills)
             followup_skills = [anchor_skill] if anchor_skill else jd_skills[:1]
             jd_text = meta.get("jd_text", "")
-            model = meta.get("model", "gpt-4o-mini")
+            model = ai_models.fast_interview_model(str(meta.get("model") or ""))
             safe_mode = meta.get("safe_mode", True)
             follow_idx = int(meta.get("followups_added", 0))
             prior_qs = list(s["questions"])
@@ -4258,8 +4735,9 @@ def answer(
             follow_q = ""
             coach = coach_hints_text()
             if not safe_mode:
-                try:
-                    follow_q = generate_followup_with_model(
+                _fq_t0 = time.perf_counter()
+                follow_q = _bounded_ai_call(
+                    lambda: generate_followup_with_model(
                         jd=jd_text,
                         jd_skills=followup_skills,
                         previous_question=previous_question,
@@ -4268,9 +4746,11 @@ def answer(
                         recent_transcript=recent_transcript,
                         avoid_questions=prior_qs,
                         coach_hints=coach,
-                    )
-                except Exception:
-                    follow_q = ""
+                    ),
+                    label="followup_mode",
+                    timeout_s=_inline_ai_timeout_s(),
+                ) or ""
+                answer_timing["followup_ms"] = int((time.perf_counter() - _fq_t0) * 1000)
             if not follow_q or question_too_similar(follow_q, prior_qs):
                 follow_q = generate_followup_fallback(
                     followup_skills, ans_clean, follow_idx + 1, previous_question
@@ -4285,7 +4765,7 @@ def answer(
         # skipping the last generated question used to end the interview with
         # time still on the clock (16 Sep 2026).
         if not s.get("finalizing"):
-            _expand_time_mode_pool(s)
+            answer_timing["pool_topup"] = _expand_time_mode_pool(s)
         _persist_interview_progress(s, status="in_progress")
 
         next_payload = None
@@ -4316,6 +4796,17 @@ def answer(
                     "answered": bool(not is_skipped_answer),
                     "transcript_len": len(ans_clean),
                     "evaluation_started": bool(not is_warmup_turn and not is_skipped_answer),
+                },
+            )
+            logger.info(
+                "interview.answer.timing",
+                extra={
+                    "event": "interview.answer.timing",
+                    "session_key": sk,
+                    "question_index": turn_index + 1,
+                    "elapsed_ms": int((time.perf_counter() - answer_t0) * 1000),
+                    "model": str(meta.get("model") or ""),
+                    **answer_timing,
                 },
             )
         except Exception:
@@ -4666,7 +5157,7 @@ def hr_records(request: Request):
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    _recover_interviews_once(limit=50)
+    _kick_recovery_async()
     # Prefer DB-backed interview_records so HR dropdown matches Admin dashboard.
     snap = get_database_snapshot(AUTH_DB_TARGET, limit=1000)
     rows = (((snap or {}).get("tables", {}) or {}).get("interview_records", {}) or {}).get("rows", []) or []
@@ -4858,8 +5349,8 @@ def hr_dashboard(request: Request, limit: int = 500):
     if auth_err:
         return auth_err
     hr_user = str((user or {}).get("sub", "hr")).strip().lower() or "hr"
-    _recover_interviews_once(limit=50)
     _cleanup_expired_integrity_rows(hr_user)
+    _kick_recovery_async()
 
     bucket_limit = max(1, min(int(limit or 500), 1000))
     role_key = str((user or {}).get("role") or "hr").lower()
@@ -5368,7 +5859,7 @@ def _interview_summary_payload(record: dict) -> dict:
         "score": int(score),
         "status": _effective_interview_status(record, report),
         "difficulty": str(record.get("difficulty") or "").strip(),
-        "model": str(record.get("model") or "").strip(),
+        **ai_models.record_models(record),
         "skills": list(record.get("skills") or []),
         "questions_count": len(questions),
         "answers_count": len(answers),
@@ -5628,6 +6119,7 @@ def hr_candidate_interview_detail(request: Request, candidate_id: str, interview
         return JSONResponse({"error": "Interview does not belong to this candidate."}, status_code=403)
     if "id" not in rec:
         rec["id"] = str(interview_id)
+    rec.update(ai_models.record_models(rec))
     return {"record": rec}
 
 
@@ -5636,7 +6128,7 @@ def _ensure_interview_strengths_weaknesses_record(rec: dict, *, force: bool = Fa
     report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
     questions = list(rec.get("questions") or [])
     answers = list(rec.get("answers") or [])
-    model = str(rec.get("model") or os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip()
+    model = str(rec.get("model") or ai_models.interview_model()).strip()
     # The record id IS the session's interview_id, so this on-demand analysis
     # lands on the same interview as the calls made during it.
     with interview_context(interview_id=str(rec.get("id") or ""),
@@ -5745,7 +6237,7 @@ def rescore_interview_record(interview_id: str, rescored_by: str = "") -> dict:
         meta["final_status"] = old.get("final_status")
     if old.get("finalization_reason"):
         meta["finalization_reason"] = old.get("finalization_reason")
-    _result, _ist, record = _evaluate_and_store_report(session)
+    _result, _ist, record = _evaluate_and_store_report(session, evaluation_model=ai_models.interview_model())
     report = record.get("report") if isinstance(record.get("report"), dict) else {}
     for qidx, by, reason in exclusions:
         if qidx < 1:
@@ -5896,7 +6388,7 @@ async def hr_exclude_question_from_score(
 
     rec = dict(rec)
     rec["report"] = updated_report
-    model = str(rec.get("model") or os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip()
+    model = str(rec.get("model") or ai_models.interview_model()).strip()
     rec["report"] = attach_strengths_weaknesses_analysis(
         updated_report,
         list(rec.get("questions") or []),
@@ -6489,7 +6981,7 @@ async def template_sample_questions(
 
     has_ai = openai_key_configured("question")
     coach_hints_text()
-    model = str(os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+    model = ai_models.interview_model()
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
     resolved_domains = _resolve_domain_titles([str(cid).strip() for cid in cat_ids if str(cid).strip()])
 
@@ -6709,7 +7201,7 @@ async def template_test_prompt(
         effective=effective,
         form_skills=skills,
     )
-    model = str(os.getenv("INTERVIEW_OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+    model = ai_models.interview_model()
     safe_mode_on = str(os.getenv("INTERVIEW_SAFE_MODE", "false")).lower() in {"1", "true", "yes", "on"}
     has_ai = openai_key_configured("question")
     # Review-step preview: generate 15–20 questions so HR can sanity-check the prompt.
@@ -6883,10 +7375,10 @@ async def ats_score_upload(
     _, auth_err = _require_interview_report_reader(request, tab="iv:ats")
     if auth_err:
         return auth_err
-    jd_text = await _extract_text_from_upload(jd_file, model, False)
+    jd_text = await _extract_text_from_upload(jd_file, False)
     if jd_text.startswith("__ERR__"):
         return {"error": jd_text.replace("__ERR__", "", 1)}
-    cv_text = await _extract_text_from_upload(cv_file, model, False)
+    cv_text = await _extract_text_from_upload(cv_file, False)
     if cv_text.startswith("__ERR__"):
         return {"error": cv_text.replace("__ERR__", "", 1)}
 
@@ -7334,7 +7826,9 @@ def _read_pdf_text(content: bytes) -> str:
     return "\n".join(chunks).strip()
 
 
-async def _extract_text_from_upload(upload: UploadFile, model: str, safe_mode_on: bool) -> str:
+async def _extract_text_from_upload(upload: UploadFile, safe_mode_on: bool) -> str:
+    """Text of an uploaded JD / CV. Images are read with `ai_models.ocr_model()`
+    — never the interview model (a reasoning model would refuse the call)."""
     filename = (upload.filename or "").strip()
     ext = Path(filename).suffix.lower()
     content = await upload.read()
@@ -7367,7 +7861,7 @@ async def _extract_text_from_upload(upload: UploadFile, model: str, safe_mode_on
             return "__ERR__Safe mode blocks image OCR. Please upload PDF/text or paste text."
         mime = content_type if content_type.startswith("image/") else "image/png"
         try:
-            text = extract_text_from_image_bytes(content, mime_type=mime, model=model)
+            text = extract_text_from_image_bytes(content, mime_type=mime, model=ai_models.ocr_model())
         except OpenAIError as err:
             return f"__ERR__Image OCR failed: {err}"
         except Exception:
@@ -7441,17 +7935,32 @@ def _build_candidate_profile(
     return base
 
 
+@app.get("/interview/ai-engine")
+def interview_ai_engine(request: Request):
+    """Which OpenAI model runs what (9 Oct 2026) — every screen that mentions
+    the AI reads its label from here, so a switch in Settings ▸ AI engine
+    changes every label at once. Staff only; ids and labels, never keys, base
+    URLs or env names."""
+    _, auth_err = _require_user(request, {"hr"})
+    if auth_err:
+        return auth_err
+    return ai_models.engine()
+
+
 @app.get("/models")
 def models(request: Request):
     if _is_production_env():
         _, auth_err = _require_user(request, {"hr", "admin", "manager", "candidate"})
         if auth_err:
             return auth_err
-    base = (os.getenv("OPENAI_BASE_URL") or "").strip()
+    # One model — the server's (ai_models). The HR form shows it; it no longer
+    # chooses it (9 Oct 2026).
+    current = ai_models.interview_model()
     return {
         "provider": "openai",
-        "provider_base_url": base,
-        "models": list(OPENAI_CHAT_MODELS),
+        "models": [current],
+        "default": current,
+        "labels": {current: ai_models.model_label(current)},
     }
 
 
@@ -8069,7 +8578,7 @@ def candidate_invite_login(token: str, request: Request):
     candidate_email = str(record.get("candidate_email", "")).strip().lower() or f"candidate-{token[:8]}@local"
     candidate_name = str(record.get("candidate_name", "Candidate")).strip() or "Candidate"
     skey = f"inv:{token}"
-    wait_snap = _wait_for_invite_prewarm(token, timeout_sec=12.0)
+    wait_snap = _wait_for_invite_prewarm(token, timeout_sec=_prewarm_wait_sec())
     if sessions.get(skey):
         boot = {"status": "ok", "session_key": skey, "reused": True, "prewarm_wait": wait_snap}
         logger.info(
@@ -8077,9 +8586,20 @@ def candidate_invite_login(token: str, request: Request):
             extra={"event": "interview.invite.login.reused", "invite_token": _invite_token_tag(token)},
         )
     else:
-        logger.info(
-            "[SESSION] Fast bootstrap starting",
-            extra={"event": "interview.invite.login.fast_bootstrap", "invite_token": _invite_token_tag(token)},
+        # The question prewarm did not finish in time: the candidate gets the
+        # template's saved / generic questions instead of AI-generated ones.
+        # WARNING, not INFO — on a reasoning model this is the thing to watch.
+        snap_now = _invite_prewarm_snapshot(token)
+        logger.warning(
+            "[SESSION] Fast bootstrap starting — prewarm not ready, questions will be generic",
+            extra={
+                "event": "interview.invite.login.fast_bootstrap",
+                "invite_token": _invite_token_tag(token),
+                "model": ai_models.interview_model(),
+                "prewarm_status": str(snap_now.get("status") or "none"),
+                "prewarm_latency_ms": int(snap_now.get("latency_ms") or 0),
+                "waited_sec": _prewarm_wait_sec(),
+            },
         )
         boot = _bootstrap_invite_interview_session(token, record, fast_only=True)
     if boot.get("error"):
@@ -8101,6 +8621,8 @@ def candidate_invite_login(token: str, request: Request):
         meta["startup_login_latency_ms"] = int((time.time() - login_started) * 1000)
         meta["startup_prewarm_status"] = str(prewarm.get("status") or "none")
         meta["startup_prewarm_latency_ms"] = int(prewarm.get("latency_ms") or 0)
+        if boot.get("fast_only"):
+            meta["fast_bootstrap"] = True
         _persist_interview_progress(sess, status="in_progress")
 
     user = {
@@ -8141,7 +8663,36 @@ def candidate_invite_login(token: str, request: Request):
         # Resume (16 Sep 2026): a reopened link continues from the saved turn.
         # The client uses this to say "resuming from question N", nothing else.
         "resume": _resume_info(sess),
+        **_candidate_model_info(sess),
     }
+
+
+def _candidate_model_info(sess: dict | None) -> dict:
+    """`ai_model` (+ `voice_model` for a live-voice template) for the candidate
+    page's "AI Interviewer · GPT-6 Astra" chip — only while Settings ▸ AI engine
+    ▸ "Show the AI model to candidates" is on. Ids and labels only."""
+    if not ai_models.show_to_candidates():
+        return {}
+    meta = (sess or {}).get("meta", {}) or {}
+    model = str(meta.get("model") or ai_models.interview_model())
+    out = {"ai_model": {"id": model, "label": ai_models.model_label(model)}}
+    if interview_conversation.is_live_voice(meta):
+        voice = str(meta.get("realtime_model") or "").strip() or ai_models.realtime_model()
+        out["voice_model"] = {"id": voice, "label": ai_models.model_label(voice)}
+    return out
+
+
+def _prewarm_wait_sec() -> float:
+    """How long invite login waits for the question prewarm before falling back
+    to generic questions. A reasoning model generates more slowly, so the
+    default is 45 s then (the client waits up to 90 s for login), else 12 s."""
+    raw = (os.getenv("INTERVIEW_PREWARM_WAIT_SEC") or "").strip()
+    if raw:
+        try:
+            return max(3.0, min(80.0, float(raw)))
+        except ValueError:
+            pass
+    return 45.0 if ai_models.is_reasoning(ai_models.interview_model()) else 12.0
 
 
 def _resume_info(sess: dict | None) -> dict | None:
@@ -8429,24 +8980,11 @@ def _cleanup_expired_integrity_rows(hr_user: str | None) -> None:
             )
             return True
 
-        if not (sess.get("answers") or []):
-            _append_pending_answer_on_submit(
-                sess,
-                "[Interview auto-closed after time limit/inactivity without a submitted response.]",
-            )
-        out = _finalize_interview_snapshot(sess, reason="stale_active_recovery", final_status="recovered")
-        sessions.pop(skey, None)
-        invalidate_hr_dashboard_cache()
-        logger.info(
-            "interview.invite.stale_active.autofinalized",
-            extra={
-                "event": "interview.invite.stale_active.autofinalized",
-                "invite_token": _invite_token_tag(token),
-                "answers_count": len(sess.get("answers") or []),
-                "report_ready": bool(out.get("report_ready")),
-            },
-        )
-        return True
+        # Finalizing is a full report evaluation — never inside a page load.
+        # Hand it to the background recovery pass (_kick_recovery_async).
+        with _ASYNC_RECOVERY_GUARD:
+            _STALE_FINALIZE_QUEUE.add(token)
+        return False
 
     for row in list_interview_integrity_logs(AUTH_DB_TARGET, hr_user):
         status = str(row.get("session_status") or "pending").strip().lower()
@@ -8673,8 +9211,8 @@ def interview_integrity_logs(request: Request):
     err = _integrity_auth(request)
     if err:
         return err
-    _recover_interviews_once(limit=50)
     _cleanup_expired_integrity_rows(None)
+    _kick_recovery_async()
     return _integrity_payload()
 
 
@@ -8891,7 +9429,9 @@ def _finalize_session_recording(invite_token: str) -> dict:
             recording_key=result.key,
             recording_bytes=int(result.size_bytes),
             recording_mime=RECORDING_MIME,
-            recording_status="ready",
+            # "corrupt" = the joined file has no WebM header (8 Oct 2026); the
+            # viewer says so instead of showing a black frame.
+            recording_status="ready" if result.valid else "corrupt",
         )
     except Exception as exc:
         logger.warning(
@@ -8904,6 +9444,14 @@ def _finalize_session_recording(invite_token: str) -> dict:
         pass
     invalidate_integrity_logs_cache()
     screen = finalized.get("screen")
+    if screen and result.valid:
+        # One file with both halves (8 Oct 2026) — background, best-effort.
+        try:
+            from services.recording_stream import start_combined_build
+
+            start_combined_build(token)
+        except Exception:
+            pass
     return {"status": "ready", "bytes": result.size_bytes, "parts": result.parts,
             "screen_bytes": screen.size_bytes if screen else 0}
 
@@ -8994,6 +9542,47 @@ def interview_recording_part(request: Request, invite_token: str, seq: int, stre
         media_type=RECORDING_MIME,
         headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"},
     )
+
+
+@app.get("/interview/recording/{invite_token}/file/{stream}")
+def interview_recording_file(request: Request, invite_token: str, stream: str,
+                             exp: str = "", sig: str = "", download: int = 0):
+    """Stream a finished recording through the app, same origin, with Range
+    support (8 Oct 2026) — `stream` is cam · screen · combined.
+
+    A `<video>` element cannot send the bearer header, so the URL carries its
+    own signature (`services.recording_stream.stream_url`, handed out only by
+    the recording gate). This replaced presigned S3 URLs / whole-file blobs in
+    the player: the page's CSP refused the S3 origin and the player stayed
+    black while the downloaded file played. Four segments, so neither the
+    two-segment playback route nor `/live` can shadow it.
+    """
+    from services import recording_stream as rs
+
+    token = _recording_route_token(invite_token)
+    if not token or not rs.verify(token, stream, exp, sig):
+        return JSONResponse({"error": "This recording link has expired — reload the page."}, status_code=403)
+    try:
+        window = rs.read_window(token, stream, request.headers.get("range"))
+    except ValueError:
+        return Response(status_code=416, headers={"Content-Range": "bytes */*"})
+    except Exception as exc:
+        logger.warning("recording.stream_failed: %s", exc, extra={"event": "recording.stream_failed"})
+        return JSONResponse({"error": "Recording unavailable"}, status_code=503)
+    if window is None:
+        return JSONResponse({"error": "Recording not found"}, status_code=404)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(len(window["data"])),
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if download:
+        headers["Content-Disposition"] = rs.download_disposition(token, stream)
+    if window["partial"]:
+        headers["Content-Range"] = f"bytes {window['start']}-{window['end']}/{window['size']}"
+        return Response(content=window["data"], status_code=206, media_type="video/webm", headers=headers)
+    return Response(content=window["data"], media_type="video/webm", headers=headers)
 
 
 @app.get("/interview/media/{key:path}")

@@ -6,6 +6,11 @@ printed on every Tax Invoice (3 Sep 2026, user request).
                                             Viewer on Vercel loads)
     GET /api/public/invoices/{token}/view   a phone-friendly HTML page
     GET /api/public/invoices/{token}/pdf    the Tax Invoice PDF
+    GET /api/public/invoices/{token}/einvoice       the e-invoice page — the invoice WITH its
+                                                    IRN / Ack No. / Ack Date (8 Oct 2026); the
+                                                    QR on the e-invoice opens this. 404 until
+                                                    Finance has recorded the IRN.
+    GET /api/public/invoices/{token}/einvoice/pdf   the e-invoice PDF
 
 NO LOGIN. The token is `{id}.{hmac}` (services/invoice_share): unguessable,
 unenumerable, and invalidated as a set by rotating AUTH_SECRET. What the
@@ -48,13 +53,29 @@ def _invoice_from_token(db: Session, token: str) -> Invoice:
     return invoice
 
 
-def public_invoice_payload(db: Session, invoice: Invoice, origin: str = "") -> dict:
+def public_invoice_payload(db: Session, invoice: Invoice, origin: str = "", *, einvoice: bool = False) -> dict:
     from services.finance import serialize_invoice
     full = serialize_invoice(invoice, detail=True, db=db, share_base_url=origin)
     data = {k: full.get(k) for k in _PUBLIC_KEYS}
     links = share_links(invoice.id, invoice.invoice_number, base_url=origin)
     data["links"] = {"view_url": links["view_url"], "pdf_url": links["pdf_url"], "data_url": links["data_url"]}
+    if einvoice:
+        # The e-invoice identifiers are printed ON the e-invoice, so its own
+        # page shows them — and only that page (8 Oct 2026).
+        data["einvoice"] = {
+            "irn": invoice.irn_number,
+            "ack_number": invoice.ack_number,
+            "ack_date": invoice.ack_date.isoformat() if invoice.ack_date else None,
+        }
+        data["links"]["pdf_url"] = links["einvoice_pdf_url"]
     return data
+
+
+def _einvoice_or_404(db: Session, token: str) -> Invoice:
+    invoice = _invoice_from_token(db, token)
+    if not invoice.irn_number or invoice.is_proforma:
+        raise HTTPException(status_code=404, detail="This invoice has no e-invoice yet")
+    return invoice
 
 
 def _origin(request: Request) -> str:
@@ -123,6 +144,17 @@ def render_public_invoice_html(data: dict) -> str:
     gst = data.get("gst") or {}
     lines = data.get("lines") or []
     links = data.get("links") or {}
+    einv = data.get("einvoice") or {}
+    doc_title = "e-Invoice" if einv.get("irn") else "Tax Invoice"
+    einv_html = ""
+    if einv.get("irn"):
+        einv_html = (
+            "<section class='card einv'><h2>e-Invoice — registered on the GST portal</h2>"
+            f"<div class='kv'><span class='k'>IRN</span> <code>{escape(str(einv.get('irn')))}</code></div>"
+            f"<div class='kv'><span class='k'>Ack No.</span> <b>{escape(str(einv.get('ack_number') or '—'))}</b></div>"
+            f"<div class='kv'><span class='k'>Ack Date</span> <b>{escape(str(einv.get('ack_date') or '—'))}</b></div>"
+            "</section>"
+        )
     row_parts: list[str] = []
     for i, l in enumerate(lines, start=1):
         desc = escape(str(l.get("description") or ""))
@@ -167,7 +199,7 @@ def render_public_invoice_html(data: dict) -> str:
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta name="robots" content="noindex"/>
-<title>Tax Invoice {escape(str(data.get('invoice_number') or ''))} — Karnex</title>
+<title>{doc_title} {escape(str(data.get('invoice_number') or ''))} — Karnex</title>
 <style>
   :root {{ --navy:#173B7A; --ink:#0f172a; --muted:#64748b; --line:#e2e8f0; --bg:#f4f6fb; }}
   * {{ box-sizing:border-box; }}
@@ -193,11 +225,13 @@ def render_public_invoice_html(data: dict) -> str:
   .btn {{ flex:1; text-align:center; padding:12px; border-radius:10px; font-weight:700; text-decoration:none; }}
   .btn-p {{ background:#2563eb; color:#fff; }} .btn-s {{ background:#fff; color:var(--navy); border:1px solid var(--line); }}
   footer {{ text-align:center; color:var(--muted); font-size:12px; margin-top:18px; }}
+  .einv {{ border-color:#1d4ed8; background:#eff6ff; }}
+  .einv .kv {{ margin-top:4px; }} .einv code {{ word-break:break-all; font-size:12px; }}
 </style></head>
 <body><div class="wrap">
   <header>
     <div class="brand">{escape(str(seller.get('name') or 'KARNEX SOFTWARE SOLUTIONS PRIVATE LIMITED'))}</div>
-    <h1>Tax Invoice {escape(str(data.get('invoice_number') or ''))}</h1>
+    <h1>{doc_title} {escape(str(data.get('invoice_number') or ''))}</h1>
     <div class="meta">
       <span>Invoice date: <b>{escape(str(data.get('invoice_date') or '—'))}</b></span>
       {f"<span>Due: <b>{escape(str(data.get('due_date')))}</b></span>" if data.get('due_date') else ''}
@@ -205,6 +239,7 @@ def render_public_invoice_html(data: dict) -> str:
       {f"<span>PO date: <b>{escape(str(data.get('po_date')))}</b></span>" if data.get('po_date') else ''}
     </div>
   </header>
+  {einv_html}
 
   <div class="grid">
     <section class="card"><h2>Seller</h2><div><b>{escape(str(seller.get('name') or ''))}</b></div><div class="muted">{seller_lines}</div></section>
@@ -249,3 +284,24 @@ def public_invoice_view(token: str, request: Request, db: Session = Depends(get_
     invoice = _invoice_from_token(db, token)
     data = public_invoice_payload(db, invoice, _origin(request))
     return HTMLResponse(render_public_invoice_html(data), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/{token}/einvoice", response_class=HTMLResponse)
+def public_einvoice_view(token: str, request: Request, db: Session = Depends(get_crm_db)):
+    """What the QR on the e-invoice opens (8 Oct 2026): the invoice with its
+    IRN / Ack No. / Ack Date. 404 until Finance records them."""
+    invoice = _einvoice_or_404(db, token)
+    data = public_invoice_payload(db, invoice, _origin(request), einvoice=True)
+    return HTMLResponse(render_public_invoice_html(data), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/{token}/einvoice/pdf")
+def public_einvoice_pdf(token: str, request: Request, db: Session = Depends(get_crm_db)):
+    from services import tax_invoice as ti
+    invoice = _einvoice_or_404(db, token)
+    tax_inv = ti.map_crm_invoice_to_tax_invoice(db, invoice, share_base_url=_origin(request), einvoice=True)
+    result = ti.render_pdf(tax_inv)
+    return Response(
+        content=result.content, media_type=result.media_type,
+        headers={"Content-Disposition": f'inline; filename="{result.filename}"', "Cache-Control": "no-store"},
+    )

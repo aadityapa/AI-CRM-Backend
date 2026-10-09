@@ -161,6 +161,20 @@ class LocalStorage:
     def get(self, key: str) -> bytes:
         return self._path(key).read_bytes()
 
+    def get_head(self, key: str, n: int) -> bytes:
+        """The first `n` bytes — enough to check a file's magic without
+        reading a 20 MB recording (8 Oct 2026)."""
+        with self._path(key).open("rb") as handle:
+            return handle.read(max(0, int(n)))
+
+    def read_range(self, key: str, start: int, end: int) -> bytes:
+        """Bytes ``start..end`` inclusive — what an HTTP Range request needs
+        to stream a recording through the app (8 Oct 2026)."""
+        start = max(0, int(start))
+        with self._path(key).open("rb") as handle:
+            handle.seek(start)
+            return handle.read(max(0, int(end) - start + 1))
+
     def size(self, key: str) -> int:
         try:
             return self._path(key).stat().st_size
@@ -252,6 +266,19 @@ class S3Storage:
 
     def get(self, key: str) -> bytes:
         obj = self._client.get_object(Bucket=self.bucket, Key=self._full(key))
+        return obj["Body"].read()
+
+    def get_head(self, key: str, n: int) -> bytes:
+        """The first `n` bytes via a Range request (8 Oct 2026)."""
+        n = max(1, int(n))
+        obj = self._client.get_object(Bucket=self.bucket, Key=self._full(key), Range=f"bytes=0-{n - 1}")
+        return obj["Body"].read()
+
+    def read_range(self, key: str, start: int, end: int) -> bytes:
+        """Bytes ``start..end`` inclusive via a Range request (8 Oct 2026)."""
+        start = max(0, int(start))
+        obj = self._client.get_object(Bucket=self.bucket, Key=self._full(key),
+                                      Range=f"bytes={start}-{max(start, int(end))}")
         return obj["Body"].read()
 
     def size(self, key: str) -> int:

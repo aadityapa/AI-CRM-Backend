@@ -17,7 +17,10 @@ def test_rescore_reruns_the_evaluation_keeps_exclusions_and_the_old_score(monkey
     progress = {"payload": {"meta": {"interview_id": "iv-1"}, "questions": ["q1", "q2"], "answers": ["a1", "a2"]}}
     saved = {}
 
-    def fake_eval(session):
+    used_models = []
+
+    def fake_eval(session, evaluation_model=None):
+        used_models.append(evaluation_model)
         rec = {"id": session["meta"]["interview_id"], "questions": ["q1", "q2"], "answers": ["a1", "a2"],
                "report": _report(65.0, [{"question_index": 1, "score": 6.5}, {"question_index": 2, "score": 7.0}])}
         return {}, {}, rec
@@ -37,7 +40,9 @@ def test_rescore_reruns_the_evaluation_keeps_exclusions_and_the_old_score(monkey
     import utils.score_exclusion as se
     monkeypatch.setattr(se, "exclude_question_from_score", fake_exclude)
 
+    monkeypatch.setattr(main.ai_models, "interview_model", lambda: "gpt-6-astra")
     out = main.rescore_interview_record("iv-1", "Test RMG")
+    assert used_models == ["gpt-6-astra"]   # re-scored on the model configured NOW
     assert out["previous"]["overall_score"] == 12.0
     assert out["current"]["overall_score"] == 65.0
     assert excluded == [(2, "Ravi", "audio cut")]

@@ -1078,6 +1078,7 @@ def record_payment(invoice_id: int, body: PaymentIn, db: Session = Depends(get_c
                    user: CurrentUser = Depends(INV_WRITE)):
     invoice = get_invoice_or_404(db, invoice_id)
     require_tax_invoice(invoice, "recording a payment")
+    invoice_approval.require_payment_open(invoice)
     if body.amount <= 0 or body.amount > Decimal(str(invoice.balance_amount)):
         raise HTTPException(status_code=400,
                             detail="Payment amount must be positive and not exceed the balance amount")
@@ -1120,6 +1121,7 @@ def record_tds(invoice_id: int, body: TdsCreateIn, db: Session = Depends(get_crm
                user: CurrentUser = Depends(gated_write("tds", "Finance"))):
     invoice = get_invoice_or_404(db, invoice_id)
     require_tax_invoice(invoice, "recording TDS")
+    invoice_approval.require_payment_open(invoice)
     if invoice.tds_record is not None:
         raise HTTPException(status_code=409, detail="TDS record already exists for this invoice")
     tds_amount = body.tds_amount if body.tds_amount is not None else tax.tds_amount(invoice.sub_total)

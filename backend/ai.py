@@ -9,7 +9,7 @@ from io import BytesIO
 from typing import Dict, List, Optional, Sequence
 
 from openai_client import get_openai_client, openai_key_configured
-from prompt_logger import tracked_chat_completion, log_openai_call
+from prompt_logger import chat_params, tracked_chat_completion, log_openai_call
 from prompt_builder import (
     build_system_prompt,
     build_user_prompt_batch,
@@ -2919,8 +2919,10 @@ def extract_text_from_image_bytes(
     error_log = ""
     res = None
     try:
+        # Direct call on purpose (the base64 image must not reach the prompt
+        # log); `chat_params` keeps it valid whatever the model is.
         res = _client().chat.completions.create(
-            model=model, messages=msgs, temperature=0,
+            model=model, messages=msgs, **chat_params(model, temperature=0),
         )
         return (res.choices[0].message.content or "").strip()
     except Exception as exc:

@@ -316,10 +316,18 @@ class Invoice(BaseModel):
     #: Grand total rounded to the nearest rupee with a "Round Off" line (5 Oct
     #: 2026). Mirrors `invoices.round_off IS NOT NULL`.
     round_off: bool = False
+    #: The GST e-invoice (8 Oct 2026): ``{"irn", "ack_no", "ack_date"}`` once
+    #: Finance recorded them — the invoice then prints an e-Invoice band with
+    #: those three and a QR to the public e-invoice page. None = a plain invoice.
+    einvoice: dict | None = None
 
     @property
     def is_proforma(self) -> bool:
         return (self.kind or "Tax") == "Proforma"
+
+    @property
+    def is_einvoice(self) -> bool:
+        return bool(self.einvoice and self.einvoice.get("irn"))
 
     @property
     def title(self) -> str:
@@ -792,7 +800,9 @@ def pdf_filename(inv: Invoice | dict) -> str:
     else:
         no = inv.invoice_no or DEFAULT_INVOICE_NO
         emp = inv.items[0].employee_name if inv.items else ""
-    prefix = "Proforma_" if (not isinstance(inv, dict) and inv.is_proforma) else ""
+    prefix = ""
+    if not isinstance(inv, dict):
+        prefix = "Proforma_" if inv.is_proforma else ("EInvoice_" if inv.is_einvoice else "")
     return f"{prefix}{sanitize_filename_part(emp)}_{sanitize_filename_part(no)}.pdf"
 
 
@@ -1105,7 +1115,18 @@ def _employee_from_line_description(desc: str | None) -> str:
     return text
 
 
-def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> Invoice:
+def einvoice_rows(inv: "Invoice") -> list[tuple[str, str]]:
+    """PURE: the e-Invoice band — IRN, Ack No., Ack Date — in print order
+    (the layout of the IRP's own e-invoice print: the three identifiers across
+    the top, the QR beside them). Empty for an invoice with no IRN."""
+    if not inv.is_einvoice:
+        return []
+    e = inv.einvoice or {}
+    return [("IRN", str(e.get("irn") or "")), ("Ack No.", str(e.get("ack_no") or "—")),
+            ("Ack Date", str(e.get("ack_date") or "—"))]
+
+
+def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "", einvoice: bool = False) -> Invoice:
     """Map a stored CRM Invoice ORM row → Tax Invoice model.
 
     `share_base_url` is the request origin, used for the "scan to view" QR link
@@ -1223,9 +1244,18 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
 
     # "Scan to view" QR (3 Sep 2026) — the same public link the on-screen sheet shows.
     share_url = None
+    einv = None
     try:
         from services.invoice_share import share_links
-        share_url = share_links(invoice.id, invoice.invoice_number, base_url=share_base_url)["qr_target"]
+        links = share_links(invoice.id, invoice.invoice_number, base_url=share_base_url)
+        share_url = links["qr_target"]
+        # The e-invoice (8 Oct 2026): its QR opens the PUBLIC e-invoice page,
+        # which shows the invoice with its IRN / Ack No. / Ack Date.
+        if einvoice and getattr(invoice, "irn_number", None):
+            share_url = links["einvoice_url"]
+            ack = getattr(invoice, "ack_date", None)
+            einv = {"irn": invoice.irn_number, "ack_no": getattr(invoice, "ack_number", None) or "",
+                    "ack_date": format_date_en_in(ack) if ack else ""}
     except Exception:
         share_url = None
 
@@ -1238,6 +1268,7 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "") -> 
         kind=str(getattr(invoice, "kind", None) or "Tax"),
         invoice_format=normalize_invoice_format(getattr(invoice, "invoice_format", None)),
         round_off=getattr(invoice, "round_off", None) is not None,
+        einvoice=einv,
         seller=seller,
         bank=bank_from_settings(db, customer_id),
         footer_text=(seller.get("declaration") or DEFAULT_FOOTER),
@@ -1329,7 +1360,25 @@ def render_invoice_html(inv: Invoice, totals: Totals | None = None) -> str:
 
     # "Scan to view" QR (3 Sep 2026) beside the declaration — the public link.
     qr_html = ""
-    if getattr(inv, "share_url", None):
+    einv_html = ""
+    if inv.is_einvoice:
+        # e-Invoice band (8 Oct 2026): IRN · Ack No. · Ack Date across the top
+        # with the QR beside them — the QR opens the public e-invoice page.
+        rows = "".join(
+            f"<tr><td class='k'>{_esc(k)}</td><td class='sep'>:</td><td class='v'>{_esc(v)}</td></tr>"
+            for k, v in einvoice_rows(inv))
+        band_qr = ""
+        try:
+            from services.invoice_share import qr_svg_data_url
+            src = qr_svg_data_url(inv.share_url or "", size_px=200) if inv.share_url else None
+            if src:
+                band_qr = (f"<div class='einv-qr'><img src='{src}' alt='Scan to view this e-invoice' "
+                           "width='84' height='84'/><div class='qr-cap'>Scan to view<br/>this e-invoice</div></div>")
+        except Exception:
+            band_qr = ""
+        einv_html = (f"<div class='einv'><div class='einv-main'><div class='einv-tag'>e-Invoice</div>"
+                     f"<table class='einv-table'>{rows}</table></div>{band_qr}</div>")
+    elif getattr(inv, "share_url", None):
         try:
             from services.invoice_share import qr_svg_data_url
             qr_src = qr_svg_data_url(inv.share_url, size_px=160)
@@ -1453,6 +1502,17 @@ table.services th {{ font-size: {"7pt" if ncols > 6 else "8pt"}; line-height: 1.
 .qr {{ position: absolute; right: 8px; top: 6px; text-align: center; width: 72px; }}
 .qr img {{ width: 68px; height: 68px; display: block; margin: 0 auto; }}
 .qr-cap {{ font-size: 6.5pt; color: var(--muted, #64748B); line-height: 1.2; margin-top: 2px; }}
+.einv {{ display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin: 6px 0 2px; padding: 6px 10px; border: 1px solid #1D4ED8; border-radius: 6px; background: #EFF6FF; }}
+.einv-main {{ min-width: 0; flex: 1; }}
+.einv-tag {{ display: inline-block; background: #1D4ED8; color: #fff; font-weight: 700; font-size: 7.5pt;
+  letter-spacing: .08em; text-transform: uppercase; padding: 1px 8px; border-radius: 999px; margin-bottom: 3px; }}
+.einv-table {{ border-collapse: collapse; font-size: 8.5pt; }}
+.einv-table td {{ padding: 1px 4px 1px 0; vertical-align: top; }}
+.einv-table td.k {{ font-weight: 700; white-space: nowrap; color: #1E3A8A; }}
+.einv-table td.v {{ word-break: break-all; font-family: "SFMono-Regular", Consolas, monospace; font-size: 8pt; }}
+.einv-qr {{ text-align: center; width: 92px; flex-shrink: 0; }}
+.einv-qr img {{ width: 84px; height: 84px; display: block; margin: 0 auto; }}
 .contact {{
   margin-top: auto; background: var(--navy); color: #fff;
   text-align: center; padding: 5px 8px; font-size: 8pt; letter-spacing: 0.02em;
@@ -1500,6 +1560,7 @@ table.services th {{ font-size: {"7pt" if ncols > 6 else "8pt"}; line-height: 1.
       </div>
     </div>
   </div>
+  {einv_html}
 
   <div class="cards">
     <div class="card">
@@ -1690,6 +1751,33 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     ]))
     story.append(header)
     story.append(Spacer(1, 4))
+    if inv.is_einvoice:
+        # e-Invoice band (8 Oct 2026) — the same three identifiers + QR.
+        band_rows = [[Paragraph(f"<b>{_esc(k)}</b>", styles["InvSmall"]),
+                      Paragraph(_esc(v), styles["InvSmall"])] for k, v in einvoice_rows(inv)]
+        band_left = Table([[Paragraph("<b>e-Invoice</b>", styles["InvBody"]), ""]] + band_rows,
+                          colWidths=[20 * mm, 140 * mm])
+        band_cells = [band_left]
+        if inv.share_url:
+            try:
+                from reportlab.graphics.barcode.qr import QrCodeWidget
+                from reportlab.graphics.shapes import Drawing
+                qw = QrCodeWidget(inv.share_url, barLevel="M")
+                x0, y0, x1, y1 = qw.getBounds()
+                side = 24 * mm
+                qd = Drawing(side, side, transform=[side / ((x1 - x0) or 1), 0, 0, side / ((y1 - y0) or 1), 0, 0])
+                qd.add(qw)
+                band_cells.append(qd)
+            except Exception:
+                pass
+        band = Table([band_cells], colWidths=[162 * mm, 26 * mm][:len(band_cells)])
+        band.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.6, HexColor("#1D4ED8")),
+            ("BACKGROUND", (0, 0), (-1, -1), HexColor("#EFF6FF")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(band)
+        story.append(Spacer(1, 4))
 
     buyer_p = Paragraph(
         f"<b>{_esc(inv.buyer.name)}</b><br/>{_esc(inv.buyer.address)}<br/>"
@@ -1832,7 +1920,7 @@ def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:
     # "Scan to view" QR (3 Sep 2026) — reportlab's own QR widget, so the
     # fallback PDF carries the same code as the WeasyPrint one.
     qr_col = None
-    if getattr(inv, "share_url", None):
+    if getattr(inv, "share_url", None) and not inv.is_einvoice:   # an e-invoice has its QR in the band
         try:
             from reportlab.graphics.barcode.qr import QrCodeWidget
             from reportlab.graphics.shapes import Drawing

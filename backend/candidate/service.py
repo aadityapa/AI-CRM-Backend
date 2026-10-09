@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from services.interview import conversation as conv
 from utils.auto_advance import auto_advance_api_payload
 from utils.question_uniqueness import ensure_unique_served_question, record_question_registry, remember_asked_question
 from utils.time_warnings import time_warnings_api_payload
@@ -28,7 +29,9 @@ def _evaluated_total(session: dict) -> int:
         except (TypeError, ValueError):
             nq = 0
         if nq > 0:
-            return nq
+            # A conversation follow-up (9 Oct 2026) is an extra question, never
+            # one taken from the plan — the total grows with it.
+            return nq + conv.followups_inserted(meta)
     warm = meta.get("warmup_indices") or []
     return max(0, len(session.get("questions") or []) - len(warm))
 
@@ -105,7 +108,7 @@ def _question_cap(session: dict) -> int | None:
     if nq <= 0:
         return None
     warm = meta.get("warmup_indices") or []
-    return nq + len(warm)
+    return nq + len(warm) + conv.followups_inserted(meta)
 
 
 #: Previous name, kept so existing callers and tests keep working. The behaviour
@@ -142,6 +145,7 @@ def next_question_payload(session: dict) -> dict:
             "auto_advance": auto_advance_api_payload(meta),
         }
         out["completion_reason"] = str(meta.get("completion_reason") or "question_limit")
+        _attach_conversation(out, meta)
         if meta.get("last_turn_score") is not None:
             out["last_turn_score"] = meta.get("last_turn_score")
             out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
@@ -163,6 +167,7 @@ def next_question_payload(session: dict) -> dict:
             "session_difficulty": str(meta.get("session_difficulty") or meta.get("difficulty") or "medium"),
             "auto_advance": auto_advance_api_payload(meta),
         }
+        _attach_conversation(out, meta)
         if meta.get("last_turn_score") is not None:
             out["last_turn_score"] = meta.get("last_turn_score")
             out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
@@ -227,6 +232,12 @@ def next_question_payload(session: dict) -> dict:
     if meta.get("last_turn_score") is not None:
         out["last_turn_score"] = meta.get("last_turn_score")
         out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
+    if _attach_conversation(out, meta):
+        cur_idx = int(session["current"])
+        out["is_followup"] = conv.is_followup_index(meta, cur_idx)
+        lead_in = conv.lead_in_for_index(meta, cur_idx)
+        if lead_in:
+            out["lead_in"] = lead_in
 
     # Start synthesising the FOLLOWING question now, while the candidate is
     # still listening to and answering this one. By the time they submit, its
@@ -275,3 +286,12 @@ def _prewarm_following_question(session: dict) -> None:
     except Exception:
         pass  # a missed prefetch only costs the usual latency
 
+
+def _attach_conversation(out: dict, meta: dict) -> bool:
+    """The two-way conversation settings (9 Oct 2026), only when the template
+    turned something on — a template without them sends the payload it always did."""
+    payload = conv.client_payload(meta)
+    if payload is None:
+        return False
+    out["conversation"] = payload
+    return True

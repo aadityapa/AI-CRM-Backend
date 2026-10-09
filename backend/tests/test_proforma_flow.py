@@ -207,6 +207,15 @@ def test_a_proforma_takes_no_money_until_finance_converts_it(world):
     # Now it behaves like any tax invoice.
     r = client.post(f"/api/invoices/{inv.id}/convert", json={})
     assert r.status_code == 400 and "already a tax invoice" in r.json()["detail"]
+    # 8 Oct 2026: money is recorded against the e-INVOICE — refused until the
+    # customer's approval is confirmed and Finance records the IRN.
+    r = client.post(f"/api/invoices/{inv.id}/record-payment", json={"payment_date": "2026-09-20", "amount": 1000})
+    assert r.status_code == 409 and "customer's approval" in r.json()["detail"]
+    from datetime import datetime, timezone
+    s.refresh(inv)
+    inv.customer_approved_at = datetime.now(timezone.utc)
+    inv.irn_number = "a" * 64
+    s.commit()
     r = client.post(f"/api/invoices/{inv.id}/record-payment", json={"payment_date": "2026-09-20", "amount": 1000})
     assert r.status_code == 200, r.text
 

@@ -582,9 +582,11 @@ def test_repair_is_a_no_op_once_a_run_found_nothing_left(tmp_path, monkeypatch):
     init_auth_db(db)
     pl.init_prompt_log_table(db)
     monkeypatch.setattr(repair, "_DONE_IN_PROCESS", {})
-    monkeypatch.setattr(repair, "_marker_read", lambda: "")
+    monkeypatch.setattr(repair, "_marker_read", lambda key=repair.REPAIR_DONE_KEY: "")
     written: list[str] = []
-    monkeypatch.setattr(repair, "_marker_write", lambda v: written.append(v) or True)
+    monkeypatch.setattr(repair, "_marker_write",
+                        lambda v, key=repair.REPAIR_DONE_KEY, *a: key == repair.REPAIR_DONE_KEY
+                        and written.append(v) or True)
     assert repair.repair_ai_costs(db) == {"attributed": 0, "estimated_rows": 0}
     assert len(written) == 1 and written[0].startswith(repair._store_hash(db) + ":")
     calls: list[str] = []
@@ -593,6 +595,7 @@ def test_repair_is_a_no_op_once_a_run_found_nothing_left(tmp_path, monkeypatch):
     assert calls == []
     # the stored marker alone (another process) is enough — and only for THIS store
     monkeypatch.setattr(repair, "_DONE_IN_PROCESS", {})
-    monkeypatch.setattr(repair, "_marker_read", lambda: written[0])
+    monkeypatch.setattr(repair, "_marker_read",
+                        lambda key=repair.REPAIR_DONE_KEY: written[0] if key == repair.REPAIR_DONE_KEY else "")
     assert repair.repair_done(db) is True
     assert repair.repair_done(db + "-other") is False

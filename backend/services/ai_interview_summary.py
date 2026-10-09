@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.ai_models import record_models
+
 MAX_BULLETS = 4
 MAX_SKILLS = 8
 MAX_TEXT = 400
@@ -135,4 +137,6 @@ def summarize_interview_record(record: dict | None) -> dict:
         "questions": _counts(rec, report),
         "job_title": _text(rec.get("job_title"), 160),
         "completed_at_ist": _text(rec.get("updated_at_ist") or rec.get("created_at_ist"), 40),
+        # Which model ran the interview / scored it (9 Oct 2026) — labels only.
+        **record_models(rec),
     }

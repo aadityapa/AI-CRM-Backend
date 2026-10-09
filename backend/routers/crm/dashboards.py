@@ -130,6 +130,24 @@ def work_desk(
     return envelope(desk(db, user, max_items=FULL_MAX_ITEMS if full else MAX_ITEMS))
 
 
+class DeskMarksIn(BaseModel):
+    keys: list[str] = Field(min_length=1, max_length=500)
+    done: bool = True
+
+
+@router.post("/desk/marks")
+def work_desk_marks(body: DeskMarksIn, db: Session = Depends(get_crm_db),
+                    user: CurrentUser = Depends(any_crm_role)):
+    """Tick (or untick) My Tasks items as done — e.g. every invoice of one
+    employee (8 Oct 2026, user ask: "work done, tick & close this employee").
+    Personal to this login; the records behind the items never change."""
+    from services.work_desk import set_marks
+    changed = set_marks(db, user.id, body.keys, body.done)
+    db.commit()
+    return envelope({"changed": changed, "done": body.done},
+                    message=(f"{changed} item(s) ticked as done" if body.done else f"{changed} item(s) back on your list"))
+
+
 # --------------------------------------------------- role desk (14 Sep 2026)
 
 

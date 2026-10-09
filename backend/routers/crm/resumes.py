@@ -1211,7 +1211,33 @@ def list_resumes(
         row["closed_note"] = notes.get(pid) if pid and stage in _CLOSED else None
         row["opening_mail"] = opening.get(pid) if pid else None
     _with_screening_extras(db, page_rows)
+    _with_other_positions(db, page_rows)
     return envelope(page_rows, meta=meta)
+
+
+def _with_other_positions(db: Session, rows: list[dict]) -> None:
+    """The resume library hint (9 Oct 2026): how many OTHER live positions the
+    candidate is already in, and how many resume versions they have — so TA sees
+    "also in 2 other positions · 3 resumes" and opens Matching positions from
+    the row. Two queries for the page; best-effort."""
+    from services.candidate_resumes import library_counts, other_open_fits
+    cids = [r.get("candidate_id") for r in rows if r.get("candidate_id")]
+    if not cids:
+        return
+    try:
+        with db.begin_nested():
+            live = other_open_fits(db, cids)
+            versions = library_counts(db, cids)
+    except Exception:  # noqa: BLE001 — a hint only; the list must load
+        logger.exception("resume library hints for Applied Candidates failed")
+        return
+    for row in rows:
+        cid = row.get("candidate_id")
+        if not cid:
+            continue
+        n = live.get(int(cid), 0) - (1 if row.get("profile_id") else 0)
+        row["other_positions"] = max(0, n)
+        row["resume_versions"] = versions.get(int(cid), 0)
 
 
 def _with_screening_extras(db: Session, rows: list[dict]) -> None:

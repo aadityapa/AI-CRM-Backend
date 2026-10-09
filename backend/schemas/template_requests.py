@@ -19,6 +19,13 @@ class TemplateRequestFulfill(BaseModel):
     notes: str | None = None
 
 
+class TemplateRequestRelink(BaseModel):
+    """RMG replaces the linked template (8 Oct 2026) — a reason is required."""
+    template_job_id: str = Field(min_length=1, max_length=64)
+    template_name: str | None = Field(default=None, max_length=255)
+    reason: str = Field(min_length=10, max_length=1000)
+
+
 class TemplateRequestPrepare(BaseModel):
     candidate_email: str = Field(min_length=3, max_length=255)
     candidate_name: str | None = Field(default=None, max_length=255)

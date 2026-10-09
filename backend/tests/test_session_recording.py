@@ -18,6 +18,8 @@ from services import media_storage as ms
 def local_store(tmp_path, monkeypatch):
     """Force the local driver, rooted in a temp dir, for one test."""
     monkeypatch.setenv("MEDIA_STORAGE_BACKEND", "local")
+    # Playback URLs are signed with AUTH_SECRET since 8 Oct 2026.
+    monkeypatch.setenv("AUTH_SECRET", "s" * 48)
     ms.reset_storage_for_tests()
     store = ms.LocalStorage(tmp_path)
     monkeypatch.setattr(ms, "_STORAGE", store)
@@ -346,3 +348,49 @@ def test_recording_routes_admit_report_readers(monkeypatch):
         assert "_recording_auth(request)" in body, route
     auth_src = __import__("inspect").getsource(main._recording_auth)
     assert "_integrity_auth(request)" in auth_src and "_require_interview_report_reader(request)" in auth_src
+
+
+# ------------------------------------------- the headerless rebuild (8 Oct 2026) ---
+
+HEAD = rec.WEBM_MAGIC + b"HEAD"
+
+
+def test_late_slices_are_appended_to_a_final_file_never_rebuilt_from_the_tail(local_store):
+    """The server finalized (a termination, the recovery worker, a reviewer
+    opening the page) and discarded the parts while the browser was still
+    uploading its last slices. Rebuilding from the tail alone used to REPLACE
+    a playable file with a headerless one — a black frame at 0:00."""
+    token = "tok-late"
+    rec.store_chunk(token, 0, HEAD)
+    rec.store_chunk(token, 1, b"BBB")
+    first = rec.finalize_from_parts(token)
+    assert first is not None and first.valid is True
+    assert rec.discard_parts(token) == 2
+    # Two slices arrive after the join; the client then calls complete.
+    rec.store_chunk(token, 2, b"CCC")
+    rec.store_chunk(token, 3, b"DDD")
+    again = rec.finalize_from_parts(token)
+    assert again is not None and again.valid is True and again.appended == 2
+    assert local_store.get(again.key) == HEAD + b"BBB" + b"CCC" + b"DDD"
+    # The appended slices are gone, so a third finalize cannot append them twice.
+    assert rec._part_keys(token) == []
+    assert rec.finalize_from_parts(token) is None
+    assert rec.recording_playback(token)["valid"] is True
+
+
+def test_a_join_with_no_header_is_flagged_not_hidden(local_store):
+    token = "tok-nohead"
+    rec.store_chunk(token, 3, b"CCC")
+    rec.store_chunk(token, 4, b"DDD")
+    result = rec.finalize_from_parts(token)
+    assert result is not None and result.valid is False and result.appended == 0
+    assert rec.recording_playback(token)["valid"] is False
+    assert rec.is_webm(HEAD) and not rec.is_webm(b"CCC") and not rec.is_webm(b"")
+
+
+def test_the_schedule_row_records_a_corrupt_join():
+    """`_finalize_session_recording` stamps "corrupt" rather than "ready"."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+    body = src.split("def _finalize_session_recording", 1)[1].split("\ndef ", 1)[0]
+    assert 'recording_status="ready" if result.valid else "corrupt"' in body

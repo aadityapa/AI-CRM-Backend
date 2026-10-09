@@ -31,6 +31,7 @@ from datetime import date, datetime, timedelta
 
 from prompt_logger import _connect, _is_postgres  # the log store's own driver
 from services.ai_pricing import CHAT, STT, TTS, usd_inr_rate
+from services.ai_models import model_label
 
 logger = logging.getLogger("karnex.ai_interview_costs")
 
@@ -50,6 +51,8 @@ OTHER_FAMILIES = (
     ("generate_", "Interview calls not matched to a session"),
     ("tts", "Interview audio not matched to a session"),
     ("transcribe", "Interview audio not matched to a session"),
+    ("realtime", "Live voice not matched to a session"),
+    ("conversation_", "Interview conversation not matched to a session"),
 )
 
 
@@ -133,7 +136,10 @@ def _kind_case(alias: str) -> str:
     `%` in the statement as a parameter marker, so `LIKE 'tts_%'` blew up on
     Postgres while the SQLite tests passed. A prefix test that needs no wildcard
     keeps this string safe under both drivers."""
-    return (f"CASE WHEN {alias}.call_type = 'tts' OR SUBSTR({alias}.call_type, 1, 4) = 'tts_' THEN '{TTS}' "
+    # A live voice interview's realtime calls (9 Oct 2026) are voice, so they
+    # land in the voice column with text-to-speech.
+    return (f"CASE WHEN {alias}.call_type = 'tts' OR SUBSTR({alias}.call_type, 1, 4) = 'tts_' "
+            f"OR SUBSTR({alias}.call_type, 1, 8) = 'realtime' THEN '{TTS}' "
             f"WHEN {alias}.call_type = 'transcribe' OR SUBSTR({alias}.call_type, 1, 11) = 'transcribe_' "
             f"THEN '{STT}' ELSE '{CHAT}' END")
 
@@ -198,6 +204,47 @@ def _per_interview(conn, ph: str, start: date, end: date) -> dict[str, dict]:
         for k in ("candidate_name", "candidate_email", "template_name"):
             row[k] = row[k] or str(r[k] or "")
     return out
+
+
+def _per_interview_models(conn, ph: str, start: date, end: date) -> dict[str, list[dict]]:
+    """interview_id -> [{model, calls, cost_usd}] (9 Oct 2026: which model ran
+    which interview). ONE grouped query; no LIKE (psycopg2 rule above)."""
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT l.interview_id AS interview_id, l.model AS model,
+               COUNT(*) AS calls, COALESCE(SUM(l.cost_usd), 0) AS cost_usd
+        FROM ai_prompt_logs l
+        WHERE l.interview_id IS NOT NULL AND l.interview_id <> ''
+          AND l.created_date_ist >= {ph} AND l.created_date_ist <= {ph}
+        GROUP BY l.interview_id, l.model
+        """,
+        (start.isoformat(), end.isoformat()),
+    )
+    out: dict[str, list[dict]] = {}
+    for r in _rows(cur):
+        out.setdefault(str(r["interview_id"]), []).append({
+            "model": str(r["model"] or "").strip() or "unknown",
+            "calls": int(r["calls"] or 0),
+            "cost_usd": float(r["cost_usd"] or 0),
+        })
+    return out
+
+
+def by_model(rows: list[dict], models: dict[str, list[dict]], rate: float) -> list[dict]:
+    """The interviews on screen, split by model: label · calls · interviews · cost."""
+    agg: dict[str, dict] = {}
+    for row in rows:
+        for m in models.get(row["interview_id"], []):
+            a = agg.setdefault(m["model"], {"model": m["model"], "label": model_label(m["model"]),
+                                            "calls": 0, "interviews": 0, "cost_usd": 0.0})
+            a["calls"] += m["calls"]
+            a["interviews"] += 1
+            a["cost_usd"] += m["cost_usd"]
+    return sorted(
+        (dict(a, cost_usd=round(a["cost_usd"], 4), cost_inr=round(a["cost_usd"] * rate, 2)) for a in agg.values()),
+        key=lambda a: -a["cost_usd"],
+    )
 
 
 def _other_spend(conn, ph: str, start: date, end: date) -> dict:
@@ -451,6 +498,7 @@ def interview_cost_report(db_target: str, crm_db=None, *, date_from: str | None 
     conn = _connect(db_target)
     try:
         per = _per_interview(conn, ph, start, end)
+        per_models = _per_interview_models(conn, ph, start, end)
         other = _other_spend(conn, ph, start, end)
         progress = _progress_rows(conn, ph, list(per.keys()))
         tokens = [str(p.get("invite_token") or "") for p in progress.values() if p.get("invite_token")]
@@ -460,6 +508,9 @@ def interview_cost_report(db_target: str, crm_db=None, *, date_from: str | None 
     crm = crm_context_by_token(crm_db, tokens)
 
     every = build_rows(per, progress, schedules, crm, rate)
+    for row in every:
+        used = sorted(per_models.get(row["interview_id"], []), key=lambda m: -m["cost_usd"])
+        row["models"] = [model_label(m["model"]) for m in used if m["model"] != "unknown"]
     options = {
         "customers": sorted({(r["customer_id"], r["customer_name"]) for r in every if r.get("customer_id")},
                             key=lambda x: (x[1] or "")),
@@ -514,6 +565,7 @@ def interview_cost_report(db_target: str, crm_db=None, *, date_from: str | None 
             {"kind": TTS, "label": "Spoken questions (TTS)", "cost_usd": summary["cost_tts_usd"]},
             {"kind": STT, "label": "Candidate speech (transcription)", "cost_usd": summary["cost_stt_usd"]},
         ],
+        "by_model": by_model(rows, per_models, rate),
         "by_customer": _group(rows, "customer_id", "customer_name"),
         "by_template": _group(rows, "template_name", "template_name"),
         "by_ta": _group(rows, "ta_owner_name", "ta_owner_name"),

@@ -203,7 +203,7 @@ def test_customer_l2_is_to_schedule_at_either_l2_stage():
 def test_finance_sees_the_timesheet_proforma_invoice_chain(db):
     """29 Sep 2026: Finance's desk is the billing chain — approved sheets still
     waiting on the GM (coming up), Proformas to convert (your move), tax
-    invoices issued in the last 30 days (done)."""
+    invoices issued (done — every one since 8 Oct 2026)."""
     from datetime import date
     from models import Employee, Invoice, Project, Timesheet, TimesheetStatus
 
@@ -618,3 +618,33 @@ def test_admin_and_ceo_get_only_their_own_decisions(db, monkeypatch):
     assert deal["chip"] == "Waiting 4 days" and deal["customer"] and tabs["opp_approvals"]["stage"] == "Your approval"
     assert [i["title"] for i in tabs["sales_approval"]["items"]] == ["Terms"]
     assert tabs["sales_approval"]["items"][0]["action"] == "Review terms"
+
+
+def test_every_tax_invoice_is_listed_and_ticks_are_personal(db):
+    """8 Oct 2026, user report: "Tax invoices issued is not showing all invoices"
+    — the 30-day window is gone; and "tick & close this employee": a tick hides
+    the item from THAT login's list only, never changes the invoice."""
+    from datetime import date
+    from models import Employee, Invoice, Project, Timesheet, TimesheetStatus
+
+    cust = Customer(name="HARMAN")
+    db.add(cust); db.flush()
+    proj = Project(customer_id=cust.id, name="Cluster")
+    emp = Employee(first_name="Asha", last_name="Rao", email="asha2@k.in")
+    db.add_all([proj, emp]); db.flush()
+    ts = Timesheet(project_id=proj.id, employee_id=emp.id, year=2026, month=1, status=TimesheetStatus.APPROVED)
+    db.add(ts); db.flush()
+    old = Invoice(invoice_number="KRSW-OLD", project_id=proj.id, timesheet_id=ts.id,
+                  invoice_date=date.today() - timedelta(days=200), sub_total=1, grand_total=1, kind="Tax")
+    db.add(old); db.flush()
+    items = _tabs(db, FINANCE)["fin_invoices"]["items"]
+    assert [i["title"].split(" · ")[0] for i in items] == ["KRSW-OLD"]          # 200 days old, still listed
+    key = items[0]["key"]
+    assert wd.set_marks(db, FINANCE.id, [key], True) == 1
+    assert wd.set_marks(db, FINANCE.id, [key], True) == 0                      # idempotent
+    tab = _tabs(db, FINANCE)["fin_invoices"]
+    assert tab["items"][0]["done"] is True and tab["done_count"] == 1 and tab["count"] == 1
+    other = CurrentUser(id=9, username="fin2", full_name="Fin 2", roles={"Finance"})
+    assert "done" not in _tabs(db, other)["fin_invoices"]["items"][0]           # personal
+    assert wd.set_marks(db, FINANCE.id, [key], False) == 1
+    assert "done" not in _tabs(db, FINANCE)["fin_invoices"]["items"][0]

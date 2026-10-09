@@ -97,6 +97,32 @@ def irn_error(irn: str, ack: str, ack_date: date | None, today: date | None = No
     return None
 
 
+def payment_block(invoice: Invoice) -> str | None:
+    """Why a payment / TDS cannot be recorded yet (None = it can). PURE.
+
+    The flow (8 Oct 2026, user rule): the customer approves the invoice → the
+    Sales Manager / Sales Head confirms it → Finance records the IRN and Ack
+    No. → THEN money is recorded against the e-invoice. An invoice that already
+    has a payment or a TDS record is grandfathered — it was mid-collection
+    before this rule, and a half-recorded receipt must be finishable."""
+    if invoice.is_proforma:
+        return None   # `require_tax_invoice` answers that one
+    if list(getattr(invoice, "payments", None) or []) or getattr(invoice, "tds_record", None) is not None:
+        return None
+    if not is_approved(invoice):
+        return ("Waiting for the customer's approval — the Sales Manager / Sales Head confirms it, "
+                "then Finance adds the IRN. Payments open after that.")
+    if not irn_recorded(invoice):
+        return "Add the e-invoice IRN and Ack No. first — payments are recorded against the e-invoice."
+    return None
+
+
+def require_payment_open(invoice: Invoice) -> None:
+    block = payment_block(invoice)
+    if block:
+        raise HTTPException(status_code=409, detail=block)
+
+
 def _log(db: Session, invoice: Invoice, user_id: int | None, action: str, note: str) -> None:
     """On the source timesheet's activity log (where invoice events already go)."""
     if not invoice.timesheet_id:
@@ -233,6 +259,12 @@ def payload(invoice: Invoice, user, names: dict[int, str] | None = None) -> dict
             "recorded_by_name": names.get(invoice.irn_recorded_by or 0),
             "can_edit": (not invoice.is_proforma) and is_approved(invoice),
         }
+    # Whether the e-invoice exists — a yes/no for every reader (the IRN itself
+    # stays Finance / Admin / CEO only); drives the invoice page's journey.
+    out["einvoice_ready"] = (not invoice.is_proforma) and irn_recorded(invoice)
+    # Payments / TDS open only once the e-invoice exists (8 Oct 2026).
+    out["payments_open"] = payment_block(invoice) is None
+    out["payment_block"] = payment_block(invoice)
     return out
 
 

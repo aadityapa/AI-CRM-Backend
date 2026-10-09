@@ -990,7 +990,9 @@ def put_org_settings(body: OrgSettingsIn,
                      db: Session = Depends(get_crm_db),
                      user: CurrentUser = Depends(admin_only)):
     from models import AppSetting
-    from services.org_settings import KEYS, invalidate, normalize_value, validation_error
+    from services.org_settings import (
+        AUDITED_KEYS, KEYS, audit_changes, invalidate, normalize_value, stored_values, validation_error,
+    )
 
     unknown = [k for k in body.values if k not in KEYS]
     if unknown:
@@ -1003,6 +1005,7 @@ def put_org_settings(body: OrgSettingsIn,
     if url and not url.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400,
                             detail="Public base URL must start with http:// or https://")
+    before = stored_values(db, [k for k in values if k in AUDITED_KEYS])
     for key, value in values.items():
         row = db.get(AppSetting, key)
         if row is None:
@@ -1014,6 +1017,7 @@ def put_org_settings(body: OrgSettingsIn,
         else:
             # Cleared in the UI -> back to the environment/code fallback.
             db.delete(row)
+    audit_changes(db, user, before, {k: v for k, v in values.items() if k in AUDITED_KEYS})
     db.commit()
     invalidate()
     return envelope(data={"saved": sorted(body.values)}, message="Organisation settings saved")

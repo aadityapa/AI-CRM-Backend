@@ -10,13 +10,14 @@ candidate has begun, the session is an audit record and stays put.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, gated_read, gated_write, get_crm_db, role_required
+from crm_deps import CurrentUser, gated_read, gated_write, get_crm_db
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Opportunity,
     Requirement,
@@ -61,10 +62,16 @@ class AiInterviewCreate(BaseModel):
     #: confirmed on the phone they will sit it on Thursday". Logged as
     #: AI_INTERVIEW_RESCHEDULED beside the previous outcome (7 Oct 2026).
     reschedule_note: str | None = None
+    #: 8 Oct 2026: set aside the previous AI L1 — even a PASS — because it ran
+    #: on the wrong template / was not a fair test of this role. Needs a reason
+    #: of at least `MIN_VOID_NOTE`; the old link is labelled "Voided".
+    void_previous: bool = False
 
 
 #: A reschedule note must say something (the same floor as a stage comment).
 MIN_RESCHEDULE_NOTE = 5
+#: Voiding a verdict needs a real reason — it overrules a recorded result.
+MIN_VOID_NOTE = 10
 
 
 def previous_finished_link(db: Session, profile_id: int) -> AiInterviewLink | None:
@@ -75,7 +82,8 @@ def previous_finished_link(db: Session, profile_id: int) -> AiInterviewLink | No
     record. None when the profile never had an AI L1, or only a pending one."""
     return db.execute(
         select(AiInterviewLink)
-        .where(AiInterviewLink.profile_id == profile_id, AiInterviewLink.result != "Pending")
+        .where(AiInterviewLink.profile_id == profile_id, AiInterviewLink.result != "Pending",
+               AiInterviewLink.voided_at.is_(None))
         .order_by(AiInterviewLink.created_at.desc(), AiInterviewLink.id.desc())
     ).scalars().first()
 
@@ -157,6 +165,8 @@ def _link_out(db: Session, link: AiInterviewLink, candidate: Candidate | None, r
     started = bool(row.get("interview_started_at") or row.get("verified_at"))
     data["started"] = started
     data["can_modify"] = bool(link.result == "Pending" and not started)
+    # 8 Oct 2026: a voided interview stays on record but never counts.
+    data["voided"] = link.voided_at is not None
     return data
 
 
@@ -295,6 +305,19 @@ def ai_interview_summary(profile_id: int, link_id: int, db: Session = Depends(ge
     return envelope(data=data)
 
 
+def void_link(db: Session, profile: CandidateProfile, link: AiInterviewLink,
+              reason: str, user: CurrentUser) -> None:
+    """Mark an AI L1 as not counting (8 Oct 2026). The verdict, score and
+    report stay readable — the history must show what happened — but every
+    screen reads the NEWER link, and this one is labelled "Voided"."""
+    link.voided_at = datetime.now(timezone.utc)
+    link.voided_by = user.id
+    link.voided_reason = reason
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                 "AI_INTERVIEW_VOIDED",
+                 f"AI L1 voided — {previous_outcome_words(link)} no longer counts. {reason}")
+
+
 #: Event the screeners hear on a reschedule (admin-editable in Email Flows).
 RESCHEDULED_EVENT = "ai_interview.rescheduled"
 
@@ -363,11 +386,21 @@ def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterview
     # the old result meanwhile. A PASSED interview is never rescheduled.
     previous = previous_finished_link(db, profile.id)
     reschedule_note = (body.reschedule_note or "").strip()
-    if previous is not None:
+    if previous is not None and body.void_previous:
+        # Wrong template / not a fair test (8 Oct 2026): any verdict may be set
+        # aside, a pass included — with a real reason, kept on the old link.
+        if len(reschedule_note) < MIN_VOID_NOTE:
+            raise HTTPException(
+                status_code=400,
+                detail="Say why the previous AI L1 does not count — e.g. it ran on the wrong "
+                       "interview template (at least 10 characters)",
+            )
+    elif previous is not None:
         if (previous.effective_result or previous.result) in ("Passed", "Selected"):
             raise HTTPException(
                 status_code=409,
-                detail="The candidate already passed the AI L1 — there is nothing to reschedule",
+                detail="The candidate already passed the AI L1 — there is nothing to reschedule. "
+                       "If it ran on the wrong template, send a fresh link and void the previous one.",
             )
         if len(reschedule_note) < MIN_RESCHEDULE_NOTE:
             raise HTTPException(
@@ -410,6 +443,8 @@ def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterview
                  f"AI L1 interview scheduled for {when or 'now'} "
                  f"(session {bridge.get('session_ref')})")
     if previous is not None:
+        if body.void_previous:
+            void_link(db, profile, previous, reschedule_note, user)
         _record_reschedule(db, profile, candidate, previous, when, reschedule_note, user)
 
     should_send = ai_interview_autosend_enabled() if body.send_email is None else body.send_email

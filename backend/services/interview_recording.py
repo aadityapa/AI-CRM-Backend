@@ -177,6 +177,21 @@ class RecordingResult:
     size_bytes: int
     parts: int
     backend: str
+    #: False when the joined file does not start with the WebM header — the
+    #: first chunk (the only one carrying it) was lost, so no player can open
+    #: the file. Recorded on the schedule row as `recording_status="corrupt"`.
+    valid: bool = True
+    #: Parts that were APPENDED to an already-final file (see finalize).
+    appended: int = 0
+
+
+#: Every WebM / Matroska file starts with this EBML header id.
+WEBM_MAGIC = b"\x1a\x45\xdf\xa3"
+
+
+def is_webm(blob: bytes | None) -> bool:
+    """PURE: does the data begin with the EBML header a player needs?"""
+    return bool(blob) and blob[:4] == WEBM_MAGIC
 
 
 # --------------------------------------------------------------------------
@@ -249,16 +264,57 @@ def finalize_from_parts(invite_token: str, stream: str = "cam") -> RecordingResu
         return None
     key = final_key(token, stream)
     try:
-        blob = b"".join(store.get(p) for p in parts)
+        chunks = [store.get(p) for p in parts]
     except Exception as exc:
         logger.warning(
             "recording.finalize_read_failed: %s", exc,
             extra={"event": "recording.finalize_read_failed"},
         )
         return None
+    appended = 0
+    blob = b"".join(chunks)
+    if not is_webm(blob):
+        # The parts on hand do not start with the header chunk. That happens
+        # when a final file was ALREADY built and its parts discarded (the
+        # server finalized first — a termination, the recovery worker, a
+        # reviewer opening the page) while the browser was still uploading
+        # its last slices: rebuilding from the tail alone would REPLACE a
+        # playable file with one no player can open (8 Oct 2026). Only the
+        # first slice carries the WebM header, and every later slice is a
+        # plain continuation, so the right file is the existing one with the
+        # new slices appended — then those slices are redundant and go.
+        existing = None
+        try:
+            if store.exists(key):
+                existing = store.get(key)
+        except Exception:
+            existing = None
+        if existing and is_webm(existing):
+            blob = existing + blob
+            appended = len(parts)
+            logger.info(
+                "recording.finalize_appended",
+                extra={"event": "recording.finalize_appended", "parts": len(parts),
+                       "stream": normalize_stream(stream)},
+            )
+        else:
+            logger.warning(
+                "recording.header_missing",
+                extra={"event": "recording.header_missing", "parts": len(parts),
+                       "first_seq": part_seq(parts[0]), "stream": normalize_stream(stream)},
+            )
     if len(blob) > MAX_RECORDING_BYTES:
         blob = blob[:MAX_RECORDING_BYTES]
     store.put(key, blob, content_type=RECORDING_MIME)
+    if appended:
+        # Appended slices must never be appended twice (a second finalize
+        # before the caller's discard would do exactly that).
+        for p in parts:
+            try:
+                store.delete(p)
+            except Exception:
+                pass
+    valid = is_webm(blob)
     logger.info(
         "recording.finalized",
         extra={
@@ -267,9 +323,11 @@ def finalize_from_parts(invite_token: str, stream: str = "cam") -> RecordingResu
             "bytes": len(blob),
             "backend": store.name,
             "stream": normalize_stream(stream),
+            "valid": valid,
         },
     )
-    return RecordingResult(key=key, size_bytes=len(blob), parts=len(parts), backend=store.name)
+    return RecordingResult(key=key, size_bytes=len(blob), parts=len(parts), backend=store.name,
+                           valid=valid, appended=appended)
 
 
 def finalize_all(invite_token: str) -> dict[str, RecordingResult | None]:
@@ -373,6 +431,17 @@ def part_bytes(invite_token: str, seq: int, stream: str = "cam") -> bytes | None
     return store.get(key)
 
 
+def _final_is_webm(store, key: str) -> bool:
+    """Read the first bytes of the final object (`get_head` when the driver
+    has one, else the whole object) and check the EBML magic. Never raises."""
+    try:
+        head = getattr(store, "get_head", None)
+        data = head(key, 4) if callable(head) else store.get(key)
+        return is_webm(data)
+    except Exception:
+        return True   # a read blip must not label a good file as corrupt
+
+
 def recording_playback(invite_token: str) -> dict:
     """What the Integrity tab needs to play (or explain the absence of) a
     recording. Never raises — a storage outage renders as "unavailable", not
@@ -381,35 +450,64 @@ def recording_playback(invite_token: str) -> dict:
     if not token:
         return {"available": False, "reason": "no_token"}
     try:
+        # Every `url` is a SIGNED, SAME-ORIGIN streaming URL (8 Oct 2026): the
+        # page's CSP refuses an S3 origin as a media source and a blob must
+        # download in full before the first frame — that was the black player
+        # whose downloaded file played fine. See services/recording_stream.py.
+        from services import recording_stream as rs
+
         store = get_storage()
         key = final_key(token)
         if store.exists(key):
             size = store.size(key)
+
+            def _download(k: str, stream: str, name: str) -> str:
+                # S3 keeps its presigned download (a navigation — no CSP, no
+                # bytes through the app); local downloads through the app.
+                if store.name == "s3":
+                    return store.url(k, ttl_s=url_ttl_seconds(), download_name=name)
+                return rs.stream_url(token, stream, download=True)
+
             info = {
                 "available": True,
-                "url": store.url(key, ttl_s=url_ttl_seconds()),
-                "download_url": store.url(
-                    key, ttl_s=url_ttl_seconds(), download_name=f"interview-{token[:12]}.webm"
-                ),
+                # The file starts with the WebM header? A headerless join
+                # (lost first slice) is reported, never silently played black.
+                "valid": _final_is_webm(store, key),
+                "url": rs.stream_url(token, "cam"),
+                "download_url": _download(key, "cam", f"interview-{token[:12]}-camera.webm"),
                 "size_bytes": size,
                 "mime": RECORDING_MIME,
                 "backend": store.name,
-                "expires_in_s": url_ttl_seconds(),
+                "streamed": True,
+                "expires_in_s": rs.SIGNED_TTL_S,
                 # The screen stream (7 Oct 2026) — absent when the browser
                 # could not share it; the viewer then shows the camera alone.
                 "screen": {"available": False},
+                # ONE file with both halves (8 Oct 2026), built in the background.
+                "combined": {"available": False, "reason": "camera_only"},
             }
             screen_key = final_key(token, "screen")
             if store.exists(screen_key):
                 info["screen"] = {
                     "available": True,
-                    "url": store.url(screen_key, ttl_s=url_ttl_seconds()),
-                    "download_url": store.url(
-                        screen_key, ttl_s=url_ttl_seconds(), download_name=f"interview-{token[:12]}-screen.webm"
-                    ),
+                    "url": rs.stream_url(token, "screen"),
+                    "download_url": _download(screen_key, "screen", f"interview-{token[:12]}-screen.webm"),
                     "size_bytes": store.size(screen_key),
                     "mime": RECORDING_MIME,
                 }
+                state = rs.combined_state(token)
+                if state.get("available"):
+                    info["combined"] = {
+                        "available": True,
+                        "url": rs.stream_url(token, "combined"),
+                        "download_url": _download(rs.combined_key(token), "combined",
+                                                  f"interview-{token[:12]}-full.webm"),
+                        "size_bytes": state.get("size_bytes") or 0,
+                        "mime": RECORDING_MIME,
+                    }
+                else:
+                    building = rs.start_combined_build(token)
+                    info["combined"] = {**state, "building": bool(building or state.get("building"))}
             return info
         pending = len(_part_keys(token))
         if pending:

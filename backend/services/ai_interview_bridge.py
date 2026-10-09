@@ -339,7 +339,9 @@ def schedule_l1_interview(
         "time_limit_sec": 0,
         "mic_always_on": "false",
         "show_spoken_text": "false",
-        "model": os.getenv("CRM_AI_L1_MODEL", "gpt-4o-mini"),
+        # No model here: the server picks it when the session starts
+        # (services/ai_models.interview_model — one switch, 9 Oct 2026).
+        "model": "",
     }
     # THE TEMPLATE'S OWN SETTINGS WIN (fix, 27 Aug 2026). This dict used to be
     # entirely hardcoded (count mode, no time limit, 5 questions) — a template

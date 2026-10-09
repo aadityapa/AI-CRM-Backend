@@ -432,6 +432,8 @@ def log_openai_call(
     difficulty: str = "",
     audio_seconds: float = 0.0,
     audio_tokens: int = 0,
+    audio_out_tokens: int = 0,
+    cached_tokens: int = 0,
 ) -> dict:
     """
     Log a single OpenAI API call to both file and database.
@@ -484,7 +486,7 @@ def log_openai_call(
         except Exception:
             resp_text = str(response)[:2000]
 
-    cached_tokens = 0
+    cached_tokens = max(0, int(cached_tokens or 0))
     if response is not None and getattr(response, "usage", None):
         usage = response.usage
         if not prompt_tokens:
@@ -527,7 +529,8 @@ def log_openai_call(
         "created_time_ist": now.strftime("%H:%M:%S"),
         "audio_seconds": round(float(audio_seconds or 0.0), 2),
         "cost_usd": _cost_now(model, call_type, prompt_tokens, completion_tokens, audio_seconds,
-                              cached_tokens=cached_tokens, audio_tokens=audio_tokens),
+                              cached_tokens=cached_tokens, audio_tokens=audio_tokens,
+                              audio_out_tokens=audio_out_tokens),
     }
 
     if not PROMPT_LOG_ENABLED:
@@ -538,14 +541,16 @@ def log_openai_call(
 
 
 def _cost_now(model: str, call_type: str, prompt_tokens: int, completion_tokens: int,
-              audio_seconds: float, *, cached_tokens: int = 0, audio_tokens: int = 0) -> float:
+              audio_seconds: float, *, cached_tokens: int = 0, audio_tokens: int = 0,
+              audio_out_tokens: int = 0) -> float:
     """Priced from the ONE price list; a failed call that returned no usage costs
     nothing. Never raises — a pricing bug must not lose the log."""
     try:
         from services.ai_pricing import estimate_cost_usd
         return estimate_cost_usd(model=model, call_type=call_type, prompt_tokens=prompt_tokens,
                                  completion_tokens=completion_tokens, cached_tokens=cached_tokens,
-                                 audio_tokens=audio_tokens, audio_seconds=audio_seconds)
+                                 audio_tokens=audio_tokens, audio_seconds=audio_seconds,
+                                 audio_out_tokens=audio_out_tokens)
     except Exception:
         return 0.0
 
@@ -687,6 +692,40 @@ atexit.register(_shutdown_worker)
 # Wrapped OpenAI call helper
 # ---------------------------------------------------------------------------
 
+_REASONING_MODEL_RE = re.compile(r"^(gpt-5|gpt-6|o1|o3|o4)(\b|[-.])", re.IGNORECASE)
+
+
+def is_reasoning_model(model: str | None) -> bool:
+    """True for models that only accept default sampling (no temperature /
+    max_tokens): the GPT-5 and GPT-6 families and the o-series."""
+    return bool(_REASONING_MODEL_RE.match((model or "").strip()))
+
+
+def chat_params(model: str | None, *, temperature: float | None = None,
+                max_tokens: int | None = None) -> dict[str, Any]:
+    """The sampling parameters a model will ACCEPT, as kwargs for
+    `chat.completions.create` — the one rule every chat call follows.
+
+    Reasoning models (GPT-5/6 family, o-series) reject any temperature other
+    than the default and reject `max_tokens` outright (8 Oct 2026: every
+    interview call 400'd on gpt-6-astra). Their hidden reasoning tokens also
+    count against the output cap, so a small cap returns an EMPTY answer —
+    drop it rather than translate it. Optional `OPENAI_REASONING_EFFORT` is
+    sent as `reasoning_effort` (NB: gpt-6-astra cannot take function tools on
+    /v1/chat/completions at any effort — see ai_help/assist.py::_model())."""
+    reasoning = is_reasoning_model(model)
+    out: dict[str, Any] = {}
+    if temperature is not None and not reasoning:
+        out["temperature"] = temperature
+    if max_tokens is not None and not reasoning:
+        out["max_tokens"] = max_tokens
+    if reasoning:
+        effort = (os.getenv("OPENAI_REASONING_EFFORT") or "").strip().lower()
+        if effort:
+            out["reasoning_effort"] = effort
+    return out
+
+
 def tracked_chat_completion(
     client,
     *,
@@ -716,10 +755,7 @@ def tracked_chat_completion(
     Returns the OpenAI response object (unchanged).
     """
     kwargs: dict[str, Any] = {"model": model, "messages": messages}
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
+    kwargs.update(chat_params(model, temperature=temperature, max_tokens=max_tokens))
     if response_format is not None:
         kwargs["response_format"] = response_format
     if tools:

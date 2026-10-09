@@ -126,3 +126,32 @@ def test_the_reschedule_event_is_routable_from_email_flows():
     from routers.crm.email_flows import EVENTS
     row = next(e for e in EVENTS if e["event"] == ai.RESCHEDULED_EVENT)
     assert set(row["default_roles"]) == {"RMG", "GM"}
+
+
+# ---- 8 Oct 2026: the AI L1 ran on the WRONG template --------------------------
+
+def test_a_pass_on_the_wrong_template_can_be_voided_and_rescheduled(db, bridge):
+    p = _profile(db, PS.TECHNICAL_SCREENING, screening="Shortlisted")
+    bad = _link(db, p, "Passed", 72.2, created=datetime.now(timezone.utc) - timedelta(days=2))
+    from unittest.mock import MagicMock
+    short = ai.AiInterviewCreate(scheduled_at="2026-10-09 11:00", reschedule_note="wrong", void_previous=True)
+    with pytest.raises(HTTPException) as err:
+        ai.trigger_ai_interview(p.id, MagicMock(), short, db, TA)
+    assert err.value.status_code == 400 and "does not count" in err.value.detail
+    body = ai.AiInterviewCreate(scheduled_at="2026-10-09 11:00",
+                                reschedule_note="Previous L1 ran on the AGM ADAS template, not Bluetooth",
+                                void_previous=True)
+    assert ai.trigger_ai_interview(p.id, MagicMock(), body, db, TA)["success"]
+    assert bad.voided_at is not None and "AGM ADAS" in bad.voided_reason and bad.voided_by == TA.id
+    assert bad.result == "Passed"                                   # kept on record, never rewritten
+    assert "AI_INTERVIEW_VOIDED" in _actions(db, p)
+    assert ai.previous_finished_link(db, p.id) is None              # a voided link is not "the previous one"
+    assert latest_ai_interviews(db, [p])[p.id]["ai_interview_result"] == "Pending"
+
+
+def test_a_template_owned_by_another_deal_is_copied_never_restamped():
+    from routers.crm.template_requests import clone_job_id, template_owner_conflict
+    assert template_owner_conflict({"opportunityId": "C-2026-00097"}, "C-2026-00095") == "C-2026-00097"
+    assert template_owner_conflict({"opportunityId": "c-2026-00095"}, "C-2026-00095") == ""
+    assert template_owner_conflict({"opportunityId": ""}, "C-2026-00095") == ""
+    assert clone_job_id("abc123", "C-2026-00095") == "abc123-c202600095"

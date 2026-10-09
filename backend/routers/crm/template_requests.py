@@ -8,13 +8,14 @@ RBAC is enforced per endpoint (Admin passes everywhere via role_required).
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, role_required, gated_read, gated_write
+from crm_deps import CurrentUser, PageParams, any_crm_role, get_crm_db, page_params, gated_read, gated_write
 from models import (
     Customer,
     Opportunity,
@@ -29,6 +30,7 @@ from schemas.template_requests import (
     TemplateRequestCreate,
     TemplateRequestFulfill,
     TemplateRequestPrepare,
+    TemplateRequestRelink,
 )
 from services.crm_common import next_sequence_number, paginate
 from services.notify import notify_role, notify_user
@@ -125,16 +127,81 @@ def _require_status(tr: TemplateRequest, allowed: tuple, action: str) -> None:
         )
 
 
-def _stamp_template_opportunity(job_id: str, opp_id: str) -> dict:
-    """Set legacy job_templates.opportunity_id so AI L1 matching resolves to this template."""
+def template_owner_conflict(tpl: dict, opp_id: str) -> str:
+    """PURE: the OTHER opportunity a template already belongs to, else "".
+
+    A job template carries ONE `opportunityId`. Linking it to a second request
+    used to overwrite that stamp silently, so two deals ran the same questions
+    and the report printed the other deal's role, opportunity and customer
+    (8 Oct 2026: a Bluetooth Developer candidate was interviewed on the "AGM -
+    R&D (ADAS & ARAS)" template of C-2026-00097)."""
+    owner = " ".join(str(tpl.get("opportunityId") or "").split())
+    return owner if owner and owner.lower() != str(opp_id or "").strip().lower() else ""
+
+
+def clone_job_id(job_id: str, opp_id: str) -> str:
+    """PURE: the id of a template copied for another opportunity."""
+    tail = re.sub(r"[^A-Za-z0-9]+", "", str(opp_id or ""))[-12:] or "copy"
+    return f"{str(job_id)[:40]}-{tail}".lower()
+
+
+def _stamp_template_opportunity(job_id: str, opp: Opportunity, customer_name: str | None) -> dict:
+    """Make the template THIS opportunity's (legacy job_templates.opportunityId
+    + customerName), so AI L1 matching and the report name the right deal.
+
+    A template that already belongs to ANOTHER opportunity is never re-stamped
+    (8 Oct 2026): it is COPIED under a new job id for this one, so both deals
+    keep their own template and their own report header. Returns the stamped
+    template; `_cloned_from` says when a copy was made."""
     from auth_db import get_job_template, upsert_job_template
 
     tpl = get_job_template(_legacy_db_target(), job_id)
     if tpl is None:
         raise HTTPException(status_code=400, detail=f"Job template '{job_id}' not found")
     tpl = dict(tpl)
-    tpl["opportunityId"] = opp_id
-    return upsert_job_template(_legacy_db_target(), tpl)
+    owner = template_owner_conflict(tpl, opp.opp_id)
+    if owner:
+        new_id = clone_job_id(job_id, opp.opp_id)
+        existing = get_job_template(_legacy_db_target(), new_id)
+        if existing is not None and not template_owner_conflict(dict(existing), opp.opp_id):
+            tpl = dict(existing)          # copied before for this deal — reuse it
+        else:
+            tpl["jobId"] = new_id
+        tpl["_cloned_from"] = job_id
+        tpl["_cloned_owner"] = owner
+    tpl["opportunityId"] = opp.opp_id
+    if customer_name:
+        tpl["customerName"] = customer_name
+    cloned_from, cloned_owner = tpl.pop("_cloned_from", None), tpl.pop("_cloned_owner", None)
+    saved = dict(upsert_job_template(_legacy_db_target(), tpl))
+    if cloned_from:
+        saved["_cloned_from"] = cloned_from
+        saved["_cloned_owner"] = cloned_owner
+    return saved
+
+
+def _link_template(db: Session, tr: TemplateRequest, job_id: str, template_name: str | None) -> tuple[dict, str]:
+    """Stamp (or copy) the template for the request's opportunity and record it
+    on the request. Returns (template, note about a copy or "")."""
+    job_id = (job_id or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="template_job_id is required")
+    if tr.opportunity_id is None:
+        req = db.get(Requirement, tr.requirement_id)
+        if req is not None:
+            tr.opportunity_id = req.opportunity_id
+    opp = db.get(Opportunity, tr.opportunity_id) if tr.opportunity_id else None
+    if opp is None:
+        raise HTTPException(status_code=400, detail="Template request has no linked opportunity")
+    customer = db.get(Customer, opp.customer_id) if opp.customer_id else None
+    stamped = _stamp_template_opportunity(job_id, opp, customer.name if customer else None)
+    tr.template_job_id = str(stamped.get("jobId") or job_id)
+    tr.template_name = (template_name or "").strip() or str(stamped.get("jobTitle") or job_id)
+    note = ""
+    if stamped.get("_cloned_from"):
+        note = (f" The template belonged to {stamped['_cloned_owner']}, so a copy was made for "
+                f"{opp.opp_id} — the other deal keeps its own.")
+    return stamped, note
 
 
 #: How an open request reads in the refusal and on the opportunity page.
@@ -249,30 +316,7 @@ def fulfill_request(
     tr = _get_or_404(db, tr_id)
     _require_status(tr, (TemplateRequestStatus.PENDING_RMG,), "fulfil")
 
-    job_id = (payload.template_job_id or "").strip()
-    if not job_id:
-        raise HTTPException(status_code=400, detail="template_job_id is required")
-
-    from auth_db import get_job_template
-    tpl = get_job_template(_legacy_db_target(), job_id)
-    if tpl is None:
-        raise HTTPException(status_code=400, detail=f"Job template '{job_id}' not found")
-
-    # Ensure opportunity_id is set (legacy rows / race).
-    if tr.opportunity_id is None:
-        req = db.get(Requirement, tr.requirement_id)
-        if req is not None:
-            tr.opportunity_id = req.opportunity_id
-    opp = db.get(Opportunity, tr.opportunity_id) if tr.opportunity_id else None
-    if opp is None:
-        raise HTTPException(status_code=400, detail="Template request has no linked opportunity")
-
-    stamped = _stamp_template_opportunity(job_id, opp.opp_id)
-    tr.template_job_id = job_id
-    tr.template_name = (
-        (payload.template_name or "").strip()
-        or str(stamped.get("jobTitle") or tpl.get("jobTitle") or job_id)
-    )
+    _, note = _link_template(db, tr, payload.template_job_id, payload.template_name)
     if payload.notes:
         tr.notes = (f"{tr.notes}\n" if tr.notes else "") + f"RMG: {payload.notes.strip()}"
     tr.status = TemplateRequestStatus.TEMPLATE_READY
@@ -281,11 +325,49 @@ def fulfill_request(
     if tr.requested_by != user.id:
         notify_user(db, tr.requested_by,
                     f"Template ready for {tr.tr_number}",
-                    f"RMG linked template '{tr.template_name}' ({job_id}). Trigger AI L1 when ready.",
+                    f"RMG linked template '{tr.template_name}' ({tr.template_job_id}). Trigger AI L1 when ready.",
                     f"/template-requests/{tr.id}", actor=user)
     db.commit()
     db.refresh(tr)
-    return envelope(_serialize(db, tr), message="Template linked to opportunity; back to TA")
+    return envelope(_serialize(db, tr), message="Template linked to opportunity; back to TA" + note)
+
+
+@router.post("/{tr_id}/relink")
+def relink_request(
+    tr_id: int,
+    payload: TemplateRequestRelink,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write("template-requests", "RMG")),
+):
+    """Change the template of a request that already has one (8 Oct 2026).
+
+    RMG linked the wrong template and every AI L1 since asked another role's
+    questions; until now only a PENDING request could be fulfilled, so the
+    mistake could not be undone. A reason is required and kept in the notes;
+    interviews already run on the old template are NOT changed — TA sends those
+    candidates a fresh link and voids the old one.
+    """
+    tr = _get_or_404(db, tr_id)
+    _require_status(tr, (TemplateRequestStatus.TEMPLATE_READY, TemplateRequestStatus.PREPARED), "change the template of")
+    old_name, old_id = tr.template_name, tr.template_job_id
+    if (payload.template_job_id or "").strip() == (old_id or ""):
+        raise HTTPException(status_code=400, detail="That template is already linked to this request")
+    _, note = _link_template(db, tr, payload.template_job_id, payload.template_name)
+    reason = payload.reason.strip()
+    tr.notes = (f"{tr.notes}\n" if tr.notes else "") + \
+        f"RMG changed the template from '{old_name or old_id}' to '{tr.template_name}': {reason}"
+    tr.fulfilled_by = user.id
+    tr.fulfilled_at = _now()
+    if tr.requested_by and tr.requested_by != user.id:
+        notify_user(db, tr.requested_by,
+                    f"Template changed for {tr.tr_number}",
+                    f"RMG replaced '{old_name or old_id}' with '{tr.template_name}' ({reason}). "
+                    "Candidates already interviewed on the old template need a fresh AI L1 link "
+                    "(Reschedule ▸ void the previous one).",
+                    f"/template-requests/{tr.id}", actor=user)
+    db.commit()
+    db.refresh(tr)
+    return envelope(_serialize(db, tr), message=f"Template changed to '{tr.template_name}'." + note)
 
 
 @router.post("/{tr_id}/prepare")

@@ -49,6 +49,7 @@ ACTIONS: dict[str, str] = {
     "template.updated": "Template edited",
     "template.deleted": "Template deleted",
     "approval.rule": "Approval rule changed",
+    "settings.ai_engine": "AI interview model changed",
 }
 
 #: Grouping for the filter chips.
@@ -59,6 +60,8 @@ ACTION_GROUPS: dict[str, tuple[str, ...]] = {
     "security": ("user.password_reset", "user.password_changed"),
     "roles": ("role.created", "role.updated", "role.deleted", "role.members",
               "template.created", "template.updated", "template.deleted", "approval.rule"),
+    # 9 Oct 2026: who switched the AI interview model, and from what to what.
+    "settings": ("settings.ai_engine",),
 }
 
 

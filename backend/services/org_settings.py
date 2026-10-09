@@ -118,7 +118,19 @@ KEYS: dict[str, tuple[str, str]] = {
     #   {invoice_number} {id}
     # e.g. https://karnex-invoice-viewer.vercel.app/?src={data_url}
     "invoice.qr_viewer_url": ("INVOICE_QR_VIEWER_URL", ""),
+    # Which OpenAI model runs AI interviews (9 Oct 2026, Settings ▸ AI engine).
+    # Applies to interviews that START after a change; the allowed values are
+    # `ai_models.SUPPORTED_INTERVIEW_MODELS` (lower-case — never in _FORMATS,
+    # whose values are upper-cased). Blank = fall back to the environment.
+    "ai.interview_model": ("INTERVIEW_OPENAI_MODEL", "gpt-4o-mini"),
+    # The calls the candidate waits on between answers; blank = automatic
+    # (gpt-4o-mini while the interview model is a reasoning model).
+    "ai.interview_fast_model": ("INTERVIEW_FAST_MODEL", ""),
+    "ui.show_ai_model_to_candidates": ("SHOW_AI_MODEL_TO_CANDIDATES", "true"),
 }
+
+#: Keys whose every change is written to the access audit log (who, from, to).
+AUDITED_KEYS = ("ai.interview_model", "ai.interview_fast_model", "ui.show_ai_model_to_candidates")
 
 #: Shape checks for values that print on a tax document (5 Oct 2026, user
 #: report: the GSTIN and PAN had been saved into each other's boxes and the Tax
@@ -142,6 +154,10 @@ def normalize_value(key: str, value: str) -> str:
 def validation_error(key: str, value: str) -> str | None:
     """Why `value` cannot be saved for `key`, or None. Blank is always allowed
     (it means "fall back to the environment / default")."""
+    if key.startswith("ai.interview_"):
+        from services.ai_models import validation_error as model_error
+
+        return model_error(key, value)
     fmt = _FORMATS.get(key)
     if not fmt or not value:
         return None
@@ -235,3 +251,44 @@ def effective(db) -> list[dict]:
         out.append({"key": key, "value": value, "source": source,
                     "env_key": env_key, "default": code_default})
     return out
+
+
+def stored_values(db, keys) -> dict[str, str]:
+    """The Settings-page rows for `keys` (blank when none), read on the
+    caller's session — the "before" half of an audited change."""
+    from sqlalchemy import bindparam, text
+
+    keys = list(keys)
+    if not keys:
+        return {}
+    try:
+        with db.begin_nested():
+            rows = dict(db.execute(
+                text("SELECT key, value FROM app_settings WHERE key IN :keys").bindparams(
+                    bindparam("keys", expanding=True)),
+                {"keys": keys},
+            ).all())
+    except Exception:
+        rows = {}
+    return {k: str(rows.get(k) or "").strip() for k in keys}
+
+
+def audit_changes(db, user, before: dict[str, str], after: dict[str, str]) -> None:
+    """Record who changed an `AUDITED_KEYS` setting and from what to what
+    (access audit log, action `settings.ai_engine`). Never raises."""
+    changed = {k: (before.get(k, ""), after.get(k, "")) for k in after
+               if k in AUDITED_KEYS and before.get(k, "") != after.get(k, "")}
+    if not changed:
+        return
+    words = "; ".join(f"{k}: {old or '(default)'} -> {new or '(default)'}" for k, (old, new) in changed.items())
+    logger.warning("AI engine setting changed by %s: %s", getattr(user, "username", "?"), words)
+    try:
+        from services.access_audit import record
+
+        record(db, actor=user, action="settings.ai_engine", subject_type="setting",
+               subject_id=",".join(changed), subject_name="AI engine",
+               before={k: v[0] for k, v in changed.items()},
+               after={k: v[1] for k, v in changed.items()},
+               summary=f"AI engine changed — {words}", commit=False)
+    except Exception:
+        logger.exception("could not audit the AI engine change")

@@ -323,7 +323,7 @@ def _store_hash(db_target: str) -> str:
     return hashlib.sha1(str(db_target or "").encode("utf-8")).hexdigest()[:12]
 
 
-def _marker_read() -> str:
+def _marker_read(key: str = REPAIR_DONE_KEY) -> str:
     """The stored marker, or "" — never raises (no CRM DB in the legacy tests)."""
     try:
         from sqlalchemy import text
@@ -333,7 +333,7 @@ def _marker_read() -> str:
         session = get_session_factory()()
         try:
             row = session.execute(text("SELECT value FROM app_settings WHERE key = :k"),
-                                  {"k": REPAIR_DONE_KEY}).first()
+                                  {"k": key}).first()
             return str(row[0] or "") if row else ""
         finally:
             session.close()
@@ -341,7 +341,8 @@ def _marker_read() -> str:
         return ""
 
 
-def _marker_write(value: str) -> bool:
+def _marker_write(value: str, key: str = REPAIR_DONE_KEY,
+                  description: str = "AI cost ledger repair finished (delete this row to run it again)") -> bool:
     try:
         from sqlalchemy import text
 
@@ -353,8 +354,7 @@ def _marker_write(value: str) -> bool:
                 session.execute(text(
                     "INSERT INTO app_settings (key, value, description) VALUES (:k, :v, :d) "
                     "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"),
-                    {"k": REPAIR_DONE_KEY, "v": value,
-                     "d": "AI cost ledger repair finished (delete this row to run it again)"})
+                    {"k": key, "v": value, "d": description})
             return True
         finally:
             session.close()
@@ -371,11 +371,65 @@ def repair_done(db_target: str) -> bool:
     return _marker_read().startswith(h + ":")
 
 
+#: 9 Oct 2026: the production patch of 8 Oct moved interviews to gpt-6-astra
+#: WITHOUT its price rows, so every Astra call logged since was priced at the
+#: gpt-4o-mini fallback (65-85x low). One idempotent re-price from the stored
+#: tokens at today's price; cached tokens are not stored per row, so these rows
+#: are priced at the full input rate (a slight over-statement, footnoted on AI
+#: Costs). A priced row is otherwise never re-priced.
+REPRICE_DONE_KEY = "ai.reprice_gpt6_done"
+REPRICE_MODELS = ("gpt-6-astra",)
+
+
+def reprice_model_rows(db_target: str, models: tuple[str, ...] = REPRICE_MODELS) -> int:
+    """Re-price the logged calls of `models` once per store (marker
+    `ai.reprice_gpt6_done`). Exact model match — no LIKE (psycopg2 rule)."""
+    if not db_target:
+        return 0
+    h = _store_hash(db_target)
+    if _DONE_IN_PROCESS.get(f"reprice:{h}") or _marker_read(REPRICE_DONE_KEY).startswith(h + ":"):
+        return 0
+    from services.ai_pricing import estimate_cost_usd, pricing_table
+
+    table = pricing_table()
+    ph = "%s" if _is_postgres(db_target) else "?"
+    updated = 0
+    try:
+        conn = _connect(db_target)
+        try:
+            cur = conn.cursor()
+            for model in models:
+                unit_in = estimate_cost_usd(model=model, call_type="chat_completion",
+                                            prompt_tokens=1_000_000, table=table)
+                unit_out = estimate_cost_usd(model=model, call_type="chat_completion",
+                                             completion_tokens=1_000_000, table=table)
+                cur.execute(
+                    "UPDATE ai_prompt_logs SET cost_usd = "
+                    f"(COALESCE(prompt_tokens, 0) * {ph} + COALESCE(completion_tokens, 0) * {ph}) / 1000000.0 "
+                    f"WHERE model = {ph} AND COALESCE(status, '') <> 'estimated'",
+                    (unit_in, unit_out, model),
+                )
+                updated += int(cur.rowcount or 0)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("AI cost re-price failed: %s", exc)
+        return 0
+    marker = f"{h}:{date.today().isoformat()}"
+    _DONE_IN_PROCESS[f"reprice:{h}"] = marker
+    _marker_write(marker, REPRICE_DONE_KEY, "gpt-6-astra calls re-priced (delete this row to run it again)")
+    logger.info("AI cost re-price: %d %s call(s) re-priced", updated, "/".join(models))
+    return updated
+
+
 def repair_ai_costs(db_target: str) -> dict:
     """Both repairs, in order (attribution first, so the audio check sees it).
-    A no-op once a run found nothing to do (`repair_done`)."""
+    A no-op once a run found nothing to do (`repair_done`). The one-off
+    gpt-6-astra re-price runs first, under its own marker."""
     if not db_target:
         return {"attributed": 0, "estimated_rows": 0}
+    reprice_model_rows(db_target)
     if repair_done(db_target):
         return {"attributed": 0, "estimated_rows": 0, "skipped": True}
     out = {"attributed": attribute_orphan_calls(db_target),

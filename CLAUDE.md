@@ -2695,6 +2695,184 @@ needs the Reports tab — GM has it, Interviewer does not); the CEO reports stay
 alembic upgrade head` (0128 + 0129), restart, rebuild F-V2; in Access Control ▸ Roles the Interviewer role is waiting under
 Interview Panel. Suite: 1,874 pass, 2 skipped.
 
+**8 Oct 2026 — a finished recording played as a black frame at 0:00 (`tests/test_session_recording.py` now 36; no
+migration):** screenshot report — the report page showed the camera pane black, `0:00`, 9.1 MB. The file downloaded
+fine; the browser could not DECODE it. Cause: only the FIRST 15-second slice carries the WebM header, and the server
+can finalize BEFORE the browser has uploaded its last slices — `_finalize_interview_snapshot` runs on the server-side
+termination (3 strikes) and when `/answer` closes a timed interview at limit + 90 s, and the recovery worker runs it
+too. That join wrote `session.webm` and `discard_parts` deleted the parts; the browser then stopped its recorder,
+uploaded the remaining slices and called `/recording/complete`, which REBUILT the final from the tail alone — a
+headerless file no player can open. **`finalize_from_parts`**: when the parts on hand do not start with the EBML magic
+(`WEBM_MAGIC`, `is_webm()` PURE) and a valid final already exists, the slices are APPENDED to it (`RecordingResult.
+appended`) and those parts deleted at once (a second finalize must never append them twice); a headerless join with no
+prior final is still written but flagged `valid=False` → the schedule row reads `recording_status="corrupt"` and
+`recording_playback` carries **`valid`** (read through the drivers' new `get_head(key, n)` — 4 bytes, a Range request
+on S3). F-V2: the viewer prints the browser's `MediaError` (code → words) and a 12-second metadata watchdog instead of a
+silent black frame, offers "Try the browser player" (a plain `<video controls>` on the same blob) and names the
+headerless case from `valid: false`. Recordings already broken this way cannot be repaired (their parts are gone).
+
+**8 Oct 2026 (later) — recordings play in the page + ONE file; wrong-template AI L1; e-invoice flow; My Tasks ticks;
+Applicants actions; migrations 0130 + 0131, head is now 0131 (`tests/test_recording_stream.py` 6,
+`tests/test_einvoice_flow.py` 5, `tests/test_applicants_actions.py` 1, `test_ai_l1_reschedule` +2, `test_work_desk` +1,
+`test_customer_receipts` / `test_proforma_flow` / `test_session_recording` re-pinned; suite 1,893 pass, 2 skipped):**
+(1) ⚠️ **Why a finished recording sat black at 0:00 while its download played**: the viewer put a presigned S3 URL into
+`<video src>` and the app's CSP allows only `media-src 'self' blob:` (an S3 origin is refused silently); the local driver
+fetched a whole 20 MB blob before the first frame. **`services/recording_stream.py`**: every `url` in
+`recording_playback` is now `/interview/recording/<token>/file/<cam|screen|combined>?exp=&sig=` — same origin, HMAC-signed
+with `AUTH_SECRET` (`SIGNED_TTL_S` 6 h; a `<video>` cannot send the bearer), served by the new route in `main.py` with HTTP
+**Range** (`parse_range` PURE, ≤ `MAX_RANGE_BYTES` 2 MB per answer, 206 / 416) through the drivers' new `read_range`.
+`streamed: true` on the payload; S3 keeps its presigned DOWNLOAD (a navigation, no CSP). **One file with both halves**:
+`combined.webm` (camera left, screen right, 360 px high, camera audio — `combine_command` PURE) built by ffmpeg in a
+background thread after finalize (`start_combined_build`; a `combined.building` storage marker stops two workers; a failed
+build retries after `RETRY_AFTER_S` 1 h); ffmpeg from PATH or the new **`imageio-ffmpeg`** requirement (lazy; without it
+`combined.reason = "no_ffmpeg"` and the two files stay). Payload `combined: {available, url, download_url, size_bytes}` |
+`{available: false, building | reason}`. (2) **Wrong interview template** (report: a Bluetooth Developer candidate, C-2026-
+00095, was interviewed on the "AGM - R&D (ADAS & ARAS)" template of C-2026-00097 and the report named 00097 / Sterling Tools):
+the template carries ONE `opportunityId` and Fulfil silently RE-STAMPED it. `template_requests._link_template` /
+`_stamp_template_opportunity`: a template owned by another opportunity (`template_owner_conflict` PURE) is now **copied**
+under `clone_job_id(job, opp)` for this deal (customerName stamped too), never re-stamped; new `POST /api/template-requests/
+{id}/relink {template_job_id, reason ≥ 10}` (RMG; Template_Ready / Prepared) changes a linked template, notifies the TA.
+**0130** adds `ai_interview_links.voided_at / voided_by / voided_reason`; `AiInterviewCreate.void_previous` (reason ≥
+`MIN_VOID_NOTE` 10) sends a fresh link over ANY finished AI L1 — a PASS included — and `void_link` labels the old one
+(`AI_INTERVIEW_VOIDED` activity, kept on record, never counts; `previous_finished_link` skips voided). (3) **E-invoice
+flow** (user rule: customer approval → IRN → e-invoice → payments): `invoice_customer_approval.payment_block` /
+`require_payment_open` — Record Payment and Record TDS answer **409** until the Sales Manager / Sales Head confirmed the
+customer's approval AND Finance recorded the IRN (an invoice already carrying a payment or a TDS record is grandfathered);
+customer receipts refuse invoices still blocked and `invoice-options` rows carry `payment_block` (Proformas no longer
+listed). Payload adds `payments_open` / `payment_block` / `einvoice_ready` (yes/no for every reader; the IRN itself stays
+Finance / Admin / CEO). **The e-invoice**: `tax_invoice.Invoice.einvoice` → an **e-Invoice band** under the header (IRN ·
+Ack No. · Ack Date, `einvoice_rows` PURE) with a QR to the PUBLIC e-invoice page (`share_links.einvoice_url`), in both the
+WeasyPrint HTML and the reportlab fallback; the declaration QR is dropped on an e-invoice; files `EInvoice_…`.
+`map_crm_invoice_to_tax_invoice(..., einvoice=True)`; `GET /api/invoices/{id}/einvoice.pdf` (Finance / Admin / CEO, 409
+before the IRN); public `GET /api/public/invoices/{token}/einvoice` (+ `/einvoice/pdf`, 404 until the IRN) shows the
+invoice with an IRN / Ack block. ⚠️ Our QR is a verification link, NOT the IRP's signed QR (a JWT the GST portal returns);
+storing that string would need a column — not done. (4) **My Tasks**: `fin_invoices` and Sales' `sales_invoices` list
+EVERY tax invoice (the 30 / 90-day windows are gone; `FIN_ISSUED_DAYS` / `SALES_INVOICES_DAYS` removed). **0131**
+`work_desk_marks` (`models/work_desk_marks.WorkDeskMark`, user_id + item_key unique, no FK; in `DATASETS["users"]`):
+`POST /api/dashboard/desk/marks {keys, done}` → `work_desk.set_marks` (idempotent, ≤ 500 keys); `desk()` stamps
+`done: True` on ticked items + `tab.done_count` (`apply_marks`) — personal, the record and the tile count never change.
+`work_desk._pending_offers` → public `pending_offers`. (5) **Applicants tab acts from the list**: `GET
+/api/candidate-profiles?with_actions=true` → each row `allowed_next_statuses` (the SAME `allowed_next_statuses_for_user`
+the profile page uses) + the pending `offer`. Deploy: `pip install -r requirements.txt` (imageio-ffmpeg), `python -m
+alembic upgrade head` (0130 + 0131), restart.
+
+**8 Oct 2026 — AI interviews run on `gpt-6-astra` (`tests/test_reasoning_model_params.py`, 8; no migration):**
+production sets `INTERVIEW_OPENAI_MODEL=gpt-6-astra` and `CRM_AI_L1_MODEL=gpt-6-astra`. Three things had to change
+first, each found by a live API call — see `docs/GPT6_ASTRA_HANDOFF.md`. (1) ⚠️ **Reasoning models (GPT-5 / GPT-6 /
+o-series) answer 400 to any `temperature` ≠ 1 and to `max_tokens`**, and every interview call sends both:
+`prompt_logger.is_reasoning_model(model)` + `tracked_chat_completion` drops them for such a model (callers unchanged;
+`max_tokens` is dropped, not translated — hidden reasoning tokens count against the cap and a small one returns an
+EMPTY answer); optional `OPENAI_REASONING_EFFORT` (low · medium · high · xhigh — `none` / `minimal` are refused).
+**Every new OpenAI call must go through `tracked_chat_completion`** — a direct `client.chat.completions.create(...,
+temperature=…)` breaks the moment the env names a reasoning model. (2) ⚠️ **`gpt-6-astra` refuses function tools on
+`/v1/chat/completions` at every `reasoning_effort`** ("use /v1/responses"; `none` is rejected too) — Ask AI uses tools,
+so `ai_help/assist._model()` never INHERITS a reasoning model: `AI_ASSIST_MODEL` wins when set, else the interview model
+unless it is a reasoning model, else gpt-4o-mini. (3) Every schedule stores `"model": "gpt-4o-mini"` in its notes (the
+HR form's hidden select + `_pack_invite_config_into_notes`' default) and that stored value beat the env, so
+`main._resolve_interview_model(stored)` treats a stored "gpt-4o-mini" as "the default" → `INTERVIEW_OPENAI_MODEL`; any
+OTHER stored model is a deliberate choice and is kept. `services/ai_pricing.DEFAULT_PRICES` gains `gpt-6-astra`
+($10 / $50, cached $1 per 1M) and `gpt-6.1-sol` ($2 / $10) — an unlisted model is priced as gpt-4o-mini, so AI Costs read
+Astra ~65× low. Measured on the live API: 3–4.5 s per call, ~$0.006–0.007 per question / evaluation call;
+`reasoning_effort=low` was not meaningfully faster. ⚠️ The adaptive follow-up (`services/interview/conversation.py`)
+runs on the session's model under `TURN_PLAN_TIMEOUT_S`=6 / `REPLY_TIMEOUT_S`=8 — Astra fits but with little margin; a
+timeout skips the follow-up silently. Pin it with `INTERVIEW_FOLLOWUP_MODEL` if follow-ups go missing. Roll back by
+setting the two env lines to gpt-4o-mini (the code is correct either way).
+
+**9 Oct 2026 — two-way AI interview (opt-in per template) + candidate resume library, migration 0132, head is now
+0132 (`tests/test_interview_conversation.py` 26, `tests/test_candidate_resumes.py` 6):** user decision — "do not disturb
+current, just add". ⚠️ **Every conversation feature is OFF unless the template's `weights.conversation` turns it on**; a
+template without the key produces byte-identical `/next` payloads and makes no extra model call (pinned).
+**(1) `services/interview/conversation.py`** — `conversation_settings(weights)` (followups · maxFollowups 0..5, default 2 ·
+probeShortAnswers · acknowledge · clarify · closingQa · voiceMode standard|live; `enabled` = any on; always carries
+`hide_names`), stamped onto session meta by BOTH bootstraps (`stamp_conversation_settings`, the customer name goes into
+`hide_names` so the model never says it). **Follow-ups (A)**: after a scored answer, `main._apply_conversation_turn` asks
+`plan_turn` (ONE model call, `INTERVIEW_FOLLOWUP_MODEL`, default gpt-4o-mini, `TURN_PLAN_TIMEOUT_S` 6 s, `call_type`
+`interview_followup`) for a lead-in + an optional follow-up; `insert_followup` inserts it at the next index and
+`followups_inserted` grows the question cap by the same number, so the planned questions are never cut (the adaptive
+blocks skip a turn that already inserted, `conv_followup_inserted`). Short answers (< `SHORT_ANSWER_WORDS`=15) get a probe
+only with probeShortAnswers; never in the last `FOLLOWUP_MIN_TIME_LEFT_S`=120 s; never on the warm-up. Follow-ups are SCORED
+like any question. **Lead-in (B)**: `lead_in` on the next payload (≤ `MAX_LEAD_IN_WORDS`=28, `sanitize_lead_in` refuses
+evaluative words — "great/correct/wrong" — so the candidate is never told how they did; fallbacks without a model).
+**Clarify (C)**: `POST /candidate/conversation/clarify {mode: repeat|rephrase}` (≤ `MAX_CLARIFY_PER_QUESTION`=3, counted for
+the report). **Closing Q&A (D)**: `POST /candidate/conversation/closing` answers ≤ `MAX_CLOSING_QUESTIONS`=3 questions about
+the role from the JD / template only (`CLOSING_UNKNOWN` when it is not there — never invents salary or policy).
+**Report (E)**: `hr/service` adds `report.conversation` = `report_summary(session)` (follow-up indices + text, repeats,
+clarifications, closing Q&A, voice mode) — display only, never scored. Payload adds `is_followup` / `lead_in` /
+`conversation` (client switches) only when enabled.
+**(2) Live voice (F) — `services/interview/realtime_voice.py`**: `POST /candidate/realtime/session` mints a short-lived
+OpenAI Realtime client secret (`/v1/realtime/client_secrets`, `SECRET_TTL_S` 600; the server key never reaches the browser;
+`openai_client` purpose `realtime` → `OPENAI_REALTIME_API_KEY`, falls back to the question key), with `instructions(meta)`
+(role, skills, JD ≤ 2,500 chars, NEVER scores aloud) and tools get_next_question / submit_answer / end_interview — the
+browser relays every tool call to the ORDINARY `/next` and `/answer`, so the server stays authoritative for questions,
+answers, scoring, clock and integrity. `POST /candidate/realtime/usage` logs the session's token usage (`call_type`
+`realtime_voice`, priced by `ai_pricing` kind `realtime`, costed into the AI Costs TTS bucket; a reported figure above
+`MAX_TOKENS_PER_REPORT` is clamped — the browser reports it, so it is not trusted). Any mint failure answers `{ok: false, reason}` and the client falls back to the standard voice.
+Env: `INTERVIEW_REALTIME_ENABLED` (default true — the template still has to ask), `INTERVIEW_REALTIME_MODEL` (default
+`gpt-realtime-mini`), `INTERVIEW_REALTIME_VOICE` (`marin`), `INTERVIEW_REALTIME_TRANSCRIBE_MODEL`. ⚠️ Live voice costs
+several times the standard pipeline (audio tokens both ways); it is per template on purpose. Also fixed in passing:
+`main._recording_auth` raised `HTTPException`, which was never imported (added to the fastapi import).
+**(3) Resume library — `models/candidate_resumes.py` (`candidate_resumes`, 0132; in `DATASETS["candidates"]`) +
+`services/candidate_resumes.py` + `routers/crm/candidate_resumes.py` (`_MODULES` += it)**: a candidate keeps up to
+`MAX_VERSIONS`=10 named resumes. `sync_library` seeds lazily (the record's `cv_url` = the MAIN version, every resume uploaded
+for a position joins as "Uploaded for REQ-…", idempotent); **the main version IS `candidates.cv_url`** (`set_primary` mirrors
+it; the main one cannot be removed — 409). 0132 seeds the libraries on Postgres. `matching_positions(db, cand)` scores EVERY
+live position (a requirement in `SOURCING_STATUSES` on a New / Active deal, ≤ `MAX_POSITIONS`=300) against
+EVERY version with the deterministic ATS (`ats_scoring`, no model call; JD via `_jd_for`, cached `JD_CACHE_TTL_S`), names
+the best version, flags experience band / over budget, `good_fit` ≥ `GOOD_FIT_PCT`=60 (user decision), and puts positions
+the candidate is already in LAST with who applied. `ai_review` (the paid AI read) runs ONLY on TA's click and is stored per
+(position, version) so it is never paid twice. Routes: `GET/POST /api/candidates/{id}/resume-library`, `PATCH/DELETE
+…/resume-library/{rid}` (read: `gated_read("candidates", …)`; write: TA · RMG · Sales · Sales Head · HR),
+`GET …/matching-positions`, `POST …/matching-positions/{req}/ai-review` and **`POST …/multi-apply {items:[{requirement_id,
+resume_id?}], note}` — both `role_required("TA")`** (user decision: TA only). Multi-apply runs each item through
+`candidate_profiles.create_profile_core` — the Apply button's own path, extracted from `create_profile` (route unchanged:
+it commits and builds the message) — then `attach_version_to_profile` (a Resume row on that requirement with the chosen
+file, `application_details.resume_version`, auto-ATS); each item in a savepoint, so one refusal ("already applied", a closed
+deal) never blocks the rest. Applied Candidates rows carry `other_positions` / `resume_versions`
+(`resumes._with_other_positions`, two queries per page). Deploy: `python -m alembic upgrade head` (0132), restart; then
+per template, Interview Templates ▸ edit ▸ "Conversation". Suite: 1,932 pass, 2 skipped.
+
+**9 Oct 2026 (later) — GPT-6 Astra made permanent: ONE model switch, slow calls off the candidate's path, the model
+shown everywhere (`tests/test_ai_models.py` 21; `test_reasoning_model_params`, `test_interview_rescore`,
+`test_ai_interview_costs` re-pinned; no migration):** brief `docs/PROMPT-gpt6-astra.md`. **(1) `services/ai_models.py`**
+is the ONE place that knows model names (pure; settings via the 60-s-cached `org_settings.setting`):
+`interview_model()` = Settings `ai.interview_model` → env `INTERVIEW_OPENAI_MODEL` → gpt-4o-mini;
+`fast_interview_model(session)` = Settings `ai.interview_fast_model` → `INTERVIEW_FAST_MODEL` → `INTERVIEW_FOLLOWUP_MODEL`
+→ gpt-4o-mini while the session runs on a reasoning model → the session model; `ocr_model()` = `INTERVIEW_OCR_MODEL` →
+gpt-4o-mini; `resolve_session_model(cfg)` — ⚠️ **the server decides when a session starts; a stored model counts only with
+`"model_locked": true`** (nothing sets it today). `_pack_invite_config_into_notes` stores `"model": ""`, the CRM bridge no
+longer reads `CRM_AI_L1_MODEL` (delete it from the env), `/setup` takes an optional `model_locked` form field,
+`/extract-skills` and the template previews use the server model, `config.OPENAI_CHAT_MODELS` is gone and `GET /models`
+returns `{provider, models: [interview_model()], default, labels}` (no base URL). A session keeps its `meta["model"]`;
+re-score scores with the model of the moment (`_evaluate_and_store_report(..., evaluation_model=)`) and every report
+records `evaluation_model` (+ `questions_generic` when login fell back). **Settings ▸ AI engine**: `org_settings.KEYS` +=
+`ai.interview_model`, `ai.interview_fast_model`, `ui.show_ai_model_to_candidates`; `validation_error` refuses a model
+outside `SUPPORTED_INTERVIEW_MODELS` (allow-list, NOT `_FORMATS` — that upper-cases); both save routes audit a change
+(`org_settings.audit_changes` → access log action `settings.ai_engine`, new group `settings`). **(2) Critical path**:
+`conversation._model_for` + both inline follow-up calls in `/answer` use the fast model, the inline ones under
+`_bounded_ai_call` (`INTERVIEW_INLINE_AI_TIMEOUT_S`=6, context copied, fallback on timeout); `/answer` logs one
+`interview.answer.timing` line (elapsed_ms · lock_wait_ms · conversation_ms · followup_ms · pool_topup). ⚠️
+**`_apply_turn_evaluation` calls the model OUTSIDE `session_lock`** and writes only while the session is on the same turn.
+⚠️ **`_expand_time_mode_pool` returns "background" | "sync" | None**: ≤ 8 unasked → a background top-up (one per session,
+`_POOL_TOPUP_RUNNING`), generated outside the lock, appended under it; only an EMPTY pool generates while the candidate
+waits, under `INTERVIEW_POOL_SYNC_TIMEOUT_S`=20 with `generate_questions_fallback` on timeout. Invite login waits
+`_prewarm_wait_sec()` (`INTERVIEW_PREWARM_WAIT_SEC`; 45 s on a reasoning model, else 12) and a fast bootstrap is a WARNING
+with model / prewarm status, stamping `meta["fast_bootstrap"]`. ⚠️ **No model call inside a staff page load**:
+`/hr/dashboard`, `/hr-records` and `/interview/integrity-logs` call `_kick_recovery_async()` (one background pass, same
+advisory lock) instead of `_recover_interviews_once`, and `_cleanup_expired_integrity_rows` queues a stale active
+interview (`_STALE_FINALIZE_QUEUE`) for `_finalize_stale_active_token` instead of finalizing inline (pinned by an AST
+scan). OCR: `_extract_text_from_upload(upload, safe_mode)` reads images with `ocr_model()`; `prompt_logger.chat_params(model,
+temperature=, max_tokens=)` is THE reasoning-model rule (`tracked_chat_completion` uses it; the OCR call is the one direct
+`chat.completions.create(`, pinned by a source scan). **(3) Exposure**: `GET /interview/ai-engine` (staff `hr` token) →
+`ai_models.engine()` (interview · fast · live_voice · transcription · voice · ask_ai · ocr · show_to_candidates ·
+supported — ids + labels only); `model_label()` longest-prefix table, unknown ids prettified, never blank;
+`record_models(record)` → model / evaluation_model + labels on `_interview_summary_payload`, the interview detail record
+and `summarize_interview_record`; invite login adds `ai_model` (+ `voice_model` for live voice) while
+`show_to_candidates()`; AI Costs adds `by_model` (`_per_interview_models`, one grouped query, no LIKE) and `models` per row;
+`ai_cost_repair.reprice_model_rows` re-prices the gpt-6-astra calls logged at the gpt-4o-mini fallback ONCE (marker
+`ai.reprice_gpt6_done`, runs first in `repair_ai_costs`). Not done: the optional reasoning-tokens column (B8.8). Deploy:
+restart; remove `CRM_AI_L1_MODEL` from `/etc/karnex/karnex.env`; keep `INTERVIEW_OPENAI_MODEL=gpt-6-astra`. Rollback =
+Settings ▸ AI engine → GPT-4o mini. Suite: 1,953 pass, 2 skipped.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 

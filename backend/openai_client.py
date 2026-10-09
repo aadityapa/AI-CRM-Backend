@@ -8,6 +8,8 @@ Env vars (each falls back to OPENAI_API_KEY when unset):
   OPENAI_EVAL_API_KEY         — interview evaluation & per-question scoring
   OPENAI_TRANSCRIBE_API_KEY   — voice-to-text (/candidate/transcribe)
   OPENAI_ATS_API_KEY          — ATS resume↔JD semantic review
+  OPENAI_REALTIME_API_KEY     — live voice interviews (mints browser client secrets;
+                                falls back to the question key, then the master)
 
 Aliases (same purpose, either name works):
   OPENAI_API_KEY_TTS, OPENAI_API_KEY_QUESTIONS, OPENAI_API_KEY_EVALUATION,
@@ -27,7 +29,7 @@ from typing import Any, Literal
 
 from openai import OpenAI
 
-OpenAIPurpose = Literal["default", "tts", "question", "eval", "transcribe", "ats"]
+OpenAIPurpose = Literal["default", "tts", "question", "eval", "transcribe", "ats", "realtime"]
 
 _PURPOSE_ENV: dict[OpenAIPurpose, tuple[str, ...]] = {
     "default": ("OPENAI_API_KEY",),
@@ -36,12 +38,13 @@ _PURPOSE_ENV: dict[OpenAIPurpose, tuple[str, ...]] = {
     "eval": ("OPENAI_EVAL_API_KEY", "OPENAI_API_KEY_EVALUATION"),
     "transcribe": ("OPENAI_TRANSCRIBE_API_KEY", "OPENAI_API_KEY_TRANSCRIBE"),
     "ats": ("OPENAI_ATS_API_KEY", "OPENAI_API_KEY_ATS"),
+    "realtime": ("OPENAI_REALTIME_API_KEY", "OPENAI_API_KEY_REALTIME"),
 }
 
 #: Purposes that borrow another purpose's key before falling back to the master.
 #: ATS used to run on the "eval" key, so an install that only sets that keeps
 #: working after this change.
-_PURPOSE_FALLBACK: dict[OpenAIPurpose, OpenAIPurpose] = {"ats": "eval"}
+_PURPOSE_FALLBACK: dict[OpenAIPurpose, OpenAIPurpose] = {"ats": "eval", "realtime": "question"}
 
 
 def _first_env(*names: str) -> str:

@@ -19,7 +19,3 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 TEXT_EXTENSIONS = {".txt", ".md", ".rtf"}
 WORD_EXTENSIONS = {".docx", ".doc"}
 
-# Chat/completions models for official OpenAI (when not using Ollama base URL).
-OPENAI_CHAT_MODELS = [
-    "gpt-4o-mini",
-]

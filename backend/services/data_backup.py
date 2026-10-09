@@ -86,7 +86,7 @@ DATASETS: tuple[Dataset, ...] = (
     Dataset("candidates", "Candidates",
             "Candidate master with education, experience, skills, outreach, resumes (CV files included)",
             ("candidates", "candidate_education", "candidate_experience", "candidate_skills",
-             "candidate_outreach", "resumes", "resume_parse_cache")),
+             "candidate_outreach", "resumes", "resume_parse_cache", "candidate_resumes")),
     Dataset("profiles", "Candidate Profiles",
             "Pipeline profiles, offers, skill evaluations, interview rounds, AI interview links, activity",
             ("candidate_profiles", "offer_history", "skill_evaluations", "interview_events",
@@ -110,7 +110,7 @@ DATASETS: tuple[Dataset, ...] = (
             "CRM users (no passwords), roles, profiles, access templates, action permissions, preferences",
             ("roles", "user_roles", "user_profiles", "access_templates",
              "custom_roles", "user_custom_roles", "user_access_log",
-             "action_permissions", "user_table_preferences", "user_notify_prefs"),
+             "action_permissions", "user_table_preferences", "user_notify_prefs", "work_desk_marks"),
             # registration_data is only a one-column FK stub in the ORM
             # (models/base.py) — read the real table through the inspector.
             ("registration_data",)),

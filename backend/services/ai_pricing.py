@@ -29,11 +29,12 @@ import json
 import os
 from dataclasses import dataclass
 
-#: Call kinds. Anything not tts/stt is priced as chat.
-CHAT, TTS, STT = "chat", "tts", "stt"
+#: Call kinds. Anything not tts/stt/realtime is priced as chat.
+CHAT, TTS, STT, REALTIME = "chat", "tts", "stt", "realtime"
 
-#: call_type prefixes that are audio, not chat.
-AUDIO_CALL_TYPES = {"tts": TTS, "tts_prewarm": TTS, "transcribe": STT}
+#: call_type prefixes that are audio, not chat. A live voice interview
+#: (9 Oct 2026) bills audio IN and audio OUT on the same call.
+AUDIO_CALL_TYPES = {"tts": TTS, "tts_prewarm": TTS, "transcribe": STT, "realtime": REALTIME}
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,15 @@ class Price:
 #: USD per 1M tokens (chat) / per minute (audio). Longest prefix wins, so
 #: "gpt-4o-mini-tts" is matched before "gpt-4o-mini" before "gpt-4o".
 DEFAULT_PRICES: dict[str, Price] = {
+    # Live voice (realtime) — text + audio tokens in and out, per 1M.
+    "gpt-realtime-mini": Price(input=0.60, output=2.40, cached_input=0.06,
+                               audio_in_per_1m=10.00, audio_out_per_1m=20.00),
+    "gpt-realtime": Price(input=4.00, output=16.00, cached_input=0.40,
+                          audio_in_per_1m=32.00, audio_out_per_1m=64.00),
+    "gpt-4o-mini-realtime": Price(input=0.60, output=2.40, cached_input=0.30,
+                                  audio_in_per_1m=10.00, audio_out_per_1m=20.00),
+    "gpt-4o-realtime": Price(input=5.00, output=20.00, cached_input=2.50,
+                             audio_in_per_1m=40.00, audio_out_per_1m=80.00),
     "gpt-4o-mini-tts": Price(input=0.60, audio_out_per_1m=12.00, audio_out_per_min=0.015),
     "gpt-4o-mini-transcribe": Price(output=5.00, audio_in_per_1m=1.25, audio_in_per_min=0.003),
     "gpt-4o-transcribe": Price(output=10.00, audio_in_per_1m=2.50, audio_in_per_min=0.006),
@@ -63,6 +73,11 @@ DEFAULT_PRICES: dict[str, Price] = {
     "gpt-4.1-mini": Price(input=0.40, output=1.60, cached_input=0.10),
     "gpt-4.1-nano": Price(input=0.10, output=0.40, cached_input=0.025),
     "gpt-4.1": Price(input=2.00, output=8.00, cached_input=0.50),
+    # GPT-6 reasoning models (OpenAI model pages, 8 Oct 2026). Without these rows
+    # an Astra call fell back to the gpt-4o-mini price — AI Costs read ~65x low.
+    # Reasoning tokens are billed as output and are already in completion_tokens.
+    "gpt-6-astra": Price(input=10.00, output=50.00, cached_input=1.00),
+    "gpt-6.1-sol": Price(input=2.00, output=10.00, cached_input=0.10),
     "text-embedding-3-small": Price(input=0.02),
     "text-embedding-3-large": Price(input=0.13),
 }
@@ -129,6 +144,7 @@ def call_kind(call_type: str) -> str:
 def estimate_cost_usd(*, model: str, call_type: str = "", prompt_tokens: int = 0,
                       completion_tokens: int = 0, cached_tokens: int = 0,
                       audio_tokens: int = 0, audio_seconds: float = 0.0,
+                      audio_out_tokens: int = 0,
                       table: dict[str, Price] | None = None) -> float:
     """USD for one call. Text tokens are per 1M (`cached_tokens` — a subset of
     `prompt_tokens` — at the cached rate). Audio in the direction the kind
@@ -149,6 +165,11 @@ def estimate_cost_usd(*, model: str, call_type: str = "", prompt_tokens: int = 0
     elif kind == STT:
         usd += a_tokens * p.audio_in_per_1m / 1_000_000.0 if a_tokens and p.audio_in_per_1m \
             else minutes * p.audio_in_per_min
+    elif kind == REALTIME:
+        # `audio_tokens` = audio the candidate spoke (in), `audio_out_tokens` =
+        # the interviewer's voice (out).
+        usd += (a_tokens * p.audio_in_per_1m
+                + max(0, int(audio_out_tokens or 0)) * p.audio_out_per_1m) / 1_000_000.0
     return round(usd, 6)
 
 

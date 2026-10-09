@@ -492,7 +492,7 @@ def _since_status_change(db: Session, ids: list[int]) -> dict[int, datetime]:
         .group_by(Log.profile_id)).all()}
 
 
-def _pending_offers(db: Session, ids: list[int]) -> dict[int, dict]:
+def pending_offers(db: Session, ids: list[int]) -> dict[int, dict]:
     """profile id → the newest PENDING offer's terms (what Sales submitted)."""
     from models import OfferHistory, OfferStatus
     out: dict[int, dict] = {}
@@ -543,7 +543,7 @@ def _sales_tabs(db: Session, user, *, is_admin: bool) -> list[dict]:
     ids = [p.id for p in profiles]
     status = statuses_for(db, profiles)
     moved = _since_status_change(db, ids)
-    offers = _pending_offers(db, ids)
+    offers = pending_offers(db, ids)
     budgets = approved_ctc_budgets(db, profiles, {c.id: c for _, c, *_ in rows})
     approver = user_may(db, user, "profile.sales_head_decision")
     may_reply = user_may(db, user, "profile.budget_resolve")
@@ -622,8 +622,6 @@ def _sales_tabs(db: Session, user, *, is_admin: bool) -> list[dict]:
 
 # ------------------------------------------------------------------ Sales billing
 
-#: "Invoices generated" looks back this far.
-SALES_INVOICES_DAYS = 90
 #: A Draft sheet for a month that ended more than this many days ago is red.
 SHEET_LATE_DAYS = 5
 
@@ -640,7 +638,7 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
     * Invoices pending — Approved sheets with no issued invoice: waiting for the
       GM's Proforma, or the Proforma was returned by Finance.
     * Proforma invoices — Proformas the GM raised, with Finance.
-    * Invoices generated — Tax invoices of the last `SALES_INVOICES_DAYS` days.
+    * Invoices generated — every Tax invoice of the scope (8 Oct 2026; was 90 days).
     * Payments to chase — Tax invoices past due and not fully paid (Sales owns
       the customer relationship, so the reminder is theirs).
 
@@ -756,13 +754,11 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
     # 3 + 4 + 5 — Proformas with Finance; tax invoices issued recently; past due
     # and unpaid. The employee comes through the invoice's timesheet — ONE query
     # for every invoice on the page; a manual invoice names nobody.
-    cutoff = today - timedelta(days=SALES_INVOICES_DAYS)
-    unpaid = (PaymentStatus.UNPAID, PaymentStatus.PARTIALLY_PAID)
+    # 8 Oct 2026: EVERY tax invoice of the scope (was the last 90 days) — the
+    # tab filters by customer / employee / month instead of hiding older ones.
     invoices = db.execute(select(Invoice).where(
         Invoice.project_id.in_(inv_pids or [-1]),
-        or_((Invoice.kind == proforma) & Invoice.returned_at.is_(None),
-            (Invoice.kind == tax) & or_(Invoice.invoice_date >= cutoff,
-                                        Invoice.payment_status.in_(unpaid) & (Invoice.due_date < today))))
+        or_((Invoice.kind == proforma) & Invoice.returned_at.is_(None), Invoice.kind == tax))
         .order_by(Invoice.invoice_date.desc(), Invoice.id.desc())).scalars().all()
     emp_of_sheet: dict[int, str] = {}
     sheet_ids = [inv.timesheet_id for inv in invoices if inv.timesheet_id]
@@ -793,13 +789,12 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
         status = str(getattr(inv.payment_status, "value", inv.payment_status) or "Unpaid")
         paid = status == PaymentStatus.PAID.value
         overdue = (not paid) and inv.due_date is not None and inv.due_date < today
-        if inv.invoice_date >= cutoff:
-            it = _item(f"siv:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}", subtitle,
-                       chip=("Overdue" if overdue else status.replace("_", " ")),
-                       tone="bad" if overdue else "ok" if paid else "info",
-                       when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Open invoice")
-            it.update(section=cname, **facets_of(inv, cname, pname))
-            iv_items.append(it)
+        it = _item(f"siv:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}", subtitle,
+                   chip=("Overdue" if overdue else status.replace("_", " ")),
+                   tone="bad" if overdue else "ok" if paid else "info",
+                   when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Open invoice")
+        it.update(section=cname, **facets_of(inv, cname, pname))
+        iv_items.append(it)
         if overdue and inv.project_id in projects:
             late = (today - inv.due_date).days
             it = _item(f"sdue:{inv.id}", f"{inv.invoice_number} · {rupees(inv.balance_amount or inv.grand_total)} due",
@@ -1388,8 +1383,6 @@ def _hr_people_tabs(db: Session, today, emp_name) -> dict[str, dict]:
 #: Approved sheets older than this are not "coming up" any more — one invoiced
 #: by hand (no timesheet link) would otherwise sit on the list for ever.
 FIN_TIMESHEET_DAYS = 90
-#: "Tax invoices issued" looks back this far.
-FIN_ISSUED_DAYS = 30
 #: A Proforma waiting longer than this is flagged amber, twice as long red.
 PROFORMA_WAIT_DAYS = 3
 
@@ -1460,7 +1453,7 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
     * `awaiting` — approved sheets with no issued invoice, or whose Proforma
       Finance returned (last `FIN_TIMESHEET_DAYS`);
     * `proformas` — Proformas with Finance (not returned);
-    * `issued` — tax invoices of the last `FIN_ISSUED_DAYS`.
+    * `issued` — every tax invoice, newest first (8 Oct 2026).
 
     Five batched queries; every item carries the customer / project / month
     facets. The WORDING follows `audience` ("finance" | "gm")."""
@@ -1551,9 +1544,11 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
             path=f"invoices/{inv.id}", action=pi_action) | {"section": cname or "No customer"}
             | _facets(cname, pname, day=inv.invoice_date, employee=who, amount=inv.grand_total))
 
-    # 3 — tax invoices issued in the window (done), newest first.
-    cutoff = today - timedelta(days=FIN_ISSUED_DAYS)
-    issued = db.execute(select(Invoice).where(Invoice.kind == tax, Invoice.invoice_date >= cutoff)
+    # 3 — EVERY tax invoice issued (done), newest first. 8 Oct 2026, user
+    # report: "Tax invoices issued is not showing all invoices" — the old
+    # 30-day window hid the older ones; the tab's customer / employee / month
+    # filters narrow it instead.
+    issued = db.execute(select(Invoice).where(Invoice.kind == tax)
                         .order_by(Invoice.invoice_date.desc(), Invoice.id.desc())).scalars().all()
     nm = names({i.project_id for i in issued})
     emp_of = employees_of(issued)
@@ -1818,9 +1813,64 @@ def desk(db: Session, user, *, max_items: int = MAX_ITEMS) -> dict:
             fill_facets(db, tabs)
     except Exception:
         logging.getLogger("karnex.crm.work_desk").warning("desk facets failed", exc_info=True)
+    try:
+        with db.begin_nested():
+            apply_marks(db, user.id, tabs)
+    except Exception:
+        logging.getLogger("karnex.crm.work_desk").warning("desk marks failed", exc_info=True)
     for tab in tabs:
         tab["items"] = tab["items"][:max_items]
     return {"tabs": tabs, "as_of": datetime.now(timezone.utc).isoformat()}
+
+
+# ------------------------------------------------------------------ ticks (8 Oct 2026)
+
+#: Most keys one tick request may carry (an employee group of invoices).
+MAX_MARK_KEYS = 500
+
+
+def marked_keys(db: Session, user_id: int) -> set[str]:
+    """The item keys this login ticked as done on My Tasks."""
+    from models import WorkDeskMark
+
+    return set(db.execute(select(WorkDeskMark.item_key).where(WorkDeskMark.user_id == user_id)).scalars())
+
+
+def apply_marks(db: Session, user_id: int, tabs: list[dict]) -> None:
+    """Stamp `done: True` on the items this login ticked ("work done, tick &
+    close" — user ask, 8 Oct 2026) and count them per tab (`done_count`). The
+    item stays in the payload (My Tasks hides it by default and can show it
+    again); the tile COUNT is unchanged — a tick is personal bookkeeping, not a
+    change to the record."""
+    marks = marked_keys(db, user_id)
+    for tab in tabs:
+        n = 0
+        for it in tab.get("items") or []:
+            if it.get("key") in marks:
+                it["done"] = True
+                n += 1
+        tab["done_count"] = n
+
+
+def set_marks(db: Session, user_id: int, keys: list[str], done: bool) -> int:
+    """Tick (done=True) or untick a batch of item keys for this login.
+    Idempotent; returns how many keys changed."""
+    from models import WorkDeskMark
+
+    clean = sorted({str(k).strip()[:80] for k in keys if str(k or "").strip()})[:MAX_MARK_KEYS]
+    if not clean:
+        return 0
+    have = set(db.execute(select(WorkDeskMark.item_key).where(
+        WorkDeskMark.user_id == user_id, WorkDeskMark.item_key.in_(clean))).scalars())
+    if done:
+        new = [k for k in clean if k not in have]
+        db.add_all([WorkDeskMark(user_id=user_id, item_key=k) for k in new])
+        return len(new)
+    gone = [k for k in clean if k in have]
+    if gone:
+        db.execute(WorkDeskMark.__table__.delete().where(
+            WorkDeskMark.user_id == user_id, WorkDeskMark.item_key.in_(gone)))
+    return len(gone)
 
 
 def fill_facets(db: Session, tabs: list[dict]) -> None:

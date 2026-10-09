@@ -27,3 +27,6 @@ slowapi>=0.1.9
 # services/media_storage.py imports this lazily and falls back to local disk
 # when it is absent, so an existing deployment keeps working without it.
 boto3>=1.34.0
+# One recording with camera + screen side by side (8 Oct 2026): ships a static ffmpeg;
+# without it the two separate files stay available. Imported lazily.
+imageio-ffmpeg>=0.5.1

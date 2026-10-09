@@ -110,6 +110,27 @@ def crm_tax_invoice_pdf(
     return _pdf_response(ti.render_pdf(tax_inv))
 
 
+@router.get("/api/invoices/{invoice_id}/einvoice.pdf")
+def crm_einvoice_pdf(
+    invoice_id: int,
+    request: Request,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(INV_READ),
+):
+    """The e-invoice (8 Oct 2026): the Tax Invoice with its e-Invoice band —
+    IRN · Ack No. · Ack Date — and a QR to the public e-invoice page. Finance /
+    Admin / CEO (the IRN is theirs), and only once the IRN is recorded."""
+    from services.invoice_customer_approval import may_see_irn
+    if not may_see_irn(user):
+        raise HTTPException(status_code=403, detail="Only Finance opens the e-invoice.")
+    invoice = get_invoice_or_404(db, invoice_id)
+    if invoice.is_proforma or not invoice.irn_number:
+        raise HTTPException(status_code=409, detail="Add the IRN and Ack No. first — the e-invoice is built from them.")
+    tax_inv = ti.map_crm_invoice_to_tax_invoice(
+        db, invoice, share_base_url=str(request.base_url).rstrip("/"), einvoice=True)
+    return _pdf_response(ti.render_pdf(tax_inv))
+
+
 @router.get("/api/invoices/{invoice_id}/tax-invoice.docx")
 def crm_tax_invoice_docx(
     invoice_id: int,

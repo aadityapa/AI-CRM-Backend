@@ -106,6 +106,13 @@ def build_report_record(session: dict, report_result: dict, evaluated_ist: dict)
         apply_not_attempted(
             report_result, session.get("questions"), session.get("answers"), meta
         )
+        # Two-way conversation (9 Oct 2026): follow-ups, repeats and the
+        # candidate's own questions, for display only — never scored.
+        from services.interview.conversation import report_summary
+
+        summary = report_summary(session)
+        if summary is not None:
+            report_result["conversation"] = summary
     return {
         "id": meta.get("interview_id", str(uuid4())),
         "created_at": meta.get("created_at"),
