@@ -92,10 +92,12 @@ def env():
     )
     session.add(cand)
     session.flush()
+    # At Sales Screening: since 13 Oct 2026 Sales sees from Sales Screening on
+    # by default (services/stage_access — role-wise candidate stages).
     profile = CandidateProfile(
         candidate_id=cand.id,
         opportunity_id=opp.id,
-        pipeline_status=PipelineStatus.SOURCING,
+        pipeline_status=PipelineStatus.SALES_SCREENING,
         current_ctc=Decimal("1200000"),
         expected_ctc=Decimal("1500000"),
         hike_percent=Decimal("25.00"),
@@ -145,7 +147,7 @@ def test_list_profiles_enriched_for_sales_roles(env, role):
     assert row["cv_url"] == "/files/priya-cv.pdf"
     assert row["opportunity_title"] == "Backend Engineer"
     assert row["opportunity_opp_id"] == "OPP-2026-APP"
-    assert row["pipeline_status"] == "Sourcing"
+    assert row["pipeline_status"] == "Sales_Screening"
 
 
 def test_list_profiles_search_by_email(env):
@@ -168,7 +170,7 @@ def test_latest_change_sorts_first(env):
     cand = Candidate(first_name="Ravi", last_name="K", email="ravi@example.com")
     s.add(cand); s.flush()
     newer = CandidateProfile(candidate_id=cand.id, opportunity_id=env._opp_id,
-                             pipeline_status=PipelineStatus.SOURCING)
+                             pipeline_status=PipelineStatus.SALES_SCREENING)
     s.add(newer); s.flush()
     s.add(CandidateProfileActivityLog(
         profile_id=env._profile_id, user_id=1, action_type="STATUS_CHANGE",

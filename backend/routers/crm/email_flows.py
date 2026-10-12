@@ -266,6 +266,12 @@ EVENTS: list[dict] = [
                     "the customer's) when TA books a round from the Applied Candidates tab or the "
                     "Interviews tab. Roles here are the DEFAULT; the round decides the recipient.",
      "default_roles": []},
+    {"event": "interview.no_show",
+     "label": "Candidate did not join — panel reported a no-show",
+     "description": "Sent when the interviewer of a Technical L1–L4 round reports from My Interviews "
+                    "that the candidate did not join: the reason and the panel's note go to the "
+                    "candidate's TAs and the screeners (RMG / GM) so the round is booked again.",
+     "default_roles": ["TA", "RMG", "GM"]},
     {"event": "interview.panel_assigned",
      "label": "You are taking this interview — panel member notified",
      "description": "Sent to the employee named as the interviewer of a Technical L1–L4 round, when "
@@ -442,6 +448,13 @@ EVENTS: list[dict] = [
      "tokens": ["candidate", "first_name", "role", "experience", "location", "work_mode", "skills",
                 "sender", "sender_designation", "sender_phone", "sender_email", "company",
                 "company_name", "company_website"]},
+    {"event": "candidate.ai_interview_reminder", "kind": "candidate",
+     "label": "Candidate — AI interview reminder (1 day + 1 hour before)",
+     "description": "Sent to the candidate one day before (when booked 12 h+ ahead) and one hour before "
+                    "(when booked 90 min+ ahead) their AI interview, with the link and the device "
+                    "checklist. Each goes once per slot; a rescheduled slot gets its own.",
+     "default_roles": [],
+     "tokens": []},
 ]
 
 

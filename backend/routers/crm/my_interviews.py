@@ -1,7 +1,8 @@
 """My Interviews — the panel member's own technical rounds (7 Oct 2026).
 
 `GET /api/my-interviews?scope=pending|upcoming|done|all` · `GET …/{id}` ·
-`GET …/{id}/ai-summary` · `PUT …/{id}/feedback {result, feedback}`.
+`GET …/{id}/ai-summary` · `PUT …/{id}/feedback {result, feedback}` ·
+`POST …/{id}/no-show {reason, note}` (the candidate did not join, 10 Oct 2026).
 
 The gate is the `my-interviews` TAB (view to read, edit to record): the seeded
 **Interviewer** custom role grants exactly that, an RMG / TA login has it by
@@ -27,6 +28,11 @@ TAB = "my-interviews"
 # employee link), a templated / custom-role login needs the tab grant.
 READ = gated_read(TAB)
 WRITE = gated_write(TAB)
+
+
+class NoShowIn(BaseModel):
+    reason: str | None = Field(default=None, max_length=120)
+    note: str = Field(max_length=2000)
 
 
 class FeedbackIn(BaseModel):
@@ -64,3 +70,12 @@ def record_my_feedback(event_id: int, payload: FeedbackIn, db: Session = Depends
     return envelope(data=row,
                     message="Feedback saved — thank you"
                             + (f" — the candidate moved to {moved.replace('_', ' ')}" if moved else ""))
+
+
+@router.post("/{event_id}/no-show")
+def report_no_show(event_id: int, payload: NoShowIn, db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(WRITE)):
+    row = svc.mark_no_show(db, user, event_id, payload.reason, payload.note)
+    db.commit()
+    return envelope(data=row,
+                    message="Recorded — the candidate did not join. TA has been told to book the round again.")

@@ -188,6 +188,7 @@ def customer_policy_matrix(
 
 @router.get("/names")
 def list_customer_names(
+    status: str | None = None,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(any_crm_role),
 ):
@@ -199,11 +200,22 @@ def list_customer_names(
     data — every requirement row already displays them.
     Declared before /{customer_id} — literal routes must precede parametric.
     """
-    rows = db.execute(
-        select(Customer.id, Customer.name).order_by(Customer.name)
-    ).all()
-    return envelope(data=[{"id": r[0], "name": r[1]} for r in rows],
-                    message="Customer names")
+    stmt = select(Customer.id, Customer.name, Customer.status).order_by(Customer.name)
+    # ``status=Active`` = exactly what the Customers tab lists by default — the
+    # pickers that START a record (project, PO, receipt) ask for it (12 Oct
+    # 2026: they listed every customer ever imported). Filters on lists and
+    # reports keep calling it bare: history refers to inactive customers too.
+    if status:
+        valid = {s.value for s in CustomerStatus}
+        if status not in valid:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid status. Allowed: {', '.join(sorted(valid))}")
+        stmt = stmt.where(Customer.status == status)
+    rows = db.execute(stmt).all()
+    return envelope(
+        data=[{"id": r[0], "name": r[1],
+               "status": getattr(r[2], "value", r[2])} for r in rows],
+        message="Customer names")
 
 
 @router.get("/all-branches")
@@ -575,25 +587,33 @@ def upsert_billing_policy(
         policy.holidays_billable = payload.holidays_billable
     elif created:
         policy.holidays_billable = False
-    policy.min_hours_full_day = payload.min_hours_full_day
-    policy.min_hours_half_day = payload.min_hours_half_day
-    policy.billing_type = payload.billing_type
+    # 12 Oct 2026: only the fields a caller SENT are written. The customer page's
+    # Default Billing Policy tab sends a few keys; assigning the rest from the
+    # schema defaults wiped the customer's "Normal hours per day" (their 9.5 h
+    # working day), billing type, comp-off figures, user role and operation.
+    sent = payload.model_fields_set
+
+    def _put(attr: str) -> None:
+        if created or attr in sent:
+            setattr(policy, attr, getattr(payload, attr))
+
+    _put("min_hours_full_day")
+    _put("min_hours_half_day")
+    _put("billing_type")
     if payload.comp_off_billable is not None:
         policy.comp_off_billable = payload.comp_off_billable
     elif created:
         policy.comp_off_billable = False
-    policy.comp_off_balance = payload.comp_off_balance
-    policy.comp_off_balance_initial = payload.comp_off_balance_initial
-    policy.comp_off_max_limit = payload.comp_off_max_limit
-    policy.comp_off_max_carry_forward = payload.comp_off_max_carry_forward
+    for _attr in ("comp_off_balance", "comp_off_balance_initial",
+                  "comp_off_max_limit", "comp_off_max_carry_forward"):
+        _put(_attr)
     if payload.comp_off_covers_lop is not None:
         policy.comp_off_covers_lop = bool(payload.comp_off_covers_lop)
     if payload.invoice_format is not None:   # only when sent — the GM's dialog also writes this
         from services.invoice_format import normalize_invoice_format
         policy.invoice_format = normalize_invoice_format(payload.invoice_format)
-    policy.normal_hours_per_day = payload.normal_hours_per_day
-    policy.user_role = payload.user_role
-    policy.operation = payload.operation
+    for _attr in ("normal_hours_per_day", "user_role", "operation"):
+        _put(_attr)
     # Paid leaves/year billed by the customer (APTIV rule, 0078) — only when
     # sent, so older callers that omit it can never wipe the value.
     if "billable_leaves_per_year" in payload.model_fields_set:

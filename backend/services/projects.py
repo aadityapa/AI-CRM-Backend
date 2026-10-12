@@ -18,7 +18,7 @@ from models import (
 )
 from services.finance import active_po_allocation_for_project
 from services.project_closure import closure_out
-from services.timesheets import _project_branch, effective_billing_policy, opportunity_branch_foreign_to_project, period_bounds
+from services.timesheets import _project_branch, default_hours_worked, effective_billing_policy, opportunity_branch_foreign_to_project, period_bounds
 
 
 def get_project_or_404(db: Session, project_id: int) -> Project:
@@ -185,7 +185,9 @@ def project_detail_out(db: Session, p: Project) -> dict:
         "comp_off_billable": bool(ep.comp_off_billable),
         "hours_required_half_day": _num(ep.min_hours_half_day),
         "hours_required_full_day": _num(ep.min_hours_full_day),
-        "working_hours_per_day": _num(rp.working_hours_per_day),
+        # The hours a timesheet day starts with — the timesheet engine's own
+        # rule (project → branch → customer working day, never below the full day).
+        "working_hours_per_day": _num(default_hours_worked(p, branch, ep)),
         "is_max_billable_hours_per_day": bool(rp.is_max_billable_hours_per_day),
         "max_billable_hours_per_day": _num(rp.max_billable_hours_per_day),
         "is_max_billable_hours_per_month": bool(rp.is_max_billable_hours_per_month),

@@ -614,6 +614,16 @@ def run_feedback_due_job(db=None) -> dict:
     return run_feedback_due_reminders(db)
 
 
+def run_ai_interview_reminders_job(db=None) -> dict:
+    """Reminder emails to candidates one day and one hour before their AI
+    interview (10 Oct 2026). Every pass — the hour window is 65 minutes; the
+    outbox dedupe key makes each reminder go once."""
+    from services.interview_reminders import run_ai_interview_reminders
+    out = run_ai_interview_reminders(db)
+    db.commit()
+    return out
+
+
 def run_prompt_log_retention(db=None, today: date | None = None) -> dict:
     """Retention for the AI call log (28 Sep 2026): file logs older than the
     window are removed, DB rows keep their figures but lose their text, and the
@@ -648,11 +658,12 @@ JOBS = {
     "project_closures": ("scheduler.project_closures", run_project_closures_job),
     "prompt_log_retention": ("scheduler.prompt_log_retention", run_prompt_log_retention),
     "interview_feedback_due": ("scheduler.interview_feedback_due", run_feedback_due_job),
+    "ai_interview_reminders": ("scheduler.ai_interview_reminders", run_ai_interview_reminders_job),
 }
 
 #: Jobs that run on every scheduler pass (≈15 min) rather than once a day after
 #: the run hour — each keeps its own "already told" record.
-EVERY_PASS_JOBS = frozenset({"interview_feedback_due"})
+EVERY_PASS_JOBS = frozenset({"interview_feedback_due", "ai_interview_reminders"})
 
 
 def run_due_jobs(*, force: bool = False, only: str | None = None) -> dict:

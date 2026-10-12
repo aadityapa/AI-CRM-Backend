@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 
 from services.interview import conversation as conv
+from services.interview import skill_bank
+from services import interview_live as live
 from utils.auto_advance import auto_advance_api_payload
 from utils.question_uniqueness import ensure_unique_served_question, record_question_registry, remember_asked_question
 from utils.time_warnings import time_warnings_api_payload
@@ -31,7 +33,7 @@ def _evaluated_total(session: dict) -> int:
         if nq > 0:
             # A conversation follow-up (9 Oct 2026) is an extra question, never
             # one taken from the plan — the total grows with it.
-            return nq + conv.followups_inserted(meta)
+            return nq + conv.followups_inserted(meta) + live.questions_inserted(meta)
     warm = meta.get("warmup_indices") or []
     return max(0, len(session.get("questions") or []) - len(warm))
 
@@ -71,7 +73,9 @@ def interview_elapsed_seconds(session: dict) -> float:
     if not started:
         return 0.0
     try:
-        return max(0.0, time.time() - float(started))
+        now = time.time()
+        # A recruiter's pause (11 Oct 2026) stops the interview's clock.
+        return max(0.0, now - float(started) - live.paused_seconds_from_meta(meta, now))
     except (TypeError, ValueError):
         return 0.0
 
@@ -108,7 +112,7 @@ def _question_cap(session: dict) -> int | None:
     if nq <= 0:
         return None
     warm = meta.get("warmup_indices") or []
-    return nq + len(warm) + conv.followups_inserted(meta)
+    return nq + len(warm) + conv.followups_inserted(meta) + live.questions_inserted(meta)
 
 
 #: Previous name, kept so existing callers and tests keep working. The behaviour
@@ -177,7 +181,10 @@ def next_question_payload(session: dict) -> dict:
     # rules or device-test screen, and that time is not interview time.
     mark_interview_started(session)
 
-    ensure_unique_served_question(session)
+    # A skill-bank question carries its spec by position; replacing its text
+    # would detach it (two pseudo-code questions may read alike on purpose).
+    if not skill_bank.is_skill_bank(meta):
+        ensure_unique_served_question(session)
     q = session["questions"][session["current"]]
     remember_asked_question(session, q)
     qnum = int(session["current"]) + 1
@@ -223,6 +230,20 @@ def next_question_payload(session: dict) -> dict:
             if _question_cap(session) is not None else None
         ),
     }
+    spec = skill_bank.spec_for(meta, session["current"]) if skill_bank.is_skill_bank(meta) else None
+    if spec:
+        # Skill-wise question (10 Oct 2026): kind + skill, and for pseudo-code /
+        # coding what the screen shows (never the correct option or answer).
+        out["question"] = str(spec.get("text") or q)
+        out.update(skill_bank.public_spec(spec))
+        # A typed question never runs past the interview's own clock
+        # (12 Oct 2026): a 10-minute coding problem at minute 18 of 20 gets 2.
+        if out.get("answer_time_limit_sec") and out.get("time_remaining_sec") is not None:
+            out["answer_time_limit_sec"] = max(1, min(int(out["answer_time_limit_sec"]),
+                                                      int(out["time_remaining_sec"])))
+    if skill_bank.is_skill_bank(meta):
+        # The progress strip (12 Oct 2026): kind + skill of every scored question.
+        out["question_map"] = skill_bank.question_map(meta, len(session.get("questions") or []))
     if is_warm:
         out["warmup_label"] = WARMUP_LABEL
         out["warmup_note"] = WARMUP_NOTE
@@ -232,6 +253,9 @@ def next_question_payload(session: dict) -> dict:
     if meta.get("last_turn_score") is not None:
         out["last_turn_score"] = meta.get("last_turn_score")
         out["last_turn_feedback"] = str(meta.get("last_turn_feedback") or "")[:500]
+    if live.is_recruiter_index(meta, session["current"]):
+        # Asked by the recruiter who joined the interview (11 Oct 2026).
+        out["asked_by_recruiter"] = True
     if _attach_conversation(out, meta):
         cur_idx = int(session["current"])
         out["is_followup"] = conv.is_followup_index(meta, cur_idx)
@@ -268,6 +292,9 @@ def upcoming_question_text(session: dict) -> str | None:
             return None
         # No point synthesising audio the candidate will never reach.
         if time_limit_reached(session):
+            return None
+        # Pseudo-code and coding questions are read on screen, never spoken.
+        if skill_bank.is_typed(meta, nxt):
             return None
         text = str(questions[nxt] or "").strip()
         return text or None

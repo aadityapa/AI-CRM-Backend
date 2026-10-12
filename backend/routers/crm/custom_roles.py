@@ -60,6 +60,38 @@ def create_role(body: RoleCreateIn, db: Session = Depends(get_crm_db),
     return envelope(data=data, message=f"Role '{data['name']}' created")
 
 
+class StageAccessIn(BaseModel):
+    #: A built-in role's name ("Sales") OR a custom role's id — exactly one.
+    builtin: str | None = None
+    custom_id: int | None = None
+    #: Stage keys (`services/candidate_status.STAGES`); null = back to the default.
+    stages: list[str] | None = None
+
+
+# ⚠️ Route order: declared BEFORE PUT /{role_id} — "stage-access" is one path
+# segment, so the parametric route would take it (and 422 on the int).
+@router.put("/stage-access")
+def set_stage_access(body: StageAccessIn, db: Session = Depends(get_crm_db),
+                     user: CurrentUser = Depends(admin_only)):
+    """Which candidate stages a role sees (13 Oct 2026) — the stage chips and
+    the candidates behind them on Candidate Profiles and inside every
+    opportunity. Admin/CEO only."""
+    from fastapi import HTTPException
+    from services import stage_access
+
+    if (body.builtin is None) == (body.custom_id is None):
+        raise HTTPException(status_code=400, detail="Name a built-in role or a custom role, not both")
+    name, before, after = stage_access.set_role_stages(
+        db, builtin=body.builtin, custom_id=body.custom_id, stages=body.stages)
+    db.commit()   # saved first: a failed audit row must never undo the change
+    audit.record(db, actor=user, action="role.stages", subject_type="role",
+                 subject_id=body.custom_id, subject_name=name,
+                 before={"stages": before}, after={"stages": after},
+                 summary=f"Candidate stages for '{name}': {stage_access.describe(after)}")
+    return envelope(data={"name": name, "candidate_stages": stage_access.role_payload(name, after)},
+                    message=f"Candidate stages saved for {name}")
+
+
 @router.get("/{role_id}/members")
 def role_members(role_id: int, db: Session = Depends(get_crm_db),
                  user: CurrentUser = Depends(admin_only)):

@@ -56,6 +56,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "scheduler.project_closures": ("", "true"),
     "scheduler.prompt_log_retention": ("", "true"),
     "scheduler.interview_feedback_due": ("", "true"),
+    "scheduler.ai_interview_reminders": ("", "true"),
     # Emails to EMPLOYEES on the HR master (timesheet-due reminders, leave
     # decisions, approvals) — OFF by default since 1 Oct 2026 (user decision: a
     # project employee deployed at a customer must receive nothing from this
@@ -122,9 +123,9 @@ KEYS: dict[str, tuple[str, str]] = {
     # Applies to interviews that START after a change; the allowed values are
     # `ai_models.SUPPORTED_INTERVIEW_MODELS` (lower-case — never in _FORMATS,
     # whose values are upper-cased). Blank = fall back to the environment.
-    "ai.interview_model": ("INTERVIEW_OPENAI_MODEL", "gpt-4o-mini"),
+    "ai.interview_model": ("INTERVIEW_OPENAI_MODEL", "gpt-6-astra"),
     # The calls the candidate waits on between answers; blank = automatic
-    # (gpt-4o-mini while the interview model is a reasoning model).
+    # (GPT-5.5 — 13 Oct 2026: GPT-6 Astra and GPT-5.5 are the only text models).
     "ai.interview_fast_model": ("INTERVIEW_FAST_MODEL", ""),
     "ui.show_ai_model_to_candidates": ("SHOW_AI_MODEL_TO_CANDIDATES", "true"),
 }

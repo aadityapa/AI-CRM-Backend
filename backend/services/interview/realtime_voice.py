@@ -32,9 +32,9 @@ from typing import Any
 
 from services.interview import conversation as conv
 
-DEFAULT_MODEL = "gpt-realtime-mini"
+DEFAULT_MODEL = "gpt-realtime-2"
 DEFAULT_VOICE = "marin"
-DEFAULT_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_TRANSCRIBE_MODEL = "gpt-realtime-whisper"
 #: How long the minted secret may be used to OPEN a call. The call itself lives
 #: on after the secret expires; a reconnect mints a fresh one.
 SECRET_TTL_S = 600
@@ -84,7 +84,10 @@ def realtime_enabled() -> bool:
 
 
 def realtime_model() -> str:
-    return (os.getenv("INTERVIEW_REALTIME_MODEL") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    # 13 Oct 2026: gpt-realtime-2 (GPT-5-class reasoning); a *-mini* env value is upgraded.
+    from services.ai_models import realtime_model as _rt
+
+    return _rt()
 
 
 def realtime_voice() -> str:
@@ -151,7 +154,7 @@ def session_config(meta: dict) -> dict:
         "audio": {
             "input": {
                 "transcription": {
-                    "model": (os.getenv("INTERVIEW_REALTIME_TRANSCRIBE_MODEL") or DEFAULT_TRANSCRIBE_MODEL).strip(),
+                    "model": _realtime_transcribe_model(),
                     "language": "en",
                 },
                 "turn_detection": {"type": "semantic_vad", "eagerness": "low",
@@ -258,3 +261,9 @@ def log_usage(meta: dict, usage: Any, *, db_target: str = "") -> float:
         response_text="",
     )
     return float(entry.get("cost_usd") or 0.0)
+
+
+def _realtime_transcribe_model() -> str:
+    from services.ai_models import realtime_transcribe_model
+
+    return realtime_transcribe_model()

@@ -43,6 +43,9 @@ class CustomRole(Base, TimestampMixin):
     #: Where the role sits on Access Control (7 Oct 2026, migration 0129): one
     #: of `access_registry.DEPARTMENT_KEYS`; NULL reads as "other".
     department = sa.Column(sa.String(40), nullable=True)
+    #: The candidate STAGES this role sees (13 Oct 2026, migration 0133) — see
+    #: `Role.stage_access`. NULL = the default for the role's name.
+    stage_access = sa.Column(sa.JSON, nullable=True)
     created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
 
     members = relationship("UserCustomRole", back_populates="role",

@@ -29,6 +29,10 @@ class Role(Base):
     __tablename__ = "roles"
     id = sa.Column(sa.Integer, primary_key=True)
     name = sa.Column(pg_enum(RoleName, "role_name"), nullable=False, unique=True)
+    #: The candidate STAGES this role sees (13 Oct 2026, migration 0133): a list
+    #: of `services/candidate_status.STAGES` keys; NULL = the role's default
+    #: (`services/stage_access.default_stages`). Set from Access Control ▸ Roles.
+    stage_access = sa.Column(sa.JSON, nullable=True)
 
 
 class UserRole(Base):

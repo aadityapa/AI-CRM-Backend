@@ -33,6 +33,9 @@ from schemas.template_requests import (
     TemplateRequestRelink,
 )
 from services.crm_common import next_sequence_number, paginate
+# The template-ownership rule lives with the AI L1 scheduler, which checks it again
+# at schedule time (13 Oct 2026); re-exported here for the link / relink code.
+from services.ai_interview_bridge import template_owner_conflict
 from services.notify import notify_role, notify_user
 
 router = APIRouter(prefix="/api/template-requests", tags=["CRM: Template Requests"])
@@ -125,18 +128,6 @@ def _require_status(tr: TemplateRequest, allowed: tuple, action: str) -> None:
             status_code=400,
             detail=f"Cannot {action} a request in status '{current}'. Allowed: {', '.join(allowed_vals)}",
         )
-
-
-def template_owner_conflict(tpl: dict, opp_id: str) -> str:
-    """PURE: the OTHER opportunity a template already belongs to, else "".
-
-    A job template carries ONE `opportunityId`. Linking it to a second request
-    used to overwrite that stamp silently, so two deals ran the same questions
-    and the report printed the other deal's role, opportunity and customer
-    (8 Oct 2026: a Bluetooth Developer candidate was interviewed on the "AGM -
-    R&D (ADAS & ARAS)" template of C-2026-00097)."""
-    owner = " ".join(str(tpl.get("opportunityId") or "").split())
-    return owner if owner and owner.lower() != str(opp_id or "").strip().lower() else ""
 
 
 def clone_job_id(job_id: str, opp_id: str) -> str:

@@ -9,7 +9,9 @@ from io import BytesIO
 from typing import Dict, List, Optional, Sequence
 
 from openai_client import get_openai_client, openai_key_configured
-from prompt_logger import chat_params, tracked_chat_completion, log_openai_call
+from prompt_logger import chat_params, force_text_model, tracked_chat_completion, log_openai_call
+from services.ai_models import TRANSCRIBE_MODEL, WORKHORSE_MODEL
+from services.interview import skill_bank as skill_bank_rules
 from prompt_builder import (
     build_system_prompt,
     build_user_prompt_batch,
@@ -443,6 +445,13 @@ def _normalize_professional_assessment_row(entry: dict) -> dict:
         ]
 
     out["overall_rating"] = format_decimal_score(overall_rating)
+    # The candidate's own words (or a code line) that earned the score — shown
+    # under each question on the report (10 Oct 2026).
+    out["evidence"] = " ".join(str(out.get("evidence") or "").split())[:300]
+    # Coding answers carry the model's right / wrong call (11 Oct 2026); the
+    # skill bank normalises it (skill_bank.coding_verdict) when the row is decorated.
+    if out.get("verdict") is not None:
+        out["verdict"] = str(out.get("verdict") or "").strip().lower()[:24]
     out["summary"] = summary
     out["correct_concepts"] = correct_concepts
     out["improvement_areas"] = improvement_areas
@@ -1176,16 +1185,23 @@ def _clamp_per_question_rows_to_substance(
 def evaluate_per_question_interview_batch(
     questions: List[str],
     answers: List[str],
-    model: str = "gpt-4o-mini",
+    model: str = WORKHORSE_MODEL,
     *,
     meta: dict | None = None,
     assess_communication: bool = True,
+    question_specs: List[dict | None] | None = None,
+    choices: List[dict | None] | None = None,
 ) -> List[dict]:
     """
     Per-question scores for the full session list (UI alignment).
 
     OpenAI is called **only** for answers that pass ``answer_turn_is_valid_for_scoring``;
     empty pool slots get a fixed zero row without an API round trip.
+
+    ``question_specs`` (skill-wise question bank, 10 Oct 2026) is aligned with
+    ``questions``: a pseudo-code answer is marked right / wrong with NO model
+    call, a coding answer is judged as typed code against the reference
+    solution, and a normal answer against HR's expected answer.
     """
     qs = list(questions or [])
     n = len(qs)
@@ -1195,6 +1211,15 @@ def evaluate_per_question_interview_batch(
     while len(ans) < n:
         ans.append("")
     ans = ans[:n]
+    specs = list(question_specs or [])
+    picks = list(choices or [])
+
+    def _spec(k: int) -> dict | None:
+        return specs[k] if k < len(specs) and isinstance(specs[k], dict) else None
+
+    def _typed(k: int) -> bool:
+        sp = _spec(k)
+        return bool(sp) and sp.get("kind") in skill_bank_rules.TYPED_KINDS
 
     slots: list[dict | None] = [None] * n
     to_score: List[tuple[int, str, str]] = []
@@ -1213,6 +1238,15 @@ def evaluate_per_question_interview_batch(
                 i + 1,
                 "Introduction warmup (not counted toward overall score).",
             )
+            continue
+        spec = _spec(i)
+        if spec and spec.get("kind") == skill_bank_rules.KIND_PSEUDO and answer_turn_is_valid_for_scoring(a):
+            slots[i] = skill_bank_rules.pseudo_row(i + 1, spec, a, picks[i] if i < len(picks) else None)
+            continue
+        if spec and spec.get("kind") == skill_bank_rules.KIND_CODING and answer_turn_is_valid_for_scoring(a):
+            # Typed code: the spoken-answer guards (echo, keyword-only, word
+            # overlap) misread code, so it goes straight to the reviewer.
+            to_score.append((i, qs[i], a))
             continue
         if answer_turn_is_valid_for_scoring(a):
             preflight = preflight_per_question_evaluation(q_text, a, i + 1)
@@ -1236,18 +1270,34 @@ def evaluate_per_question_interview_batch(
                 "Not scorable (not counted toward overall score).",
             )
 
+    def _finish(rows_out: list) -> list:
+        # Typed answers (pseudo-code, code) keep their own rows: the spoken
+        # substance clamp would read "Option B: 12" as a non-answer.
+        kept = {i: rows_out[i] for i in range(n) if _typed(i) and isinstance(rows_out[i], dict)}
+        _clamp_per_question_rows_to_substance(rows_out, ans)
+        for i, row in kept.items():
+            rows_out[i] = row
+        for i in range(n):
+            if isinstance(rows_out[i], dict):
+                skill_bank_rules.decorate_row(rows_out[i], _spec(i), picks[i] if i < len(picks) else None)
+        return rows_out
+
     if not to_score:
         out0 = [slots[i] or _not_scored_per_question_row(i + 1, "No data.") for i in range(n)]
         for i in range(n):
-            if isinstance(out0[i], dict) and answer_turn_is_valid_for_scoring(ans[i]):
+            if isinstance(out0[i], dict) and answer_turn_is_valid_for_scoring(ans[i]) and not _typed(i):
                 out0[i] = apply_quality_caps_to_per_question_row(out0[i], qs[i], ans[i])
-        _clamp_per_question_rows_to_substance(out0, ans)
-        return out0
+        return _finish(out0)
 
     from openai_client import openai_key_configured
 
     if not openai_key_configured("eval"):
         for i, q, a in to_score:
+            if _typed(i):
+                dr = _deterministic_per_question_rows([q], [a], i)
+                dr[0]["question_index"] = i + 1
+                slots[i] = dr[0]
+                continue
             preflight = preflight_per_question_evaluation(q, a, i + 1)
             if preflight is not None:
                 slots[i] = preflight
@@ -1257,8 +1307,7 @@ def evaluate_per_question_interview_batch(
             row["question_index"] = i + 1
             slots[i] = row
         out = [slots[i] for i in range(n)]
-        _clamp_per_question_rows_to_substance(out, ans)
-        return out
+        return _finish(out)
 
     chunk = _pq_chunk_size()
     for s in range(0, len(to_score), chunk):
@@ -1269,6 +1318,7 @@ def evaluate_per_question_interview_batch(
         part = _evaluate_per_question_chunk_openai_indexed(
             cq, ca, idxs, model=model, role_hint=_role_hint_from_meta(meta),
             assess_communication=assess_communication,
+            extras=[skill_bank_rules.evaluation_extra(_spec(gi)) for gi in idxs],
         )
         if len(part) != len(block):
             for gi, q, a in block:
@@ -1278,16 +1328,15 @@ def evaluate_per_question_interview_batch(
                 slots[gi] = row
         else:
             for j, gi in enumerate(idxs):
-                row = apply_quality_caps_to_per_question_row(part[j], cq[j], ca[j])
+                row = part[j] if _typed(gi) else apply_quality_caps_to_per_question_row(part[j], cq[j], ca[j])
                 row["question_index"] = gi + 1
                 slots[gi] = row
 
     out = [slots[i] for i in range(n)]
     for i in range(n):
-        if isinstance(out[i], dict) and answer_turn_is_valid_for_scoring(ans[i]):
+        if isinstance(out[i], dict) and answer_turn_is_valid_for_scoring(ans[i]) and not _typed(i):
             out[i] = apply_quality_caps_to_per_question_row(out[i], qs[i], ans[i])
-    _clamp_per_question_rows_to_substance(out, ans)
-    return out
+    return _finish(out)
 
 
 def _evaluate_per_question_chunk_openai_indexed(
@@ -1298,18 +1347,44 @@ def _evaluate_per_question_chunk_openai_indexed(
     *,
     role_hint: str = "",
     assess_communication: bool = True,
+    extras: List[dict | None] | None = None,
 ) -> List[dict]:
-    """Score a chunk of answers; ``zero_based_indices[k]`` is the session index for qs[k]/ans[k]."""
+    """Score a chunk of answers; ``zero_based_indices[k]`` is the session index for qs[k]/ans[k].
+
+    ``extras[k]`` (skill-wise question bank) adds ``kind`` (spoken / typed_code),
+    HR's ``reference_answer`` and, for code, the language and starter code."""
     if len(qs) != len(ans) or len(qs) != len(zero_based_indices):
         return []
     turns = []
     for k in range(len(qs)):
-        turns.append(
-            {
-                "i": zero_based_indices[k] + 1,
-                "question": (qs[k] or "")[:900],
-                "answer": (ans[k] or "")[:2400],
-            }
+        extra = extras[k] if extras and k < len(extras) and isinstance(extras[k], dict) else None
+        is_code = bool(extra) and extra.get("kind") == "typed_code"
+        turn = {
+            "i": zero_based_indices[k] + 1,
+            "question": (qs[k] or "")[:900],
+            "answer": (ans[k] or "")[: 6000 if is_code else 2400],
+        }
+        if extra:
+            turn.update({key: val for key, val in extra.items() if val})
+        turns.append(turn)
+    has_reference = any(t.get("reference_answer") for t in turns)
+    has_code = any(t.get("kind") == "typed_code" for t in turns)
+    bank_rules = ""
+    if has_reference:
+        bank_rules += (
+            "Some items carry \"reference_answer\": the hiring team's OWN expected answer. Judge correctness "
+            "against it — credit an equivalent answer in other words, and credit a different approach that is "
+            "technically correct. When it is given, expected_answer is that reference (lightly tidied).\n"
+        )
+    if has_code:
+        bank_rules += (
+            "Items with \"kind\": \"typed_code\" are code the candidate TYPED for an easy coding problem (not a "
+            "speech transcript). Judge whether the logic solves the problem (and matches the reference behaviour "
+            "when given): correct logic scores 7+, logic that works for the main case but misses an edge case 5-6, "
+            "a partial attempt 2-4, wrong or empty 0-1. Ignore small syntax slips, missing imports and style. "
+            "Communication does not apply to typed code — set dimension_scores.communication to 0. "
+            "For each typed_code item also give \"verdict\": \"correct\" (solves the problem), "
+            "\"partially_correct\" (main case only / small logic gap) or \"incorrect\".\n"
         )
     role_ctx = (role_hint or "").strip()
     role_line = (
@@ -1377,12 +1452,16 @@ def _evaluate_per_question_chunk_openai_indexed(
         "Step 9: Write expected_answer independently as a 9-10/10 model answer for the role — "
         "do NOT copy or paraphrase the candidate's answer.\n"
         "Step 10: Provide 2-4 manager follow-up questions to probe gaps.\n"
+        "Step 11: evidence = the candidate's OWN words (at most 25, quoted exactly from the answer) or one "
+        "line of their code that most supports the score; \"\" when nothing in the answer supports it.\n"
+        f"{bank_rules}"
         "Weighted score formula (0-10, one decimal allowed):\n"
         f"{weight_line}"
         "Question repetition or keyword-only answers without explanation MUST score 0.\n"
         "score and overall_rating MUST follow the score bands above.\n"
         "Return ONLY JSON with this schema per item:\n"
         "{\"items\":[{\"i\":N,\"score\":0,\"overall_rating\":0,\"summary\":\"2-4 line evaluation summary\","
+        "\"evidence\":\"the candidate's own words that earned the score\","
         "\"correct_concepts\":[{\"topic\":\"\",\"explanation\":\"\"}],"
         "\"improvement_areas\":[{\"topic\":\"\",\"explanation\":\"\",\"correction\":\"\"}],"
         "\"expected_answer\":\"9-10/10 model answer\","
@@ -1464,6 +1543,9 @@ def merge_per_question_eval_into_report(
     *,
     session_meta: dict | None = None,
     assess_communication: bool = True,
+    question_specs: List[dict | None] | None = None,
+    choices: List[dict | None] | None = None,
+    picked_skills: List[str] | None = None,
 ) -> dict:
     """
     Final validation pass: OpenAI per-question scores drive technical / problem-solving
@@ -1473,10 +1555,14 @@ def merge_per_question_eval_into_report(
     over evaluable answers** (non-empty, non-placeholder, not skip-only tokens).
     Unattempted pool questions are ignored in the denominator; per-question rows for
     the full session are unchanged for display.
+
+    With ``question_specs`` (skill-wise question bank) the skill scores are the
+    mean of each picked skill's own questions, not a model's estimate.
     """
     rows = evaluate_per_question_interview_batch(
         questions, answers, model=model, meta=session_meta,
         assess_communication=assess_communication,
+        question_specs=question_specs, choices=choices,
     )
     out = dict(result) if isinstance(result, dict) else {}
     n = len(rows)
@@ -1549,8 +1635,16 @@ def merge_per_question_eval_into_report(
     out["overall_score_percent"] = format_percent_from_ten_scale(mean_evaluated)
 
     mt = float(mean_evaluated)
+    if question_specs and any(isinstance(s, dict) for s in question_specs):
+        valid_set = set(valid_idx)
+        valid_flags = [i in valid_set for i in range(n)]
+        specs_aligned = list(question_specs)[:n]
+        out["skill_scores"] = skill_bank_rules.skill_scores_from_rows(
+            rows, specs_aligned, list(picked_skills or []), valid_flags)
+        out["question_kind_scores"] = skill_bank_rules.kind_summary(rows, specs_aligned, valid_flags)
+        out["question_source"] = skill_bank_rules.QUESTION_SOURCE
     ss = out.get("skill_scores")
-    if isinstance(ss, list):
+    if isinstance(ss, list) and not out.get("question_kind_scores"):
         for row in ss:
             if not isinstance(row, dict):
                 continue
@@ -1590,7 +1684,7 @@ def transcribe_speech_bytes(
     audio_bytes: bytes,
     filename: str = "candidate-response.webm",
     mime_type: str = "audio/webm",
-    model: str = "gpt-4o-mini-transcribe",
+    model: str = TRANSCRIBE_MODEL,
     *,
     duration_s: float = 0.0,
 ) -> str:
@@ -2102,7 +2196,7 @@ def evaluate_turn_with_model(
     answer: str,
     skill_focus: str,
     current_difficulty: str,
-    model: str = "gpt-4o-mini",
+    model: str = WORKHORSE_MODEL,
     *,
     assess_communication: bool = True,
 ) -> dict:
@@ -2417,7 +2511,7 @@ def generate_followup_with_model(
     jd_skills: List[str],
     previous_question: str,
     previous_answer: str,
-    model: str = "gpt-4o-mini",
+    model: str = WORKHORSE_MODEL,
     recent_transcript: str = "",
     avoid_questions: List[str] | None = None,
     coach_hints: str = "",
@@ -2705,7 +2799,7 @@ def evaluate_with_model_skill_based(
     questions: List[str],
     answers: List[str],
     jd_skills: List[str],
-    model: str = "gpt-4o-mini",
+    model: str = WORKHORSE_MODEL,
 ) -> dict:
     skills = jd_skills[:8] if jd_skills else []
     qs_in = list(questions or [])
@@ -2896,7 +2990,7 @@ def evaluate_fallback_skill_based(
 
 
 def extract_text_from_image_bytes(
-    image_bytes: bytes, mime_type: str, model: str = "gpt-4o-mini"
+    image_bytes: bytes, mime_type: str, model: str = WORKHORSE_MODEL
 ) -> str:
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     image_url = f"data:{mime_type};base64,{encoded}"
@@ -2921,6 +3015,7 @@ def extract_text_from_image_bytes(
     try:
         # Direct call on purpose (the base64 image must not reach the prompt
         # log); `chat_params` keeps it valid whatever the model is.
+        model = force_text_model(model)
         res = _client().chat.completions.create(
             model=model, messages=msgs, **chat_params(model, temperature=0),
         )
@@ -3204,7 +3299,7 @@ def parse_cv_profile(cv_text: str) -> dict:
             # Tracked (29 Sep 2026): this call used to go straight to the client
             # and was missing from AI Costs.
             res = tracked_chat_completion(
-                _client(), model="gpt-4o-mini",
+                _client(), model=WORKHORSE_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0, response_format={"type": "json_object"},
                 call_type="resume_parse_cv", db_target=_db_target(),
@@ -3220,7 +3315,7 @@ def parse_cv_profile(cv_text: str) -> dict:
 def evaluate_communication_skills(
     questions: List[str],
     answers: List[str],
-    model: str = "gpt-4o-mini",
+    model: str = WORKHORSE_MODEL,
 ) -> dict:
     metrics = interview_substance_metrics(questions, answers)
     if not list(questions or []) or not list(answers or []):

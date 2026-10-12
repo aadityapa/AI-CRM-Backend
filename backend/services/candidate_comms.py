@@ -498,6 +498,11 @@ def builtin_candidate_draft(event: str) -> dict | None:
         if event == "candidate.hiring_interest":
             from routers.crm.opportunities import CANDIDATE_EMAIL_BODY, CANDIDATE_EMAIL_SUBJECT
             return {"subject": CANDIDATE_EMAIL_SUBJECT, "body": CANDIDATE_EMAIL_BODY}
+        if event == "candidate.ai_interview_reminder":
+            from services.interview_reminders import KIND_DAY, reminder_message
+            m = reminder_message(candidate_name="{candidate}", position="{role}",
+                                 when_text="{when}", invite_url="{link}", kind=KIND_DAY)
+            return {"subject": m["subject"], "body": m["text"]}
     except Exception:  # pragma: no cover — the editor degrades to an empty box
         logger.warning("builtin draft for %s failed", event, exc_info=True)
     return None

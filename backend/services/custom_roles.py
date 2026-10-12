@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from models.custom_roles import CustomRole, UserCustomRole
 from models.rbac import Role, RoleName, UserRole
-from services import access_registry
+from services import access_registry, stage_access
 from services.access_templates import _strip_removed_keys
 
 #: Built-in names are reserved — a custom "Finance" would be two different
@@ -105,6 +105,8 @@ def serialize(role: CustomRole, members: int = 0) -> dict:
         "department": access_registry.department_of_role(role.name, getattr(role, "department", None)),
         "members_count": members,
         "builtin": False,
+        # Which candidate stages the role sees (13 Oct 2026, migration 0133).
+        "candidate_stages": stage_access.role_payload(role.name, getattr(role, "stage_access", None)),
         "created_at": role.created_at.isoformat() if role.created_at else None,
         "updated_at": role.updated_at.isoformat() if role.updated_at else None,
     }
@@ -120,16 +122,19 @@ def list_roles(db: Session) -> dict:
             .group_by(Role.name)
         ).all()
     }
+    saved_stages = stage_access._saved_builtin(db)
     builtin = [
         {"name": r.value, "label": BUILTIN_LABELS.get(r.value, r.value), "builtin": True,
          "department": access_registry.department_of_role(r.value),
          "members_count": builtin_counts.get(r.value, 0),
+         "candidate_stages": stage_access.role_payload(r.value, saved_stages.get(r.value)),
          "description": "Built-in role — permissions come from the product's role rules and any Access Template."}
         for r in RoleName
     ]
     customs = db.execute(select(CustomRole).order_by(CustomRole.name)).scalars().all()
     counts = _member_counts(db, [c.id for c in customs])
-    return {"builtin": builtin, "custom": [serialize(c, counts.get(c.id, 0)) for c in customs]}
+    return {"builtin": builtin, "custom": [serialize(c, counts.get(c.id, 0)) for c in customs],
+            "candidate_stages": stage_access.catalogue()}
 
 
 def create_role(db: Session, payload: dict, actor_id: int | None) -> dict:

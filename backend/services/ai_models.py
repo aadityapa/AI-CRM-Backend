@@ -1,21 +1,33 @@
 """Which OpenAI model runs what — the ONE place that knows model names (9 Oct 2026).
 
-Since 8 Oct 2026 production runs AI interviews on `gpt-6-astra`. Before this
-module four places decided the interview model (the HR form's hidden select,
-the schedule notes, the CRM bridge's `CRM_AI_L1_MODEL`, `INTERVIEW_OPENAI_MODEL`)
-and they disagreed. Now:
+⚠️ 13 Oct 2026 — user rule: "remove gpt-4o-mini from everywhere; use GPT-5.5 and
+GPT-6 (Astra) for everything — forcefully". So every TEXT / VISION call runs on
+one of `TEXT_MODELS`:
 
-* `interview_model()` — Settings `ai.interview_model` → env
-  `INTERVIEW_OPENAI_MODEL` → `gpt-4o-mini`. Decided by the SERVER when a session
-  starts; a model stored in a schedule counts only with `"model_locked": true`
-  (`resolve_session_model`).
-* `fast_interview_model(session_model)` — the calls the candidate WAITS on
-  between answers (follow-up plan, clarify, closing answer, inline follow-up).
-  A reasoning model takes 3–5 s per call, so they default to gpt-4o-mini while the
-  interview runs on one; quality-deciding calls (questions, evaluation, report,
-  re-score) stay on the interview model.
-* `ocr_model()` — reading an uploaded image; never the interview model.
-* `model_label(id)` / `describe(id)` / `engine()` — what the UI prints.
+* `interview_model()` — questions, per-answer evaluation, the report, re-score:
+  Settings `ai.interview_model` → env `INTERVIEW_OPENAI_MODEL` → **gpt-6-astra**.
+* `fast_interview_model()` — the calls the candidate WAITS on between answers
+  (follow-up plan, lead-in, clarify, closing answer, skill-bank top-up):
+  Settings `ai.interview_fast_model` → env → **gpt-5.5** (sent with
+  `reasoning_effort=low`, `prompt_logger.chat_params`).
+* `workhorse_model()` — everything else that writes text (resume parsing, ATS
+  review, strengths / weaknesses, Ask AI, the support bot …) → **gpt-5.5**.
+* `ocr_model()` — reading an uploaded image → **gpt-5.5** (it takes image input).
+* `assist_model()` — Ask AI uses function tools; GPT-6 Astra refuses tools on
+  Chat Completions, so Ask AI is always GPT-5.5.
+
+Any other text model named in a setting, an env line, a stored schedule or a
+caller's default (gpt-4o-mini, gpt-4o, gpt-4.1 …) is REPLACED by
+`force_text_model()` — `prompt_logger.tracked_chat_completion` runs every call
+through it, so an old env line can never bring gpt-4o-mini back.
+
+Audio cannot run on a text model — OpenAI ships no GPT-5.5 / GPT-6 voice:
+* transcription → **gpt-transcribe** (`transcribe_model()`; any *-mini* / whisper
+  value is upgraded);
+* live voice → **gpt-realtime-2** (GPT-5-class reasoning; its streaming
+  transcription is gpt-realtime-whisper);
+* spoken questions → **gpt-4o-mini-tts**, OpenAI's only voice model that takes
+  speaking instructions — the ONE "mini" left, because there is no alternative.
 
 Pure: no DB work at import. Settings reads go through `org_settings.setting`,
 which is cached 60 s and never raises.
@@ -25,19 +37,24 @@ from __future__ import annotations
 import os
 import re
 
-DEFAULT_MODEL = "gpt-4o-mini"
+#: The interview's own model (questions, scoring, report).
+INTERVIEW_DEFAULT = "gpt-6-astra"
+#: Every other text / vision call.
+WORKHORSE_MODEL = "gpt-5.5"
+#: Kept for older imports: "the default text model".
+DEFAULT_MODEL = WORKHORSE_MODEL
+#: The ONLY text models the platform runs (13 Oct 2026 user rule).
+TEXT_MODELS: tuple[str, ...] = (INTERVIEW_DEFAULT, WORKHORSE_MODEL)
+#: Audio models (no GPT-5.5 / GPT-6 voice exists).
+TRANSCRIBE_MODEL = "gpt-transcribe"
+TTS_MODEL = "gpt-4o-mini-tts"
+REALTIME_MODEL = "gpt-realtime-2"
+REALTIME_TRANSCRIBE_MODEL = "gpt-realtime-whisper"
 PROVIDER = "OpenAI"
 
 #: Models an admin may pick in Settings ▸ AI engine (and `validation_error`
 #: refuses anything else). Order = the order of the picker.
-SUPPORTED_INTERVIEW_MODELS: tuple[str, ...] = (
-    "gpt-6-astra",
-    "gpt-6.1-sol",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4o",
-    "gpt-4o-mini",
-)
+SUPPORTED_INTERVIEW_MODELS: tuple[str, ...] = TEXT_MODELS
 
 #: Settings keys (registered in `org_settings.KEYS`).
 INTERVIEW_MODEL_KEY = "ai.interview_model"
@@ -49,7 +66,11 @@ MODEL_KEYS = (INTERVIEW_MODEL_KEY, FAST_MODEL_KEY)
 MODEL_LABELS: dict[str, str] = {
     "gpt-6-astra": "GPT-6 Astra",
     "gpt-6.1-sol": "GPT-6.1 Sol",
+    "gpt-5.5": "GPT-5.5",
     "gpt-5": "GPT-5",
+    "gpt-transcribe": "GPT Transcribe",
+    "gpt-realtime-whisper": "GPT Realtime Whisper",
+    "gpt-realtime-2": "GPT Realtime 2",
     "gpt-4.1-mini": "GPT-4.1 mini",
     "gpt-4.1": "GPT-4.1",
     "gpt-4o-mini-tts": "GPT-4o mini TTS",
@@ -59,6 +80,21 @@ MODEL_LABELS: dict[str, str] = {
     "gpt-realtime-mini": "GPT Realtime mini",
     "gpt-realtime": "GPT Realtime",
 }
+
+_AUDIO_HINTS = ("tts", "transcribe", "whisper", "realtime", "audio", "embedding", "speech")
+
+
+def force_text_model(model: str | None, default: str = WORKHORSE_MODEL) -> str:
+    """THE rule (13 Oct 2026): a text / vision call runs on GPT-6 Astra or
+    GPT-5.5, never anything else. A blank or any other model id becomes
+    `default`. Audio / embedding ids are not text models and pass unchanged."""
+    mid = (model or "").strip()
+    if not mid:
+        return default
+    low = mid.lower()
+    if any(h in low for h in _AUDIO_HINTS):
+        return mid
+    return mid if low in TEXT_MODELS else default
 
 
 def _setting(key: str) -> str:
@@ -84,39 +120,64 @@ def is_reasoning(model: str | None) -> bool:
 
 
 def interview_model() -> str:
-    """The model AI interviews run on: Settings → env → gpt-4o-mini."""
-    return _setting(INTERVIEW_MODEL_KEY) or _env("INTERVIEW_OPENAI_MODEL") or DEFAULT_MODEL
+    """The model AI interviews run on: Settings → env → GPT-6 Astra (only
+    GPT-6 Astra or GPT-5.5 are accepted — anything else means Astra)."""
+    raw = _setting(INTERVIEW_MODEL_KEY) or _env("INTERVIEW_OPENAI_MODEL")
+    return force_text_model(raw, INTERVIEW_DEFAULT)
 
 
 def fast_interview_model(session_model: str | None = None) -> str:
-    """The model for calls the candidate waits on between answers.
-
-    Settings `ai.interview_fast_model` → env `INTERVIEW_FAST_MODEL` → env
-    `INTERVIEW_FOLLOWUP_MODEL` (the older name, still honoured) → gpt-4o-mini
-    when the session runs on a reasoning model → the session model."""
+    """The model for calls the candidate waits on between answers:
+    Settings `ai.interview_fast_model` → env `INTERVIEW_FAST_MODEL` /
+    `INTERVIEW_FOLLOWUP_MODEL` → GPT-5.5. `session_model` is accepted for the
+    callers that pass it; it no longer decides anything."""
     explicit = (_setting(FAST_MODEL_KEY) or _env("INTERVIEW_FAST_MODEL")
                 or _env("INTERVIEW_FOLLOWUP_MODEL"))
-    if explicit:
-        return explicit
-    session = (session_model or "").strip() or interview_model()
-    return DEFAULT_MODEL if is_reasoning(session) else session
+    return force_text_model(explicit, WORKHORSE_MODEL)
+
+
+def workhorse_model(env_name: str | None = None) -> str:
+    """Every other text call (resume parsing, ATS review, report text …):
+    an optional env override, forced to GPT-5.5 / GPT-6 Astra."""
+    return force_text_model(_env(env_name) if env_name else "", WORKHORSE_MODEL)
 
 
 def ocr_model() -> str:
-    """Model for reading text out of an uploaded image — a vision call that
-    must keep its own model (the interview model may refuse its parameters)."""
-    return _env("INTERVIEW_OCR_MODEL") or DEFAULT_MODEL
+    """Reading text out of an uploaded image — GPT-5.5 takes image input."""
+    return force_text_model(_env("INTERVIEW_OCR_MODEL"), WORKHORSE_MODEL)
+
+
+def assist_model() -> str:
+    """Ask AI. It calls function tools and GPT-6 Astra refuses tools on Chat
+    Completions (8 Oct 2026), so it is GPT-5.5 whatever the env says."""
+    chosen = force_text_model(_env("AI_ASSIST_MODEL"), WORKHORSE_MODEL)
+    return WORKHORSE_MODEL if chosen == INTERVIEW_DEFAULT else chosen
+
+
+def transcribe_model() -> str:
+    """Speech-to-text: env `OPENAI_TRANSCRIBE_MODEL` → gpt-transcribe. A
+    *-mini* or whisper value (the old defaults) is upgraded."""
+    raw = _env("OPENAI_TRANSCRIBE_MODEL")
+    low = raw.lower()
+    if not raw or "mini" in low or low.startswith("whisper"):
+        return TRANSCRIBE_MODEL
+    return raw
+
+
+def tts_model() -> str:
+    """Spoken questions. OpenAI has no GPT-5.5 / GPT-6 voice; gpt-4o-mini-tts is
+    its only model that follows speaking instructions (the Indian-English voice)."""
+    return _env("OPENAI_TTS_MODEL") or TTS_MODEL
 
 
 def resolve_session_model(cfg: dict | None) -> str:
     """The model a NEW session runs on. A model stored in a schedule / template
     counts only when the config says `"model_locked": true` (nothing sets it
-    today — it is the hook for a future per-template choice); otherwise the
-    server decides, so one switch moves every interview."""
+    today) — and even then only GPT-6 Astra / GPT-5.5."""
     cfg = cfg if isinstance(cfg, dict) else {}
     stored = str(cfg.get("model") or "").strip()
     if stored and cfg.get("model_locked") is True:
-        return stored
+        return force_text_model(stored, interview_model())
     return interview_model()
 
 
@@ -182,21 +243,23 @@ def record_models(record: dict | None) -> dict:
 
 
 def _assist_model() -> str:
-    try:
-        from ai_help.assist import _model
-
-        return _model()
-    except Exception:
-        return DEFAULT_MODEL
+    return assist_model()
 
 
 def realtime_model() -> str:
-    try:
-        from services.interview import realtime_voice
+    """Live voice: env `INTERVIEW_REALTIME_MODEL` → gpt-realtime-2 (a *-mini*
+    value is upgraded)."""
+    raw = _env("INTERVIEW_REALTIME_MODEL")
+    if not raw or "mini" in raw.lower():
+        return REALTIME_MODEL
+    return raw
 
-        return realtime_voice.realtime_model()
-    except Exception:
-        return "gpt-realtime-mini"
+
+def realtime_transcribe_model() -> str:
+    raw = _env("INTERVIEW_REALTIME_TRANSCRIBE_MODEL")
+    if not raw or "mini" in raw.lower():
+        return REALTIME_TRANSCRIBE_MODEL
+    return raw
 
 
 def engine() -> dict:
@@ -207,8 +270,8 @@ def engine() -> dict:
         "interview": describe(interview),
         "fast": describe(fast_interview_model(interview)),
         "live_voice": describe(realtime_model()),
-        "transcription": describe(_env("OPENAI_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe"),
-        "voice": describe(_env("OPENAI_TTS_MODEL") or "gpt-4o-mini-tts"),
+        "transcription": describe(transcribe_model()),
+        "voice": describe(tts_model()),
         "ask_ai": describe(_assist_model()),
         "ocr": describe(ocr_model()),
         "show_to_candidates": show_to_candidates(),

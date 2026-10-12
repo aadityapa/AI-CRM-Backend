@@ -68,7 +68,7 @@ def test_prices_are_per_kind_and_longest_prefix_wins():
     assert pricing.price_for("gpt-4o-mini-tts").audio_out_per_min == 0.015
     assert pricing.price_for("gpt-4o-mini-2024-07-18").input == 0.15
     assert pricing.price_for("gpt-4o").input == 2.50
-    assert pricing.price_for("something-unknown") == pricing.price_for("gpt-4o-mini")
+    assert pricing.price_for("something-unknown") == pricing.price_for("gpt-5.5")
     assert pricing.call_kind("tts_prewarm") == "tts"
     assert pricing.call_kind("transcribe") == "stt"
     assert pricing.call_kind("evaluate_turn") == "chat"

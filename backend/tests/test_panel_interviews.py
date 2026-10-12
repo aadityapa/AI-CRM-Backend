@@ -67,7 +67,7 @@ def test_each_panel_member_sees_only_their_own_rounds(db, quiet):
     _round(db, p2, asha, kind="L2_F2F", status="Cancelled")  # not held
 
     data = pi.my_rounds(db, ASHA, "all")
-    assert data["linked"] and data["counts"] == {"pending": 1, "upcoming": 1, "done": 0}
+    assert data["linked"] and data["counts"] == {"pending": 1, "upcoming": 1, "done": 0, "no_show": 0}
     assert [r["id"] for r in data["rows"]] == [mine_due.id, mine_soon.id]
     row = data["rows"][0]
     assert row["candidate"]["name"] == "Ravi" and row["position"]["customer_name"].startswith("VISTEON")

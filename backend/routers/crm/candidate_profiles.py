@@ -41,8 +41,9 @@ from services.candidate_profiles import (
 from services.panel_interviews import link_round_to_employee, notify_panel_member
 from services.candidate_status import (
     GROUPS, archive_clause, archive_reasons, catalogue as candidate_status_catalogue, parse_phases, parse_status_keys,
-    phase_counts, profile_ids_in_phase, profile_ids_with_status,
+    phase_access_clause, phase_counts, profile_ids_in_phase, profile_ids_with_status,
 )
+from services.stage_access import allowed_stages as stages_for_login
 from services.candidates import candidate_search_clause
 from services.crm_common import log_activity, paginate
 from services import hr_offer
@@ -241,9 +242,15 @@ def _id_csv(raw, field: str) -> list[int]:
 
 
 def _apply_bucket(stmt, bucket: str | None):
-    """`?bucket=` on the directory + its export: `active` (in pipeline) and
-    `rejected` (closed) leave out what is in Archive; `archive` lists only it
-    (archived by hand, or parked by its deal's hold — `archive_clause`)."""
+    """`?bucket=` on the directory + its export: `active` (in pipeline),
+    `joined` and `rejected` (closed) leave out what is in Archive; `archive`
+    lists only it (archived by hand, or parked by its deal's hold —
+    `archive_clause`).
+
+    ⚠️ 13 Oct 2026 (user report): a JOINED candidate is no longer "in
+    pipeline" — the candidacy is finished, the person works for the customer.
+    `active` now leaves Joined out and `joined` lists only them (the Joined
+    chip); before, a new joiner sat at the top of every recruiter's live list."""
     if not bucket:
         return stmt
     bucket = bucket.strip().lower()
@@ -252,10 +259,14 @@ def _apply_bucket(stmt, bucket: str | None):
         return stmt.where(archive_clause())
     if bucket == "rejected":
         stmt = stmt.where(CandidateProfile.pipeline_status.in_(rejected_enums))
+    elif bucket == "joined":
+        stmt = stmt.where(CandidateProfile.pipeline_status == PipelineStatus.JOINED)
     elif bucket == "active":
-        stmt = stmt.where(CandidateProfile.pipeline_status.not_in(rejected_enums))
+        stmt = stmt.where(CandidateProfile.pipeline_status.not_in(
+            [*rejected_enums, PipelineStatus.JOINED]))
     else:
-        raise HTTPException(status_code=400, detail="bucket must be 'active', 'rejected' or 'archive'")
+        raise HTTPException(status_code=400,
+                            detail="bucket must be 'active', 'joined', 'rejected' or 'archive'")
     return stmt.where(sa.not_(archive_clause()))
 
 
@@ -278,6 +289,16 @@ def _narrow_by_status(db: Session, stmt, status_key: str | None, phase: str | No
         ids = profile_ids_in_phase(db, stmt, phases)
         stmt = stmt.where(CandidateProfile.id.in_(ids)) if ids else stmt.where(sa.false())
     return stmt
+
+
+def _narrow_to_stages(db: Session, stmt, user: CurrentUser):
+    """Role-wise candidate stages (13 Oct 2026, Access Control ▸ Roles): a
+    login sees only the candidates in the stages its roles carry — Sales from
+    Sales Screening on by default (`services/stage_access`). Applied to the
+    filtered query BEFORE the bucket, the stage chips' counts and pagination,
+    so every number on the page agrees with the rows."""
+    clause = phase_access_clause(db, stmt, stages_for_login(db, user))
+    return stmt if clause is None else stmt.where(clause)
 
 
 @router.get("")
@@ -389,6 +410,7 @@ def list_profiles(pp: PageParams = Depends(page_params),
         # is_hidden is NOT NULL with a false default, so this never drops rows
         # that predate the column.
         stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
+    stmt = _narrow_to_stages(db, stmt, user)
     # The stage strip counts every stage, Closed included, whatever the bucket.
     pre_bucket = stmt
     stmt = _apply_bucket(stmt, bucket)
@@ -607,6 +629,7 @@ def export_profiles(format: str = "csv",
         stmt = stmt.where(CandidateProfile.opportunity_id.in_(
             select(Opportunity.id).where(Opportunity.customer_id == customer_id)))
     stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
+    stmt = _narrow_to_stages(db, stmt, user)
     stmt = _apply_bucket(stmt, bucket)
     visible = visible_statuses_for(user)
     if visible is not None:

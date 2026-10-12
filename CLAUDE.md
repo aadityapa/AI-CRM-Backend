@@ -2873,6 +2873,310 @@ and `summarize_interview_record`; invite login adds `ai_model` (+ `voice_model` 
 restart; remove `CRM_AI_L1_MODEL` from `/etc/karnex/karnex.env`; keep `INTERVIEW_OPENAI_MODEL=gpt-6-astra`. Rollback =
 Settings ▸ AI engine → GPT-4o mini. Suite: 1,953 pass, 2 skipped.
 
+**10 Oct 2026 — skill-wise question bank (pseudo-code · coding · spoken), candidate picks skills, reminders, template
+archive, evidence in the report (`tests/test_skill_bank.py`, 15; no migration):** user design — the 30-min AI L1 asks
+ONLY questions HR wrote into the position template, per skill, and the AI only MARKS them (no generation → cheaper).
+**(1) `services/interview/skill_bank.py`** (PURE) — config lives in `job_templates.weights["skillBank"]`
+(`clean_config`, 400 `skill_bank_invalid` from `/job/config`): `enabled`, `coding_count` 1, `pseudo_count` 2,
+`normal_per_skill` 2, `coding_minutes` 10, `pseudo_minutes` 2, `pick_min` 2 / `pick_max` 5, optional `mandatory_skills`,
+`questions[{id, skill, kind normal|pseudo|coding, text, expected?, code?, options?, correct?, language?, starter?}]` (a
+pseudo needs ≥ 2 options + a correct index). `pick_options` (mandatory = `mandatory_skills`, else the template's required
+skills — LOCKED; the rest optional), `build_plan(cfg, picked, seed)` (normals of the picked skills split around the pseudo
++ coding block), `stamp_specs` → session `meta["question_specs"]` keyed by `str(index)`; `public_spec` is what the
+candidate sees (kind · skill · code · language · options · time limit · `speak: False`) — ⚠️ never `correct` / `expected`.
+`shift_after_insert` keeps specs aligned when a conversation follow-up is inserted. **(2) Session**: `main.py` bootstrap
+has a skill-bank branch BEFORE the manual one (`question_source = generation_mode = "skill_bank"`, adaptive / follow-up
+generation off, no `prepare_unique` / dedupe, `_time_pool_need` excludes it — no pool top-up), login returns
+`skill_pick` + `practice`; **`POST /candidate/skill-selection {skills}`** rebuilds the plan from the pick (409 `started`
+once the first `/next` ran — the interview clock starts there, so the pick and the practice question cost no interview
+time; `not_skill_bank` otherwise). `/answer` takes `choice` (Form): a pseudo answer is built from the SERVER's options
+("Option B: …"; 400 `invalid_choice`) and recorded in `meta["choices"]`; no per-turn AI eval, no conversation turn after a
+typed answer. `candidate/service.next_question_payload` merges `public_spec`; `upcoming_question_text` is None before a
+typed question (no TTS prewarm). **(3) Scoring** (`ai.py`): `evaluate_per_question_interview_batch(..., question_specs,
+choices)` — pseudo rows are DETERMINISTIC (`skill_bank.pseudo_row`: 10 or 0, no model call), coding rows skip the
+preflight / quality caps and are judged as typed code against the template's reference (`evaluation_extra`), normal rows
+against HR's expected answer; every row now carries **`evidence`** (≤ 300 chars — the candidate's own words / code line
+that earned the score). `merge_per_question_eval_into_report(..., question_specs, choices, picked_skills)` sets
+`skill_scores` from the rows (`skill_scores_from_rows`) and `question_kind_scores` (`kind_summary`); communication is
+evaluated on spoken turns only; the report carries `skill_selection` {picked, mandatory, confirmed_by_candidate}.
+**(4) Reminders** — `services/interview_reminders.py`: a Pending, not voided AI L1 link gets a mail ~24 h before
+(`KIND_DAY`, only when scheduled ≥ 12 h ahead) and ~1 h before (`KIND_HOUR`, only when scheduled ≥ 90 min ahead), dedupe
+`ai_reminder:{link}:{kind}:{slot stamp}` (a reschedule re-arms them); scheduler job `ai_interview_reminders` is an
+**every-pass** job (`scheduler.ai_interview_reminders`, default on); event `candidate.ai_interview_reminder` in
+`email_flows.EVENTS` (kind candidate) with a built-in draft in `candidate_comms.builtin_candidate_draft`.
+**(5) Template archive** — `services/template_archive.py`: a template whose linked opportunity is Closed Won / Lost /
+Partial, Rejected or Archived is ARCHIVED (derived, nothing stored — reopening the deal brings it back); `/job/configs` and
+`/job/config/{id}` rows carry `archived` / `opportunity_stage` / `archived_reason` (ONE CRM query, `{}` without a CRM DB);
+`/hr/schedule-interview` refuses an archived template (code `template_archived`) and `ai_interview_bridge.
+l1_template_status` returns `state: "archived"` (`TEMPLATE_ARCHIVED_CODE`). ⚠️ The HR `/setup` direct path does not use the
+bank (CRM / invite path only). Suite: every chunk green (aa 340 · ab 406 · ac 257 · ad 324 · ae 313 · af + skill bank 343).
+Deploy: restart; per template, Interview Templates ▸ edit ▸ Skills & JD ▸ "Skill-wise question bank".
+
+**11 Oct 2026 — skill bank follow-ups: AI top-up, partial credit, theory-first order, coding verdict, RMG / GM
+author templates (`tests/test_skill_bank.py` now 21; no migration):** user answers. (1) **AI top-up (medium)** — config
+`ai_fill` (default ON). `skill_bank.missing_normals(cfg, picked)` = (skill, how many spoken questions short of
+`normal_per_skill`); new `services/interview/skill_bank_fill.py`: `generate_fill(meta, needs, avoid=)` = ONE bounded call
+(`conversation._chat_json`, fast model, `FILL_TIMEOUT_S`=15, `call_type` `skill_bank_fill`, never raises) and PURE
+`parse_fill` (only the asked skills, at most the number short, no repeat of a bank question, `?`-terminated, `source: ai`,
+`difficulty: medium`, the model's key points as `expected`). Called by `POST /candidate/skill-selection` OUTSIDE the session
+lock (validate under the lock → generate via `run_in_threadpool` → re-lock, re-check nothing started, build); cached in
+`meta["skill_bank_fill"]` per skill key so a re-pick never pays twice; the reply carries `ai_filled`. Pseudo-code and coding
+questions are NEVER AI-written; skills offered are still only those with ≥ 1 bank question. (2) **Partial credit** — a
+pseudo question may carry `partial` (option indices, never the correct one, out-of-range dropped) + `partial_credit` %
+(10..90, default 50); `choice_credit` / `record_choice` (`credit` on the pick) / `pseudo_row` (score = 10 × credit,
+"Partly right — …"); `decorate_row` adds `partial_options` / `partial_credit`; `kind_summary.pseudo.partial`. `public_spec`
+never exposes them. (3) **Order** — `interleave(normals, typed)`: theory first, each typed question after an evenly spaced
+share of the spoken ones (never first / last while spoken ones exist), the coding problem in the middle of the typed ones
+(`build_plan(..., extra_normals=)`). (4) **Coding verdict** — the scoring prompt asks typed_code items for `verdict`
+correct / partially_correct / incorrect (`ai._normalize_professional_assessment_row` keeps it); `skill_bank.coding_verdict`
+normalises it, else reads it off the score (≥ 7 / ≥ 4); every coding row carries `verdict`, `kind_summary.coding.verdicts`
+counts them. There is NO code execution — the AI judges the code against the reference. (5) **Template authoring is RMG /
+GM only** — `main._enforce_template_author(request)` replaces the five `_enforce_crm_roles(…, "RMG", tab="iv:templates",
+mode="edit")` gates (save, delete, three authoring routes): the same check plus, on a 403, whoever
+`_screens_as_rmg_for_request` (the GM custom role, whose iv:templates grant is view-only). HR was never in that list and
+stays out (pinned by a source scan). Deploy: restart. Suite: every chunk green (aa 340 · ab 406 · ac 257 · ad 324 · ae 319
+· af 328).
+
+**10 Oct 2026 — interviewer logins: feedback at start + 10 min, JD + AI evidence, no-show, no CTC
+(`tests/test_panel_interview_improvements.py` 8; `test_panel_interviews` re-pinned; no migration):** user report from
+the panel. (1) `services/panel_interviews.FEEDBACK_OPENS_AFTER_MIN = 10` — `phase_of` makes a round "pending" (feedback
+due) 10 minutes after `scheduled_at`; it used to wait for start + the booked length (60 min default). Rows carry
+`feedback_opens_at`. (2) ⚠️ **The panel no longer receives `current_ctc` / `expected_ctc` / `notice_period`** (pinned).
+(3) `round_detail` adds `jd` (`_position_jd`: latest requirement's title · band · `rmg_jd_text` · description · RMG JD
+files · the opportunity's customer JD files) and `no_show_reasons`. (4) ⚠️ **The AI summary is read as evidence, not
+adjectives** — reported: "the AI said good at X, the candidate could not explain X". `ai_interview_summary.evidence_report
+(record, position_skills)` (PURE): every question (warm-up dropped) with the answer, score %, band strong ≥ 70 · partial
+≥ 45 · weak · skipped · unscored, `got_right` / `missed` from the per-question rows; per position skill the questions
+that covered it (`question_covers_skill`, whole-word match), the average of THOSE answers, `status` not_tested · weak ·
+thin (one answer) · mixed · shown, and `estimate_overstated` when the model's own `skill_scores` value is above what the
+answers support; `probe` (mandatory + untested first, ≤ 8) and `caveats`. `ai_summary_for_round` returns it as
+`evidence`. (5) **No-show**: `mark_no_show(db, user, id, reason, note)` → `POST /api/my-interviews/{id}/no-show {reason?,
+note ≥ 5}` — 409 before the start or over a verdict; status **"No Show"** (in `NOT_HELD_STATUSES`, so TA's desk offers
+the rebooking and the feedback reminder stops), phase `no_show` (listed under Done, own count), activity
+`INTERVIEW_NO_SHOW`, bell + mail to the candidate's TAs + screeners (event **`interview.no_show`** in
+`email_flows.EVENTS`, dedupe per round + person). A verdict recorded afterwards overwrites it (the candidate joined late).
+Deploy: restart.
+
+**12 Oct 2026 — coding in any language, the question map (`tests/test_skill_bank.py` +4; no migration):** user ask —
+automotive and Android hiring, not Python only. `services/interview/skill_bank.py`: `CODE_LANGUAGES` (c · embedded_c · cpp ·
+java · kotlin · python · javascript · typescript · csharp · go · rust · swift · sql · shell · capl · matlab · asm),
+`LANGUAGES` = those + pseudo + any, `LANGUAGE_LABELS` (what the scoring prompt is told — "Embedded C (C for
+microcontrollers: registers, ISRs, fixed-width types)", "Kotlin (Android)", "CAPL (Vector CANoe / CANalyzer)").
+A coding question carries `languages` (offered; empty = any — `clean_languages`) and `starters` (per-language starter
+code, `clean_starters`, ≤ `MAX_STARTERS`); `public_spec` sends both. **`/answer` takes `code_language`** (Form):
+`chosen_language(spec, raw)` (must be offered, else the question's default) → `record_language` stamps
+`spec["answered_language"]`; `evaluation_extra` gives the model the language label + that language's starter;
+`decorate_row` prints the answered language and its starter on the report. **`question_map(meta, total)`** — the kind +
+skill of every scored question (warm-ups out, no answers / options) — is added to every `/next` payload of a skill-bank
+session (`candidate/service.next_question_payload`); the candidate page draws its progress strip from it.
+
+**12 Oct 2026 — customer pickers list the Customers tab's ACTIVE customers (`tests/test_customer_names_status.py`, 3;
+no migration):** screenshot report — New Project's Customer dropdown listed every customer ever imported while the
+Customers tab (default Active) shows a handful. `GET /api/customers/names` takes an optional **`status`** (`Active` ·
+`Inactive`, 400 otherwise) and every row now carries `status`; still `any_crm_role`, so GM / Finance logins get it.
+The pickers that START a record call `?status=Active` (F-V2 `crm/lib/activeCustomers.ts`); list filters and reports keep
+the bare call — history refers to inactive customers too.
+
+**12 Oct 2026 (later) — a 9.5-hour working day reaches the timesheet; project leave policies reach the employees
+already mapped (`tests/test_working_day_hours.py` 7, `tests/test_project_leave_reapply.py` 4; no migration):** two user
+reports. (1) ⚠️ **Working day.** `services/timesheets.default_hours_worked` read `resolve_branch_project_policy`, which
+fills an unset "Working Hours Per Day" with a built-in 8 — so `candidates[0]` was ALWAYS 8, the project's 9.5 h full day
+never won, the customer level was never read, and 8 h against a 9.5 h threshold generated every day as Half Day.
+`BillingPolicy.working_hours_per_day` (resolved in `effective_billing_policy`: customer `normal_hours_per_day` → branch
+→ project `working_hours_per_day`, `_positive_hours`) and `default_hours_worked(project, branch, policy)` now decide from
+RAW values: working day → else the effective full-day threshold → else 8; never below the full day; capped only by
+**`daily_hours_cap(project, branch)`** — ⚠️ the cap honours its switch now (an explicit OFF on the project = no cap; a
+legacy project with switch NULL keeps its value; a branch cap counts only when ON). Project create copies the branch's
+cap VALUE with its switch, so a typed-but-off 9 used to cap a 9.5 customer's billing at 9 (`_capped_hours` uses it too).
+`display_billable_day(hours, full_day)` divides by `full_day_hours(policy)` (9.5 h read 1.19 days). Payload:
+`default_hours_per_day`, `billing_policy.working_hours_per_day`, and `max_billable_hours_day` only when the switch is ON;
+the timesheet import's "full" hours and the project Overview's `working_hours_per_day` use the same rule.
+⚠️ `PUT /api/customers/{id}/billing-policy` now writes only the fields SENT (`_put`; all on create) — the Customers page's
+Default tab sends three keys and used to wipe `normal_hours_per_day`, billing type, the comp-off figures, user role and
+operation on every save. (2) ⚠️ **Leave.** The timesheet's leave choices are the assignment's
+`project_employee_leave_details` rows, copied from the policies ONCE at assignment. `services/project_employees.
+apply_effective_leave_policies(db, pe, project)` (idempotent; caller commits) adds missing types and re-points rows still
+on another policy at the effective one (project → branch → customer); a row with no history (`_row_has_history`: nothing
+consumed, balance = opening, no `pe_credit:` / `pe_carry:` / expiry event) re-opens at the new policy's balance with an
+`Adjustment` ledger event (`pe_relink:…`, note `PE#<id>`), a LIVE row keeps its balance and only `leave_accrual` follows.
+`_opening_from_policy` is the ONE opening rule (extracted from `seed_leave_details_from_customer_policy`).
+`apply_project_leave_policies_to_team(db, project)` (savepoint per PE) runs from every project leave-policy create /
+reactivate / update / delete and from `update_project` when branch / customer / opportunity change
+(`routers/crm/projects._reapply_team_leave`, best-effort after the policy commit). `POST …/employees/{pe}/leave/sync` now
+re-points too (`relinked_count`). Timesheet create runs it for the assignment (`_sync_assignment_leave`, savepoint) and
+**`POST /api/timesheets/{id}/leave/sync`** (TS_EDIT + `_require_owner_or`, same as editing entries) does it for an
+existing sheet and returns the sheet. `_row_policy` ignores a soft-deleted project policy (stops crediting).
+Suite: 1,999 pass, 3 skipped. Deploy: restart; existing sheets get their leave types from the new "Apply leave policies"
+button (or by re-saving the project's leave policies).
+
+**12 Oct 2026 (night) — interview links are laptop / PC only (`tests/test_desktop_only_invite.py`, 11; no
+migration):** user rule — a candidate must sit the AI interview on a computer with a camera. `services/device_class.py`
+(PURE): `is_handheld_user_agent(ua)` (Android · iPhone · iPad · iPod · Mobile · Windows Phone · tablets …; a blank UA
+passes), `handheld_block(headers)` → `{error, code: "desktop_required"}` also on `Sec-CH-UA-Mobile: ?1`, off when
+`INTERVIEW_ALLOW_MOBILE=1`. `POST /candidate/invite/{t}/verify` (after the closed-link checks — no attempt is spent)
+and `/login` answer **403** with it. The lookup stays open so the page can show its own notice. F-V2 gates first
+(touch-only and iPad-desktop-mode too) and also drops the Repeat / Explain buttons and the model name from the
+candidate screen — see that repo's notes.
+
+**11 Oct 2026 — recruiter joins a live interview, /next + /submit locked, "We write the questions", Reports list
+(`tests/test_interview_live_join.py` 14; no Alembic migration — two legacy columns by startup ALTER):** (1) **`services/
+interview_live.py`** (PURE; `now` passed in) — a recruiter with the Integrity tab can pause the AI, put a note on the
+candidate's screen, queue their OWN question (asked next by the AI voice, answered and scored like any other) and call the
+candidate (WebRTC, browser to browser — the server only carries the two SDPs, vanilla ICE, no trickle). State lives in two
+JSON columns on `interview_schedule`, ONE PER WRITER so the two app processes never overwrite each other: `live_control`
+(staff) and `live_reply` (candidate: the call answer + a check-in stamp written at most every 6 s). `auth_db.get_live_columns
+/ set_live_control / set_live_reply`. Clock: `candidate.service.interview_elapsed_seconds` subtracts
+`live.paused_seconds_from_meta` (meta `live_pause_total_sec` + the running `live_paused_at`, mirrored from the row by
+`main._live_sync_session`, which also stores `meta.live_summary` → `report.live_intervention` via `hr/service`). A pause is
+capped at `max_pause_sec()` (`INTERVIEW_LIVE_MAX_PAUSE_SEC`, default 1200, under the recovery worker's 35-min idle rule) and
+ends by itself (`expire_pause`, written back). ⚠️ **A queued question is inserted only at a turn boundary** — `/next` and
+`/answer` AFTER it advanced (`_live_pause_payload(s)`), never by `/answer`'s pause check (`apply_questions=False`, which
+would attribute the current answer to the inserted question). `insert_questions` puts it at `current` (after the warm-up),
+shifts `followup_indices` / `lead_in` / `question_specs`, counts it in `live_questions_inserted` (the question cap and
+`_evaluated_total` add it) and marks `live_question_indices` (`asked_by_recruiter` on the payload); ids in
+`live_applied_question_ids` make it idempotent. While paused `/next` and `/answer` answer **409 `code: live_paused`**
+(`/next` returns it as a body), and `/interview/violation` + `/proctor/violation` ignore every event. Routes:
+`GET /interview/live/{token}`, `POST /interview/live/{token}/{join|pause|resume|message|question|remove-question|call|hangup}`
+(`_integrity_auth`; 409 on a finished interview), `GET /interview/live-config`, `GET /candidate/live/state`,
+`POST /candidate/live/answer` (bearer + device binding). Recruiter actions reach the Integrity timeline at READ time
+(`_live_timeline_events` from the control log; `violations_log` is rewritten wholesale by /interview/violation, so nothing is
+appended there); new informational `EVENT_TYPES` `recruiter_*`. ICE: `INTERVIEW_STUN_URLS` (default Google STUN),
+`INTERVIEW_TURN_URLS/USERNAME/CREDENTIAL` (needed behind strict firewalls); `INTERVIEW_LIVE_JOIN_ENABLED` switch. (2) **`/next`
+and `/submit` hold `session_lock(sk)`** (C1/C2 closed; `/setup` is HR-only, left). `/next` → `_next_question_locked`; a second
+`/submit` waits and gets the report already made. (3) Skill bank limits raised for "We write the questions":
+`normal_per_skill` 0..50, `pseudo_count` 0..20, `coding_count` 0..10; `_skill_pick_payload` returns None when every offered
+skill is mandatory (no picker). (4) `/hr/dashboard` interviews carry `recommendation`, `fitment`, `not_attempted`, `time`,
+`recruiter_joined` (`_dash_report_extras`) for the redesigned Reports list. Deploy guide: `docs/DEPLOY_CHECKLIST_2026-10-11.md`.
+Suite: 2,024 pass, 3 skipped.
+
+**12 Oct 2026 — after the first test interview: question mix set by the template, ONE limit, real counts on the rules
+page, instant live join (`tests/test_interview_format_and_limits.py`, 10; no migration):** (1) **Skill bank `spoken_count`**
+(`_LIMITS` 0..200, default 0 = the old `normal_per_skill`-per-skill rule): `build_plan` draws that many spoken questions
+(seeded per interview, round robin over the picked skills — a list longer than the count gives each candidate a different
+draw); `missing_normals` computes the AI top-up shortfall for the WHOLE interview when it is set. `pseudo_count` /
+`coding_count` are now what the author chose (no longer forced to "all"). New PURE `plan_summary(cfg, required_skills)`
+(total · spoken · pseudo · coding · varies · pick range · minutes estimate, AI top-up counted; `SPOKEN_MINUTES_EACH`=2.5).
+A bank with no picker that still needs AI top-up stamps `meta.skill_bank.fill_needed`; invite login returns
+`skill_autofill {skills}` (`_skill_autofill_payload`) and the page posts it to `/candidate/skill-selection` before question
+1 — otherwise the top-up never ran and the interview came out short. Spoken questions no longer need an expected answer
+(the UI field is gone; `expected` stays accepted). (2) ⚠️ **One limit, the one the template chose:**
+`main._effective_time_limit(timing_mode, raw)` — **count mode has NO clock** (time_limit_sec = 0; the template form used to
+save a hidden leftover 20 min that both cut and confused "fixed count" interviews), time mode keeps its limit (≤ 6 h). Used
+by the invite bootstrap and `/setup`. Time mode is enforced three ways: the page countdown, `next_question_payload`, and
+NEW `time_up` on `GET /candidate/live/state` (`_session_time_up`) → the page submits even if its own countdown was
+throttled or broken. A typed question's `answer_time_limit_sec` is capped by `time_remaining_sec` (a 10-min coding task at
+minute 18 of 20 gets 2). (3) **Rules page shows the truth:** `_interview_format(cfg, job)` (used by `_public_schedule_view`)
+→ `num_q` = the real plan total for a bank (`plan_summary`), min(count, manual list) for manual, the template count
+otherwise (the session caps at it in both modes) + `question_mix`, `mix_varies`, `skills_choice`, `minutes_estimate`,
+`typed_minutes`, `followups` (max), `closing_qa`, `recruiter_may_join`, `screen_recorded`. (4) **Instant join:**
+`interview_live.presence()` (no log line) + `recruiter_present` / `candidate_poll_ms` (`FAST_POLL_MS`=1000 while a recruiter
+is present within `PRESENCE_WINDOW_SEC`=45, paused or on a call; else 3 s) → `poll_ms` on the candidate view;
+`/candidate/live/state` reads fresh (no cache); new staff action `presence` (not logged, allowed on a finished interview);
+staff view adds `presence_every_sec`=15. Deploy: restart.
+
+**12 Oct 2026 (night, last) — gpt-4o-mini retired: text calls run ONLY on GPT-6 Astra or GPT-5.5
+(`test_ai_models` now 22 + re-pinned, `test_reasoning_model_params` / `test_ai_interview_costs` re-pinned; no migration):**
+user rule "remove gpt-4o-mini everywhere, use GPT-5.5 and GPT-6 Astra, forcefully". `services/ai_models.py`:
+`INTERVIEW_DEFAULT` = gpt-6-astra, `WORKHORSE_MODEL` = `DEFAULT_MODEL` = gpt-5.5, `TEXT_MODELS` =
+`SUPPORTED_INTERVIEW_MODELS` = (astra, 5.5). ⚠️ **`force_text_model(model, default)`** turns any other text id (blank,
+gpt-4o-mini, gpt-4o, gpt-4.1…) into the default; audio ids (`_AUDIO_HINTS`: tts · transcribe · whisper · realtime · audio ·
+embedding · speech) pass. Applied by `interview_model()` (default Astra), `fast_interview_model()` / `workhorse_model(env)` /
+`ocr_model()` (5.5), `assist_model()` (5.5 — Astra refuses tools), `resolve_session_model` (a locked old model → the
+interview model), AND by `prompt_logger.tracked_chat_completion` + the OCR direct call — the safety net, so an old env line,
+Settings row, stored schedule or a literal default anywhere can never reach OpenAI as gpt-4o-mini. Every
+`model="gpt-4o-mini"` default in `ai.py` / `ats.py` / `question_service` / `strengths_weaknesses_analysis` / `resume_parse`
+(`_resume_parse_model`) / the ATS semantic review / `main.py` Form defaults is gone. **Audio** (no GPT-5.5/6 audio model
+exists): `transcribe_model()` → gpt-transcribe (an old mini / whisper id is forced), `realtime_model()` → gpt-realtime-2
+with `realtime_transcribe_model()` gpt-realtime-whisper; **TTS stays gpt-4o-mini-tts** (`tts_model()`) — the only OpenAI
+voice model that takes the Indian-English instructions. `prompt_logger.chat_params` gives gpt-5.5
+`reasoning_effort="low"` unless `OPENAI_REASONING_EFFORT` is set (latency). Pricing: gpt-5.5 ($5 / $30, cached $0.50),
+gpt-transcribe, gpt-realtime-2, gpt-realtime-whisper added; an unknown model is priced as gpt-5.5 (`FALLBACK_MODEL`).
+Historic rows keep their real gpt-4o-mini price. ⚠️ Cost: GPT-5.5 is ~30× gpt-4o-mini per token — resume parsing, ATS
+review, Ask AI and follow-ups cost more. Deploy: restart; old `INTERVIEW_FAST_MODEL` / `OPENAI_TRANSCRIBE_MODEL` /
+`CRM_*` env lines are overridden automatically (delete them when convenient). Suite: 2,035 pass, 3 skipped.
+
+**13 Oct 2026 — the template decides how an interview ends; extra faces really detected; look-away warnings
+(`tests/test_camera_monitor.py` 6, `tests/test_interview_format_and_limits.py` now 12; no migration):** test report — a
+template set to "Time limit 10 min" ran 13 min with no clock and no time warnings; a second face on camera was never caught.
+(1) ⚠️ **Root cause of the time limit**: the dashboard's HR Setup page posts only `jobId` + skills to
+`/hr/schedule-interview`, so the Form defaults (`timing_mode=count`, `time_limit_sec=0`, `num_q=5`, transcript / mic off)
+were packed into the schedule notes, and at session start the SCHEDULE's copy beat the template (verified from
+`logs/server-https.log`: scheduled 15:01:11, first question 15:03:18, submit 15:16:42). **The template now wins
+everywhere**: `utils/interview_limits.template_timing(invite_cfg, job)` → `(mode, raw_limit)` (template mode first; a
+time-mode template with no minutes falls back to the schedule's number; no template → the schedule, as before) and
+`resolve_template_num_q` (template `numQ` before the schedule's) — used by the invite bootstrap, the manual-list count,
+`/setup` (when a template is picked), `_interview_format` (the rules page) and `/hr/schedule-interview` (which now packs the
+template's timing, count, difficulty, follow-up, transcript and mic switches). The bootstrap also reads the template's
+transcript / mic switches first. Old schedules are fixed at session start, no data change. Client
+(`interview_time_warnings.js`): a warning at or above the whole limit (5-min warning on a 5-min interview) is skipped
+instead of firing at once. (2) ⚠️ **Why no second face was ever detected**: the page CSP had no `'wasm-unsafe-eval'`, so
+MediaPipe's WebAssembly could not compile; the fallback model came from storage.googleapis.com, outside `connect-src`; and
+Chrome on Windows has no built-in `FaceDetector`. Every failure was swallowed (reproduced in headless Chromium against the
+old header). The CSP (`_security_headers`) now has `'wasm-unsafe-eval'` + `https://storage.googleapis.com` in
+`connect-src`; `mimetypes` registers `.mjs` → text/javascript, `.wasm` → application/wasm, `.task`. ⚠️ Silero VAD had been
+blocked by the same rule all along; F-V2 keeps it OFF behind `window.KARNEX_SILERO_VAD` so the speech path does not change
+silently. (3) **Look-away (gaze) warnings — user decision: warnings 1–9 soft, the 10th ends the interview.**
+`services/interview_integrity.py`: `gaze_away` ("Looked away from the screen", family `gaze`, penalty 2, NOT a strike),
+`camera_monitor_unavailable` (system, informational), `GAZE_TYPES`, `count_gaze`, `gaze_limit()` (`INTERVIEW_GAZE_WARNING_LIMIT`,
+default 10, 0 = never ends), `gaze_limit_reached`; `summarise` adds `gaze_warnings`, FAMILIES + CSV gain `gaze` /
+`looked_away`. `POST /interview/violation` counts gaze separately and terminates on the limit with reason **"Looked away
+from the screen too often"** (strikes keep "Repeated interview policy violations"); the reply carries `gaze_count` /
+`gaze_limit`. `_interview_format` adds `gaze_limit` for the rules page. `multiple_faces` stays a strike (3-warning rule).
+F-V2: self-hosted MediaPipe Face Landmarker + `camera_monitor_logic.js` (see that repo's notes). Deploy: restart the
+backend; deploy F-V2 including `frontend/vendor/mediapipe` (~13 MB); rebuild the dashboard (Integrity tab chip).
+
+**13 Oct 2026 (later) — an AI L1 never runs on another opportunity's template; an interview that did is flagged
+(`tests/test_template_owner_guard.py` 6; no migration):** screenshot report — Annam Yaswanth Kumar (C-2026-00095, Bluetooth
+Developer) was interviewed on 1 Oct on the "AGM - R&D (ADAS & ARAS)" template of C-2026-00097 and the profile read "AI L1
+Passed 64.5 %". The 8 Oct fix (copy at LINK time) never touched requests linked BEFORE it, so such a request kept handing
+out the other deal's questions to every new candidate. **`services/ai_interview_bridge.py`** now owns the pure rule
+`template_owner_conflict` (the router `template_requests` imports it — one rule) + `linked_template_owner(opportunity,
+job_id)` → `{job_id, owner, title}` | None (never raises; an unreadable template does not block) + PURE
+`other_opportunity_reason`. `l1_template_status` returns **`state: "other_opportunity"`** (`TEMPLATE_OTHER_OPPORTUNITY_CODE`,
+`template_owner`, `template_title`, reason "RMG: … use Change template") — so `ensure_l1_template_ready` refuses all four
+schedule routes — and `schedule_l1_interview` refuses too (`scheduled: False`), which covers the candidate's own slot
+booking. **Already-taken interviews**: `auth_db.interview_record_job_ids(db, ids)` (ONE slim query, `payload->>'job_id'` /
+`json_extract`, never the payload) → `routers/crm/ai_interviews.wrong_templates_for_links` puts `template_mismatch
+{job_id, owner, title, opportunity}` on every finished, NOT voided row of `GET …/ai-interviews`, and `wrong_template_for`
+on the `…/summary` payload. Voided links are never flagged (they already say "does not count"). F-V2: the warning on the AI
+card, the RMG review banner and the AI Interview tab; the schedule pop-up's new state. **To fix the reported candidate**:
+RMG ▸ Template Requests ▸ C-2026-00095's request ▸ Change template (the Bluetooth template; build one if none exists) →
+Applied Candidates ▸ **Redo AI L1** (void reason ≥ 10) → the candidate gets a fresh link. Deploy: restart.
+
+**13 Oct 2026 (later) — a Joined candidate is not "In pipeline" (`tests/test_profiles_joined_bucket.py`, 2; no
+migration):** screenshot report — a candidate who had JOINED the customer sat at the top of Candidate Profiles ▸ In
+pipeline. `routers/crm/candidate_profiles._apply_bucket`: `bucket=active` now leaves out Joined as well as
+`REJECTED_BUCKET`; new `bucket=joined` lists only Joined (both still exclude Archive); list AND export. No bucket =
+everything, unchanged (the opportunity's Applicants tab). `phase_counts` is unchanged (it already carries `joined`).
+F-V2 sends `bucket=joined` from the Joined chip.
+
+**13 Oct 2026 (later) — role-wise candidate stages, migration 0133, head is now 0133
+(`tests/test_role_stage_access.py` 10; `test_candidate_profiles_list_enrichment` re-pinned):** user ask — "Sales only
+needs the candidates from Sales Screening on; Admin manages it from Access Control, for Candidate Profiles and inside every
+Opportunity." Decisions: per ROLE (built-in and custom), a hidden stage hides its chip AND its candidates, defaults = the
+Sales family from Sales Screening on. **0133** adds `roles.stage_access` + `custom_roles.stage_access` (JSON, NULL = the
+code default). **`services/stage_access.py`**: `ALL_STAGES` (= `candidate_status.STAGES` keys), `SALES_FAMILY_STAGES`
+(sales_screening … joined, closed), `default_stages(name)` (Sales · Sales_Head · any custom role whose
+`role_implications.approval_default_roles` reaches them — the Sales Manager — get the Sales view; everyone else all),
+`effective_stages` (a corrupt row falls back to the default, never an empty page), `stages_for_roles` / `allowed_stages(db,
+user)` = the UNION over the roles the user HOLDS (`held_roles`, so a Sales Manager is judged by that role, not the Sales it
+implies); None = everything; Admin/CEO always None (`UNRESTRICTED`, not configurable). Reads are savepointed — a database
+before 0133 reads as all defaults. `set_role_stages(db, builtin=|custom_id=, stages)` (None = back to default; 400 for
+Admin/CEO, an empty list or an unknown key). **`candidate_status.phase_access_clause(db, stmt, allowed)`** is the SQL:
+stored stages whose phase is fixed are decided in SQL; only the ambiguous ones (Sourcing / Technical_Screening → three
+front phases, RMG_Rejected, Self_Withdrawn, generic Rejected) are derived, and only when the set splits them; never NULL.
+`phase_visible(phase, closed, allowed)` (PURE): a CLOSED candidacy needs the Closed chip AND the phase it closed in (Sales
+sees who the customer turned down, not who RMG screened out); an unknown-phase close needs Closed only. Enforced in
+`GET /api/candidate-profiles` (`_narrow_to_stages`, BEFORE the bucket, the phase counts and pagination) + its export, and
+in `GET /api/requirements/{id}/resumes` (the opportunity's profiles, the status / phase counts, the Archive tab; a resume
+with no candidacy on this opportunity reads as Sourcing). ⚠️ The profile DETAIL page is not narrowed (user decision: a
+direct link still opens); Reports and the Screening Desk are not narrowed either. `/api/me.candidate_stages` (list in flow
+order, or null). Roles page: `GET /api/roles` rows carry `candidate_stages {stages, all, is_default, default,
+configurable}` + top-level `candidate_stages` catalogue (stages + `PRESETS`); **`PUT /api/roles/stage-access`**
+`{builtin | custom_id, stages | null}` (Admin/CEO; declared BEFORE `PUT /{role_id}` — pinned), audited as `role.stages`
+(group roles) after the commit. ⚠️ This deliberately brings back what `PROFILE_VISIBILITY = {}` removed on 18 Aug 2026 —
+now as admin data; `visible_statuses_for` is untouched and still empty. Deploy: `python -m alembic upgrade head`, restart.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 

@@ -83,7 +83,7 @@ def generate_mode_aware_questions(
     resume_summary: str = "",
     jd_text: str = "",
     cv_text: str = "",
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5.5",
     temperature: float = 0.45,
     coach_hints: str = "",
     avoid_history: Optional[List[str]] = None,

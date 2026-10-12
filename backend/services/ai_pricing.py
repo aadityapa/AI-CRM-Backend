@@ -78,10 +78,19 @@ DEFAULT_PRICES: dict[str, Price] = {
     # Reasoning tokens are billed as output and are already in completion_tokens.
     "gpt-6-astra": Price(input=10.00, output=50.00, cached_input=1.00),
     "gpt-6.1-sol": Price(input=2.00, output=10.00, cached_input=0.10),
+    # 13 Oct 2026 — GPT-5.5 runs every non-interview text call; the new audio
+    # models replace the mini ones (OpenAI model pages / launch posts).
+    "gpt-5.5": Price(input=5.00, output=30.00, cached_input=0.50),
+    "gpt-transcribe": Price(audio_in_per_min=0.0045),
+    "gpt-realtime-whisper": Price(audio_in_per_min=0.017),
+    "gpt-realtime-2": Price(input=4.00, output=16.00, cached_input=0.40,
+                            audio_in_per_1m=32.00, audio_out_per_1m=64.00),
     "text-embedding-3-small": Price(input=0.02),
     "text-embedding-3-large": Price(input=0.13),
 }
-FALLBACK_MODEL = "gpt-4o-mini"
+#: An unknown model is priced like GPT-5.5 (13 Oct 2026) — pricing it like the
+#: retired gpt-4o-mini would understate the spend ~30x.
+FALLBACK_MODEL = "gpt-5.5"
 
 #: Rough words-per-minute of the OpenAI voices, used to turn a spoken question's
 #: text into seconds when the stream's true length is not known.

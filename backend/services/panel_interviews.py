@@ -57,6 +57,21 @@ HISTORY_DAYS = 180
 #: The bell / mail a panel member gets when a round is booked for them.
 PANEL_ASSIGNED_EVENT = "interview.panel_assigned"
 DEFAULT_DURATION_MIN = 60
+#: Feedback opens this long after the round STARTS (10 Oct 2026, user rule).
+#: It used to open only once the booked length had run out — start + 60 min by
+#: default — so a 30-minute conversation kept the button locked for half an hour.
+FEEDBACK_OPENS_AFTER_MIN = 10
+#: Why the candidate did not take the round — one-tap picks on the page.
+NO_SHOW_STATUS = "No Show"
+NO_SHOW_EVENT = "interview.no_show"
+NO_SHOW_REASONS = (
+    "Did not join the call",
+    "Joined too late to run the round",
+    "Technical problem on the candidate's side",
+    "Asked to reschedule",
+    "Not reachable",
+)
+MIN_NO_SHOW_NOTE = 5
 
 SCOPES = ("pending", "upcoming", "done", "all")
 
@@ -129,18 +144,26 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def feedback_opens_at(event: InterviewEvent) -> datetime | None:
+    """When the panel member may record the verdict: start + 10 min. PURE."""
+    when = _aware(event.scheduled_at)
+    return when + timedelta(minutes=FEEDBACK_OPENS_AFTER_MIN) if when else None
+
+
 def phase_of(event: InterviewEvent, now: datetime) -> str:
-    """pending (held, no verdict) · upcoming (not yet held) · done (verdict) ·
-    not_held (cancelled / no-show …). PURE."""
+    """pending (feedback due — started 10+ min ago, no verdict) · upcoming ·
+    done (verdict) · no_show (the candidate did not join) · not_held
+    (cancelled / rescheduled). PURE."""
+    if (event.status or "") == NO_SHOW_STATUS and not (event.result or "").strip():
+        return "no_show"
     if (event.status or "") in NOT_HELD_STATUSES:
         return "not_held"
     if (event.result or "").strip():
         return "done"
-    when = _aware(event.scheduled_at)
-    if when is None:
+    opens = feedback_opens_at(event)
+    if opens is None:
         return "pending"
-    ends = when + timedelta(minutes=int(event.duration_minutes or DEFAULT_DURATION_MIN))
-    return "pending" if ends <= now else "upcoming"
+    return "pending" if opens <= now else "upcoming"
 
 
 def _base_query(employee_ids: list[int]):
@@ -188,6 +211,7 @@ def _row(event: InterviewEvent, profile: CandidateProfile, cand: Candidate, opp,
         "round_label": round_label(event.kind),
         "phase": phase_of(event, now),
         "scheduled_at": _iso(event.scheduled_at),
+        "feedback_opens_at": _iso(feedback_opens_at(event)),
         "raw_when": event.raw_when,
         "duration_minutes": event.duration_minutes,
         "meeting_link": event.meeting_link,
@@ -202,11 +226,10 @@ def _row(event: InterviewEvent, profile: CandidateProfile, cand: Candidate, opp,
             "email": cand.email,
             "phone": cand.phone,
             "experience_years": _money(cand.experience_years),
-            "notice_period": cand.notice_period,
             "technical_domain": cand.technical_domain,
             "cv_url": cand.cv_url,
-            "current_ctc": _money(profile.current_ctc if profile.current_ctc is not None else cand.current_ctc),
-            "expected_ctc": _money(profile.expected_ctc if profile.expected_ctc is not None else cand.expected_ctc),
+            # CTC and notice period are NOT sent (10 Oct 2026, user rule): the
+            # panel judges the skills, money and joining dates are not theirs.
         },
         "position": {
             "opportunity_id": getattr(opp, "id", None),
@@ -227,7 +250,7 @@ def my_rounds(db: Session, user, scope: str = "pending", *, now: datetime | None
 
     now = _aware(now) or datetime.now(timezone.utc)
     ids = my_employee_ids(db, user)
-    empty = {"rows": [], "counts": {"pending": 0, "upcoming": 0, "done": 0}, "linked": False}
+    empty = {"rows": [], "counts": {"pending": 0, "upcoming": 0, "done": 0, "no_show": 0}, "linked": False}
     if not ids:
         return empty
     rows = db.execute(
@@ -238,18 +261,21 @@ def my_rounds(db: Session, user, scope: str = "pending", *, now: datetime | None
         .limit(limit)
     ).all()
     ai_by_profile = latest_ai_interviews(db, [p for _, p, _, _, _ in rows])
-    out, counts = [], {"pending": 0, "upcoming": 0, "done": 0}
+    out, counts = [], {"pending": 0, "upcoming": 0, "done": 0, "no_show": 0}
     for ev, profile, cand, opp, cname in rows:
         phase = phase_of(ev, now)
         if phase == "not_held":
             continue
         counts[phase] += 1
-        if scope != "all" and phase != scope:
+        # A round the candidate did not join is listed under Done (with its
+        # own chip), so the panel member can see what they reported.
+        listed_as = "done" if phase == "no_show" else phase
+        if scope != "all" and listed_as != scope:
             continue
         out.append(_row(ev, profile, cand, opp, cname, ai_by_profile.get(profile.id), now))
     # Pending first, oldest first — the one that waited longest is on top.
     if scope in ("pending", "all"):
-        out.sort(key=lambda r: ({"pending": 0, "upcoming": 1, "done": 2}[r["phase"]],
+        out.sort(key=lambda r: ({"pending": 0, "upcoming": 1, "done": 2, "no_show": 3}[r["phase"]],
                                 r["scheduled_at"] or "", r["id"]))
     return {"rows": out, "counts": counts, "linked": True}
 
@@ -268,6 +294,42 @@ def _required_skills(db: Session, opp) -> list[dict]:
     return _skills_by_requirement(db, [req_id]).get(req_id, [])
 
 
+def _position_jd(db: Session, opp) -> dict | None:
+    """The position's JD for the panel (10 Oct 2026, user ask): the RMG JD text,
+    the requirement description, and the JD files (RMG's + the customer's) —
+    the same files the ATS reads. Two queries; None for a round with no deal."""
+    if opp is None:
+        return None
+    from models import OpportunityAttachment, RequirementAttachment
+
+    req = db.execute(
+        select(Requirement).where(Requirement.opportunity_id == opp.id)
+        .order_by(Requirement.id.desc()).limit(1)
+    ).scalars().first()
+
+    def files(rows):
+        return [{"name": a.file_name or "JD", "url": a.file_url} for a in rows if a.file_url]
+
+    rmg_files = files(db.execute(
+        select(RequirementAttachment).where(RequirementAttachment.requirement_id == req.id,
+                                            RequirementAttachment.kind == "rmg_jd")
+        .order_by(RequirementAttachment.id.desc())).scalars().all()) if req else []
+    customer_files = files(db.execute(
+        select(OpportunityAttachment).where(OpportunityAttachment.opportunity_id == opp.id,
+                                            OpportunityAttachment.kind == "customer_jd")
+        .order_by(OpportunityAttachment.id.desc())).scalars().all())
+    return {
+        "requirement_id": getattr(req, "id", None),
+        "title": getattr(req, "title", None) or getattr(opp, "title", None),
+        "experience_min": _money(getattr(req, "experience_min", None)),
+        "experience_max": _money(getattr(req, "experience_max", None)),
+        "rmg_jd_text": (getattr(req, "rmg_jd_text", None) or "").strip() or None,
+        "description": (getattr(req, "description", None) or "").strip() or None,
+        "rmg_jd_files": rmg_files,
+        "customer_jd_files": customer_files,
+    }
+
+
 def round_detail(db: Session, user, event_id: int, *, now: datetime | None = None) -> dict:
     """One of the caller's own rounds + the position's skills + the other
     rounds of THIS candidacy the caller also took (never anyone else's)."""
@@ -278,7 +340,9 @@ def round_detail(db: Session, user, event_id: int, *, now: datetime | None = Non
     ai = latest_ai_interviews(db, [profile]).get(profile.id)
     data = _row(ev, profile, cand, opp, cname, ai, now)
     data["skills"] = _required_skills(db, opp)
+    data["jd"] = _position_jd(db, opp)
     data["results_scale"] = list(RESULTS)
+    data["no_show_reasons"] = list(NO_SHOW_REASONS)
     ids = my_employee_ids(db, user)
     siblings = db.execute(
         _base_query(ids).where(InterviewEvent.profile_id == profile.id, InterviewEvent.id != ev.id)
@@ -299,7 +363,7 @@ def ai_summary_for_round(db: Session, user, event_id: int) -> dict:
     from models.ai_links import hr_decision_label
     from services.ai_interview_summary import summarize_interview_record
 
-    ev, profile, _, _, _ = _own_round(db, user, event_id)
+    ev, profile, _, opp, _ = _own_round(db, user, event_id)
     link = db.execute(
         select(AiInterviewLink).where(AiInterviewLink.profile_id == profile.id)
         .order_by(AiInterviewLink.created_at.desc(), AiInterviewLink.id.desc()).limit(1)
@@ -315,6 +379,13 @@ def ai_summary_for_round(db: Session, user, event_id: int) -> dict:
     except Exception:
         record = None
     data = summarize_interview_record(record)
+    # The panel reads the AI interview to know WHERE TO PROBE, so it gets the
+    # evidence — every question, the answer, the score and what was missing —
+    # and a per-skill check of how many questions actually covered each skill
+    # (10 Oct 2026, user report: the summary said "good at X" and the candidate
+    # could not explain X when the panel asked). Never the model's adjectives alone.
+    from services.ai_interview_summary import evidence_report
+    data["evidence"] = evidence_report(record, _required_skills(db, opp))
     if data.get("overall_score_percent") is None and link.overall_score_percent is not None:
         data["overall_score_percent"] = float(link.overall_score_percent)
     data["result"] = link.result
@@ -355,6 +426,79 @@ def record_panel_feedback(db: Session, user, event_id: int, result: str | None,
     now = datetime.now(timezone.utc)
     ai = latest_ai_interviews(db, [profile]).get(profile.id)
     return _row(ev, profile, cand, opp, cname, ai, now), moved
+
+
+def mark_no_show(db: Session, user, event_id: int, reason: str | None, note: str | None,
+                 *, now: datetime | None = None) -> dict:
+    """The panel member reports that the candidate did not take the round
+    (10 Oct 2026, user ask). Only once the round's time has come and before a
+    verdict. The round becomes "No Show" — a not-held round, so TA's desk offers
+    it for booking again and no feedback reminder fires — the panel's note is
+    kept on the round, logged on the candidacy, and the candidate's TAs plus the
+    screeners are told to reschedule. Recording a verdict later (the candidate
+    joined after all) overwrites it through the normal feedback path."""
+    from models import CandidateProfileActivityLog
+    from services.crm_common import log_activity
+
+    now = _aware(now) or datetime.now(timezone.utc)
+    ev, profile, cand, opp, cname = _own_round(db, user, event_id)
+    if (ev.result or "").strip():
+        raise HTTPException(status_code=409, detail="This round already has your verdict — edit the feedback instead.")
+    when = _aware(ev.scheduled_at)
+    if when is not None and when > now:
+        raise HTTPException(status_code=409,
+                            detail="The round has not started yet — you can report a no-show once its time has come.")
+    why = " ".join(str(reason or "").split())[:120] or NO_SHOW_REASONS[0]
+    words = " ".join(str(note or "").split())
+    if len(words) < MIN_NO_SHOW_NOTE:
+        raise HTTPException(status_code=400,
+                            detail="Add a short note — e.g. waited 15 minutes, called twice, no answer.")
+    ev.status = NO_SHOW_STATUS
+    ev.feedback = f"Candidate did not join — {why}. {words}"[:5000]
+    ev.user_role = PANEL_USER_ROLE
+    label = round_label(ev.kind)
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id, "INTERVIEW_NO_SHOW",
+                 f"{label}: candidate did not join ({why}) — reported by the panel "
+                 f"({ev.interviewer or user.full_name}): {words}")
+    _tell_schedulers_no_show(db, profile, cand, ev, why, words, user)
+    from services.candidate_profiles import latest_ai_interviews
+    ai = latest_ai_interviews(db, [profile]).get(profile.id)
+    return _row(ev, profile, cand, opp, cname, ai, now)
+
+
+def _tell_schedulers_no_show(db: Session, profile, cand, event, why: str, note: str, actor) -> int:
+    """Bell + mail to the candidate's TAs and every screener: book the round
+    again. Savepointed and best-effort — a mail problem never undoes the report."""
+    try:
+        with db.begin_nested():
+            from services.candidate_profiles import (
+                applied_candidates_link, screening_notify_user_ids, ta_user_ids,
+            )
+            from services.notify import notify_user
+
+            targets = set(ta_user_ids(db, profile)) | set(screening_notify_user_ids(db))
+            targets.discard(getattr(actor, "id", None))
+            if not targets:
+                return 0
+            cname = _name(cand)
+            label = round_label(event.kind)
+            title = f"Candidate did not join the {label}: {cname}"
+            message = (f"{event.interviewer or 'The panel'} reports that {cname} did not join the {label}"
+                       f" ({why}). Note: {note} — please contact the candidate and book the round again.")
+            try:
+                link = applied_candidates_link(db, profile)
+            except Exception:
+                link = f"/admin/?view=crm&p=profiles/{profile.id}"
+            for uid in targets:
+                notify_user(db, uid, title, message, link, actor=actor, event=NO_SHOW_EVENT,
+                            dedupe_key=f"no_show:{event.id}:{uid}",
+                            related_type="candidate", related_id=profile.candidate_id)
+            return len(targets)
+    except Exception:
+        import logging
+        logging.getLogger("karnex.crm.panel_interviews").warning(
+            "no-show notice failed for round %s", getattr(event, "id", "?"), exc_info=True)
+        return 0
 
 
 def notify_panel_member(db: Session, profile, event: InterviewEvent, actor) -> int:

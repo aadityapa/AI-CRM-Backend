@@ -60,6 +60,19 @@ EVENT_TYPES: dict[str, tuple[str, str, int, bool]] = {
     # 7 Oct 2026 — why a recording has no screen half (not shared when the
     # interview started, an unsupported browser, or the server has it off).
     "screen_share_missing": ("Screen not recorded", "system", 0, False),
+    # A recruiter joined the live interview (11 Oct 2026) — informational.
+    "recruiter_joined": ("Recruiter opened live controls", "system", 0, False),
+    "recruiter_paused": ("Recruiter paused the interview", "system", 0, False),
+    "recruiter_resumed": ("Interview resumed", "system", 0, False),
+    "recruiter_question": ("Recruiter queued a question", "system", 0, False),
+    "recruiter_message": ("Recruiter sent a note", "system", 0, False),
+    "recruiter_call": ("Recruiter call started", "system", 0, False),
+    "recruiter_call_ended": ("Recruiter call ended", "system", 0, False),
+    "violation_during_pause": ("Event while paused (not counted)", "system", 0, False),
+    # Camera monitor (13 Oct 2026): looking away from the screen is a SOFT
+    # warning — never a strike; `gaze_limit()` of them end the interview.
+    "gaze_away": ("Looked away from the screen", "gaze", 2, False),
+    "camera_monitor_unavailable": ("Face / eye monitor unavailable", "system", 0, False),
     # bookkeeping
     "termination": ("Terminated", "system", 0, False),
 }
@@ -67,10 +80,38 @@ EVENT_TYPES: dict[str, tuple[str, str, int, bool]] = {
 FAMILIES: dict[str, str] = {
     "tab": "Tab switches", "focus": "Focus loss", "fullscreen": "Fullscreen exits",
     "keys": "Key escapes", "face": "Camera", "clipboard": "Clipboard", "devtools": "Dev tools",
+    "gaze": "Looking away",
 }
 
 #: Types that count toward the three-warning termination rule.
 STRIKE_TYPES: frozenset[str] = frozenset(t for t, (_, _, _, strike) in EVENT_TYPES.items() if strike)
+
+#: Soft look-away warnings (13 Oct 2026) — counted on their own, never strikes.
+GAZE_TYPES: frozenset[str] = frozenset({"gaze_away"})
+DEFAULT_GAZE_LIMIT = 10
+
+
+def gaze_limit() -> int:
+    """How many look-away warnings end the interview (user decision 13 Oct 2026:
+    warnings 1-9 are soft, the 10th ends it). `INTERVIEW_GAZE_WARNING_LIMIT`
+    overrides; 0 = never end the interview for looking away."""
+    import os
+    raw = str(os.getenv("INTERVIEW_GAZE_WARNING_LIMIT", "") or "").strip()
+    if not raw:
+        return DEFAULT_GAZE_LIMIT
+    try:
+        return max(0, min(100, int(raw)))
+    except ValueError:
+        return DEFAULT_GAZE_LIMIT
+
+
+def count_gaze(events: Iterable) -> int:
+    return sum(1 for ev in events if event_type(ev) in GAZE_TYPES)
+
+
+def gaze_limit_reached(events: Iterable, limit: int | None = None) -> bool:
+    lim = gaze_limit() if limit is None else limit
+    return lim > 0 and count_gaze(events) >= lim
 
 #: A terminated interview can never score above this.
 TERMINATED_CAP = 20
@@ -133,6 +174,7 @@ def summarise(events: Iterable, *, session_status: str = "") -> dict:
     return {
         "events": evs,
         "strikes": count_strikes(evs),
+        "gaze_warnings": count_gaze(evs),
         "by_family": {k: by_family.get(k, 0) for k in FAMILIES},
         "by_type": dict(by_type),
         "integrity_score": score,
@@ -176,7 +218,8 @@ def shared_device_flags(rows: list[dict]) -> dict[str, list[str]]:
 CSV_COLUMNS = [
     "candidate_name", "candidate_email", "customer_name", "requirement_title", "scheduled_at",
     "session_status", "integrity_score", "strikes", "tab_switches", "focus_loss", "fullscreen_exits",
-    "face_events", "clipboard", "devtools", "reason", "interview_started_at", "interview_completed_at",
+    "face_events", "clipboard", "devtools", "looked_away", "reason", "interview_started_at",
+    "interview_completed_at",
 ]
 
 
@@ -196,6 +239,6 @@ def rows_to_csv(rows: list[dict]) -> str:
             r.get("requirement_title"), r.get("scheduled_at"), r.get("session_status"),
             r.get("integrity_score"), r.get("strikes"), fam.get("tab", 0), fam.get("focus", 0),
             fam.get("fullscreen", 0), fam.get("face", 0), fam.get("clipboard", 0), fam.get("devtools", 0),
-            r.get("reason"), r.get("interview_started_at"), r.get("interview_completed_at"),
+            fam.get("gaze", 0), r.get("reason"), r.get("interview_started_at"), r.get("interview_completed_at"),
         )])
     return buf.getvalue()

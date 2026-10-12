@@ -212,6 +212,10 @@ def create_timesheet(
     )
     db.add(ts)
     db.flush()
+    # The sheet's leave choices are the assignment's leave rows — bring them onto
+    # the project's CURRENT leave policies first (12 Oct 2026: policies added on
+    # the project after the employee was mapped never reached the timesheet).
+    _sync_assignment_leave(db, assignment, project)
     if body.generate_days:
         holiday_dates = holidays_for_project_period(db, project, body.year, body.month)
         pe = assignment
@@ -493,7 +497,9 @@ def timesheet_bulk_import(
     # a code carries a status, not hours.
     from services.timesheets import default_hours_worked
     _proj_row = db.get(Project, project_id)
-    _full_hours = default_hours_worked(_proj_row, _project_branch(db, _proj_row) if _proj_row else None)
+    _full_hours = default_hours_worked(
+        _proj_row, _project_branch(db, _proj_row) if _proj_row else None,
+        effective_billing_policy(db, _proj_row) if _proj_row else None)
     _hours_for = {"full": _full_hours, "half": _full_hours / 2, "none": Decimal("0")}
 
     # ---- parse every row up front so a bad file fails BEFORE any DB write --
@@ -882,6 +888,59 @@ def update_period(
 
 
 # ---------------------------------------------------------------- entries
+
+def _sync_assignment_leave(db: Session, pe: ProjectEmployee, project: Project | None) -> dict | None:
+    """Best-effort: the assignment's leave rows follow the current project →
+    branch → customer leave policies. Never fails the caller (savepoint)."""
+    from services.project_employees import apply_effective_leave_policies
+    try:
+        with db.begin_nested():
+            out = apply_effective_leave_policies(db, pe, project)
+        out.pop("created_rows", None)
+        return out
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).exception("leave sync failed for PE#%s", pe.id)
+        return None
+
+
+@router.post("/{timesheet_id}/leave/sync")
+def sync_timesheet_leave(
+    timesheet_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(get_current_user),
+    _acc: CurrentUser = Depends(TS_EDIT),
+):
+    """Bring this sheet's leave types onto the project's current leave policies.
+
+    The timesheet's leave choices are the employee's leave rows on the
+    assignment. A sheet opened before the project's policies were set up shows
+    none (or the customer's); this adds the missing types and re-points rows
+    still on an older policy — the same rule Edit Project now runs for the team.
+    Used / credited balances are never rewritten. Same gate as editing entries.
+    """
+    ts = get_timesheet_or_404(db, timesheet_id)
+    _require_owner_or(db, user, ts, "HR", "Finance", "RMG", "Sales", "Sales_Head")
+    pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
+    if pe is None:
+        raise HTTPException(status_code=400,
+                            detail="This timesheet is not linked to a project assignment")
+    out = _sync_assignment_leave(db, pe, db.get(Project, ts.project_id))
+    if out is None:
+        raise HTTPException(status_code=500, detail="Could not apply the leave policies — try again")
+    db.commit()
+    added, relinked = out.get("added", 0), out.get("relinked", 0)
+    if added or relinked:
+        msg = (f"Leave updated from the project's policies — {added} type(s) added, "
+               f"{relinked} moved to the current policy")
+    else:
+        msg = "Leave already follows the project's policies"
+    entries = db.execute(
+        select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
+        .order_by(TimesheetEntry.entry_date)
+    ).scalars().all()
+    return envelope(data=timesheet_detail_out(db, ts, entries), message=msg)
+
 
 @router.post("/{timesheet_id}/entries")
 def upsert_entries(

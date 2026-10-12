@@ -26,7 +26,7 @@ from models.ai_links import hr_decision_label
 from schemas.common import envelope
 from services.ai_interview_bridge import (
     ai_interview_autosend_enabled, ensure_l1_template_ready, l1_template_status,
-    schedule_l1_interview,
+    linked_template_owner, schedule_l1_interview,
 )
 from services.candidate_comms import interview_link_message, notify_candidate
 from services.crm_common import log_activity, to_dict
@@ -260,8 +260,12 @@ def list_ai_interviews(profile_id: int, request: Request, db: Session = Depends(
         select(AiInterviewLink).where(AiInterviewLink.profile_id == profile.id)
         .order_by(AiInterviewLink.created_at.desc())
     ).scalars().all()
+    rows = [_link_out(db, l, candidate, request) for l in links]
+    mismatches = wrong_templates_for_links(db, profile, links)
+    for row, link in zip(rows, links):
+        row["template_mismatch"] = mismatches.get(link.id)
     return envelope(
-        data=[_link_out(db, l, candidate, request) for l in links],
+        data=rows,
         meta={"pending_count": sum(1 for l in links if l.result == "Pending"),
               "page": 1, "limit": len(links) or 1, "total": len(links), "pages": 1},
     )
@@ -302,7 +306,57 @@ def ai_interview_summary(profile_id: int, link_id: int, db: Session = Depends(ge
     data["effective_result"] = link.effective_result
     data["hr_decision_label"] = hr_decision_label(link.hr_decision)
     data["level"] = link.level
+    data["template_mismatch"] = wrong_template_for(db, profile, link, record)
     return envelope(data=data)
+
+
+def wrong_templates_for_links(db: Session, profile: CandidateProfile, links) -> dict[int, dict]:
+    """link id -> template_mismatch for every finished, not voided link of one
+    profile. ONE slim read for the job ids (never the whole record) and one
+    template read per distinct job; never raises."""
+    wanted = {l.id: str(l.interview_record_id).strip() for l in links
+              if l.interview_record_id and getattr(l, "voided_at", None) is None}
+    if not wanted:
+        return {}
+    try:
+        from auth_db import interview_record_job_ids
+        jobs = interview_record_job_ids(_legacy_target(), wanted.values())
+    except Exception:
+        return {}
+    opportunity = db.get(Opportunity, profile.opportunity_id) if profile.opportunity_id else None
+    by_job: dict[str, dict | None] = {}
+    out: dict[int, dict] = {}
+    for link_id, rid in wanted.items():
+        job = jobs.get(rid)
+        if not job:
+            continue
+        if job not in by_job:
+            by_job[job] = linked_template_owner(opportunity, job)
+        if by_job[job]:
+            out[link_id] = {**by_job[job], "opportunity": getattr(opportunity, "opp_id", "") or ""}
+    return out
+
+
+def wrong_template_for(db: Session, profile: CandidateProfile, link: AiInterviewLink,
+                       record: dict | None) -> dict | None:
+    """The interview was taken on ANOTHER opportunity's template (13 Oct 2026).
+
+    Reported: a Bluetooth Developer candidate (C-2026-00095) was asked the
+    "AGM - R&D (ADAS & ARAS)" questions of C-2026-00097, and the profile still
+    read "AI L1 Passed" with nothing to say the verdict was about another role.
+    Interviews run before the 8 Oct fix keep that verdict, so every reader of the
+    summary is told: {job_id, owner, title, opportunity}. None when the template
+    is this deal's, unreadable, or the link was already voided (it says so)."""
+    if getattr(link, "voided_at", None) is not None or not isinstance(record, dict):
+        return None
+    job_id = str(record.get("job_id") or "").strip()
+    if not job_id:
+        return None
+    opportunity = db.get(Opportunity, profile.opportunity_id) if profile.opportunity_id else None
+    mismatch = linked_template_owner(opportunity, job_id)
+    if not mismatch:
+        return None
+    return {**mismatch, "opportunity": getattr(opportunity, "opp_id", "") or ""}
 
 
 def void_link(db: Session, profile: CandidateProfile, link: AiInterviewLink,

@@ -491,7 +491,7 @@ def ats_score(
     return out
 
 
-def ats_score_llm(*, jd_text: str, resume_text: str, model: str = "gpt-4o-mini") -> dict:
+def ats_score_llm(*, jd_text: str, resume_text: str, model: str = "gpt-5.5") -> dict:
     """
     LLM-assisted ATS scoring (best-effort).
     Returns the same top-level keys as ats_score().

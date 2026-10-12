@@ -423,7 +423,7 @@ def attach_strengths_weaknesses_analysis(
     questions: List[str],
     answers: List[str],
     *,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5.5",
     force_regenerate: bool = False,
 ) -> dict:
     """

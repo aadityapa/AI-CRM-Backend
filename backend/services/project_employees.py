@@ -511,6 +511,54 @@ def resolve_effective_leave_policies(
     return list(merged.values())
 
 
+def _opening_from_policy(policy, pe: ProjectEmployee, seed_as_of: date) -> tuple[Decimal, Decimal, Decimal]:
+    """(initial, leave_accrual, balance) a PE leave row opens with under ``policy``.
+
+    The ONE opening rule — used when a row is first seeded and when a row is
+    re-pointed at a project policy added later (``apply_effective_leave_policies``).
+    """
+    initial, accrual = _seed_balance_from_policy(policy)
+    # Upfront (One_Time / Yearly-start) policies with proration enabled credit a
+    # fraction of the annual grant based on the join month: remaining months / 12
+    # (e.g. onboard in July -> 6/12 of 18 = 9). Accrual policies open at 0 and are
+    # prorated per-day by the monthly credit job instead.
+    _ct = (policy.leave_credit_type or "Monthly")
+    _timing = (policy.leave_credit_timing or "Start_Of_Period")
+    _is_upfront = _ct == "One_Time" or (_ct == "Yearly" and _timing != "End_Of_Period")
+    start = accrual_start(policy, pe)
+    deferred = start is not None and start > seed_as_of
+    if deferred:
+        base_initial = Decimal(policy.initial_credit_balance or 0)
+        period_amt = Decimal(policy.leave_credit_balance or 0)
+        if _is_upfront:
+            # Defer the period grant; credit job releases it on/after accrual_start.
+            initial = base_initial
+            accrual = period_amt
+        elif _timing != "End_Of_Period":
+            # Monthly/Quarterly Start → behave like End_Of_Period until start.
+            initial = base_initial
+            if _ct == "Quarterly":
+                accrual = (
+                    (period_amt / Decimal(4)).quantize(Decimal("0.01"))
+                    if period_amt else Decimal("0")
+                )
+            else:
+                accrual = period_amt
+    elif _is_upfront and getattr(policy, "prorate_balance_credit", False) and initial > 0:
+        # Prorate by accrual_start month (onboarding, or later effective_date).
+        # ProjectLeavePolicy has no prorate flag → treated as False.
+        proration_date = start or pe.onboarding_date
+        if proration_date is not None:
+            factor = Decimal(13 - proration_date.month) / Decimal(12)
+            factor = min(max(factor, Decimal("0")), Decimal("1"))
+            initial = (initial * factor).quantize(Decimal("0.01"))
+    bal = initial
+    _max_limit = getattr(policy, "max_limit", None)  # not on ProjectLeavePolicy
+    if policy.is_max_limit and _max_limit is not None:
+        bal = min(bal, Decimal(_max_limit))
+    return initial, accrual, bal
+
+
 def seed_leave_details_from_customer_policy(
     db: Session,
     pe: ProjectEmployee,
@@ -547,45 +595,7 @@ def seed_leave_details_from_customer_policy(
     for policy, policy_source in resolve_effective_leave_policies(db, project, pe=pe):
         if policy.leave_type_id in existing_types:
             continue
-        initial, accrual = _seed_balance_from_policy(policy)
-        # Upfront (One_Time / Yearly-start) policies with proration enabled credit a
-        # fraction of the annual grant based on the join month: remaining months / 12
-        # (e.g. onboard in July -> 6/12 of 18 = 9). Accrual policies open at 0 and are
-        # prorated per-day by the monthly credit job instead.
-        _ct = (policy.leave_credit_type or "Monthly")
-        _timing = (policy.leave_credit_timing or "Start_Of_Period")
-        _is_upfront = _ct == "One_Time" or (_ct == "Yearly" and _timing != "End_Of_Period")
-        start = accrual_start(policy, pe)
-        deferred = start is not None and start > seed_as_of
-        if deferred:
-            base_initial = Decimal(policy.initial_credit_balance or 0)
-            period_amt = Decimal(policy.leave_credit_balance or 0)
-            if _is_upfront:
-                # Defer the period grant; credit job releases it on/after accrual_start.
-                initial = base_initial
-                accrual = period_amt
-            elif _timing != "End_Of_Period":
-                # Monthly/Quarterly Start → behave like End_Of_Period until start.
-                initial = base_initial
-                if _ct == "Quarterly":
-                    accrual = (
-                        (period_amt / Decimal(4)).quantize(Decimal("0.01"))
-                        if period_amt else Decimal("0")
-                    )
-                else:
-                    accrual = period_amt
-        elif _is_upfront and getattr(policy, "prorate_balance_credit", False) and initial > 0:
-            # Prorate by accrual_start month (onboarding, or later effective_date).
-            # ProjectLeavePolicy has no prorate flag → treated as False.
-            proration_date = start or pe.onboarding_date
-            if proration_date is not None:
-                factor = Decimal(13 - proration_date.month) / Decimal(12)
-                factor = min(max(factor, Decimal("0")), Decimal("1"))
-                initial = (initial * factor).quantize(Decimal("0.01"))
-        bal = initial
-        _max_limit = getattr(policy, "max_limit", None)  # not on ProjectLeavePolicy
-        if policy.is_max_limit and _max_limit is not None:
-            bal = min(bal, Decimal(_max_limit))
+        initial, accrual, bal = _opening_from_policy(policy, pe, seed_as_of)
         row = ProjectEmployeeLeaveDetail(
             project_employee_id=pe.id,
             leave_type_id=policy.leave_type_id,
@@ -616,15 +626,145 @@ def seed_leave_details_from_customer_policy(
     return created
 
 
+def _row_has_history(db: Session, pe: ProjectEmployee, row: ProjectEmployeeLeaveDetail) -> bool:
+    """True once a leave row has been used or credited beyond its opening.
+
+    Consumed leave, a balance that moved off the opening, or any monthly credit
+    / carry-forward on the ledger means the row is LIVE — its balance is kept.
+    """
+    if Decimal(row.leave_consumed or 0) != 0:
+        return True
+    if Decimal(row.leave_balance or 0) != Decimal(row.initial_balance or 0):
+        return True
+    hit = db.execute(
+        select(LeaveAccrualEvent.id).where(
+            LeaveAccrualEvent.employee_id == pe.employee_id,
+            LeaveAccrualEvent.leave_type_id == row.leave_type_id,
+            or_(
+                LeaveAccrualEvent.source.like(f"pe_credit:{pe.id}:{row.leave_type_id}:%"),
+                LeaveAccrualEvent.source.like(f"pe_carry:{pe.id}:{row.leave_type_id}:%"),
+                LeaveAccrualEvent.source.like(f"pe_expire:{pe.id}:{row.leave_type_id}:%"),
+                LeaveAccrualEvent.source.like(f"pe_cycle_expire:{pe.id}:{row.leave_type_id}:%"),
+            ),
+        ).limit(1)
+    ).first()
+    return hit is not None
+
+
+def apply_effective_leave_policies(
+    db: Session,
+    pe: ProjectEmployee,
+    project: Project | None = None,
+    *,
+    as_of: date | None = None,
+) -> dict:
+    """Make the PE's leave rows follow the project's CURRENT leave policies.
+
+    12 Oct 2026, user report: leave policies added on the project did not show
+    on the timesheet. A PE's leave rows were copied from the policies ONCE, at
+    assignment, and never again — so an employee mapped before the project's
+    policies existed (or a policy added / changed / removed later in Edit
+    Project) kept the customer's rules, or no rows at all, for ever.
+
+    For every leave type the project → branch → customer chain resolves:
+      * no row yet            → seeded (``seed_leave_details_from_customer_policy``);
+      * row on another policy → re-pointed at the effective one. A row with no
+        history (nothing used or credited yet) also re-opens at the new policy's
+        balance — the difference is booked as an Adjustment on the ledger. A
+        LIVE row keeps its balance; only its future credits follow the new rule.
+    Rows of types no policy covers (Comp-Off, LOP, a removed type) are untouched.
+    Idempotent; the caller commits.
+    """
+    project = project or db.get(Project, pe.project_id)
+    if project is None:
+        return {"added": 0, "relinked": 0, "reopened": 0}
+    as_of = as_of or date.today()
+    rows = {
+        r.leave_type_id: r
+        for r in db.execute(
+            select(ProjectEmployeeLeaveDetail)
+            .where(ProjectEmployeeLeaveDetail.project_employee_id == pe.id)
+        ).scalars().all()
+    }
+    relinked = reopened = 0
+    for policy, source in resolve_effective_leave_policies(db, project, pe=pe):
+        row = rows.get(policy.leave_type_id)
+        if row is None:
+            continue
+        want_project = policy.id if source == "project" else None
+        want_customer = policy.id if source != "project" else None
+        if (row.project_leave_policy_id == want_project
+                and row.customer_leave_policy_id == want_customer):
+            continue
+        row.project_leave_policy_id = want_project
+        row.customer_leave_policy_id = want_customer
+        initial, accrual, bal = _opening_from_policy(policy, pe, as_of)
+        row.leave_accrual = accrual          # future credits follow the new rule
+        relinked += 1
+        if not _row_has_history(db, pe, row):
+            delta = bal - Decimal(row.leave_balance or 0)
+            row.initial_balance = initial
+            row.opening_balance = initial
+            row.leave_balance = bal
+            reopened += 1
+            if delta != 0:
+                db.add(LeaveAccrualEvent(
+                    employee_id=pe.employee_id,
+                    leave_type_id=policy.leave_type_id,
+                    event_type="Adjustment",
+                    amount=delta,
+                    balance_after=bal,
+                    source=f"pe_relink:{pe.id}:{policy.leave_type_id}:{source[:1]}{policy.id}",
+                    note=f"PE#{pe.id} leave re-opened under {source} policy #{policy.id}",
+                ))
+    created = seed_leave_details_from_customer_policy(db, pe, project, seed_as_of=as_of)
+    if relinked:
+        db.flush()
+    return {"added": len(created), "relinked": relinked, "reopened": reopened,
+            "created_rows": created}
+
+
+def apply_project_leave_policies_to_team(db: Session, project: Project) -> dict:
+    """``apply_effective_leave_policies`` for every ACTIVE assignment on the project.
+
+    Run after a project leave policy is added, edited or removed and after the
+    project itself is edited, so every timesheet on the project shows the
+    project's leave types. Each assignment runs in its own savepoint — one bad
+    row never blocks the rest. The caller commits.
+    """
+    totals = {"employees": 0, "added": 0, "relinked": 0}
+    pes = db.execute(
+        select(ProjectEmployee).where(
+            ProjectEmployee.project_id == project.id,
+            ProjectEmployee.is_active.is_(True),
+        )
+    ).scalars().all()
+    for pe in pes:
+        try:
+            with db.begin_nested():
+                out = apply_effective_leave_policies(db, pe, project)
+        except Exception:  # noqa: BLE001 — logged, the rest of the team still syncs
+            import logging
+            logging.getLogger(__name__).exception(
+                "leave policy re-apply failed for PE#%s", pe.id)
+            continue
+        totals["employees"] += 1
+        totals["added"] += out["added"]
+        totals["relinked"] += out["relinked"]
+    return totals
+
+
 def sync_pe_leave_from_customer_policy(
     db: Session, pe: ProjectEmployee,
 ) -> dict:
-    """Idempotent back-fill: add missing leave types from customer/branch policy.
-
-    Existing PE leave rows (balances / consumed) are never modified.
+    """Make the PE's leave rows follow the current project → branch → customer
+    leave policies (``apply_effective_leave_policies``): missing types are added
+    and rows still on an older policy are re-pointed. Used / credited balances
+    are never rewritten.
     """
     project = db.get(Project, pe.project_id)
-    created = seed_leave_details_from_customer_policy(db, pe, project)
+    applied = apply_effective_leave_policies(db, pe, project)
+    created = applied["created_rows"]
     type_names: dict[int, str] = {}
     if created:
         ids = [r.leave_type_id for r in created]
@@ -634,6 +774,7 @@ def sync_pe_leave_from_customer_policy(
             type_names[lt.id] = lt.name
     return {
         "added_count": len(created),
+        "relinked_count": applied["relinked"],
         "added": [
             {
                 "leave_type_id": r.leave_type_id,

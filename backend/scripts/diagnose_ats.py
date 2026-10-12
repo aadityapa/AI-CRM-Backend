@@ -65,7 +65,7 @@ def check_openai() -> bool:
     try:
         from openai_client import get_openai_client
         res = get_openai_client(ATS_OPENAI_PURPOSE).chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.5",
             messages=[{"role": "user", "content": 'Reply with JSON {"ok":true}'}],
             response_format={"type": "json_object"},
             max_tokens=20,

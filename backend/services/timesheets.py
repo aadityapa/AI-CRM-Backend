@@ -64,6 +64,10 @@ class BillingPolicy:
     #: Which weekdays are the week-off (0=Mon..6=Sun). Sat+Sun unless a
     #: policy level overrides it (0072) — Gulf customers run Fri+Sat.
     week_off_days: tuple = (5, 6)
+    #: The customer's normal working day (12 Oct 2026): project "Working Hours
+    #: Per Day" → branch → customer "Normal hours per day". None = not set at
+    #: any level — the full-day threshold then decides the pre-filled hours.
+    working_hours_per_day: Decimal | None = None
 
 
 def parse_week_off_days(raw) -> tuple | None:
@@ -284,6 +288,7 @@ def effective_billing_policy(
             min_hours_full_day=Decimal(row.min_hours_full_day),
             min_hours_half_day=Decimal(row.min_hours_half_day),
             week_off_days=parse_week_off_days(getattr(row, "week_off_days", None)) or (5, 6),
+            working_hours_per_day=_positive_hours(getattr(row, "normal_hours_per_day", None)),
         )
     if branch is None:
         branch = resolve_timesheet_display_branch(db, project, pe=pe)
@@ -304,6 +309,8 @@ def effective_billing_policy(
             else Decimal(branch.hours_required_half_day),
             week_off_days=parse_week_off_days(getattr(branch, "week_off_days", None))
             or base.week_off_days,
+            working_hours_per_day=_positive_hours(getattr(branch, "working_hours_per_day", None))
+            or base.working_hours_per_day,
         )
     # Project overrides (spec §6 / resolve_branch_project_policy order)
     return BillingPolicy(
@@ -322,6 +329,8 @@ def effective_billing_policy(
         else Decimal(project.hours_required_half_day),
         week_off_days=parse_week_off_days(getattr(project, "week_off_days", None))
         or base.week_off_days,
+        working_hours_per_day=_positive_hours(getattr(project, "working_hours_per_day", None))
+        or base.working_hours_per_day,
     )
 
 
@@ -329,37 +338,82 @@ DEFAULT_WORKING_HOURS = Decimal("8")
 FOUR = Decimal("4")
 
 
+def _positive_hours(v) -> Decimal | None:
+    """A stored hours value, or None when unset / zero / unreadable."""
+    if v is None:
+        return None
+    try:
+        d = Decimal(str(v))
+    except Exception:  # noqa: BLE001 — a bad value means "not set"
+        return None
+    return d if d > ZERO else None
+
+
+def daily_hours_cap(project, branch: CustomerBranch | None = None) -> Decimal | None:
+    """The max billable hours per day, honouring its on/off switch (12 Oct 2026).
+
+    Project creation copies the branch's cap VALUE together with its switch, so
+    a branch that typed 9 but left "Max billable hours / day" OFF used to cap a
+    9.5-hour customer's days at 9 anyway. Now: an explicit OFF on the project
+    means no cap; a legacy project (switch NULL) with a value keeps it, as
+    before; with no project value the branch's cap counts only when switched on.
+    """
+    sw = getattr(project, "is_max_billable_hours_per_day", None) if project is not None else None
+    if sw is False:
+        return None
+    pv = _positive_hours(getattr(project, "max_billable_hours_day", None)) if project is not None else None
+    if pv is not None:
+        return pv
+    if branch is not None and getattr(branch, "is_max_billable_hours_per_day", False):
+        return _positive_hours(getattr(branch, "max_billable_hours_per_day", None))
+    return None
+
+
 def default_hours_worked(
     project: Project | None,
     branch: CustomerBranch | None = None,
+    policy: BillingPolicy | None = None,
 ) -> Decimal:
     """Default Hours Worked for a Present / generated working day.
 
-    Uses the project-resolved max billable hours per day
-    (``Project.max_billable_hours_day`` ← branch ``max_billable_hours_per_day``).
-    Falls back to ``DEFAULT_WORKING_HOURS`` (8) when unset.
-    """
-    from services.branch_policy import resolve_branch_project_policy
+    12 Oct 2026, user report: a 9.5-hour customer (set on the project and in the
+    customer's Default tab) still got 8 h pre-filled, and 8 h against a 9.5 h
+    full day reads Half Day. The old resolver filled "Working Hours Per Day"
+    with a built-in 8 whenever nothing was typed, so the project's 9.5 never
+    won, and the customer level was never read. Now, from RAW values:
 
-    resolved = resolve_branch_project_policy(project, branch)
-    # The customer's working day (11 Sep 2026, user report: a 9.5-hour
-    # customer's sheets pre-filled 8 h and every day read Half Day). Order:
-    # project/branch "Working Hours Per Day" → "Hours Required Full Day" →
-    # the max-hours cap → 8. Never above the cap when one is set.
-    candidates = []
-    for attr in ("working_hours_per_day", "hours_required_full_day"):
-        v = getattr(resolved, attr, None)
-        if v is not None and Decimal(str(v)) > 0:
-            candidates.append(Decimal(str(v)))
-    cap = resolved.max_billable_hours_per_day
-    if candidates:
-        hours = candidates[0]
-        if cap is not None and Decimal(str(cap)) > 0:
-            hours = min(hours, Decimal(str(cap)))
-        return hours
+      working day = project → branch → customer "Normal hours per day"
+                    (``policy.working_hours_per_day``)
+      else          the effective full-day threshold (project → branch →
+                    customer "Min hours — full day", ``policy.min_hours_full_day``)
+      else          8
+
+    A generated working day is never shorter than the full-day threshold (it
+    would read Half Day), and never longer than the daily cap when the cap is
+    switched on.
+    """
+    full = _positive_hours(policy.min_hours_full_day) if policy is not None else None
+    working = policy.working_hours_per_day if policy is not None else None
+    if policy is None:
+        # Callers without a resolved policy: raw project → branch values only.
+        for obj in (project, branch):
+            if obj is None:
+                continue
+            working = working or _positive_hours(getattr(obj, "working_hours_per_day", None))
+            full = full or _positive_hours(getattr(obj, "hours_required_full_day", None))
+    hours = working or full or DEFAULT_WORKING_HOURS
+    if full is not None and hours < full:
+        hours = full
+    cap = daily_hours_cap(project, branch)
     if cap is not None:
-        return Decimal(str(cap))
-    return DEFAULT_WORKING_HOURS
+        hours = min(hours, cap)
+    return hours
+
+
+def full_day_hours(policy: BillingPolicy | None) -> Decimal:
+    """The hours that make one billable day — the divisor for "billable day"."""
+    full = _positive_hours(policy.min_hours_full_day) if policy is not None else None
+    return full or EIGHT
 
 
 def attendance_from_hours_worked(
@@ -383,12 +437,18 @@ def attendance_from_hours_worked(
     return AttendanceStatus.ABSENT
 
 
-def display_billable_day(billable_hours: Decimal) -> Decimal:
-    """Report/display billable day = billable hours ÷ 8 (invoice math stays threshold-based)."""
+def display_billable_day(billable_hours: Decimal, full_day: Decimal | None = None) -> Decimal:
+    """Report/display billable day = billable hours ÷ the customer's full day.
+
+    ``full_day`` is the policy's full-day hours (``full_day_hours``); 8 when the
+    caller has none. A 9.5-hour customer's 9.5 h used to read 1.19 days.
+    (Invoice maths stays threshold-based.)
+    """
     bh = Decimal(billable_hours or 0)
     if bh <= ZERO:
         return ZERO
-    return (bh / EIGHT).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    div = _positive_hours(full_day) or EIGHT
+    return (bh / div).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
 
 def period_range_label(year: int, month: int) -> str:
@@ -468,7 +528,7 @@ def build_generated_entry(*, timesheet_id: int, d: date, holiday_dates: set[date
                           project: Project, policy: BillingPolicy,
                           branch: CustomerBranch | None = None) -> TimesheetEntry:
     day_type, is_working, attendance, hours = classify_calendar_day(
-        d, holiday_dates, default_hours=default_hours_worked(project, branch),
+        d, holiday_dates, default_hours=default_hours_worked(project, branch, policy),
         week_off_days=policy.week_off_days,
     )
     billable_hours, billable_days = compute_billables(
@@ -587,10 +647,10 @@ def resolve_entry_fields(
 
 
 def _capped_hours(hours: Decimal, project: Project) -> Decimal:
-    cap = project.max_billable_hours_day
+    cap = daily_hours_cap(project)
     if cap is None:
         return hours
-    return min(hours, Decimal(cap))
+    return min(hours, cap)
 
 
 def _days_from_hours(hours: Decimal, policy: BillingPolicy) -> Decimal:
@@ -1228,7 +1288,7 @@ def _num(v):
     return float(v) if v is not None else None
 
 
-def entry_out(e: TimesheetEntry) -> dict:
+def entry_out(e: TimesheetEntry, full_day: Decimal | None = None) -> dict:
     bh = Decimal(e.billable_hours or 0)
     return {
         "id": e.id,
@@ -1244,7 +1304,7 @@ def entry_out(e: TimesheetEntry) -> dict:
         "leave_reason": getattr(e, "leave_reason", None) or None,
         "billable_hours": _num(e.billable_hours),
         "billable_days": _num(e.billable_days),
-        "billable_day": float(display_billable_day(bh)),
+        "billable_day": float(display_billable_day(bh, full_day)),
         "location": getattr(e.location, "value", e.location) if e.location else None,
         "view_flag": bool(e.view_flag),
         "entry_project_id": e.entry_project_id,
@@ -1432,21 +1492,20 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
     }
     data["leave_billable_by_type"] = leave_map
     data["leave_balances_by_type"] = timesheet_leave_balances_map(db, ts)
-    # Project → branch resolved max billable hrs/day (same source as Hours Worked default).
-    if project:
-        from services.branch_policy import resolve_branch_project_policy
-        resolved_caps = resolve_branch_project_policy(project, branch)
-        data["max_billable_hours_day"] = (
-            float(resolved_caps.max_billable_hours_per_day)
-            if resolved_caps.max_billable_hours_per_day is not None
-            else None
-        )
-    else:
-        data["max_billable_hours_day"] = None
+    # Max billable hrs/day — only when its switch is ON (12 Oct 2026: a cap
+    # value saved with the switch off used to clamp a 9.5-hour customer's days).
+    cap = daily_hours_cap(project, branch) if project else None
+    data["max_billable_hours_day"] = float(cap) if cap is not None else None
+    # The hours a working day starts with (new rows, "Fill worked days", a day
+    # switched back to Working): the customer's working day, never below the
+    # full-day threshold — the SAME rule the server generates rows with.
+    data["default_hours_per_day"] = float(default_hours_worked(project, branch, policy))
+    data["billing_policy"]["working_hours_per_day"] = (
+        float(policy.working_hours_per_day) if policy.working_hours_per_day is not None else None)
     data["holiday_dates"] = sorted(
         d.isoformat() for d in holidays_for_project_period(db, project, ts.year, ts.month)
     ) if project else []
-    data["entries"] = [entry_out(e) for e in live]  # type: ignore[arg-type]
+    data["entries"] = [entry_out(e, full_day_hours(policy)) for e in live]  # type: ignore[arg-type]
     data["summary"] = timesheet_summary(db, ts, entries)
     data["attachments"] = list_attachments(db, ts)
     # The linked invoice, so the detail page can say WHY an approved sheet
@@ -2060,7 +2119,8 @@ def timesheet_summary(db: Session, ts: Timesheet, entries: list[TimesheetEntry])
                                     if project is not None and project.max_billable_days_month is not None else None),
         "actual_billable_hours": float(rollup["actual_billable_hours"]),
         "actual_billable_days": float(rollup["actual_billable_days"]),
-        "actual_billable_day": float(display_billable_day(rollup["actual_billable_hours"])),
+        "actual_billable_day": float(display_billable_day(rollup["actual_billable_hours"],
+                                                          full_day_hours(policy))),
         # Leave attendance only (paid + leave-LOP). Absent/Half_Day are NOT leave.
         # Invariant when leave types are billable:
         # total_leave_days == total_leave_billable_days + loss_of_pay_from_leave
@@ -2141,7 +2201,7 @@ def timesheet_report_out(db: Session, ts: Timesheet,
     rollup = _billable_rollup(project, live, _policy)  # type: ignore[arg-type]
     hours_worked = sum((Decimal(e.hours_worked or 0) for e in live), ZERO)
     actual_billable_hours = rollup["actual_billable_hours"]
-    actual_billable_day = display_billable_day(actual_billable_hours)
+    actual_billable_day = display_billable_day(actual_billable_hours, full_day_hours(_policy))
     summary = timesheet_summary(db, ts, entries)
 
     data.update({

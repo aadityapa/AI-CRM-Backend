@@ -79,8 +79,12 @@ def _row_policy(db: Session, row: ProjectEmployeeLeaveDetail):
     if getattr(row, "project_leave_policy_id", None):
         from models import ProjectLeavePolicy
         pol = db.get(ProjectLeavePolicy, row.project_leave_policy_id)
-        if pol is not None:
+        # A REMOVED project policy (soft-deleted) stops crediting (12 Oct 2026);
+        # apply_effective_leave_policies re-points the row at what now applies.
+        if pol is not None and getattr(pol, "is_active", True) is not False:
             return pol
+        if pol is not None:
+            return None
     return (
         db.get(CustomerLeavePolicy, row.customer_leave_policy_id)
         if row.customer_leave_policy_id else None

@@ -387,6 +387,10 @@ def _ensure_schedule_security_columns_postgres(conn) -> None:
         "recording_bytes": "BIGINT NOT NULL DEFAULT 0",
         "recording_mime": "TEXT",
         "recording_status": "TEXT NOT NULL DEFAULT ''",
+        # A recruiter joining the live interview (11 Oct 2026): one JSON column
+        # per writer, so staff and candidate never overwrite each other.
+        "live_control": "TEXT",
+        "live_reply": "TEXT",
     }
     with conn.cursor() as cur:
         cur.execute(
@@ -419,6 +423,8 @@ def _ensure_schedule_security_columns_sqlite(conn: sqlite3.Connection) -> None:
         "recording_bytes": "INTEGER NOT NULL DEFAULT 0",
         "recording_mime": "TEXT",
         "recording_status": "TEXT NOT NULL DEFAULT ''",
+        "live_control": "TEXT",
+        "live_reply": "TEXT",
     }
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(interview_schedule)")
@@ -2595,6 +2601,45 @@ def update_schedule_field(db_target: DbTarget, invite_token: str, **kwargs) -> N
             conn.commit()
 
 
+def get_live_columns(db_target: DbTarget, invite_token: str) -> tuple[dict, dict] | None:
+    """(live_control, live_reply) of one interview, parsed — None when the
+    interview does not exist. Two columns by the unique invite index; the
+    candidate's page reads this every few seconds, so nothing else is fetched."""
+    token = (invite_token or "").strip()
+    if not token:
+        return None
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT live_control, live_reply FROM interview_schedule WHERE invite_token = %s",
+                        (token,),
+                    )
+                    row = cur.fetchone()
+        else:
+            with _connect_sqlite(Path(db_target)) as conn:
+                row = conn.execute(
+                    "SELECT live_control, live_reply FROM interview_schedule WHERE invite_token = ?",
+                    (token,),
+                ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    control = _json_loads_db(row[0], {})
+    reply = _json_loads_db(row[1], {})
+    return (control if isinstance(control, dict) else {}), (reply if isinstance(reply, dict) else {})
+
+
+def set_live_control(db_target: DbTarget, invite_token: str, control: dict) -> None:
+    update_schedule_field(db_target, invite_token, live_control=_json_dumps_db(control, {}))
+
+
+def set_live_reply(db_target: DbTarget, invite_token: str, reply: dict) -> None:
+    update_schedule_field(db_target, invite_token, live_reply=_json_dumps_db(reply, {}))
+
+
 def _json_dumps_db(value: Any, fallback: Any) -> str:
     try:
         return json.dumps(value if value is not None else fallback, ensure_ascii=False)
@@ -2805,6 +2850,37 @@ def interview_ids_by_invite(db_target: DbTarget, invite_tokens) -> dict[str, str
         if token and interview_id:
             out[str(token).strip()] = str(interview_id).strip()
     return out
+
+
+def interview_record_job_ids(db_target: DbTarget, interview_ids) -> dict[str, str]:
+    """interview_id -> the job template id the interview ran on (13 Oct 2026, the
+    "taken on another opportunity's template" warning on the profile).
+
+    ONE slim query — the id and one JSON field, never the whole payload (the
+    DB-traffic brief of 7 Oct 2026). Never raises; a missing row is absent."""
+    ids = sorted({str(i).strip() for i in (interview_ids or []) if str(i or "").strip()})
+    if not ids:
+        return {}
+    rows: list = []
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, payload->>'job_id' FROM interview_records WHERE id = ANY(%s)",
+                        (ids,),
+                    )
+                    rows = cur.fetchall()
+        else:
+            placeholders = ",".join("?" for _ in ids)
+            with _connect_sqlite(Path(db_target)) as conn:
+                rows = conn.execute(
+                    f"SELECT id, json_extract(payload, '$.job_id') FROM interview_records WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+    except Exception:
+        return {}
+    return {str(rid).strip(): str(job).strip() for rid, job in rows if rid and job}
 
 
 # --- interview recovery (7 Oct 2026) ------------------------------------------

@@ -67,6 +67,14 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
         approvals = allowed_approvals(db, user, access)
     except Exception:
         approvals = []
+    try:
+        # The candidate stages this login sees (13 Oct 2026, Access Control ▸
+        # Roles) — the stage chips show only these. None = every stage.
+        from services.stage_access import ALL_STAGES, allowed_stages
+        stages = allowed_stages(db, user)
+        candidate_stages = None if stages is None else [s for s in ALL_STAGES if s in stages]
+    except Exception:
+        candidate_stages = None
     return envelope(data={
         "id": user.id,
         "username": user.username,
@@ -89,6 +97,8 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
         "access": access,
         # ["timesheet.approve", ...] — every approval action this user may do.
         "approvals": approvals,
+        # ["sales_screening", …] or null (every stage) — services/stage_access.
+        "candidate_stages": candidate_stages,
         # An Admin/CEO reset is waiting for the user's own password (7 Oct 2026):
         # the dashboard shows ONLY the change-password screen until it is done.
         "must_change_password": bool(getattr(user, "must_change_password", False)),

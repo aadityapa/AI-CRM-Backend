@@ -721,9 +721,28 @@ def chat_params(model: str | None, *, temperature: float | None = None,
         out["max_tokens"] = max_tokens
     if reasoning:
         effort = (os.getenv("OPENAI_REASONING_EFFORT") or "").strip().lower()
+        if not effort:
+            effort = _DEFAULT_REASONING_EFFORT.get((model or "").strip().lower(), "")
         if effort:
             out["reasoning_effort"] = effort
     return out
+
+
+#: GPT-5.5 runs the calls a person waits on (lead-ins, follow-ups, resume parsing,
+#: Ask AI) since 13 Oct 2026 — "low" keeps those quick. GPT-6 Astra keeps its own
+#: default (it decides the score). `OPENAI_REASONING_EFFORT` overrides both.
+_DEFAULT_REASONING_EFFORT: dict[str, str] = {"gpt-5.5": "low"}
+
+
+def force_text_model(model: str | None) -> str:
+    """Every text call runs on GPT-6 Astra or GPT-5.5 (13 Oct 2026 user rule) —
+    `services.ai_models.force_text_model`; a lookup failure keeps the model."""
+    try:
+        from services.ai_models import force_text_model as _force
+
+        return _force(model)
+    except Exception:
+        return (model or "").strip()
 
 
 def tracked_chat_completion(
@@ -754,6 +773,9 @@ def tracked_chat_completion(
     Drop-in replacement for client.chat.completions.create() that adds logging.
     Returns the OpenAI response object (unchanged).
     """
+    # The safety net (13 Oct 2026): whatever a caller, a stored schedule or an
+    # old env line asks for, the call runs on GPT-6 Astra or GPT-5.5.
+    model = force_text_model(model)
     kwargs: dict[str, Any] = {"model": model, "messages": messages}
     kwargs.update(chat_params(model, temperature=temperature, max_tokens=max_tokens))
     if response_format is not None:

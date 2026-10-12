@@ -94,9 +94,11 @@ def _ai_semantic_review(jd_text: str | None, mandatory: list[str], optional: lis
         )
         # Tracked (29 Sep 2026) so the ATS review shows in AI Costs ▸ Other spend.
         from ai import _db_target
+        from services.ai_models import workhorse_model
+        _ats_model = workhorse_model("ATS_REVIEW_MODEL")
         from prompt_logger import tracked_chat_completion
         res = tracked_chat_completion(
-            get_openai_client(ATS_OPENAI_PURPOSE), model="gpt-4o-mini",
+            get_openai_client(ATS_OPENAI_PURPOSE), model=_ats_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0, response_format={"type": "json_object"},
             call_type="ats_semantic_review", db_target=_db_target(),
@@ -110,7 +112,7 @@ def _ai_semantic_review(jd_text: str | None, mandatory: list[str], optional: lis
             "summary": str(data.get("summary") or "").strip()[:1000],
             "strengths": [str(s).strip() for s in (data.get("strengths") or []) if str(s).strip()][:8],
             "gaps": [str(s).strip() for s in (data.get("gaps") or []) if str(s).strip()][:8],
-            "model": "gpt-4o-mini",
+            "model": _ats_model,
         }
     except Exception as exc:  # noqa: BLE001 - never block scoring on the AI call
         logger.warning("ATS semantic review failed: %s", exc)

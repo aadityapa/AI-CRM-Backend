@@ -62,7 +62,7 @@ def build_submitted_record(session: dict, updated_ist: dict) -> dict:
         "candidate_email": (meta.get("candidate_profile", {}) or {}).get("email", "Not available"),
         "candidate_profile": meta.get("candidate_profile", {}),
         "difficulty": meta.get("difficulty", "Medium"),
-        "model": meta.get("model", "gpt-4o-mini"),
+        "model": meta.get("model") or "gpt-6-astra",
         "skills": meta.get("jd_skills", []),
         "job_id": job_id,
         "job_title": job_title,
@@ -113,6 +113,11 @@ def build_report_record(session: dict, report_result: dict, evaluated_ist: dict)
         summary = report_summary(session)
         if summary is not None:
             report_result["conversation"] = summary
+        # A recruiter joined the live interview (11 Oct 2026): who, the pauses
+        # and the questions they asked (answered and scored like any other).
+        live_summary = meta.get("live_summary")
+        if isinstance(live_summary, dict):
+            report_result["live_intervention"] = live_summary
     return {
         "id": meta.get("interview_id", str(uuid4())),
         "created_at": meta.get("created_at"),
@@ -127,7 +132,7 @@ def build_report_record(session: dict, report_result: dict, evaluated_ist: dict)
         "candidate_email": (meta.get("candidate_profile", {}) or {}).get("email", "Not available"),
         "candidate_profile": meta.get("candidate_profile", {}),
         "difficulty": meta.get("difficulty", "Medium"),
-        "model": meta.get("model", "gpt-4o-mini"),
+        "model": meta.get("model") or "gpt-6-astra",
         "skills": meta.get("jd_skills", []),
         "job_id": job_id,
         "job_title": job_title,

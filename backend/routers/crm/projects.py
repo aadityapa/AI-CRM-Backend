@@ -1,6 +1,7 @@
 """Projects API: CRUD, team (project employees), timesheets view, communication matrix."""
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -93,6 +94,24 @@ def _get_leave_policy_or_404(db: Session, policy_id: int) -> ProjectLeavePolicy:
     return policy
 
 
+def _reapply_team_leave(db: Session, project_id: int) -> None:
+    """After a project leave policy changes, bring every active assignment's leave
+    rows onto the project's current policies (12 Oct 2026 — the timesheet reads
+    those rows, and they were only ever copied once at assignment). Best-effort:
+    the policy change is already committed and must never be undone by this."""
+    from services.project_employees import apply_project_leave_policies_to_team
+    project = db.get(Project, project_id)
+    if project is None:
+        return
+    try:
+        apply_project_leave_policies_to_team(db, project)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logging.getLogger(__name__).exception(
+            "re-applying leave policies failed for project %s", project_id)
+
+
 def _apply_leave_policy_update(
     db: Session, policy: ProjectLeavePolicy, body: ProjectLeavePolicyUpdate,
 ) -> ProjectLeavePolicy:
@@ -116,6 +135,7 @@ def _apply_leave_policy_update(
     for field, value in changes.items():
         setattr(policy, field, value)
     db.commit()
+    _reapply_team_leave(db, policy.project_id)
     db.refresh(policy)
     return policy
 
@@ -143,6 +163,7 @@ def delete_project_leave_policy_by_id(
     policy = _get_leave_policy_or_404(db, policy_id)
     policy.is_active = False
     db.commit()
+    _reapply_team_leave(db, policy.project_id)
     return envelope(data=project_leave_policy_out(db, policy), message="Leave policy deactivated")
 
 
@@ -876,6 +897,9 @@ def update_project(
                 project.branch_id = opp.branch_id
             # else: keep existing project.branch_id (do not null it)
     db.commit()
+    # A branch / customer change moves the leave chain too (12 Oct 2026).
+    if {"branch_id", "customer_id", "opportunity_id"} & set(changes):
+        _reapply_team_leave(db, project.id)
     db.refresh(project)
     return envelope(data=project_out(project), message="Project updated")
 
@@ -1016,6 +1040,7 @@ def create_project_leave_policy(
                 setattr(dup, field, value)
             dup.is_active = True
             db.commit()
+            _reapply_team_leave(db, project_id)
             db.refresh(dup)
             return envelope(data=project_leave_policy_out(db, dup),
                             message="Leave policy reactivated")
@@ -1026,6 +1051,7 @@ def create_project_leave_policy(
     policy = ProjectLeavePolicy(project_id=project_id, **data)
     db.add(policy)
     db.commit()
+    _reapply_team_leave(db, project_id)
     db.refresh(policy)
     return envelope(data=project_leave_policy_out(db, policy), message="Leave policy created")
 
@@ -1061,6 +1087,7 @@ def delete_project_leave_policy(
         raise HTTPException(status_code=404, detail="Leave policy not found for this project")
     policy.is_active = False
     db.commit()
+    _reapply_team_leave(db, policy.project_id)
     return envelope(data=project_leave_policy_out(db, policy), message="Leave policy deactivated")
 
 

@@ -55,21 +55,37 @@ def test_labels_never_blank():
 # ----------------------------------------------------------------- resolution
 
 def test_interview_model_order(monkeypatch):
-    assert ai_models.interview_model() == "gpt-4o-mini"
-    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-6-astra")
-    assert ai_models.interview_model() == "gpt-6-astra"
+    monkeypatch.delenv("INTERVIEW_OPENAI_MODEL", raising=False)
+    assert ai_models.interview_model() == "gpt-6-astra"                    # default
+    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-5.5")
+    assert ai_models.interview_model() == "gpt-5.5"
+    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-4o-mini")
+    assert ai_models.interview_model() == "gpt-6-astra"                    # old id forced
     monkeypatch.setattr(ai_models, "_setting",
-                        lambda key: "gpt-4.1" if key == ai_models.INTERVIEW_MODEL_KEY else "")
-    assert ai_models.interview_model() == "gpt-4.1"   # the Settings row wins over the env
+                        lambda key: "gpt-5.5" if key == ai_models.INTERVIEW_MODEL_KEY else "")
+    assert ai_models.interview_model() == "gpt-5.5"   # the Settings row wins over the env
 
 
 def test_fast_model(monkeypatch):
-    assert ai_models.fast_interview_model("gpt-6-astra") == "gpt-4o-mini"   # reasoning → fast default
-    assert ai_models.fast_interview_model("gpt-4o") == "gpt-4o"            # classic → same model
-    monkeypatch.setenv("INTERVIEW_FOLLOWUP_MODEL", "gpt-4.1-mini")          # the older name still works
-    assert ai_models.fast_interview_model("gpt-6-astra") == "gpt-4.1-mini"
-    monkeypatch.setenv("INTERVIEW_FAST_MODEL", "gpt-6-astra")               # explicit wins
-    assert ai_models.fast_interview_model("gpt-4o") == "gpt-6-astra"
+    for name in ("INTERVIEW_FAST_MODEL", "INTERVIEW_FOLLOWUP_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    assert ai_models.fast_interview_model("gpt-6-astra") == "gpt-5.5"
+    monkeypatch.setenv("INTERVIEW_FOLLOWUP_MODEL", "gpt-4.1-mini")          # old id forced
+    assert ai_models.fast_interview_model("gpt-6-astra") == "gpt-5.5"
+    monkeypatch.setenv("INTERVIEW_FAST_MODEL", "gpt-6-astra")               # explicit allowed wins
+    assert ai_models.fast_interview_model("gpt-5.5") == "gpt-6-astra"
+
+
+def test_force_text_model_and_audio_models(monkeypatch):
+    assert ai_models.force_text_model("gpt-4o-mini") == "gpt-5.5"
+    assert ai_models.force_text_model("gpt-4o") == "gpt-5.5"
+    assert ai_models.force_text_model("") == "gpt-5.5"
+    assert ai_models.force_text_model("gpt-6-astra") == "gpt-6-astra"
+    assert ai_models.force_text_model("gpt-4o-mini-tts") == "gpt-4o-mini-tts"   # audio passes
+    monkeypatch.setenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+    assert ai_models.transcribe_model() == "gpt-transcribe"
+    monkeypatch.setenv("INTERVIEW_REALTIME_MODEL", "gpt-realtime-mini")
+    assert ai_models.realtime_model() == "gpt-realtime-2"
 
 
 def test_settings_refuse_an_unsupported_model():
@@ -85,7 +101,8 @@ def test_settings_refuse_an_unsupported_model():
 def test_stored_model_ignored_without_a_lock(monkeypatch):
     monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-6-astra")
     assert ai_models.resolve_session_model({"model": "gpt-4o-mini"}) == "gpt-6-astra"
-    assert ai_models.resolve_session_model({"model": "gpt-4o", "model_locked": True}) == "gpt-4o"
+    assert ai_models.resolve_session_model({"model": "gpt-4o", "model_locked": True}) == "gpt-6-astra"
+    assert ai_models.resolve_session_model({"model": "gpt-5.5", "model_locked": True}) == "gpt-5.5"
     notes = main._pack_invite_config_into_notes("", {"model": "gpt-4o-mini"})
     assert main._extract_invite_config_from_notes(notes)["model"] == ""     # new schedules store no model
 
@@ -233,7 +250,7 @@ def test_ocr_uses_its_own_model(monkeypatch):
             return b"\x89PNG"
 
     asyncio.run(main._extract_text_from_upload(Upload(), False))
-    assert seen["model"] == "gpt-4o-mini"
+    assert seen["model"] == "gpt-5.5"
 
 
 def test_no_direct_chat_completion_calls():
@@ -262,7 +279,9 @@ def test_ai_engine_endpoint_is_safe(monkeypatch):
     monkeypatch.setattr(main, "_require_user", lambda request, roles: ({"role": "hr"}, None))
     out = main.interview_ai_engine(object())
     assert out["interview"]["label"] == "GPT-6 Astra" and out["interview"]["reasoning"] is True
-    assert out["fast"]["id"] == "gpt-4o-mini"
+    assert out["fast"]["id"] == "gpt-5.5"
+    assert out["ask_ai"]["id"] == "gpt-5.5" and out["ocr"]["id"] == "gpt-5.5"
+    assert out["transcription"]["id"] == "gpt-transcribe"
     assert {"interview", "fast", "live_voice", "transcription", "voice", "ask_ai", "ocr",
             "show_to_candidates"} <= set(out)
     blob = json.dumps(out)
@@ -291,8 +310,8 @@ def test_record_models_and_summary():
 def test_prewarm_wait_follows_the_model(monkeypatch):
     monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-6-astra")
     assert main._prewarm_wait_sec() == 45.0
-    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-4o-mini")
-    assert main._prewarm_wait_sec() == 12.0
+    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-4o-mini")   # forced to Astra
+    assert main._prewarm_wait_sec() == 45.0
     monkeypatch.setenv("INTERVIEW_PREWARM_WAIT_SEC", "30")
     assert main._prewarm_wait_sec() == 30.0
 

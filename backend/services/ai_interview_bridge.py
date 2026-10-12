@@ -34,6 +34,7 @@ from models import (
 )
 from services.crm_common import get_app_setting, log_activity
 from services.notify import notify_role, notify_roles
+from services.template_archive import STAGE_WORDS, is_archiving_stage
 
 logger = logging.getLogger("karnex.crm.ai_bridge")
 
@@ -93,6 +94,52 @@ def _matching_job_template_id(opportunity: Opportunity | None) -> str:
     except Exception as exc:  # pragma: no cover — template reuse is optional
         logger.warning("Job template lookup failed: %s", exc)
     return ""
+
+
+def template_owner_conflict(tpl: dict, opp_id: str) -> str:
+    """PURE: the OTHER opportunity a template already belongs to, else "".
+
+    A job template carries ONE `opportunityId`. Linking it to a second request
+    used to overwrite that stamp silently, so two deals ran the same questions
+    and the report printed the other deal's role, opportunity and customer
+    (8 Oct 2026: a Bluetooth Developer candidate was interviewed on the "AGM -
+    R&D (ADAS & ARAS)" template of C-2026-00097)."""
+    owner = " ".join(str((tpl or {}).get("opportunityId") or "").split())
+    return owner if owner and owner.lower() != str(opp_id or "").strip().lower() else ""
+
+
+def linked_template_owner(opportunity: Opportunity | None, job_id: str) -> dict | None:
+    """The linked template when it belongs to ANOTHER opportunity, else None.
+
+    13 Oct 2026: the 8 Oct fix copies a template at link time, but a request
+    linked BEFORE it still points at the other deal's template — so every new AI
+    L1 for that position kept asking the other position's questions. This is
+    checked at schedule time. Returns {job_id, owner, title} or None (also None
+    when the template cannot be read — the scheduling path decides on its own)."""
+    if opportunity is None or not job_id:
+        return None
+    try:
+        from auth_db import get_job_template  # deferred — avoids cycles
+        tpl = get_job_template(_legacy_db_target(), str(job_id)) or {}
+    except Exception as exc:  # pragma: no cover — a read failure must not block scheduling
+        logger.warning("Template owner check failed for %s: %s", job_id, exc)
+        return None
+    owner = template_owner_conflict(dict(tpl), getattr(opportunity, "opp_id", ""))
+    if not owner:
+        return None
+    title = str(tpl.get("jobTitle") or tpl.get("job_title") or tpl.get("title") or job_id).strip()
+    return {"job_id": str(job_id), "owner": owner, "title": title}
+
+
+def other_opportunity_reason(opportunity: Opportunity | None, mismatch: dict) -> str:
+    """PURE: what TA / RMG read when the linked template is another deal's."""
+    opp = getattr(opportunity, "opp_id", "") or "this opportunity"
+    return (
+        f"The AI interview template linked to {opp} is \"{mismatch.get('title')}\", which belongs to "
+        f"{mismatch.get('owner')}. A candidate here would be asked the other position's questions. "
+        f"RMG: open Template Requests, choose {opp}'s request and use Change template to link "
+        f"{opp}'s own template — then schedule the AI L1."
+    )
 
 
 def _template_job_id_from_request(
@@ -191,6 +238,10 @@ def resolve_l1_template_job_id(
 
 
 TEMPLATE_NOT_READY_CODE = "AI_TEMPLATE_NOT_READY"
+#: The deal is closed / rejected / archived, so its template is in the Archive tab.
+TEMPLATE_ARCHIVED_CODE = "AI_TEMPLATE_ARCHIVED"
+#: The linked template belongs to ANOTHER opportunity (13 Oct 2026).
+TEMPLATE_OTHER_OPPORTUNITY_CODE = "AI_TEMPLATE_OTHER_OPPORTUNITY"
 
 
 def _open_template_request(
@@ -240,6 +291,29 @@ def l1_template_status(
             "status": status,
             "requested_at": tr.created_at.isoformat() if getattr(tr, "created_at", None) else None,
             "template_name": getattr(tr, "template_name", None),
+        }
+    stage = getattr(getattr(opportunity, "pipeline_stage", None), "value",
+                    getattr(opportunity, "pipeline_stage", None))
+    if job and opportunity is not None and is_archiving_stage(stage):
+        # 10 Oct 2026: a closed deal's template sits in the Archive tab; it comes
+        # back the moment Sales reopens the opportunity.
+        return {
+            "ready": False, "state": "archived", "code": TEMPLATE_ARCHIVED_CODE,
+            "template_job_id": job, "request": request,
+            "requirement_id": requirement.id if requirement is not None else None,
+            "opportunity_id": opportunity.id,
+            "reason": (f"Opportunity {opportunity.opp_id} is {STAGE_WORDS.get(stage, stage)}, so its interview "
+                       "template is archived. Reopen the opportunity to schedule AI interviews again."),
+        }
+    mismatch = linked_template_owner(opportunity, job) if job else None
+    if mismatch:
+        return {
+            "ready": False, "state": "other_opportunity", "code": TEMPLATE_OTHER_OPPORTUNITY_CODE,
+            "template_job_id": job, "request": request, "template_owner": mismatch["owner"],
+            "template_title": mismatch["title"],
+            "requirement_id": requirement.id if requirement is not None else None,
+            "opportunity_id": opportunity.id if opportunity is not None else None,
+            "reason": other_opportunity_reason(opportunity, mismatch),
         }
     if job:
         state, reason = "ready", ""
@@ -328,6 +402,14 @@ def schedule_l1_interview(
     opportunity = db.get(Opportunity, profile.opportunity_id)
     skills = _skills_for(db, requirement, profile.opportunity_id)
     job_id = resolve_l1_template_job_id(db, opportunity, requirement)
+    # The candidate's own booking (slot confirm) reaches here without the
+    # route-level check: never run another deal's questions (13 Oct 2026).
+    mismatch = linked_template_owner(opportunity, job_id) if job_id else None
+    if mismatch:
+        reason = other_opportunity_reason(opportunity, mismatch)
+        logger.error("AI L1 scheduling refused for profile %s: %s", getattr(profile, "id", "?"), reason)
+        return {"scheduled": False, "session_ref": None, "invite_url": "", "access_key": "",
+                "link_id": None, "job_id": job_id, "error": reason}
 
     cfg = {
         "job_id": job_id,

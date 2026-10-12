@@ -33,10 +33,11 @@ from services.candidate_comms import interview_link_message, notify_candidate
 from services.candidate_profiles import budget_fit
 from services.candidate_status import (
     ARCHIVE_BUCKET, LIVE_BUCKET, applied_buckets, parse_phases, parse_status_keys,
-    profile_ids_in_phase, profile_ids_with_status, status_counts,
+    phase_access_clause, profile_ids_in_phase, profile_ids_with_status, status_counts,
 )
 from services.crm_common import log_activity, paginate, save_upload_hashed
 from services.requirements import get_requirement_or_404
+from services.stage_access import allowed_stages as stages_for_login
 from services.resumes import (
     enrich_resumes_with_ai, ensure_resume_for_profile, run_ats_scan, serialize_resume,
 )
@@ -1032,6 +1033,20 @@ def list_resumes(
     stmt = stmt.where(or_(Resume.candidate_id.is_(None), Resume.id.in_(
         _latest_resume_ids(req.id, dismissed))))
     pstmt = select(CandidateProfile).where(CandidateProfile.opportunity_id == req.opportunity_id)
+    # Role-wise candidate stages (13 Oct 2026, Access Control ▸ Roles): this
+    # login sees only the candidacies in its roles' stages — the rows, the
+    # chips' counts and the Archive tab alike. A resume with no candidacy on
+    # this opportunity yet reads as Sourcing.
+    seen_stages = stages_for_login(db, user)
+    stage_clause = phase_access_clause(db, pstmt, seen_stages)
+    if stage_clause is not None:
+        pstmt = pstmt.where(stage_clause)
+        opp_cids = select(CandidateProfile.candidate_id).where(
+            CandidateProfile.opportunity_id == req.opportunity_id)
+        keep = Resume.candidate_id.in_(opp_cids.where(stage_clause))
+        if "sourcing" in seen_stages:
+            keep = or_(keep, Resume.candidate_id.is_(None), ~Resume.candidate_id.in_(opp_cids))
+        stmt = stmt.where(keep)
     # Live / Archive (30 Sep 2026): a rejected or withdrawn candidacy leaves
     # Applied Candidates for the Archive tab. Resolved on the opportunity's
     # profiles once; resume rows follow their candidate. A resume with no
@@ -1121,6 +1136,8 @@ def list_resumes(
         or_(CandidateProfile.is_hidden.is_(None), CandidateProfile.is_hidden.is_(False)))
     if applied_by:
         counts_stmt = counts_stmt.where(CandidateProfile.ta_owner_name == applied_by.strip())
+    if stage_clause is not None:
+        counts_stmt = counts_stmt.where(stage_clause)
     meta["status_counts"] = status_counts(db, counts_stmt)
     meta["bucket"] = bucket
     data = enrich_resumes_with_ai(db, items)

@@ -36,6 +36,13 @@ import mimetypes
 # /site.webmanifest (Karnex Orbit icons) — Python's table has no entry for it on
 # every platform, and a manifest served as octet-stream is ignored by browsers.
 mimetypes.add_type("application/manifest+json", ".webmanifest")
+# The candidate page's face / eye monitor (13 Oct 2026) is self-hosted under
+# /vendor/mediapipe: an ES module, a WebAssembly binary and a model file. A
+# Windows box's registry may not know these, and a module served with the
+# wrong type is refused by the browser.
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("application/wasm", ".wasm")
+mimetypes.add_type("application/octet-stream", ".task")
 from openai import OpenAIError
 from pypdf import PdfReader
 from starlette.middleware.gzip import GZipMiddleware
@@ -109,6 +116,9 @@ from auth_db import (
     interview_ids_by_invite,
     get_hr_candidate_decision,
     get_schedule_by_token,
+    get_live_columns,
+    set_live_control,
+    set_live_reply,
     increment_schedule_login_attempts,
     init_auth_db,
     list_recoverable_interview_progress,
@@ -160,13 +170,16 @@ from candidate.service import next_question_payload
 from ats import AtsWeights, ats_score, ats_score_llm, list_job_configs
 from services.interview.question_service import generate_mode_aware_questions
 from services.interview import conversation as interview_conversation
-from services import ai_models
+from services.interview import skill_bank as interview_skill_bank
+from services.interview import skill_bank_fill as interview_skill_bank_fill
+from services import ai_models, template_archive
 from services.report_links import ai_report_link
 from utils.interview_limits import (
     MAX_COUNT_MODE_QUESTIONS,
     clamp_count_mode_questions,
     pool_questions_for_timing,
     resolve_template_num_q,
+    template_timing,
     trim_questions_for_count_mode,
 )
 from utils.interview_mode_mapper import normalize_interview_mode, to_display_label
@@ -952,12 +965,26 @@ def _resolve_interview_model(cfg: object) -> str:
     """The model a NEW interview session runs on (9 Oct 2026: one switch).
 
     The server decides — `ai_models.interview_model()` (Settings ▸ AI engine →
-    `INTERVIEW_OPENAI_MODEL` → gpt-4o-mini). A model stored in a schedule's
+    `INTERVIEW_OPENAI_MODEL` → GPT-6 Astra). A model stored in a schedule's
     config counts only when the config also says `"model_locked": true`; no UI
     sets that today (schedules used to store the HR form's hard-wired
     "gpt-4o-mini", which kept HR-run and older invites off the configured
     model). A session keeps the model it started with (`meta["model"]`)."""
     return ai_models.resolve_session_model(cfg if isinstance(cfg, dict) else {})
+
+
+def _effective_time_limit(timing_mode: object, raw_limit: object) -> int:
+    """The interview's clock (12 Oct 2026, user rule: "Question count OR Time
+    limit — it ends on the one the template chose"). A count-mode template
+    carries a leftover time value from the form (the field is hidden in that
+    mode) — it must not cut the interview short or show on the rules page, so
+    count mode has NO clock; time mode keeps its limit (≤ 6 h)."""
+    if str(timing_mode or "").strip().lower() != "time":
+        return 0
+    try:
+        return max(0, min(int(raw_limit or 0), 6 * 60 * 60))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _pack_invite_config_into_notes(notes: str, cfg: dict) -> str:
@@ -1528,18 +1555,21 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         env_num=os.getenv("INTERVIEW_NUM_QUESTIONS"),
         skills_fallback=len(selected_skills) or 5,
     )
-    timing_mode = str(invite_cfg.get("timing_mode") or "count").strip().lower() or "count"
-    if timing_mode not in {"count", "time"}:
-        timing_mode = "count"
-    time_limit_sec = max(0, min(int(invite_cfg.get("time_limit_sec") or 0), 6 * 60 * 60))
+    # The TEMPLATE decides how the interview ends (13 Oct 2026); the schedule's
+    # copy of the scheduling form is only the fallback (utils.interview_limits).
+    timing_mode, raw_time_limit = template_timing(invite_cfg, job)
+    time_limit_sec = _effective_time_limit(timing_mode, raw_time_limit)
     pool_q = pool_questions_for_timing(num_q, timing_mode, time_limit_sec=time_limit_sec)
-    mic_always_on = bool(invite_cfg.get("mic_always_on", False))
-    if "enable_transcript_input" in invite_cfg:
+    tpl_job = job or {}
+    mic_always_on = (bool(tpl_job.get("micAlwaysOn")) if "micAlwaysOn" in tpl_job
+                     else bool(invite_cfg.get("mic_always_on", False)))
+    if "enableTranscriptInput" in tpl_job or "showSpokenText" in tpl_job:
+        # Template first, like the timing (13 Oct 2026).
+        show_spoken_text = bool(tpl_job.get("enableTranscriptInput") or tpl_job.get("showSpokenText"))
+    elif "enable_transcript_input" in invite_cfg:
         show_spoken_text = bool(invite_cfg.get("enable_transcript_input"))
-    elif "show_spoken_text" in invite_cfg:
-        show_spoken_text = bool(invite_cfg.get("show_spoken_text"))
     else:
-        show_spoken_text = bool((job or {}).get("enableTranscriptInput", (job or {}).get("showSpokenText", False)))
+        show_spoken_text = bool(invite_cfg.get("show_spoken_text", False))
     coach_hints_text()
 
     exp_min = int((job or {}).get("expMin") or 0)
@@ -1582,10 +1612,27 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
 
     qt_inv = _coerce_question_type((job or {}).get("questionType"))
     manual_list_inv = _normalized_manual_questions_for_job((job or {}).get("manualQuestions"))
-    is_manual_invite = bool(job) and qt_inv == "manual"
+    # Skill-wise question bank (10 Oct 2026): the template's own questions, per
+    # skill, for the skills the candidate ticks. No model writes questions.
+    skill_cfg = interview_skill_bank.config_of(weights) if job else None
+    is_manual_invite = bool(job) and qt_inv == "manual" and not skill_cfg
+    skill_pick: dict | None = None
+    skill_specs: list[dict] = []
 
     used_saved_preview = False
-    if is_manual_invite:
+    if skill_cfg:
+        skill_pick = interview_skill_bank.pick_options(skill_cfg, req)
+        picked_default = interview_skill_bank.default_pick(skill_pick)
+        skill_specs = interview_skill_bank.build_plan(skill_cfg, picked_default, question_seed)
+        if not skill_specs:
+            return {"error": "This interview template's question bank has no questions for its skills. "
+                             "RMG / GM must add questions in the template before the interview can start."}
+        questions = interview_skill_bank.session_questions(skill_specs)
+        pool_q = num_q = len(questions)
+        selected_skills = picked_default
+        skill_pick["picked"] = picked_default
+        used_saved_preview = True
+    elif is_manual_invite:
         if not manual_list_inv:
             return {
                 "error": (
@@ -1606,11 +1653,8 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
                 str((job or {}).get("jobId") or ""),
                 str(schedule.get("scheduled_at_local") or ""),
             )
-        job_timing = str((job or {}).get("timingMode") or (job or {}).get("timing_mode") or timing_mode or "count").strip().lower()
-        if job_timing == "count":
-            ask_n = clamp_count_mode_questions(
-                invite_cfg.get("num_q") or (job or {}).get("numQ") or (job or {}).get("num_q") or num_q or 5
-            )
+        if timing_mode == "count":
+            ask_n = clamp_count_mode_questions(num_q or 5)
             if len(questions) > ask_n:
                 questions = questions[:ask_n]
         pool_q = len(questions)
@@ -1699,10 +1743,13 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
     if not questions:
         return {"error": "Could not generate interview questions. Set OPENAI_API_KEY and configure a job (HR → ATS / job config), or set INTERVIEW_SAFE_MODE=false with a valid key."}
 
-    questions = prepare_unique_question_sequence(questions, seed=question_seed, limit=pool_q)
     from utils.question_uniqueness import dedupe_question_list_semantic, record_generated_questions_batch
 
-    questions = dedupe_question_list_semantic(questions)
+    if not skill_cfg:
+        # A skill-bank plan is already ordered (spoken · pseudo-code · coding ·
+        # spoken) and each string carries a spec by position — never shuffle it.
+        questions = prepare_unique_question_sequence(questions, seed=question_seed, limit=pool_q)
+        questions = dedupe_question_list_semantic(questions)
     if not questions:
         return {"error": "Could not generate unique interview questions for this session."}
 
@@ -1737,9 +1784,12 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             "num_q": num_q,
             "model": selected_model,
             "generation_mode": (
+                interview_skill_bank.QUESTION_SOURCE if skill_cfg else
                 "manual" if is_manual_invite else ("ai" if has_ai and not safe_mode_on else "fallback")
             ),
-            "question_source": "manual" if is_manual_invite else "dynamic",
+            "question_source": (
+                interview_skill_bank.QUESTION_SOURCE if skill_cfg else "manual" if is_manual_invite else "dynamic"
+            ),
             "safe_mode": safe_mode_on,
             "candidate_profile": candidate_profile,
             "candidate_experience": invite_experience,
@@ -1752,7 +1802,7 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             "intelligence_target_role": str(weights.get("intelligenceTargetRole") or "").strip(),
             "intelligence_seniority": seniority_w,
             "intelligence_tech_stack": str(weights.get("intelligenceTechStack") or "").strip(),
-            "followup_mode": followup_mode_on,
+            "followup_mode": followup_mode_on and not skill_cfg,
             "interview_mode": _interview_mode_from_job(job),
             "interview_mode_label": to_display_label(_interview_mode_from_job(job)),
             "timing_mode": timing_mode,
@@ -1764,7 +1814,8 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             if str(difficulty).strip().lower() in ("easy", "medium", "hard")
             else "medium",
             "followups_added": 0,
-            "max_followups": 0 if (is_manual_invite or not followup_mode_on) else max(0, pool_q - len(selected_skills)),
+            "max_followups": (0 if (is_manual_invite or skill_cfg or not followup_mode_on)
+                              else max(0, pool_q - len(selected_skills))),
             "job_id": str((job or {}).get("jobId") or ""),
             "job_title": job_title,
             "invite_token": invite_token,
@@ -1774,7 +1825,7 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
             "pool_generated": len(questions),
             "warmup_indices": warmup_indices,
             "template_prompt": effective_prompt,
-            "adaptive_next_question": bool((weights or {}).get("adaptiveNextQuestion", False)),
+            "adaptive_next_question": bool((weights or {}).get("adaptiveNextQuestion", False)) and not skill_cfg,
         },
         "questions": questions,
         "answers": [],
@@ -1788,10 +1839,18 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         interview_conversation.stamp_conversation_settings(
             sessions[skey]["meta"], weights, customer_name=str((job or {}).get("customerName") or ""))
         stamp_introduction_question_types(sessions[skey]["meta"], warmup_indices)
+        if skill_cfg:
+            _stamp_skill_bank(sessions[skey]["meta"], skill_pick, skill_specs, offset=len(warmup_indices or []))
+            # No picker but the AI must write spoken questions (12 Oct 2026): the
+            # page confirms the default pick at once so the top-up happens
+            # before the clock starts — otherwise the interview would be short.
+            sessions[skey]["meta"]["skill_bank"]["fill_needed"] = bool(
+                interview_skill_bank.missing_normals(skill_cfg, list(skill_pick.get("picked") or [])))
         record_generated_questions_batch(
             sessions[skey],
             questions,
-            source="manual" if is_manual_invite else "dynamic",
+            source=(interview_skill_bank.QUESTION_SOURCE if skill_cfg
+                    else "manual" if is_manual_invite else "dynamic"),
         )
         _persist_interview_progress(sessions[skey], status="started")
         latency_ms = int((time.time() - bootstrap_started) * 1000)
@@ -1942,6 +2001,20 @@ def _enforce_crm_roles(request: Request, *allowed: str, tab: str | None = None, 
     except Exception:
         return
     enforce_roles(request, *allowed, tab=tab, mode=mode)
+
+
+def _enforce_template_author(request: Request) -> None:
+    """Who may create / edit / delete an interview template and its questions
+    (11 Oct 2026, user rule: "RMG & GM create templates and add questions; HR
+    does not"). The Templates tab at Edit as before (RMG by role, Admin/CEO, or a
+    template granting it) — and, on a refusal only, whoever screens as RMG (the
+    GM custom role, whose Interview Platform grant is view-only)."""
+    try:
+        _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")
+    except HTTPException as exc:
+        if exc.status_code == 403 and _screens_as_rmg_for_request(request):
+            return
+        raise
 
 
 def _parse_cors_origins() -> list[str]:
@@ -2111,6 +2184,20 @@ def _evaluate_and_store_report(session: dict, *, evaluation_model: str | None = 
     # May 2026: score only answered turns — not the prefetched question pool.
     q_answered, a_answered, scope_meta = align_qa_to_answered_turns(full_q, full_a)
     q_eval, a_eval, _scr_meta = slice_qa_for_final_evaluation(q_answered, a_answered)
+    # Skill-wise question bank (10 Oct 2026): each answered turn's spec (kind,
+    # skill, HR's expected answer) and the option clicked on a pseudo-code one.
+    bank_specs = bank_choices = None
+    if interview_skill_bank.is_skill_bank(meta):
+        bank_specs = interview_skill_bank.specs_for_evaluation(meta, len(raw_q), len(q_answered))
+        bank_choices = interview_skill_bank.choices_for_evaluation(meta, len(raw_q), len(q_answered))
+        # Communication is judged on what was SAID — never on typed code or a click.
+        spoken = [i for i, sp in enumerate(bank_specs)
+                  if not (sp and sp.get("kind") in interview_skill_bank.TYPED_KINDS)]
+        comm_q = [q_answered[i] for i in spoken]
+        comm_a = [a_answered[i] for i in spoken]
+        comm_q, comm_a, _ = slice_qa_for_final_evaluation(comm_q, comm_a)
+    else:
+        comm_q, comm_a = q_eval, a_eval
     try:
         result = evaluate_with_model_skill_based(
             q_eval, a_eval, jd_skills=jd_skills, model=model
@@ -2135,9 +2222,9 @@ def _evaluate_and_store_report(session: dict, *, evaluation_model: str | None = 
     # some other view could surface later.
     assess_communication = bool(meta.get("communication_required", True))
     result["communication_required"] = assess_communication
-    if assess_communication:
+    if assess_communication and comm_q:
         result["communication_evaluation"] = evaluate_communication_skills(
-            q_eval, a_eval, model=model
+            comm_q, comm_a, model=model
         )
     else:
         result["communication_evaluation"] = {}
@@ -2154,8 +2241,17 @@ def _evaluate_and_store_report(session: dict, *, evaluation_model: str | None = 
         model=model,
         session_meta=None,
         assess_communication=assess_communication,
+        question_specs=bank_specs,
+        choices=bank_choices,
+        picked_skills=list(jd_skills or []) if bank_specs else None,
     )
     result["evaluation_scope"] = scope_meta
+    if bank_specs:
+        result["skill_selection"] = {
+            "picked": list((meta.get("skill_bank") or {}).get("picked") or jd_skills or []),
+            "mandatory": list((meta.get("skill_bank") or {}).get("mandatory") or []),
+            "confirmed_by_candidate": bool((meta.get("skill_bank") or {}).get("pick_confirmed")),
+        }
     result["evaluation_model"] = model
     if meta.get("fast_bootstrap"):
         # Login fell back to generic questions (the prewarm was not ready).
@@ -2909,9 +3005,15 @@ async def _security_headers(request: Request, call_next):
     response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        # 'wasm-unsafe-eval' lets WebAssembly compile (the face / eye monitor and
+        # the Silero voice detector both run on it — without it the browser
+        # refused them silently and no second face was ever detected, 13 Oct
+        # 2026). storage.googleapis.com is the face model's fallback location
+        # when the self-hosted copy under /vendor/mediapipe is missing.
+        "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; "
         "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; "
-        "connect-src 'self' https://api.openai.com https://cdn.jsdelivr.net; frame-ancestors 'self'",
+        "connect-src 'self' https://api.openai.com https://cdn.jsdelivr.net https://storage.googleapis.com; "
+        "frame-ancestors 'self'",
     )
     if request.url.scheme == "https" or str(os.getenv("HSTS_ENABLED", "")).strip().lower() in {
         "1",
@@ -3121,7 +3223,7 @@ async def setup(
     timing_mode_val = str(timing_mode).strip().lower() or "count"
     if timing_mode_val not in {"count", "time"}:
         timing_mode_val = "count"
-    time_limit_sec_val = max(0, min(int(time_limit_sec or 0), 6 * 60 * 60))
+    time_limit_sec_val = _effective_time_limit(timing_mode_val, time_limit_sec)
     mic_always_on_val = str(mic_always_on).strip().lower() in {"1", "true", "yes", "on"}
     transcript_toggle_raw = enable_transcript_input if str(enable_transcript_input).strip() else show_spoken_text
     show_spoken_text_val = str(transcript_toggle_raw).strip().lower() in {"1", "true", "yes", "on"}
@@ -3150,6 +3252,11 @@ async def setup(
 
     job_id_setup = str(jobId or "").strip()
     job_cfg_row = get_job_template(AUTH_DB_TARGET, job_id_setup) if job_id_setup else None
+    if job_cfg_row:
+        # Same rule as the invite path: the template decides how it ends.
+        timing_mode_val, raw_setup_limit = template_timing(
+            {"timing_mode": timing_mode_val, "time_limit_sec": time_limit_sec}, job_cfg_row)
+        time_limit_sec_val = _effective_time_limit(timing_mode_val, raw_setup_limit)
     setup_interview_mode = normalize_interview_mode(
         (interview_mode or "").strip()
         or (job_cfg_row or {}).get("interviewMode")
@@ -3549,8 +3656,18 @@ def next_question(request: Request):
             )
     if not s:
         return {"error": "No active session. Run setup first."}
+    # Serialised with /answer and /submit (11 Oct 2026): a double click or a
+    # second tab used to read and move the same session at the same time.
+    with session_lock(sk):
+        return _next_question_locked(s)
+
+
+def _next_question_locked(s: dict) -> dict:
     if s.get("finalizing"):
         return {"message": "Interview completed"}
+    paused = _live_pause_payload(s)
+    if paused is not None:
+        return paused
     set_interview_context(**_interview_log_context(s))
     meta = s.get("meta", {}) or {}
     _persist_interview_progress(s, status=_progress_status_for_session(s))
@@ -3611,6 +3728,185 @@ def _live_session_for_candidate(request: Request):
         return None, JSONResponse({"error": "No active session.", "code": "no_session"}, status_code=404)
     set_interview_context(**_interview_log_context(s))
     return s, None
+
+
+def _stamp_skill_bank(meta: dict, pick: dict | None, specs: list[dict], *, offset: int) -> None:
+    """A skill-bank session's meta (10 Oct 2026): the per-question specs by
+    index, the skill offer for the picker, the picked skills as `jd_skills`."""
+    interview_skill_bank.stamp_specs(meta, specs, offset)
+    pick = pick or {}
+    meta["skill_bank"] = {
+        "offered": list(pick.get("offered") or []),
+        "mandatory": list(pick.get("mandatory") or []),
+        "min": int(pick.get("min") or 0),
+        "max": int(pick.get("max") or 0),
+        "picked": list(pick.get("picked") or []),
+        "pick_confirmed": bool(pick.get("pick_confirmed")),
+        "plan": _skill_plan_counts(specs),
+    }
+    meta["jd_skills"] = list(pick.get("picked") or [])
+    meta["num_q"] = len(specs)
+    # The live voice call cannot show code or options — these interviews use
+    # the standard voice whatever the template says.
+    conv_cfg = meta.get(interview_conversation.META_KEY)
+    if isinstance(conv_cfg, dict) and conv_cfg.get("voice_mode") == interview_conversation.VOICE_LIVE:
+        conv_cfg["voice_mode"] = interview_conversation.VOICE_STANDARD
+
+
+def _skill_plan_counts(specs: list[dict]) -> dict:
+    out = {k: 0 for k in interview_skill_bank.KINDS}
+    for spec in specs or []:
+        k = str((spec or {}).get("kind") or interview_skill_bank.KIND_NORMAL)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _skill_pick_payload(sess: dict | None) -> dict | None:
+    """What invite login hands the skill picker, while the pick is still open
+    (nothing asked yet); None for every other interview."""
+    if not isinstance(sess, dict):
+        return None
+    meta = sess.get("meta", {}) or {}
+    sb = meta.get("skill_bank")
+    if not interview_skill_bank.is_skill_bank(meta) or not isinstance(sb, dict):
+        return None
+    if sb.get("pick_confirmed") or int(sess.get("current") or 0) > 0 or meta.get("interview_started_epoch"):
+        return None
+    offered = {str(x).lower() for x in sb.get("offered") or []}
+    if offered and offered <= {str(x).lower() for x in sb.get("mandatory") or []}:
+        # Nothing to choose (11 Oct 2026): every skill is asked — no picker.
+        return None
+    return {
+        "offered": list(sb.get("offered") or []),
+        "mandatory": list(sb.get("mandatory") or []),
+        "min": int(sb.get("min") or 0),
+        "max": int(sb.get("max") or 0),
+        "picked": list(sb.get("picked") or []),
+        "plan": dict(sb.get("plan") or {}),
+    }
+
+
+def _skill_autofill_payload(sess: dict | None) -> dict | None:
+    """No picker, but the template asks the AI for spoken questions the bank
+    does not hold (12 Oct 2026): the page posts the default pick to
+    /candidate/skill-selection silently, which writes them before question 1."""
+    if not isinstance(sess, dict) or _skill_pick_payload(sess) is not None:
+        return None
+    meta = sess.get("meta", {}) or {}
+    sb = meta.get("skill_bank")
+    if not interview_skill_bank.is_skill_bank(meta) or not isinstance(sb, dict):
+        return None
+    if sb.get("pick_confirmed") or not sb.get("fill_needed"):
+        return None
+    if int(sess.get("current") or 0) > 0 or meta.get("interview_started_epoch"):
+        return None
+    return {"skills": list(sb.get("picked") or [])}
+
+
+def _practice_payload(sess: dict | None) -> dict | None:
+    """A fresh interview gets the practice screen (10 Oct 2026): which answer
+    screens it will meet. Nothing on a resumed interview."""
+    if not isinstance(sess, dict):
+        return None
+    meta = sess.get("meta", {}) or {}
+    if int(sess.get("current") or 0) > 0 or meta.get("interview_started_epoch"):
+        return None
+    plan = (meta.get("skill_bank") or {}).get("plan") if interview_skill_bank.is_skill_bank(meta) else None
+    kinds = ["normal"]
+    if isinstance(plan, dict):
+        kinds += [k for k in (interview_skill_bank.KIND_PSEUDO, interview_skill_bank.KIND_CODING) if int(plan.get(k) or 0) > 0]
+    return {"kinds": kinds}
+
+
+@app.post("/candidate/skill-selection")
+@_rl.limit("10/minute")
+async def candidate_skill_selection(request: Request):
+    """The candidate's "skills I have worked on" (10 Oct 2026). Rebuilds the
+    question plan from the template's bank for exactly those skills (the JD's
+    mandatory ones are always in). Allowed only before the first question — the
+    interview clock starts at the first /next, so choosing costs no time."""
+    s, err = _live_session_for_candidate(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw_skills = body.get("skills") if isinstance(body, dict) else None
+    if not isinstance(raw_skills, list):
+        return JSONResponse({"error": "Send the skills you have worked on.", "code": "no_skills"}, status_code=400)
+    sk = _session_key_from_session(s)
+
+    def _gate_and_pick():
+        meta = s.setdefault("meta", {})
+        sb = meta.get("skill_bank")
+        if not interview_skill_bank.is_skill_bank(meta) or not isinstance(sb, dict):
+            return None, None, None, JSONResponse({"error": "This interview has no skill selection.",
+                                                   "code": "not_skill_bank"}, status_code=409)
+        if int(s.get("current") or 0) > 0 or s.get("answers") or meta.get("interview_started_epoch"):
+            return None, None, None, JSONResponse({"error": "The interview has already started.",
+                                                   "code": "started"}, status_code=409)
+        job = get_job_template(AUTH_DB_TARGET, str(meta.get("job_id") or "")) if meta.get("job_id") else None
+        cfg = interview_skill_bank.config_of((job or {}).get("weights") if job else None)
+        if not cfg:
+            return None, None, None, JSONResponse({"error": "The interview template's question bank is no longer "
+                                                            "available. Please contact the recruiter.",
+                                                   "code": "bank_missing"}, status_code=409)
+        options = {k: sb.get(k) for k in ("offered", "mandatory", "min", "max")}
+        try:
+            picked = interview_skill_bank.validate_pick(raw_skills, options)
+        except interview_skill_bank.SkillBankError as exc:
+            return None, None, None, JSONResponse({"error": str(exc), "code": "invalid_pick"}, status_code=400)
+        return cfg, options, picked, None
+
+    with session_lock(sk):
+        cfg, options, picked, refusal = _gate_and_pick()
+        if refusal is not None:
+            return refusal
+        meta = s.setdefault("meta", {})
+        cached = meta.get("skill_bank_fill") if isinstance(meta.get("skill_bank_fill"), dict) else {}
+        needs = [(skill, n) for skill, n in interview_skill_bank.missing_normals(cfg, picked)
+                 if len(cached.get(interview_skill_bank.skill_key(skill)) or []) < n]
+        avoid = [q["text"] for q in cfg.get("questions") or [] if q.get("kind") == interview_skill_bank.KIND_NORMAL]
+        fill_meta = {"job_title": meta.get("job_title"), "model": meta.get("model"),
+                     "safe_mode": meta.get("safe_mode")}
+
+    # 11 Oct 2026: a picked skill short of spoken questions gets medium-level
+    # AI questions — ONE bounded model call, made OUTSIDE the session lock.
+    fresh: dict = {}
+    if needs:
+        fresh = await run_in_threadpool(interview_skill_bank_fill.generate_fill, fill_meta, needs, avoid=avoid)
+
+    with session_lock(sk):
+        cfg, options, picked, refusal = _gate_and_pick()  # re-checked: nothing may have started meanwhile
+        if refusal is not None:
+            return refusal
+        meta = s.setdefault("meta", {})
+        cache = dict(meta.get("skill_bank_fill") or {}) if isinstance(meta.get("skill_bank_fill"), dict) else {}
+        for key, items in (fresh or {}).items():
+            cache[key] = list(cache.get(key) or []) + list(items)
+        if cache:
+            meta["skill_bank_fill"] = cache
+        specs = interview_skill_bank.build_plan(cfg, picked, str(meta.get("question_seed") or ""),
+                                                extra_normals=cache)
+        if not specs:
+            return JSONResponse({"error": "No questions are set for these skills. Please pick others.",
+                                 "code": "empty_plan"}, status_code=400)
+        warm = [int(i) for i in (meta.get("warmup_indices") or []) if str(i).lstrip("-").isdigit()]
+        questions = interview_skill_bank.session_questions(specs)
+        warm_texts = [s["questions"][i] for i in sorted(warm) if i < len(s.get("questions") or [])]
+        s["questions"] = warm_texts + questions
+        meta["pool_generated"] = len(s["questions"])
+        _stamp_skill_bank(meta, {**options, "picked": picked, "pick_confirmed": True}, specs, offset=len(warm_texts))
+        ai_written = sum(1 for sp in specs if sp.get("source") == "ai")
+        meta["skill_bank"]["ai_filled"] = ai_written
+        _persist_interview_progress(s, status=_progress_status_for_session(s))
+        logger.info("interview.skill_bank.picked",
+                    extra={"event": "interview.skill_bank.picked", "skills": picked,
+                           "questions": len(specs), "plan": meta["skill_bank"]["plan"],
+                           "ai_filled": ai_written})
+        return {"status": "ok", "skills": picked, "question_count": len(specs),
+                "plan": meta["skill_bank"]["plan"], "ai_filled": ai_written}
 
 
 @app.post("/candidate/conversation/clarify")
@@ -3778,7 +4074,7 @@ async def transcribe_candidate_audio(
     if len(raw) < 400:
         return _speech_error(400, "too_short",
                              "Recording was too short. Speak a bit longer, then stop the mic.")
-    model_name = (os.getenv("OPENAI_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
+    model_name = ai_models.transcribe_model()
     seconds = _seconds_from_ms(duration_ms)
     # The call is logged + priced inside `transcribe_speech_bytes` (it sees the
     # response's audio-token usage); this frame only supplies the interview it
@@ -4220,8 +4516,8 @@ def _pool_sync_timeout_s() -> float:
 def _time_pool_need(session: dict) -> int:
     """How many questions a timed interview's rolling pool should get now (0 = none)."""
     meta = session.get("meta", {})
-    if str(meta.get("question_source") or "") == "manual":
-        return 0
+    if str(meta.get("question_source") or "") in {"manual", interview_skill_bank.QUESTION_SOURCE}:
+        return 0  # a fixed plan — the template's own questions, never topped up by a model
     if str(meta.get("timing_mode") or "") != "time":
         return 0
     if not openai_key_configured("question") or meta.get("safe_mode", True):
@@ -4401,6 +4697,8 @@ def answer(
     skip_reason: str = Form(""),
     auto_advance_meta: str = Form(""),
     turn: str = Form(""),
+    choice: str = Form(""),
+    code_language: str = Form(""),
 ):
     payload, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
@@ -4431,6 +4729,11 @@ def answer(
         set_interview_context(**_interview_log_context(s))
         if s.get("finalizing") or s.get("completed"):
             return {"error": "Interview already completed."}
+        # A recruiter paused the interview (11 Oct 2026): nothing is recorded
+        # until they resume — the page re-asks the question then.
+        live_paused = _live_pause_payload(s, apply_questions=False)
+        if live_paused is not None:
+            return JSONResponse(live_paused, status_code=409)
         if int(s.get("current", 0) or 0) >= len(s.get("questions") or []):
             s["completed"] = True
             _persist_interview_progress(s, status="completed")
@@ -4475,6 +4778,18 @@ def answer(
         if action_clean not in {"send", "skip"}:
             action_clean = "send"
         ans_clean = str(ans or "").strip()
+        # Skill-wise question bank (10 Oct 2026): a pseudo-code answer is the
+        # OPTION the candidate clicked — the stored text is built here from the
+        # server's own options, never taken from the browser.
+        _sb_meta = s.get("meta") or {}
+        typed_spec = (interview_skill_bank.spec_for(_sb_meta, turn_index)
+                      if interview_skill_bank.is_skill_bank(_sb_meta) else None)
+        choice_idx: int | None = None
+        if typed_spec and typed_spec.get("kind") == interview_skill_bank.KIND_PSEUDO and action_clean == "send":
+            try:
+                choice_idx, ans_clean = interview_skill_bank.choice_answer(typed_spec, choice)
+            except interview_skill_bank.SkillBankError as exc:
+                return JSONResponse({"error": str(exc), "code": "invalid_choice"}, status_code=400)
         if action_clean == "skip":
             if not ans_clean:
                 ans_clean = "skip"
@@ -4603,7 +4918,17 @@ def answer(
         )
         remember_asked_question(s, previous_question)
         meta = s.get("meta", {})
-        is_manual_session = str(meta.get("question_source") or "") == "manual"
+        is_skill_bank_session = interview_skill_bank.is_skill_bank(meta)
+        if choice_idx is not None:
+            interview_skill_bank.record_choice(meta, turn_index, choice_idx)
+        # Coding (12 Oct 2026): the language the candidate chose in the editor —
+        # the AI judges the code in it, and the report shows it.
+        if typed_spec and typed_spec.get("kind") == interview_skill_bank.KIND_CODING:
+            interview_skill_bank.record_language(
+                meta, turn_index, interview_skill_bank.chosen_language(typed_spec, code_language))
+        # A fixed plan (manual list, or the skill-wise bank) is never rewritten
+        # mid-interview by the skill-gap swap or the adaptive follow-up.
+        is_manual_session = str(meta.get("question_source") or "") == "manual" or is_skill_bank_session
         is_warmup_turn = is_warmup_index(meta, s["current"])
         if not is_warmup_turn and not is_skipped_answer:
             append_interview_turn(
@@ -4612,7 +4937,11 @@ def answer(
                 answer=ans_clean,
                 skills=meta.get("jd_skills", []),
             )
-            _schedule_turn_evaluation(s, previous_question, ans_clean)
+            # The skill-wise bank is scored once, in the final report, against
+            # HR's own answers — the per-answer model call (used only to steer
+            # generated questions) would be paid for nothing.
+            if not is_skill_bank_session:
+                _schedule_turn_evaluation(s, previous_question, ans_clean)
         s["current"] += 1
         idx_next = s["current"]
         if s.get("finalizing"):
@@ -4643,7 +4972,10 @@ def answer(
         # INSERTED as the next question (the plan is never cut) and the spoken
         # lead-in for the next question is prepared. Off → nothing runs here.
         conv_followup_inserted = False
-        if interview_conversation.conversation_of(meta)["enabled"] and not s.get("finalizing"):
+        # Follow-ups and lead-ins belong to SPOKEN turns; a pseudo-code or coding
+        # answer gets neither (the next screen is read, not heard).
+        if (interview_conversation.conversation_of(meta)["enabled"] and not s.get("finalizing")
+                and not (typed_spec and typed_spec.get("kind") in interview_skill_bank.TYPED_KINDS)):
             _conv_t0 = time.perf_counter()
             conv_followup_inserted = _apply_conversation_turn(
                 s,
@@ -4766,10 +5098,15 @@ def answer(
         # time still on the clock (16 Sep 2026).
         if not s.get("finalizing"):
             answer_timing["pool_topup"] = _expand_time_mode_pool(s)
+        # The recruiter's queued question goes in at this turn boundary; a
+        # pause that landed while this answer was saved is honoured below.
+        live_after = None if s.get("finalizing") else _live_pause_payload(s)
         _persist_interview_progress(s, status="in_progress")
 
         next_payload = None
-        if not s.get("finalizing"):
+        if live_after is not None:
+            next_payload = live_after
+        elif not s.get("finalizing"):
             next_payload = next_question_payload(s)
             if meta.get("pending_tts_invalidate"):
                 next_payload["tts_invalidate"] = True
@@ -4973,50 +5310,54 @@ def submit(
             # burn every attempt on this non-retryable condition.
             return JSONResponse({"error": "No active session."}, status_code=404)
         sessions[sk] = s
-    if s.get("finalizing") and s.get("report_result"):
-        existing_id = str((s.get("meta", {}) or {}).get("interview_id") or "")
-        return {"status": "submitted", "report_ready": True, "interview_id": existing_id, "reused_report": True}
-    s["finalizing"] = True
-    time_expired_flag = str(time_expired or "").strip().lower() in ("1", "true", "yes", "on")
-    finalize_via_clean = str(finalize_via or "").strip().lower()
-    auto_saved_flag = str(boundary_auto_saved or "").strip().lower() in ("1", "true", "yes", "on")
-    pending_appended = _append_pending_answer_on_submit(s, pending_answer)
-    _record_boundary_question_meta(
-        s,
-        time_expired=time_expired_flag,
-        finalize_via=finalize_via_clean,
-        auto_saved=auto_saved_flag,
-        pending_appended=pending_appended,
-    )
-    meta = s.get("meta", {})
-    bg_finalize = str(background_finalize or "").strip().lower() in ("1", "true", "yes", "on")
-    final_status = "completed"
-    reason = "candidate_submitted"
-    if meta.get("termination_reason") or s.get("terminated"):
-        final_status = "terminated"
-        reason = str(meta.get("termination_reason") or "terminated")
-    elif time_expired_flag:
-        final_status = "partially_completed" if int(s.get("current") or 0) < len(s.get("questions") or []) else "completed"
-        reason = "time_expired"
-    elif int(s.get("current") or 0) < len(s.get("questions") or []):
-        final_status = "partially_completed"
-        reason = "candidate_ended_early"
+    # One finalisation at a time per session (11 Oct 2026): a second /submit
+    # (retry, double click, unload beacon) waits and gets the report already made.
+    with session_lock(sk):
+        if s.get("finalizing") and s.get("report_result"):
+            existing_id = str((s.get("meta", {}) or {}).get("interview_id") or "")
+            return {"status": "submitted", "report_ready": True, "interview_id": existing_id, "reused_report": True}
+        _live_sync_session(s)  # the recruiter's final actions reach the report
+        s["finalizing"] = True
+        time_expired_flag = str(time_expired or "").strip().lower() in ("1", "true", "yes", "on")
+        finalize_via_clean = str(finalize_via or "").strip().lower()
+        auto_saved_flag = str(boundary_auto_saved or "").strip().lower() in ("1", "true", "yes", "on")
+        pending_appended = _append_pending_answer_on_submit(s, pending_answer)
+        _record_boundary_question_meta(
+            s,
+            time_expired=time_expired_flag,
+            finalize_via=finalize_via_clean,
+            auto_saved=auto_saved_flag,
+            pending_appended=pending_appended,
+        )
+        meta = s.get("meta", {})
+        bg_finalize = str(background_finalize or "").strip().lower() in ("1", "true", "yes", "on")
+        final_status = "completed"
+        reason = "candidate_submitted"
+        if meta.get("termination_reason") or s.get("terminated"):
+            final_status = "terminated"
+            reason = str(meta.get("termination_reason") or "terminated")
+        elif time_expired_flag:
+            final_status = "partially_completed" if int(s.get("current") or 0) < len(s.get("questions") or []) else "completed"
+            reason = "time_expired"
+        elif int(s.get("current") or 0) < len(s.get("questions") or []):
+            final_status = "partially_completed"
+            reason = "candidate_ended_early"
 
-    candidate_fast_finalize = bg_finalize or str((payload or {}).get("role") or "").lower() == "candidate"
-    logger.info(
-        "[FLOW] INTERVIEW_ENDED",
-        extra={"event": "interview.ended", "interview_id": str(meta.get("interview_id") or "")},
-    )
-    logger.info(
-        "[FLOW] REPORT_STARTED",
-        extra={"event": "report.generation.started", "interview_id": str(meta.get("interview_id") or "")},
-    )
-    if candidate_fast_finalize:
-        session_snapshot = copy.deepcopy(s)
-        out = _persist_fast_final_report(s, reason=reason, final_status=final_status)
-        background_tasks.add_task(_upgrade_interview_report_background, session_snapshot, reason, final_status)
-    else:
-        out = _finalize_interview_snapshot(s, reason=reason, final_status=final_status)
+        candidate_fast_finalize = bg_finalize or str((payload or {}).get("role") or "").lower() == "candidate"
+        logger.info(
+            "[FLOW] INTERVIEW_ENDED",
+            extra={"event": "interview.ended", "interview_id": str(meta.get("interview_id") or "")},
+        )
+        logger.info(
+            "[FLOW] REPORT_STARTED",
+            extra={"event": "report.generation.started", "interview_id": str(meta.get("interview_id") or "")},
+        )
+        if candidate_fast_finalize:
+            session_snapshot = copy.deepcopy(s)
+            out = _persist_fast_final_report(s, reason=reason, final_status=final_status)
+            background_tasks.add_task(_upgrade_interview_report_background, session_snapshot, reason, final_status)
+        else:
+            out = _finalize_interview_snapshot(s, reason=reason, final_status=final_status)
     if bg_finalize:
         out["background_finalize"] = False
         out["synchronous_finalize"] = True
@@ -5069,7 +5410,7 @@ def _report_response_from_persisted_record(rec: dict) -> dict:
         "candidate_profile": rec.get("candidate_profile", {}),
         "jd_skills": rec.get("skills", []),
         "jd_text": "",
-        "model": rec.get("model", "gpt-4o-mini"),
+        "model": rec.get("model") or ai_models.interview_model(),
     }
     evaluated_ist = {
         "ist_iso": rec.get("updated_at_ist") or "",
@@ -5301,6 +5642,21 @@ def _report_completion_status(record: dict, report: dict | None) -> str:
     return "Pending"
 
 
+def _dash_report_extras(record: dict, report: dict) -> dict:
+    """What the Reports list shows beside the score (11 Oct 2026): the AI's
+    recommendation, whether anything was attempted, the time, and whether a
+    recruiter joined. Small fields only — the list never carries transcripts."""
+    report = report if isinstance(report, dict) else {}
+    live = report.get("live_intervention") if isinstance(report.get("live_intervention"), dict) else None
+    return {
+        "recommendation": str(report.get("recommendation") or "").strip(),
+        "fitment": str(report.get("overall_fitment") or "").strip(),
+        "not_attempted": bool(report.get("not_attempted")),
+        "time": str(record.get("created_time_ist") or "").strip(),
+        "recruiter_joined": bool(live),
+    }
+
+
 def _dash_score_from_report(report: dict | None) -> int:
     r = report or {}
     ss = r.get("scoring_summary") if isinstance(r.get("scoring_summary"), dict) else None
@@ -5453,6 +5809,7 @@ def hr_dashboard(request: Request, limit: int = 500):
             "completion_status": _report_completion_status(record, report),
             "final_status": str(record.get("final_status") or "").strip(),
             "report_status": str(record.get("report_status") or ("ready" if report else "pending")).strip(),
+            **_dash_report_extras(record, report),
         }
         candidates_by_key[key]["interviews"].append(interview)
         _add_session_attendee(
@@ -5501,6 +5858,7 @@ def hr_dashboard(request: Request, limit: int = 500):
                 "completion_status": _report_completion_status(record, report),
                 "final_status": str(record.get("final_status") or "").strip(),
                 "report_status": str(record.get("report_status") or ("ready" if report else "pending")).strip(),
+                **_dash_report_extras(record, report),
             }
             candidates_by_key[key]["interviews"].append(interview)
             _add_session_attendee(
@@ -6708,12 +7066,20 @@ async def job_config(
     user_payload, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template management: Admin/RMG
+    _enforce_template_author(request)  # Template management: Admin/RMG/GM — never HR
     weights_obj = {}
     try:
         weights_obj = json.loads(weights) if (weights or "").strip() else {}
     except json.JSONDecodeError:
         weights_obj = {}
+    # Skill-wise question bank (10 Oct 2026): validated here so a template can
+    # never be saved with a pseudo-code question that has no correct option.
+    if isinstance(weights_obj, dict) and interview_skill_bank.WEIGHTS_KEY in weights_obj:
+        try:
+            weights_obj[interview_skill_bank.WEIGHTS_KEY] = interview_skill_bank.clean_config(
+                weights_obj[interview_skill_bank.WEIGHTS_KEY])
+        except interview_skill_bank.SkillBankError as exc:
+            return JSONResponse({"error": str(exc), "code": "skill_bank_invalid"}, status_code=400)
     mq_list: list = []
     mq_raw = (manualQuestions or "").strip()
     if mq_raw:
@@ -6901,7 +7267,7 @@ async def template_sample_questions(
     _, auth_err = _require_user(request, {"hr"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template authoring: Admin/RMG
+    _enforce_template_author(request)  # Template authoring: Admin/RMG/GM — never HR
     required_list = [s.strip().lower() for s in str(requiredSkills or "").split(",") if s.strip()]
     optional_list = [s.strip().lower() for s in str(optionalSkills or "").split(",") if s.strip()]
     if not required_list:
@@ -7095,7 +7461,7 @@ async def template_prompt_preview(
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template authoring: Admin/RMG
+    _enforce_template_author(request)  # Template authoring: Admin/RMG/GM — never HR
     mode = normalize_interview_mode(interviewMode)
     ctx = build_template_prompt_context(
         role=jobTitle,
@@ -7159,7 +7525,7 @@ async def template_test_prompt(
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template authoring: Admin/RMG
+    _enforce_template_author(request)  # Template authoring: Admin/RMG/GM — never HR
     required_list = [s.strip().lower() for s in str(requiredSkills or "").split(",") if s.strip()]
     optional_list = [s.strip().lower() for s in str(optionalSkills or "").split(",") if s.strip()]
     skills = []
@@ -7265,7 +7631,9 @@ def job_configs(request: Request):
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    return {"jobs": list_job_templates(AUTH_DB_TARGET)}
+    # Archive tab (10 Oct 2026): a template whose opportunity is closed is
+    # flagged `archived` — derived from the deal's stage, never stored.
+    return {"jobs": template_archive.annotate(list_job_templates(AUTH_DB_TARGET))}
 
 
 @app.get("/job/config/{jobId}")
@@ -7282,7 +7650,7 @@ def job_config_get(request: Request, jobId: str):
     job = get_job_template(AUTH_DB_TARGET, jobId)
     if not job:
         return JSONResponse({"error": "Template not found."}, status_code=404)
-    return {"job": job}
+    return {"job": template_archive.annotate([job])[0]}
 
 
 @app.delete("/job/config/{jobId}")
@@ -7290,7 +7658,7 @@ def job_config_delete(request: Request, jobId: str):
     _, auth_err = _require_user(request, {"hr", "manager", "admin"})
     if auth_err:
         return auth_err
-    _enforce_crm_roles(request, "RMG", tab="iv:templates", mode="edit")  # Template management: Admin/RMG
+    _enforce_template_author(request)  # Template management: Admin/RMG/GM — never HR
     ok = delete_job_template(AUTH_DB_TARGET, jobId)
     if not ok:
         return JSONResponse({"error": "Template not found."}, status_code=404)
@@ -7370,7 +7738,7 @@ async def ats_score_upload(
     request: Request,
     jd_file: UploadFile = File(...),
     cv_file: UploadFile = File(...),
-    model: str = Form("gpt-4o-mini"),
+    model: str = Form(""),
 ):
     _, auth_err = _require_interview_report_reader(request, tab="iv:ats")
     if auth_err:
@@ -7460,6 +7828,385 @@ MAX_WARNINGS = 3
 # devtools attempts. See services/interview_integrity.py.
 from services.interview_integrity import STRIKE_TYPES as _INTEGRITY_VIOLATION_TYPES  # noqa: E402
 from services.interview_integrity import count_strikes as _count_integrity_violations  # noqa: E402
+from services.interview_integrity import count_gaze as _count_gaze_events  # noqa: E402
+from services.interview_integrity import gaze_limit as _integrity_gaze_limit  # noqa: E402
+from services.device_class import handheld_block as _handheld_block  # noqa: E402
+from services import interview_live as live_ctl  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# A recruiter joins the live interview (11 Oct 2026) — services/interview_live.py
+# ---------------------------------------------------------------------------
+_LIVE_CACHE: dict[str, tuple[float, tuple[dict, dict]]] = {}
+_LIVE_CACHE_GUARD = threading.Lock()
+_LIVE_CACHE_TTL_S = 1.5
+
+
+def _live_read(token: str, *, fresh: bool = False) -> tuple[dict, dict] | None:
+    """(control, reply), normalised. Cached for 1.5 s per interview so a burst of
+    /next + /answer + the candidate's own check-in costs one database read."""
+    token = str(token or "").strip()
+    if not token:
+        return None
+    now = time.time()
+    if not fresh:
+        with _LIVE_CACHE_GUARD:
+            hit = _LIVE_CACHE.get(token)
+        if hit and now - hit[0] < _LIVE_CACHE_TTL_S:
+            return hit[1]
+    cols = get_live_columns(AUTH_DB_TARGET, token)
+    if cols is None:
+        return None
+    out = (live_ctl.normalize_control(cols[0]), live_ctl.normalize_reply(cols[1]))
+    with _LIVE_CACHE_GUARD:
+        if len(_LIVE_CACHE) > 2000:
+            _LIVE_CACHE.clear()
+        _LIVE_CACHE[token] = (now, out)
+    return out
+
+
+def _live_write_control(token: str, ctrl: dict) -> None:
+    set_live_control(AUTH_DB_TARGET, token, ctrl)
+    with _LIVE_CACHE_GUARD:
+        _LIVE_CACHE.pop(str(token or "").strip(), None)
+
+
+def _live_write_reply(token: str, reply: dict) -> None:
+    set_live_reply(AUTH_DB_TARGET, token, reply)
+    with _LIVE_CACHE_GUARD:
+        _LIVE_CACHE.pop(str(token or "").strip(), None)
+
+
+def _live_sync_session(s: dict) -> dict | None:
+    """Read the interview's live control and copy the pause clock onto the
+    session (the elapsed-time calculation reads it). An over-long pause is ended
+    here and written back. None when the interview has no invite / no row."""
+    if not live_ctl.enabled() or not isinstance(s, dict):
+        return None
+    meta = s.setdefault("meta", {})
+    token = str(meta.get("invite_token") or "").strip()
+    if not token:
+        return None
+    try:
+        cols = _live_read(token)
+        if cols is None:
+            return None
+        ctrl = cols[0]
+        now = time.time()
+        if live_ctl.expire_pause(ctrl, now):
+            try:
+                _live_write_control(token, ctrl)
+            except Exception:
+                logger.warning("interview.live.expire_write_failed", extra={"event": "interview.live.expire_write_failed"})
+        live_ctl.mirror_clock(meta, ctrl, now)
+        summary = live_ctl.report_summary(ctrl, now)
+        if summary is not None:
+            meta["live_summary"] = summary  # the report's "Recruiter joined" section
+        return ctrl
+    except Exception:
+        logger.warning("interview.live.sync_failed", extra={"event": "interview.live.sync_failed"}, exc_info=True)
+        return None
+
+
+def _live_paused_body(ctrl: dict) -> dict:
+    now = time.time()
+    view = live_ctl.candidate_view(ctrl, live_ctl.empty_reply(), now)
+    return {
+        "paused": True,
+        "code": "live_paused",
+        "message": f"{view['by']} from Karnex has paused the interview for a moment.",
+        "live": view,
+    }
+
+
+def _live_apply_questions(s: dict, ctrl: dict | None) -> list[dict]:
+    """Put the recruiter's queued questions into the interview at the current
+    turn — only ever at a turn boundary (/next, or /answer after it advanced)."""
+    if not ctrl or not ctrl.get("questions"):
+        return []
+    applied = live_ctl.insert_questions(s, ctrl.get("questions") or [])
+    if not applied:
+        return []
+    token = str((s.get("meta") or {}).get("invite_token") or "").strip()
+    try:
+        cols = _live_read(token, fresh=True)
+        fresh_ctrl = cols[0] if cols else ctrl
+        live_ctl.mark_questions_asked(fresh_ctrl, applied, time.time())
+        _live_write_control(token, fresh_ctrl)
+    except Exception:
+        logger.warning("interview.live.mark_asked_failed", extra={"event": "interview.live.mark_asked_failed"}, exc_info=True)
+    logger.info("interview.live.questions_inserted",
+                extra={"event": "interview.live.questions_inserted", "count": len(applied),
+                       "invite_token": _invite_token_tag(token)})
+    return applied
+
+
+def _live_pause_payload(s: dict, *, apply_questions: bool = True) -> dict | None:
+    """The paused body when a recruiter has paused this interview, else None
+    (after putting any queued recruiter question in, when allowed)."""
+    ctrl = _live_sync_session(s)
+    if ctrl is None:
+        return None
+    if live_ctl.is_paused(ctrl, time.time()):
+        return _live_paused_body(ctrl)
+    if apply_questions:
+        _live_apply_questions(s, ctrl)
+    return None
+
+
+def _live_staff(request: Request):
+    """(name, id, error) — who is acting from the Integrity tab."""
+    err = _integrity_auth(request)
+    if err:
+        return "", "", err
+    payload = _decode_token_from_header(request) or {}
+    name = str(payload.get("full_name") or payload.get("sub") or "Recruiter").strip() or "Recruiter"
+    return name, str(payload.get("sub") or name), None
+
+
+def _live_route_token(invite_token: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", invite_token or "")[:64]
+
+
+def _live_staff_target(request: Request, invite_token: str):
+    """(token, record, name, id, error) for a staff live-control route."""
+    name, uid, err = _live_staff(request)
+    if err:
+        return "", None, "", "", err
+    if not live_ctl.enabled():
+        return "", None, "", "", JSONResponse({"error": "Joining a live interview is switched off on this server."}, status_code=403)
+    token = _live_route_token(invite_token)
+    rec = get_schedule_by_token(AUTH_DB_TARGET, token) if token else None
+    if not rec:
+        return "", None, "", "", JSONResponse({"error": "Interview not found."}, status_code=404)
+    return token, rec, name, uid, None
+
+
+def _live_refuse_finished(rec: dict):
+    status = str(rec.get("session_status") or "").strip().lower()
+    if status in ("completed", "terminated"):
+        return JSONResponse({"error": "This interview has already finished.", "code": "finished"}, status_code=409)
+    return None
+
+
+def _live_record_event(token: str, event_type: str, details: str) -> None:
+    """Recruiter actions reach the Integrity timeline from the live-control log
+    at READ time (`_live_timeline_events`) — `violations_log` is rewritten
+    wholesale by /interview/violation, so nothing is appended to it here."""
+    invalidate_integrity_logs_cache()
+
+
+_LIVE_TIMELINE_LABELS = {
+    "joined": ("recruiter_joined", "opened the live controls"),
+    "paused": ("recruiter_paused", "paused the interview"),
+    "resumed": ("recruiter_resumed", "resumed the interview"),
+    "auto_resumed": ("recruiter_resumed", "the pause ended by itself"),
+    "question_added": ("recruiter_question", "queued a question"),
+    "message": ("recruiter_message", "sent a note"),
+    "call_started": ("recruiter_call", "started a call"),
+    "call_ended": ("recruiter_call_ended", "ended the call"),
+}
+
+
+def _live_timeline_events(token: str) -> list[dict]:
+    """The recruiter's actions as integrity-timeline events (informational)."""
+    try:
+        cols = _live_read(token, fresh=True)
+    except Exception:
+        return []
+    if not cols:
+        return []
+    out = []
+    for e in cols[0].get("log") or []:
+        mapped = _LIVE_TIMELINE_LABELS.get(str(e.get("action") or ""))
+        if not mapped:
+            continue
+        try:
+            from services.ist import IST as _IST
+            stamp = datetime.fromtimestamp(float(e.get("at") or 0), tz=_IST).isoformat()
+        except Exception:
+            stamp = ""
+        text = str(e.get("text") or "").strip()
+        out.append({"type": mapped[0], "details": f"{e.get('by') or 'Recruiter'} {mapped[1]}" + (f": {text}" if text else ""),
+                    "timestamp": stamp})
+    return out
+
+
+async def _live_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+@app.get("/interview/live/{invite_token}")
+def interview_live_state(request: Request, invite_token: str):
+    """The recruiter's live-control panel: pause state, queued and asked
+    questions, the call and whether the candidate's page is checking in."""
+    token, rec, _name, _uid, err = _live_staff_target(request, invite_token)
+    if err:
+        return err
+    ctrl, reply = _live_read(token, fresh=True) or (live_ctl.empty_control(), live_ctl.empty_reply())
+    now = time.time()
+    if live_ctl.expire_pause(ctrl, now):
+        _live_write_control(token, ctrl)
+    out = live_ctl.staff_view(ctrl, reply, now)
+    out["session_status"] = str(rec.get("session_status") or "pending")
+    out["candidate_name"] = str(rec.get("candidate_name") or "")
+    return out
+
+
+@app.post("/interview/live/{invite_token}/{action}")
+async def interview_live_action(request: Request, invite_token: str, action: str):
+    """join · pause · resume · message · question · remove-question · call · hangup.
+    Every action is logged on the interview (shown in the report) and the
+    pause / resume / call ones on the Integrity timeline."""
+    token, rec, name, uid, err = _live_staff_target(request, invite_token)
+    if err:
+        return err
+    finished = _live_refuse_finished(rec)
+    if finished and action not in ("hangup", "presence"):
+        return finished
+    body = await _live_body(request)
+    ctrl, reply = _live_read(token, fresh=True) or (live_ctl.empty_control(), live_ctl.empty_reply())
+    now = time.time()
+    live_ctl.expire_pause(ctrl, now)
+    try:
+        if action == "join":
+            live_ctl.join(ctrl, uid, name, now)
+        elif action == "presence":
+            live_ctl.presence(ctrl, uid, name, now)
+        elif action == "pause":
+            live_ctl.pause(ctrl, name, str(body.get("reason") or ""), now)
+            if body.get("message"):
+                live_ctl.set_message(ctrl, str(body.get("message")), name, now)
+            _live_record_event(token, "recruiter_paused", f"{name} paused the interview")
+        elif action == "resume":
+            live_ctl.resume(ctrl, name, now)
+            _live_record_event(token, "recruiter_resumed", f"{name} resumed the interview")
+        elif action == "message":
+            live_ctl.set_message(ctrl, str(body.get("text") or ""), name, now)
+        elif action == "question":
+            live_ctl.add_question(ctrl, str(body.get("text") or ""), name, now)
+        elif action == "remove-question":
+            live_ctl.remove_question(ctrl, str(body.get("id") or ""), name, now)
+        elif action == "call":
+            live_ctl.start_call(ctrl, str(body.get("offer") or ""), name, now, video=bool(body.get("video", True)))
+            _live_record_event(token, "recruiter_call", f"{name} started a call with the candidate")
+        elif action == "hangup":
+            live_ctl.end_call(ctrl, name, now)
+        else:
+            return JSONResponse({"error": "Unknown action."}, status_code=404)
+    except live_ctl.LiveError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    _live_write_control(token, ctrl)
+    logger.info("interview.live.action",
+                extra={"event": "interview.live.action", "action": action, "by": name,
+                       "invite_token": _invite_token_tag(token)})
+    out = live_ctl.staff_view(ctrl, reply, now)
+    out["session_status"] = str(rec.get("session_status") or "pending")
+    out["candidate_name"] = str(rec.get("candidate_name") or "")
+    return out
+
+
+def _session_time_up(sess: dict | None) -> bool:
+    """A timed interview past its limit (12 Oct 2026) — the page's own countdown
+    can be throttled, reloaded or paused by the browser; this check rides on
+    the live poll so the interview ends on time whatever the page's clock did."""
+    if not isinstance(sess, dict) or sess.get("finalizing") or sess.get("finalized"):
+        return False
+    try:
+        from candidate.service import time_limit_reached
+        return bool(time_limit_reached(sess))
+    except Exception:
+        return False
+
+
+def _live_candidate(request: Request):
+    """(token, error) for the candidate's own live endpoints — the bearer's
+    invite and the bound device, like /answer."""
+    payload, auth_err = _require_user(request, {"candidate", "hr"})
+    if auth_err:
+        return "", auth_err
+    device_err = _enforce_invite_device_binding(request, payload)
+    if device_err:
+        return "", device_err
+    token = str((payload or {}).get("invite_token") or "").strip()
+    if not token:
+        return "", JSONResponse({"error": "Not an interview session.", "code": "no_invite"}, status_code=404)
+    return token, None
+
+
+@app.get("/candidate/live/state")
+def candidate_live_state(request: Request):
+    """The candidate's page checks in every few seconds: is the interview paused,
+    is there a note, is a recruiter calling. One small read of two columns."""
+    token, err = _live_candidate(request)
+    if err:
+        return err
+    sess = sessions.get(f"inv:{token}")
+    if not live_ctl.enabled():
+        return {"enabled": False, "paused": False, "poll_sec": 10, "time_up": _session_time_up(sess)}
+    # Fresh (no cache) while a recruiter is on the panel — that is when every
+    # second counts; otherwise the short cache keeps the poll cheap.
+    cols = _live_read(token, fresh=True)
+    if cols is None:
+        return {"enabled": True, "paused": False, "poll_sec": live_ctl.CANDIDATE_POLL_SEC,
+                "time_up": _session_time_up(sess)}
+    ctrl, reply = cols
+    now = time.time()
+    if live_ctl.expire_pause(ctrl, now):
+        _live_write_control(token, ctrl)
+    # Check-in stamp for the recruiter's "candidate online" dot — at most every
+    # 6 s, so polling does not turn into a write per poll.
+    try:
+        seen = float(reply.get("seen_at") or 0)
+    except (TypeError, ValueError):
+        seen = 0.0
+    if now - seen > live_ctl.CANDIDATE_POLL_SEC * 2:
+        reply["seen_at"] = now
+        try:
+            _live_write_reply(token, reply)
+        except Exception:
+            pass
+    if isinstance(sess, dict):
+        live_ctl.mirror_clock(sess.setdefault("meta", {}), ctrl, now)
+    view = live_ctl.candidate_view(ctrl, reply, now)
+    view["enabled"] = True
+    view["time_up"] = _session_time_up(sess)
+    if view.get("call"):
+        view["ice_servers"] = live_ctl.ice_servers()
+    return view
+
+
+@app.post("/candidate/live/answer")
+async def candidate_live_answer(request: Request):
+    """The candidate's browser accepted the recruiter's call: its answer."""
+    token, err = _live_candidate(request)
+    if err:
+        return err
+    body = await _live_body(request)
+    cols = _live_read(token, fresh=True)
+    if cols is None:
+        return JSONResponse({"error": "Interview not found."}, status_code=404)
+    ctrl, reply = cols
+    try:
+        live_ctl.set_answer(reply, ctrl, str(body.get("call_id") or ""), str(body.get("answer") or ""), time.time())
+    except live_ctl.LiveError as exc:
+        return JSONResponse({"error": str(exc), "code": "call_gone"}, status_code=409)
+    _live_write_reply(token, reply)
+    return {"status": "ok"}
+
+
+@app.get("/interview/live-config")
+def interview_live_config(request: Request):
+    """Whether live join is on and the ICE servers (staff side)."""
+    _name, _uid, err = _live_staff(request)
+    if err:
+        return err
+    return {"enabled": live_ctl.enabled(), "ice_servers": live_ctl.ice_servers(),
+            "max_pause_sec": live_ctl.max_pause_sec(), "poll_sec": live_ctl.STAFF_POLL_SEC}
 
 
 def _load_proctor_reports() -> dict:
@@ -7592,6 +8339,16 @@ async def proctor_violation(
     sess = _proctor_sessions.get(sid)
     if not sess:
         return {"error": "Invalid proctor session."}
+    paused_tok = str(sess.get("invite_token") or sess.get("interviewId") or "").strip()
+    if paused_tok and live_ctl.enabled():
+        cols = _live_read(paused_tok)
+        if cols and live_ctl.is_paused(cols[0], time.time()):
+            # A recruiter has the interview paused (11 Oct 2026) — not counted.
+            score, status, prob, risk = _proctor_score(sess["violations"])
+            return {"violations": sess["violations"], "proctorScore": score, "status": status,
+                    "terminated": False, "ignored": "paused",
+                    "warning_level": min(sum(int(v or 0) for v in sess["violations"].values()), MAX_WARNINGS + 1),
+                    "max_warnings": MAX_WARNINGS, "anomaly": {"riskLevel": risk, "cheatingProbability": prob}}
     vtype = (type or "").strip()
     if vtype not in {"tabSwitch", "extraFace"}:
         vtype = "tabSwitch"
@@ -8182,7 +8939,7 @@ def hr_schedule_interview(
     mic_always_on: str = Form("false"),
     show_spoken_text: str = Form("false"),
     enable_transcript_input: str = Form(""),
-    model: str = Form("gpt-4o-mini"),
+    model: str = Form(""),
     candidate_id: int = Form(0),      # optional Karnex CRM candidate id (Phase 5)
     opportunity_id: int = Form(0),    # optional Karnex CRM opportunity id (Phase 5)
 ):
@@ -8193,29 +8950,48 @@ def hr_schedule_interview(
     skill_list = [s.strip().lower() for s in str(final_skills or "").split(",") if s.strip()]
     transcript_toggle_raw = enable_transcript_input if str(enable_transcript_input).strip() else show_spoken_text
     job_row = get_job_template(AUTH_DB_TARGET, str(jobId or "").strip()) if str(jobId or "").strip() else None
+    archived_why = template_archive.archived_reason(job_row) if job_row else None
+    if archived_why:
+        return JSONResponse({"error": f"{archived_why} — this template is archived. Reopen the opportunity "
+                                      "to use it again.", "code": "template_archived"}, status_code=400)
     qt_schedule = str((job_row or {}).get("questionType") or (job_row or {}).get("question_type") or "dynamic").strip().lower()
     mq_schedule = _normalized_manual_questions_for_job((job_row or {}).get("manualQuestions") if job_row else [])
-    tm_schedule = str((job_row or {}).get("timingMode") or (job_row or {}).get("timing_mode") or timing_mode or "count").strip().lower()
+    # The TEMPLATE's settings are what gets stored (13 Oct 2026). The dashboard's
+    # HR Setup form posts only the template and the skills, so the Form
+    # defaults above (count · no limit · 5 questions · transcript off) used to be
+    # packed into every schedule and then beat the template at session start.
+    form_cfg = {"timing_mode": timing_mode, "time_limit_sec": time_limit_sec, "num_q": num_q}
+    tm_schedule, tl_schedule = template_timing(form_cfg, job_row)
+    num_q_tpl = resolve_template_num_q(form_cfg, job_row, skills_fallback=num_q or 5)
     if qt_schedule == "manual" and mq_schedule:
         if tm_schedule == "count":
-            num_q_packed = min(clamp_count_mode_questions(num_q), len(mq_schedule))
+            num_q_packed = min(clamp_count_mode_questions(num_q_tpl), len(mq_schedule))
         else:
             num_q_packed = len(mq_schedule)
     else:
-        num_q_packed = clamp_count_mode_questions(num_q)
+        num_q_packed = clamp_count_mode_questions(num_q_tpl)
+    tpl = job_row or {}
+    truthy = {"1", "true", "yes", "on"}
+    if job_row and ("enableTranscriptInput" in tpl or "showSpokenText" in tpl):
+        transcript_on = bool(tpl.get("enableTranscriptInput") or tpl.get("showSpokenText"))
+    else:
+        transcript_on = str(transcript_toggle_raw).strip().lower() in truthy
+    mic_on = (bool(tpl.get("micAlwaysOn")) if job_row and "micAlwaysOn" in tpl
+              else str(mic_always_on).strip().lower() in truthy)
     packed_notes = _pack_invite_config_into_notes(
         notes,
         {
             "final_skills": skill_list,
             "job_id": str(jobId or "").strip(),
             "num_q": num_q_packed,
-            "difficulty": difficulty,
-            "followup_mode": str(followup_mode).strip().lower() in {"1", "true", "yes", "on"},
-            "timing_mode": timing_mode,
-            "time_limit_sec": int(time_limit_sec or 0),
-            "mic_always_on": str(mic_always_on).strip().lower() in {"1", "true", "yes", "on"},
-            "show_spoken_text": str(transcript_toggle_raw).strip().lower() in {"1", "true", "yes", "on"},
-            "enable_transcript_input": str(transcript_toggle_raw).strip().lower() in {"1", "true", "yes", "on"},
+            "difficulty": str(tpl.get("difficulty") or difficulty or "medium").strip().lower(),
+            "followup_mode": (bool(tpl.get("followupMode")) if job_row and "followupMode" in tpl
+                              else str(followup_mode).strip().lower() in truthy),
+            "timing_mode": tm_schedule,
+            "time_limit_sec": int(tl_schedule or 0),
+            "mic_always_on": mic_on,
+            "show_spoken_text": transcript_on,
+            "enable_transcript_input": transcript_on,
             "model": model,
         },
     )
@@ -8327,26 +9103,90 @@ def _invite_closed_response(record: dict, invite_state: str, error_message: str)
     return JSONResponse(body, status_code=403)
 
 
+def _interview_format(cfg: dict, job: dict | None) -> dict:
+    """What the candidate is agreeing to (12 Oct 2026): the REAL number and kind
+    of questions and how the interview ends — read from the template the same
+    way the session will be built. The rules page used to print the template's
+    stale "question count" (5) for a bank that asks 9, and a leftover 20-minute
+    value for a count-mode template that has no clock."""
+    job = job or {}
+    weights = job.get("weights") if isinstance(job.get("weights"), dict) else {}
+    # The SAME resolution the session uses (template first — 13 Oct 2026).
+    timing_mode, raw_limit = template_timing(cfg, job or None)
+    time_limit = _effective_time_limit(timing_mode, raw_limit)
+    try:
+        num_q = resolve_template_num_q(cfg, job or None)
+    except Exception:
+        num_q = 5
+    mix = {"spoken": 0, "pseudo": 0, "coding": 0}
+    varies = False
+    skills_choice = None
+    minutes_estimate = 0
+    typed_minutes = {"pseudo": 0, "coding": 0}
+    bank = interview_skill_bank.config_of(weights) if job else None
+    if bank:
+        summary = interview_skill_bank.plan_summary(bank, list(job.get("requiredSkills") or []))
+        mix = {"spoken": summary["spoken"], "pseudo": summary["pseudo"], "coding": summary["coding"]}
+        total = summary["total"]
+        varies = bool(summary["varies"])
+        if varies:
+            skills_choice = {"min": summary["pick_min"], "max": summary["pick_max"], "skills": summary["skills"][:20]}
+        minutes_estimate = summary["minutes_estimate"]
+        typed_minutes = {"pseudo": summary["pseudo_minutes"], "coding": summary["coding_minutes"]}
+    else:
+        manual = (_normalized_manual_questions_for_job(job.get("manualQuestions"))
+                  if _coerce_question_type(job.get("questionType")) == "manual" else [])
+        if manual:
+            total = min(num_q, len(manual)) if timing_mode == "count" else len(manual)
+        else:
+            # The session caps at the template's count in BOTH modes (`_question_cap`).
+            total = num_q
+        mix["spoken"] = total
+        minutes_estimate = int(round(total * interview_skill_bank.SPOKEN_MINUTES_EACH + 1)) if total else 0
+    conv = interview_conversation.conversation_settings(weights) if job else {}
+    return {
+        "timing_mode": timing_mode,
+        "time_limit_sec": time_limit,
+        # The questions this interview asks (time mode: at most this many).
+        "num_q": total,
+        "question_mix": mix,
+        "mix_varies": varies,
+        "skills_choice": skills_choice,
+        "minutes_estimate": minutes_estimate,
+        "typed_minutes": typed_minutes,
+        "followups": int(conv.get("max_followups") or 0) if conv.get("followups") and not bank else 0,
+        "closing_qa": bool(conv.get("closing_qa")),
+        "recruiter_may_join": live_ctl.enabled(),
+        "screen_recorded": _screen_recording_on(),
+        # Look-away reminders that end the interview (0 = never) — the rules page.
+        "gaze_limit": _integrity_gaze_limit(),
+    }
+
+
+def _screen_recording_on() -> bool:
+    try:
+        from services.interview_recording import recording_client_config
+        return bool(recording_client_config().get("screen_enabled"))
+    except Exception:
+        return False
+
+
 def _public_schedule_view(record: dict, session_status: str | None = None) -> dict:
     """What the candidate page may see about its own schedule (15 Sep 2026).
 
     Never the raw row: `access_key`, `notes`, `active_device_id` and the
-    violations log stay server-side. Adds the interview's job title, timing
-    mode, time limit and question count (from the packed invite config) so the
-    welcome card and the rules gate can state what the candidate is agreeing to.
+    violations log stay server-side. Adds the interview's job title and its
+    format (`_interview_format`) so the welcome card and the rules gate can
+    state what the candidate is agreeing to.
     """
     cfg = _extract_invite_config_from_notes(str(record.get("notes") or ""))
     jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
     job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
-    timing_mode = str(cfg.get("timing_mode") or (job or {}).get("timingMode") or "count").strip().lower()
     try:
-        time_limit = max(0, int(cfg.get("time_limit_sec") or (job or {}).get("timeLimitSec") or 0))
-    except (TypeError, ValueError):
-        time_limit = 0
-    try:
-        num_q = int(cfg.get("num_q") or (job or {}).get("numQ") or (job or {}).get("num_q") or 0)
-    except (TypeError, ValueError):
-        num_q = 0
+        fmt = _interview_format(cfg, job)
+    except Exception:
+        logger.warning("interview.format_failed", exc_info=True)
+        fmt = {"timing_mode": "count", "time_limit_sec": 0, "num_q": 0}
     return {
         "candidate_name": record.get("candidate_name", ""),
         "scheduled_at_local": record.get("scheduled_at_local", ""),
@@ -8354,9 +9194,7 @@ def _public_schedule_view(record: dict, session_status: str | None = None) -> di
         "session_status": (session_status or str(record.get("session_status") or "pending")).strip().lower(),
         "access_key": bool(record.get("access_key")),
         "job_title": str((job or {}).get("jobTitle") or "").strip(),
-        "timing_mode": timing_mode if timing_mode in {"count", "time"} else "count",
-        "time_limit_sec": time_limit,
-        "num_q": num_q,
+        **fmt,
     }
 
 
@@ -8435,6 +9273,12 @@ def candidate_invite_verify(token: str, request: Request, email: str = Form(""),
             record, "terminated",
             "This interview was terminated due to policy violations. The link is no longer valid.",
         )
+
+    # Laptop / PC only (12 Oct 2026): a phone or tablet never verifies, and
+    # no attempt is spent — the candidate simply opens the link on a computer.
+    handheld = _handheld_block(request.headers)
+    if handheld:
+        return JSONResponse(handheld, status_code=403)
 
     access = _invite_access_state(record)
     if access.get("reason") == "expired":
@@ -8526,6 +9370,10 @@ def candidate_invite_login(token: str, request: Request):
             "terminated",
             "This interview was terminated due to policy violations. The link is no longer valid.",
         )
+
+    handheld = _handheld_block(request.headers)  # laptop / PC only (12 Oct 2026)
+    if handheld:
+        return JSONResponse(handheld, status_code=403)
 
     stored_key = str(record.get("access_key") or "").strip()
     if stored_key and session_status not in ("verified", "active"):
@@ -8663,6 +9511,11 @@ def candidate_invite_login(token: str, request: Request):
         # Resume (16 Sep 2026): a reopened link continues from the saved turn.
         # The client uses this to say "resuming from question N", nothing else.
         "resume": _resume_info(sess),
+        # Skill-wise question bank (10 Oct 2026): the picker, while nothing has
+        # been asked yet; and the practice screen for a fresh start.
+        "skill_pick": _skill_pick_payload(sess),
+        "skill_autofill": _skill_autofill_payload(sess),
+        "practice": _practice_payload(sess),
         **_candidate_model_info(sess),
     }
 
@@ -8787,6 +9640,13 @@ async def interview_violation(
         return {"status": "ignored"}
 
     meta = s.get("meta", {})
+    # While a recruiter has the interview paused (11 Oct 2026) the candidate may
+    # look away, leave fullscreen or talk to them on camera — nothing counts.
+    if _live_pause_payload(s, apply_questions=False) is not None:
+        logger.info("interview.violation.ignored_paused",
+                    extra={"event": "interview.violation.ignored_paused", "type": (violation_type or "")[:40]})
+        return {"status": "ignored", "reason": "paused", "violation_count": int(meta.get("violation_count") or 0),
+                "max_warnings": MAX_WARNINGS, "auto_terminated": False}
     violations = meta.get("violations", [])
     now = _now_ist_parts()
     invite_token = str(meta.get("invite_token", "")).strip()
@@ -8809,23 +9669,33 @@ async def interview_violation(
     meta["violations"] = violations
     violation_count = _count_integrity_violations(violations)
     meta["violation_count"] = violation_count
+    # Look-away warnings (13 Oct 2026) are SOFT: counted on their own, never
+    # strikes; the `gaze_limit()`-th (default 10) ends the interview.
+    gaze_count = _count_gaze_events(violations)
+    gaze_cap = _integrity_gaze_limit()
+    gaze_over = event["type"] == "gaze_away" and gaze_cap > 0 and gaze_count >= gaze_cap
 
     auto_terminated = False
 
     already_terminated = bool(meta.get("terminated_at"))
-    if violation_count > MAX_WARNINGS and not already_terminated:
+    if (violation_count > MAX_WARNINGS or gaze_over) and not already_terminated:
         # Mark policy termination immediately, but leave the in-memory session
         # answerable so the frontend can auto-save the current response before
         # the normal /submit finalization path removes the session.
         from services.interview_integrity import label_for as _ilabel
-        reason = "Repeated interview policy violations"
+        if gaze_over and violation_count <= MAX_WARNINGS:
+            reason = "Looked away from the screen too often"
+            detail_text = f"Interview terminated after {gaze_count} look-away warnings"
+        else:
+            reason = "Repeated interview policy violations"
+            detail_text = (f"Interview terminated after {violation_count} policy violations "
+                           f"(last: {_ilabel(event['type'])})")
         meta["termination_reason"] = reason
         meta["terminated_at"] = now["ist_iso"]
         violations.append({
             "type": "termination",
             "reason": reason,
-            "details": f"Interview terminated after {violation_count} policy violations "
-                       f"(last: {_ilabel(event['type'])})",
+            "details": detail_text,
             "timestamp": now["ist_iso"],
         })
         meta["violations"] = violations
@@ -8857,6 +9727,8 @@ async def interview_violation(
         "auto_terminated": auto_terminated,
         "warning_level": min(violation_count, MAX_WARNINGS + 1),
         "max_warnings": MAX_WARNINGS,
+        "gaze_count": gaze_count,
+        "gaze_limit": gaze_cap,
     }
 
 
@@ -9247,8 +10119,13 @@ def interview_integrity_detail(request: Request, invite_token: str):
     events = _parse_violations_log(rec.get("violations_log"))
     status = str(rec.get("session_status") or "pending").strip().lower()
     summary = summarise(events, session_status=status)
+    # A recruiter's live actions (11 Oct 2026) sit on the same timeline,
+    # informational — they never change the score.
+    live_events = _live_timeline_events(token)
+    summary_events = sorted(list(summary["events"]) + live_events,
+                            key=lambda ev: str(ev.get("timestamp") or ev.get("at_ist") or ""))
     timeline = []
-    for ev in summary["events"]:
+    for ev in summary_events:
         t = str(ev.get("type") or "")
         timeline.append({
             "type": t,

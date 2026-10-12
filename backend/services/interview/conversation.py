@@ -39,6 +39,8 @@ import logging
 import re
 from typing import Any
 
+from services.interview import skill_bank
+
 logger = logging.getLogger("karnex.interview.conversation")
 
 #: The settings key inside the template's `weights` bag.
@@ -340,6 +342,9 @@ def insert_followup(session: dict, index: int, question: str) -> bool:
     meta = session.setdefault("meta", {})
     meta["followup_indices"] = sorted({*(i + 1 if i >= idx else i for i in followup_indices(meta)), idx})
     meta["followups_inserted"] = followups_inserted(meta) + 1
+    # A skill-bank interview (10 Oct 2026) keeps per-question details by index;
+    # everything from the insert point moves one place down with its question.
+    skill_bank.shift_after_insert(meta, idx)
     return True
 
 
@@ -368,7 +373,7 @@ def lead_in_for_index(meta: Any, index: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _model_for(meta: Any) -> str:
-    """The candidate waits on every call here — the FAST model (gpt-4o-mini
+    """The candidate waits on every call here — the FAST model (GPT-5.5
     while the interview runs on a reasoning model; `INTERVIEW_FAST_MODEL` /
     `INTERVIEW_FOLLOWUP_MODEL` / Settings override). 9 Oct 2026."""
     from services.ai_models import fast_interview_model

@@ -66,18 +66,12 @@ _DEFAULT_MAX_TOKENS = 700
 
 
 def _model() -> str:
-    """Ask AI's model. `AI_ASSIST_MODEL` wins when set. Otherwise it inherits
-    the interview model — unless that is a reasoning model (GPT-5/6, o-series):
-    Ask AI relies on function tools, which those models refuse on Chat
-    Completions (8 Oct 2026, gpt-6-astra), so it falls back to gpt-4o-mini."""
-    explicit = (os.getenv("AI_ASSIST_MODEL") or "").strip()
-    if explicit:
-        return explicit
-    inherited = (os.getenv("INTERVIEW_OPENAI_MODEL") or os.getenv("OPENAI_MODEL") or "").strip()
-    from prompt_logger import is_reasoning_model
-    if not inherited or is_reasoning_model(inherited):
-        return "gpt-4o-mini"
-    return inherited
+    """Ask AI's model — always GPT-5.5 (13 Oct 2026: "GPT-5.5 and GPT-6 Astra
+    everywhere"). It calls function tools, which GPT-6 Astra refuses on Chat
+    Completions, so the choice lives in `services.ai_models.assist_model`."""
+    from services.ai_models import assist_model
+
+    return assist_model()
 
 
 def _max_tokens() -> int:

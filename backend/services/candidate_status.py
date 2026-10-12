@@ -847,6 +847,93 @@ def profile_ids_in_phase(db, stmt, phases: list[str]) -> list[int]:
     return sorted(found)
 
 
+#: Every phase a FRONT-of-the-flow stored stage can read as (the facts decide).
+_FRONT_PHASES = frozenset({"sourcing", "technical_screening", "technical_interview"})
+
+
+def _possible_phases(value: str) -> frozenset[str] | None:
+    """The phases a profile stored at `value` can read as (`stage_for`); None
+    when it depends on another column (Self Withdrawn → where it withdrew)."""
+    if value in _PRE_REVIEW:
+        return _FRONT_PHASES
+    if value in _STAGE_BY_PIPELINE:
+        return frozenset({_STAGE_BY_PIPELINE[value]})
+    if value == PS.RMG_REJECTED.value:
+        return frozenset({"technical_screening", "technical_interview"})
+    if value == PS.SELF_WITHDRAWN.value:
+        return None
+    if value == PS.REJECTED.value:
+        return frozenset({"sourcing", "closed"})
+    return frozenset({"closed"})
+
+
+def phase_visible(phase: str, closed: bool, allowed: set[str]) -> bool:
+    """Whether a candidate in `phase` is shown to a login allowed `allowed`
+    phases (13 Oct 2026, role-wise stages). PURE.
+
+    A live candidate needs its phase. A CLOSED one (rejected / withdrawn) needs
+    the Closed chip AND the phase it closed in — Sales sees who the customer
+    turned down, not who RMG screened out. A generic rejection whose phase is
+    unknown ("closed") needs only the Closed chip."""
+    if closed:
+        return "closed" in allowed and (phase == "closed" or phase in allowed)
+    return phase in allowed
+
+
+def phase_access_clause(db, stmt, allowed: set[str] | None):
+    """SQL: the profiles `stmt` selects whose phase this login may see.
+
+    `None` (or every phase) → None, nothing to narrow. Stored stages whose
+    phase is fixed are decided in SQL; only the ambiguous ones (the front of
+    the flow, RMG Rejected, Self Withdrawn, a generic Rejected) are derived —
+    and only when the allowed set splits them. The clause is TRUE/FALSE, never
+    NULL (it may be combined with other filters freely).
+    """
+    from sqlalchemy import false, or_
+    from services.candidate_profiles import REJECTED_BUCKET  # lazy: that module imports this one
+    from models import CandidateProfile
+
+    if allowed is None:
+        return None
+    allowed = set(allowed)
+    if allowed >= set(STAGE_LABEL):
+        return None
+    sure: list[str] = []
+    maybe: list[str] = []
+    for ps in PS:
+        value = ps.value
+        closed = value in REJECTED_BUCKET
+        possible = _possible_phases(value)
+        if possible is None:                       # Self Withdrawn: depends on where
+            if "closed" in allowed:
+                maybe.append(value)
+            continue
+        oks = {p for p in possible if phase_visible(p, closed, allowed)}
+        if oks == set(possible):
+            sure.append(value)
+        elif oks:
+            maybe.append(value)
+    derived: list[int] = []
+    if maybe:
+        rows = db.execute(stmt.with_only_columns(
+            CandidateProfile.id, CandidateProfile.pipeline_status,
+            CandidateProfile.rmg_screening_status, CandidateProfile.withdrawn_from_status,
+            CandidateProfile.budget_status)
+            .where(CandidateProfile.pipeline_status.in_([PS(v) for v in maybe]))
+            .order_by(None)).all()
+        facts = load_facts(db, rows)
+        for r in rows:
+            f = facts.get(r[0])
+            if f is not None and phase_visible(stage_for(f), _value(r[1]) in REJECTED_BUCKET, allowed):
+                derived.append(r[0])
+    conds = []
+    if sure:
+        conds.append(CandidateProfile.pipeline_status.in_([PS(v) for v in sure]))
+    if derived:
+        conds.append(CandidateProfile.id.in_(derived))
+    return or_(*conds) if conds else false()
+
+
 def phase_counts(db, stmt) -> dict[str, int]:
     """How many of the profiles `stmt` selects sit in each phase (+ "all").
 

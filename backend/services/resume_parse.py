@@ -9,7 +9,7 @@ Powers two TA features (20 Aug 2026):
   through the same extraction, non-duplicates are applied, duplicates are HELD
   for the TA to review (routers/crm/resumes.py::bulk_zip_upload).
 
-Extraction is AI-first (one gpt-4o-mini JSON call per resume, logged through
+Extraction is AI-first (one GPT-5.5 JSON call per resume, logged through
 prompt_logger like every other model call) with a deterministic regex fallback,
 so a missing API key or a model hiccup degrades to "less complete", never to
 "broken".
@@ -89,6 +89,14 @@ _DOMAIN_TYPOS = {
 #: Our own synthesised placeholders (slot_booking / importers) — never real.
 _PLACEHOLDER_MARKERS = ("@noemail.", "@import.karnex.in")
 
+
+
+def _resume_parse_model() -> str:
+    """Resume parsing runs on GPT-5.5 (13 Oct 2026; `RESUME_PARSE_MODEL` may
+    name GPT-6 Astra, nothing else)."""
+    from services.ai_models import workhorse_model
+
+    return workhorse_model("RESUME_PARSE_MODEL")
 
 def clean_email(raw) -> str:
     """One extracted address made safe to store and mail, or "" when it is not
@@ -274,7 +282,7 @@ def _ai_parse(text: str, base: dict) -> tuple[dict, bool]:
 
         if not openai_key_configured():
             return base, False
-        model = (os.getenv("RESUME_PARSE_MODEL") or "gpt-4o-mini").strip()
+        model = _resume_parse_model()
         res = tracked_chat_completion(
             _client("default"),
             model=model,
@@ -335,7 +343,7 @@ def _ai_parse_pdf_file(data: bytes) -> tuple[dict, bool]:
 
         if not openai_key_configured():
             return empty, False
-        model = (os.getenv("RESUME_PARSE_MODEL") or "gpt-4o-mini").strip()
+        model = _resume_parse_model()
         b64 = base64.b64encode(data).decode("ascii")
         res = tracked_chat_completion(
             _client("default"),
@@ -440,7 +448,7 @@ def parse_resume_bytes(data: bytes, ext: str, *, db: Session | None = None,
                         with db.begin_nested():  # savepoint — see the cache-read note
                             row = db.get(ResumeParseCache, sha256)
                             payload = {k: ocr.get(k) for k in (*PARSE_FIELDS,)}
-                            model_name = (os.getenv("RESUME_PARSE_MODEL") or "gpt-4o-mini").strip()
+                            model_name = _resume_parse_model()
                             if row is None:
                                 db.add(ResumeParseCache(file_sha256=sha256, parsed=payload, model=model_name))
                             else:
@@ -464,7 +472,7 @@ def parse_resume_bytes(data: bytes, ext: str, *, db: Session | None = None,
             with db.begin_nested():  # savepoint — see the cache-read note
                 row = db.get(ResumeParseCache, sha256)
                 payload = {k: out.get(k) for k in (*PARSE_FIELDS,)}
-                model_name = (os.getenv("RESUME_PARSE_MODEL") or "gpt-4o-mini").strip()
+                model_name = _resume_parse_model()
                 if row is None:
                     db.add(ResumeParseCache(file_sha256=sha256, parsed=payload, model=model_name))
                 else:

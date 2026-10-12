@@ -45,6 +45,7 @@ ACTIONS: dict[str, str] = {
     "role.updated": "Role edited",
     "role.deleted": "Role deleted",
     "role.members": "Role members changed",
+    "role.stages": "Candidate stages changed",
     "template.created": "Template created",
     "template.updated": "Template edited",
     "template.deleted": "Template deleted",
@@ -58,7 +59,7 @@ ACTION_GROUPS: dict[str, tuple[str, ...]] = {
     "account": ("user.created", "user.invited", "user.activated", "user.deactivated", "user.deleted",
                 "user.portal_access"),
     "security": ("user.password_reset", "user.password_changed"),
-    "roles": ("role.created", "role.updated", "role.deleted", "role.members",
+    "roles": ("role.created", "role.updated", "role.deleted", "role.members", "role.stages",
               "template.created", "template.updated", "template.deleted", "approval.rule"),
     # 9 Oct 2026: who switched the AI interview model, and from what to what.
     "settings": ("settings.ai_engine",),

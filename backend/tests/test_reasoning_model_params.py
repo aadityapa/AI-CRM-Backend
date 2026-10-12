@@ -48,30 +48,31 @@ def test_reasoning_effort_env(monkeypatch):
     assert _call("gpt-6-astra", monkeypatch, "low")["reasoning_effort"] == "low"
 
 
-def test_classic_model_unchanged(monkeypatch):
-    sent = _call("gpt-4o-mini", monkeypatch, "low")
-    assert sent["temperature"] == 0.45 and sent["max_tokens"] == 300
-    assert "reasoning_effort" not in sent
+def test_old_model_is_forced_to_gpt55(monkeypatch):
+    """12 Oct 2026: gpt-4o-mini is retired — a call naming it runs on GPT-5.5."""
+    sent = _call("gpt-4o-mini", monkeypatch)
+    assert sent["model"] == "gpt-5.5"
+    assert "temperature" not in sent and "max_tokens" not in sent
+    assert sent["reasoning_effort"] == "low"        # GPT-5.5's default effort
+
+
+def test_classic_params_survive_for_a_non_reasoning_audio_free_path():
+    from prompt_logger import chat_params
+    out = chat_params("gpt-4o", temperature=0.45, max_tokens=300)
+    assert out["temperature"] == 0.45 and out["max_tokens"] == 300
 
 
 
-def test_ask_ai_never_inherits_a_reasoning_model(monkeypatch):
+def test_ask_ai_runs_on_gpt55(monkeypatch):
+    """Ask AI uses tools, which GPT-6 Astra refuses on chat completions — GPT-5.5."""
     from ai_help import assist
     monkeypatch.delenv("AI_ASSIST_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_MODEL", raising=False)
     monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-6-astra")
-    assert assist._model() == "gpt-4o-mini"
-    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-4o")
-    assert assist._model() == "gpt-4o"
-    monkeypatch.delenv("INTERVIEW_OPENAI_MODEL")
-    assert assist._model() == "gpt-4o-mini"
-
-
-def test_ask_ai_explicit_model_wins(monkeypatch):
-    from ai_help import assist
-    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-6-astra")
+    assert assist._model() == "gpt-5.5"
+    monkeypatch.setenv("AI_ASSIST_MODEL", "gpt-6-astra")
+    assert assist._model() == "gpt-5.5"               # Astra cannot call tools
     monkeypatch.setenv("AI_ASSIST_MODEL", "gpt-4.1-mini")
-    assert assist._model() == "gpt-4.1-mini"
+    assert assist._model() == "gpt-5.5"               # old models are forced
 
 
 def test_interview_model_resolution(monkeypatch):
@@ -84,10 +85,12 @@ def test_interview_model_resolution(monkeypatch):
     assert main._resolve_interview_model({"model": ""}) == "gpt-6-astra"
     assert main._resolve_interview_model(None) == "gpt-6-astra"
     assert main._resolve_interview_model({"model": "gpt-4o"}) == "gpt-6-astra"  # unlocked: ignored
-    assert main._resolve_interview_model({"model": "gpt-4o", "model_locked": True}) == "gpt-4o"
+    assert main._resolve_interview_model({"model": "gpt-4o", "model_locked": True}) == "gpt-6-astra"  # forced
+    assert main._resolve_interview_model({"model": "gpt-5.5", "model_locked": True}) == "gpt-5.5"
+    monkeypatch.setenv("INTERVIEW_OPENAI_MODEL", "gpt-4o-mini")   # an old env line
+    assert main._resolve_interview_model(None) == "gpt-6-astra"
     monkeypatch.delenv("INTERVIEW_OPENAI_MODEL")
-    assert main._resolve_interview_model({"model": "gpt-6-astra"}) == "gpt-4o-mini"
-    assert main._resolve_interview_model(None) == "gpt-4o-mini"
+    assert main._resolve_interview_model(None) == "gpt-6-astra"
 
 
 def test_gpt6_models_are_priced_not_billed_as_gpt4o_mini():
@@ -97,4 +100,5 @@ def test_gpt6_models_are_priced_not_billed_as_gpt4o_mini():
     assert (astra.input, astra.output, astra.cached_input) == (10.0, 50.0, 1.0)
     sol = price_for("gpt-6.1-sol")
     assert (sol.input, sol.output) == (2.0, 10.0)
-    assert price_for("gpt-4o-mini").input == 0.15
+    assert price_for("gpt-4o-mini").input == 0.15        # old calls keep their real price
+    assert price_for("gpt-5.5").input == 5.0
