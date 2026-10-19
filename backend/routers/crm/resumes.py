@@ -289,16 +289,16 @@ def _bulk_jobs_get(job_id: str) -> dict | None:
 
 def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
                       user_name: str, files: list[tuple[str, str, bytes]],
-                      user_email: str = "", send_opening_email: bool = True) -> None:
+                      user_email: str = "", send_opening_email: bool = False) -> None:
     """The worker. Own DB session (we are on a thread, not in a request).
 
     Progress is written to the job store after every file so the UI can show
     "23 / 50". Every terminal path sets status done/error — a job must never
     hang in "running" forever.
 
-    `send_opening_email` (1 Oct 2026, user ask): every applied candidate with a
-    real address gets the "we have an opening — are you interested?" mail
-    (`services/opening_interest`); replies reach the TA's mailbox.
+    `send_opening_email` — kept for the worker's tests only. Since 16 Oct 2026
+    the route always passes False: the "are you interested?" mail is sent by
+    TA by hand (`POST /api/candidate-profiles/opening-email`).
     """
     import hashlib
     import uuid as _uuid
@@ -501,9 +501,6 @@ def _run_bulk_zip_job(job_id: str, requirement_id: int, user_id: int,
 def bulk_zip_upload(
     requirement_id: int,
     file: UploadFile = File(...),
-    #: Email every applied candidate about the opening (1 Oct 2026; the upload
-    #: dialog's checkbox, on by default).
-    send_opening_email: bool = Form(True),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA")),
 ):
@@ -566,7 +563,10 @@ def bulk_zip_upload(
     threading.Thread(
         target=_run_bulk_zip_job,
         args=(job_id, req.id, user.id, user.full_name or user.username, files,
-              user.email or "", send_opening_email),
+              # The opening email is MANUAL only (16 Oct 2026, user decision):
+              # TA sends it from Applied Candidates ▸ Sourcing. An older client's
+              # `send_opening_email` form field is ignored.
+              user.email or "", False),
         daemon=True,
         name=f"bulk-zip-{job_id[:8]}",
     ).start()
@@ -1211,6 +1211,8 @@ def list_resumes(
     # The opening email and the candidate's answer (1 Oct 2026) — ONE query.
     from services.opening_interest import opening_states
     opening = opening_states(db, [r.get("profile_id") for r in page_rows])
+    from services.candidate_profiles import holds_for
+    holds = holds_for(db, [r.get("profile_id") for r in page_rows])
     # Availability + the candidate line, for resume AND profile-only rows (ONE query).
     avail = availability_by_candidate(db, [r.get("candidate_id") for r in page_rows])
     for row in page_rows:
@@ -1227,9 +1229,30 @@ def list_resumes(
         row["closed"] = bool(pid and stage in _CLOSED)
         row["closed_note"] = notes.get(pid) if pid and stage in _CLOSED else None
         row["opening_mail"] = opening.get(pid) if pid else None
+        row["hold"] = holds.get(pid) if pid else None
     _with_screening_extras(db, page_rows)
     _with_other_positions(db, page_rows)
+    _with_call_notes(db, page_rows)
     return envelope(page_rows, meta=meta)
+
+
+def _with_call_notes(db: Session, rows: list[dict]) -> None:
+    """TA's call notes on the row (16 Oct 2026, user ask): how many, and the
+    latest one — so a second call starts from what was said, without opening
+    the profile's Outreach tab. Same store (`candidate_outreach`)."""
+    from routers.crm.outreach import notes_summary
+    cids = [r.get("candidate_id") for r in rows if r.get("candidate_id")]
+    if not cids:
+        return
+    try:
+        with db.begin_nested():
+            notes = notes_summary(db, cids)
+    except Exception:  # noqa: BLE001 — a hint only; the list must load
+        logger.exception("call notes for Applied Candidates failed")
+        return
+    for row in rows:
+        cid = row.get("candidate_id")
+        row["call_notes"] = notes.get(int(cid), {"count": 0, "latest": None}) if cid else None
 
 
 def _with_other_positions(db: Session, rows: list[dict]) -> None:

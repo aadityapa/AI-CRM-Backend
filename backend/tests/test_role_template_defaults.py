@@ -39,3 +39,36 @@ def test_core_workflow_grants_hold():
     assert d["HR"]["employees"] == "create"           # HR owns the directory
     for role in d:
         assert d[role].get("dashboard") == "view"     # everyone lands somewhere
+
+
+def test_every_role_that_sees_branches_opens_the_branch_page():
+    """16 Oct 2026: Finance opened Customers ▸ Branches ▸ Received amount and got
+    "no access to the 'branch-policy' tab" — the defaults never listed it."""
+    for role, tabs in ROLE_TEMPLATE_DEFAULTS.items():
+        if tabs.get("customers") or tabs.get("invoices"):
+            assert tabs.get("branch-policy"), f"{role} links to the branch page"
+
+
+def test_customers_or_invoices_imply_the_branch_page():
+    from services.access_registry import with_implied_tabs
+
+    assert with_implied_tabs({"invoices": "create"})["branch-policy"] == "view"
+    assert with_implied_tabs({"customers": "view"})["branch-policy"] == "view"
+    # never lowers an explicit grant, never invents one from nothing
+    assert with_implied_tabs({"invoices": "view", "branch-policy": "edit"})["branch-policy"] == "edit"
+    assert "branch-policy" not in with_implied_tabs({"timesheets": "edit"})
+
+
+def test_the_0137_snapshot_matches_the_registry():
+    import importlib.util
+    import pathlib
+
+    from services.access_registry import IMPLIED_TABS
+
+    path = next(pathlib.Path(__file__).resolve().parents[1].glob("alembic/versions/0137_*.py"))
+    spec = importlib.util.spec_from_file_location("m0137", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._IMPLIED == IMPLIED_TABS
+    assert mod._fill({"crm:invoices": "create"}) == {"crm:invoices": "create", "branch-policy": "view"}
+    assert mod._fill({"invoices": "view", "branch-policy": "edit"}) is None

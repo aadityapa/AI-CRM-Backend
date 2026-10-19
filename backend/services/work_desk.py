@@ -47,8 +47,10 @@ PS = PipelineStatus
 #: Items per tab — a to-do list, not a report; the count still says the total.
 MAX_ITEMS = 50
 #: The My Tasks page asks for the whole list (`?full=true`) so its filters see
-#: every item, not the Dashboard's first 50.
-FULL_MAX_ITEMS = 500
+#: every item, not the Dashboard's first 50. 20 Oct 2026: 3000 (was 500) —
+#: "Tax invoices issued" lists EVERY invoice, and past 500 the oldest ones
+#: silently fell off before the month / customer filter ever saw them.
+FULL_MAX_ITEMS = 3000
 
 TABS = {
     "feedback": ("Feedback due", "Interviews that are over with no verdict — record it so the candidate moves on."),
@@ -718,7 +720,7 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
             chip, tone, action, order = "With GM for approval", "info", "Open", 2
         if order < 2:
             ts_move += 1
-        it = _item(f"sts:{ts.id}", f"{_employee_name(emp)} · {_month_label(ts.year, ts.month)}", pname,
+        it = _item(f"sts:{ts.id}", f"{_employee_name(emp)} · {_sheet_month(ts)}", pname,
                    chip=chip, tone=tone, when=_when(ts.submitted_at or ts.updated_at),
                    path=f"timesheets/{ts.id}", action=action)
         it.update(section=cname, _order=order, employee=_employee_name(emp),
@@ -731,21 +733,21 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
         select(Timesheet, Employee).outerjoin(Employee, Employee.id == Timesheet.employee_id)
         .where(Timesheet.project_id.in_(inv_pids or [-1]), Timesheet.status == TimesheetStatus.APPROVED,
                func.coalesce(Timesheet.approved_at, Timesheet.updated_at) >= since)).all()
-    docs: dict[int, Invoice] = {}
-    if approved:
-        for inv in db.execute(select(Invoice).where(
-                Invoice.timesheet_id.in_([ts.id for ts, _ in approved])).order_by(Invoice.id)).scalars():
-            docs[inv.timesheet_id] = inv
+    sdocs = _sheet_docs(db, [ts.id for ts, _ in approved])
     pend_items = []
     for ts, emp in approved:
-        doc = docs.get(ts.id)
-        if doc is not None and not (doc.kind == proforma and doc.returned_at):
+        state = _sheet_bill_state(ts, sdocs.get(ts.id) or [])
+        if state is None:
             continue
         pname, cname = where_of(ts.project_id, inv_projects)
-        returned = doc is not None
-        it = _item(f"sip:{ts.id}", f"{_employee_name(emp)} · {_month_label(ts.year, ts.month)}", pname,
-                   chip="Proforma returned by Finance" if returned else "Approved — waiting for GM's Proforma",
-                   tone="warn" if returned else "info", when=_when(ts.approved_at or ts.updated_at),
+        returned = state[0] == "returned"
+        chip = ("Proforma returned by Finance" if returned
+                else f"Part billed — {rupees(state[1])} still to bill" if state[0] == "partial"
+                else "Approved — waiting for GM's Proforma")
+        it = _item(f"sip:{ts.id}", f"{_employee_name(emp)} · {_sheet_month(ts)}", pname,
+                   chip=chip,
+                   tone="warn" if returned or state[0] == "partial" else "info",
+                   when=_when(ts.approved_at or ts.updated_at),
                    path=f"timesheets/{ts.id}", action="Open timesheet")
         it.update(section=cname, _order=0, employee=_employee_name(emp),
                   **_facets(cname, pname, ts.year, ts.month))
@@ -880,10 +882,14 @@ def _renewal_items(db: Session, *, customers: set[int] | None, po_days=RENEWAL_P
     for po, cname in db.execute(q).all():
         days = (po.end_date - today).days
         chip = f"Expired {-days} d ago" if days < 0 else "Ends today" if days == 0 else f"Ends in {days} d"
-        it = _item(f"{prefix}po:{po.id}", f"PO {po.po_number} · {rupees(po.balance_value)} left", "Purchase order",
+        period = " → ".join(d.strftime("%d %b %Y") for d in (po.start_date, po.end_date) if d)
+        it = _item(f"{prefix}po:{po.id}", f"PO {po.po_number} · {rupees(po.balance_value)} left",
+                   f"Purchase order · {period}" if period else "Purchase order",
                    chip=chip, tone="bad" if days <= 7 else "warn" if days <= 21 else "info",
                    when=po.end_date.isoformat(), path=f"pos/{po.id}", action="Open PO")
-        it.update(section=cname, **_facets(cname, None, day=po.end_date))
+        it.update(section=cname, **_facets(cname, None, day=po.end_date),
+                  po_start=po.start_date.isoformat() if po.start_date else None,
+                  po_end=po.end_date.isoformat())
         items.append(it)
     if rolloff_days:
         names = None
@@ -1009,7 +1015,7 @@ def _team_tabs(db: Session) -> list[dict]:
         month_end = date(ts.year + (ts.month // 12), ts.month % 12 + 1, 1) - timedelta(days=1)
         late = (today - month_end).days
         rejected = getattr(ts.status, "value", ts.status) == TimesheetStatus.REJECTED.value
-        it = _item(f"tts:{ts.id}", f"{_employee_name(emp)} · {_month_label(ts.year, ts.month)}",
+        it = _item(f"tts:{ts.id}", f"{_employee_name(emp)} · {_sheet_month(ts)}",
                    f"{cname} · {pname}",
                    chip=("Sent back · " if rejected else "Not submitted · ") + f"{late} d late",
                    tone="bad" if late > SHEET_LATE_DAYS else "warn", when=_when(ts.updated_at),
@@ -1382,7 +1388,10 @@ def _hr_people_tabs(db: Session, today, emp_name) -> dict[str, dict]:
 
 #: Approved sheets older than this are not "coming up" any more — one invoiced
 #: by hand (no timesheet link) would otherwise sit on the list for ever.
-FIN_TIMESHEET_DAYS = 90
+#: 20 Oct 2026: 180 (was 90) — an approved sheet waiting three months for its
+#: Proforma was dropping off Finance's list; the Dashboard's billing tracker
+#: (`services/billing_tracker`) lists every one with no window at all.
+FIN_TIMESHEET_DAYS = 180
 #: A Proforma waiting longer than this is flagged amber, twice as long red.
 PROFORMA_WAIT_DAYS = 3
 
@@ -1398,6 +1407,18 @@ def _month_label(year: int, month: int) -> str:
     from calendar import month_abbr
 
     return f"{month_abbr[month]} {year}"
+
+
+def _sheet_month(ts) -> str:
+    """"May 2026", or "May 2026 (21 Apr – 30 May 2026)" for a sheet whose
+    period crosses a month (20 Oct 2026, user ask: "see which month a
+    timesheet is without opening it")."""
+    from services.billing_tracker import period_label
+
+    label = _month_label(ts.year, ts.month)
+    period = period_label(ts.year, ts.month, getattr(ts, "period_start_date", None),
+                          getattr(ts, "period_end_date", None))
+    return f"{label} ({period})" if period else label
 
 
 def _employee_name(e) -> str:
@@ -1475,7 +1496,7 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
     def sheet_item(key, ts, emp, nm, chip, tone, action, when):
         pname, cname = nm.get(ts.project_id, ("Project", None))
         return _item(
-            f"{key}:{ts.id}", f"{_employee_name(emp)} · {_month_label(ts.year, ts.month)}",
+            f"{key}:{ts.id}", f"{_employee_name(emp)} · {_sheet_month(ts)}",
             " · ".join(x for x in (pname, cname) if x), chip=chip, tone=tone, when=_when(when),
             path=f"timesheets/{ts.id}", action=action) | {"section": cname or "No customer"} \
             | _facets(cname, pname, ts.year, ts.month, employee=_employee_name(emp))
@@ -1512,17 +1533,17 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
                func.coalesce(Timesheet.approved_at, Timesheet.updated_at) >= since)
         .order_by(func.coalesce(Timesheet.approved_at, Timesheet.updated_at).desc())
     ).all()
-    docs: dict[int, Invoice] = {}
-    if sheets:
-        for inv in db.execute(select(Invoice).where(
-                Invoice.timesheet_id.in_([ts.id for ts, _ in sheets])).order_by(Invoice.id)).scalars():
-            docs[inv.timesheet_id] = inv          # latest document per sheet wins
-    waiting = [(ts, emp) for ts, emp in sheets
-               if docs.get(ts.id) is None or (docs[ts.id].kind == proforma and docs[ts.id].returned_at)]
+    sdocs = _sheet_docs(db, [ts.id for ts, _ in sheets])
+    states = {ts.id: _sheet_bill_state(ts, sdocs.get(ts.id) or []) for ts, _ in sheets}
+    waiting = [(ts, emp) for ts, emp in sheets if states.get(ts.id) is not None]
     nm = names({ts.project_id for ts, _ in waiting})
     ts_items = []
     for ts, emp in waiting:
-        chip, tone, action = words["returned" if docs.get(ts.id) is not None else "awaiting"]
+        state = states[ts.id]
+        chip, tone, action = words["returned" if state[0] == "returned" else "awaiting"]
+        if state[0] == "partial":
+            # 0141 — a sheet split across POs with a part still to raise.
+            chip, tone = f"Part billed — {rupees(state[1])} still to bill", "warn"
         ts_items.append(sheet_item("ts", ts, emp, nm, chip, tone, action, ts.approved_at or ts.updated_at))
 
     # 2 — Proformas raised and not returned: Finance's move.
@@ -1888,12 +1909,64 @@ def fill_facets(db: Session, tabs: list[dict]) -> None:
             .join(Opportunity, Opportunity.id == CandidateProfile.opportunity_id)
             .join(Customer, Customer.id == Opportunity.customer_id)
             .where(CandidateProfile.id.in_(missing))).all())
+    _fill_billing_facets(db, tabs)
     for tab in tabs:
         for it in tab["items"]:
             if not it.get("customer"):
                 it["customer"] = names.get(it.get("profile_id")) or None
             if not it.get("month") and isinstance(it.get("when"), str) and len(it["when"]) >= 7:
                 it["month"] = it["when"][:7]
+
+
+def _fill_billing_facets(db: Session, tabs: list[dict]) -> None:
+    """16 Oct 2026 (user ask): every invoice / timesheet item says its customer
+    BRANCH, and an invoice the MONTH it bills (the timesheet period — not the
+    day it was raised) and its employee, so Finance / Sales filter by branch,
+    employee and month without opening anything. Two queries for the desk."""
+    import re
+
+    from models import CustomerBranch, Invoice, Project, Timesheet
+    from services.invoice_facets import invoice_facets
+
+    inv_ids, ts_ids = set(), set()
+    for tab in tabs:
+        for it in tab["items"]:
+            path = it.get("path") or ""
+            if m := re.fullmatch(r"invoices/(\d+)", path):
+                inv_ids.add(int(m.group(1)))
+            elif m := re.fullmatch(r"timesheets/(\d+)", path):
+                ts_ids.add(int(m.group(1)))
+    if not inv_ids and not ts_ids:
+        return
+    try:
+        with db.begin_nested():
+            invs = db.execute(select(Invoice).where(Invoice.id.in_(inv_ids))).scalars().all() if inv_ids else []
+            facets = invoice_facets(db, invs)
+            ts_branch = dict(db.execute(
+                select(Timesheet.id, CustomerBranch.branch_name)
+                .join(Project, Project.id == Timesheet.project_id)
+                .join(CustomerBranch, CustomerBranch.id == Project.branch_id)
+                .where(Timesheet.id.in_(ts_ids))).all()) if ts_ids else {}
+    except Exception:  # noqa: BLE001 — filter aids only
+        import logging
+        logging.getLogger("karnex.crm.work_desk").warning("work desk billing facets failed", exc_info=True)
+        return
+    for tab in tabs:
+        for it in tab["items"]:
+            path = it.get("path") or ""
+            if m := re.fullmatch(r"invoices/(\d+)", path):
+                f = facets.get(int(m.group(1))) or {}
+                if f.get("branch_name"):
+                    it["branch"] = f["branch_name"]
+                if f.get("month"):
+                    it["month"] = f["month"]
+                    it["for_month"] = f["month_label"]
+                if f.get("employee") and not it.get("employee"):
+                    it["employee"] = f["employee"]
+                it["invoice_id"] = int(m.group(1))
+            elif m := re.fullmatch(r"timesheets/(\d+)", path):
+                if ts_branch.get(int(m.group(1))):
+                    it["branch"] = ts_branch[int(m.group(1))]
 
 
 def _confirms_invoices(user) -> bool:
@@ -1938,3 +2011,30 @@ def _screener_tabs(db: Session, user) -> list[dict]:
             tab["stage"] = _SCREENER_STAGE[c["key"]]
         out.append(tab)
     return out
+
+
+def _sheet_docs(db: Session, ids: list[int]) -> dict[int, list]:
+    """Every invoice per sheet (0141: a split sheet has one per part) — one query."""
+    from models import Invoice
+    out: dict[int, list] = {}
+    if not ids:
+        return out
+    for inv in db.execute(select(Invoice).where(Invoice.timesheet_id.in_(ids))
+                          .order_by(Invoice.id)).scalars():
+        out.setdefault(inv.timesheet_id, []).append(inv)
+    return out
+
+
+def _sheet_bill_state(ts, docs: list) -> tuple[str, float] | None:
+    """('new', 0) no document yet · ('returned', 0) a Proforma came back ·
+    ('partial', left) split parts leave money to bill · None = nothing to raise."""
+    from services.timesheets import billing_progress
+    if not docs:
+        return ("new", 0.0)
+    prog = billing_progress(None, ts, docs)
+    if prog.get("returned"):
+        return ("returned", 0.0)
+    left = prog.get("remaining")
+    if prog.get("split") and left is not None and left > 0.01:
+        return ("partial", float(left))
+    return None

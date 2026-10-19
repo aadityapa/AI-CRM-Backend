@@ -123,6 +123,26 @@ _BUDGET_STAGES = {PS.PREBOARDING.value, PS.HR_INTERVIEWING.value}
 TERMS_SENT_BACK = "OFFER_SENT_BACK"
 TERMS_SUBMITTED = "SUBMITTED_FOR_APPROVAL"
 
+#: A candidacy put on hold by anyone who works it (16 Oct 2026, user ask) —
+#: activity rows, the latest of the two wins (no migration, audited). The
+#: comment starts "[<side>]" so the reader knows whose hold it is.
+CANDIDATE_HELD = "CANDIDATE_HELD"
+CANDIDATE_RELEASED = "CANDIDATE_RELEASED"
+#: Who asked for the hold, and how the status reads it.
+HOLD_SIDES: dict[str, str] = {"TA": "TA", "RMG": "RMG", "Sales": "Sales",
+                              "Customer": "Customer", "HR": "HR"}
+
+
+def parse_hold_comment(comment: str | None) -> tuple[str, str]:
+    """PURE. "[Customer] Neha Rao put … on hold: reason" → ("Customer", "reason")."""
+    text = (comment or "").strip()
+    side = ""
+    if text.startswith("[") and "]" in text:
+        side, text = text[1:text.index("]")], text[text.index("]") + 1:].strip()
+    reason = text.split(": ", 1)[1] if ": " in text else text
+    return (side if side in HOLD_SIDES else ""), reason.strip()
+
+
 #: Opportunity stages that PARK every live candidacy on the deal (1 Oct 2026).
 #: `Opportunity.pipeline_stage` values — "On_Hold" is "Customer Hold" in the UI.
 DEAL_HOLD_STATUS_KEY: dict[str, str] = {"On_Hold": "deal_customer_hold",
@@ -134,6 +154,7 @@ _SETTLED = frozenset({
     PS.SELF_WITHDRAWN.value, PS.REJECTED.value,
 })
 _LIVE_PIPELINES = frozenset(p.value for p in PS) - _SETTLED
+SETTLED_PIPELINES = _SETTLED
 _HOLD_HINT = ("Sales put the opportunity on {who} — the candidacy is parked where it was, not closed. "
               "It resumes when the deal is reactivated; the candidate can be applied to other "
               "opportunities meanwhile.")
@@ -210,6 +231,9 @@ STATUS_DEFS: list[StatusDef] = [
     _d("joined", "Joined", OK, "selection", "The candidate has joined.", {PS.JOINED.value}),
     _d("deal_customer_hold", "Customer Hold", WARN, "parked", _HOLD_HINT.format(who="Customer Hold"),
        _LIVE_PIPELINES),
+    _d("candidate_hold", "On Hold – by request", WARN, "parked",
+       "Someone who works this candidate put them on hold — the reason is shown; the candidacy stays "
+       "where it was and Release continues it.", _LIVE_PIPELINES),
     _d("deal_sales_hold", "Sales Hold", WARN, "parked", _HOLD_HINT.format(who="Sales Hold"),
        _LIVE_PIPELINES),
     _d("sales_rejected", "Sales Rejected", BAD, "closed",
@@ -316,6 +340,8 @@ class StatusFacts:
     terms_sent_back: bool = False
     #: `Opportunity.pipeline_stage` of the deal — a hold parks a live candidacy.
     opportunity_stage: str | None = None
+    #: (side, reason) while the candidacy itself is on hold (16 Oct 2026).
+    hold: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -436,6 +462,11 @@ def _derive(f: StatusFacts) -> CandidateStatus:
     # resumes exactly there — and a settled candidacy keeps its own word.
     if f.opportunity_stage in DEAL_HOLD_STATUS_KEY and stage not in _SETTLED:
         return _status(DEAL_HOLD_STATUS_KEY[f.opportunity_stage])
+    if f.hold and stage not in _SETTLED:
+        side, reason = f.hold
+        return _status("candidate_hold",
+                       label=f"On Hold – {HOLD_SIDES.get(side, side)}" if side else None,
+                       hint=f"Reason: {reason}" if reason else None)
     if stage == PS.SHORTLISTED.value and f.terms_sent_back:
         return _status("terms_sent_back")
     if stage in _BUDGET_STAGES and f.budget_status in _BUDGET_STATUS_KEY:
@@ -566,6 +597,7 @@ _ROUND_STATES = {"pending": "Yet to Schedule", "scheduled": "Scheduled", "passed
 _STATUS_ROUND: dict[str, tuple[str | None, str, str | None]] = {
     "sourcing": (None, "New Applicant", None),
     "ta_hold": (None, "On Hold", None),
+    "candidate_hold": (None, "On Hold", None),
     "technical_screening": (None, "CV Screening", "With RMG / GM"),
     "technical_interview": (None, "Technical L1 Interview", "Yet to Schedule"),
     "hr_discussion": ("hr", "HR Discussion", None),
@@ -645,6 +677,7 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
     ta_closed: dict[int, str] = {}
     sent_back: dict[int, bool] = {}
     deal_stage: dict[int, str] = {}
+    holds: dict[int, tuple[str, str] | None] = {}
     for chunk in _chunks(ids):
         # The deal's stage — a hold parks the candidacy (one query, never per row).
         for pid, opp_stage in db.execute(
@@ -666,15 +699,18 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
             state = round_state(status, result, when is not None)
             if state is not None:          # ascending id → the latest real round wins
                 rounds[pid][key] = state
-        for pid, action in db.execute(
-            select(CandidateProfileActivityLog.profile_id, CandidateProfileActivityLog.action_type)
+        for pid, action, comment in db.execute(
+            select(CandidateProfileActivityLog.profile_id, CandidateProfileActivityLog.action_type,
+                   CandidateProfileActivityLog.comment)
             .where(CandidateProfileActivityLog.profile_id.in_(chunk),
                    CandidateProfileActivityLog.action_type.in_(
                        tuple(_REQUEST_TO_ROUND) + tuple(TA_CLOSE_ACTIONS)
-                       + (TERMS_SENT_BACK, TERMS_SUBMITTED)))
+                       + (TERMS_SENT_BACK, TERMS_SUBMITTED, CANDIDATE_HELD, CANDIDATE_RELEASED)))
             .order_by(CandidateProfileActivityLog.id)
         ).all():
-            if action in (TERMS_SENT_BACK, TERMS_SUBMITTED):
+            if action in (CANDIDATE_HELD, CANDIDATE_RELEASED):
+                holds[pid] = parse_hold_comment(comment) if action == CANDIDATE_HELD else None
+            elif action in (TERMS_SENT_BACK, TERMS_SUBMITTED):
                 sent_back[pid] = action == TERMS_SENT_BACK          # the latest wins
             elif action in TA_CLOSE_ACTIONS:
                 ta_closed[pid] = TA_CLOSE_ACTIONS[action]   # the latest wins
@@ -702,6 +738,7 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
             ta_closed=ta_closed.get(pid),
             terms_sent_back=sent_back.get(pid, False),
             opportunity_stage=deal_stage.get(pid),
+            hold=holds.get(pid),
         )
         for pid in ids
     }

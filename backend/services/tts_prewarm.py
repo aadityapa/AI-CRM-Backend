@@ -40,6 +40,13 @@ MAX_INFLIGHT = 4
 _cache: "OrderedDict[tuple[str, str, str, str], tuple[float, bytes]]" = OrderedDict()
 _lock = threading.Lock()
 _inflight: set[tuple[str, str, str, str]] = set()
+#: One Event per in-flight prewarm (16 Oct 2026): /candidate/tts asked for a
+#: clip whose prewarm had started milliseconds earlier (a follow-up question is
+#: only decided at the end of /answer) and fired a SECOND OpenAI call for the
+#: same text instead of waiting for the first — two calls racing on one key.
+_events: dict[tuple[str, str, str, str], threading.Event] = {}
+#: How long the live path waits for a prewarm already making this exact clip.
+INFLIGHT_WAIT_S = 4.0
 
 #: How the interviewer voice should sound (16 Sep 2026, user request: read every
 #: question aloud in Indian English). `gpt-4o-mini-tts` takes free-text style
@@ -163,6 +170,7 @@ def prewarm_tts(text: str) -> bool:
         if len(_inflight) >= MAX_INFLIGHT:
             return False
         _inflight.add(key)
+        _events[key] = threading.Event()
 
     # A bare Thread does not inherit ContextVars: carry the interview
     # attribution across so the prewarmed clip is costed to its interview.
@@ -184,13 +192,33 @@ def prewarm_tts(text: str) -> bool:
         finally:
             with _lock:
                 _inflight.discard(key)
+                done = _events.pop(key, None)
+            if done is not None:
+                done.set()
 
     threading.Thread(target=_run, daemon=True).start()
     return True
 
 
+def wait_for_inflight(text: str, voice: str, model: str, timeout_s: float = INFLIGHT_WAIT_S) -> bytes | None:
+    """When a prewarm is already synthesising this exact clip, wait for it (up
+    to `timeout_s`) and return the audio; None when nothing is in flight, the
+    prewarm failed, or it is slower than the deadline (the caller then streams).
+    Blocking — call it from a worker thread."""
+    payload = normalize_tts_text(text)
+    if not payload:
+        return None
+    key = _key(payload, voice, model)
+    with _lock:
+        event = _events.get(key)
+    if event is None:
+        return None
+    event.wait(max(0.0, float(timeout_s)))
+    return get_cached(payload, voice, model)
+
+
 def cache_stats() -> dict:
     """For diagnostics/tests — never used to make decisions."""
     with _lock:
-        return {"entries": len(_cache), "inflight": len(_inflight),
+        return {"entries": len(_cache), "inflight": len(_inflight), "waiters": len(_events),
                 "max_entries": MAX_ENTRIES, "ttl_seconds": TTL_SECONDS}

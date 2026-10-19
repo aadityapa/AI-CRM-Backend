@@ -110,3 +110,16 @@ def test_source_markers_are_stable():
     """The frontend colour-codes on these strings."""
     assert SOURCE_AI == "ai_l1"
     assert SOURCE_MANUAL == "manual_round"
+
+
+def test_event_carries_the_contact_block_and_hides_placeholder_emails():
+    """16 Oct 2026 — TA reaches a candidate who did not join from the pop-up."""
+    from services import interview_calendar as ic
+    ev = ic._event(id="manual:1", source="manual_round", title="t", starts_at=None,
+                   candidate_email="resume-3508@noemail.karnex.local",
+                   candidate_phone="+919876543210", candidate_city="Pune",
+                   candidate_notice="30 days", ta_owner="Gargee Joshi")
+    assert ev["candidate_email"] is None
+    assert ev["candidate_phone"] == "+919876543210" and ev["ta_owner"] == "Gargee Joshi"
+    assert ic._event(id="x", source="s", title="t", starts_at=None,
+                     candidate_email="Ravi.K@Gmail.com")["candidate_email"] == "ravi.k@gmail.com"

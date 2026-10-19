@@ -368,6 +368,22 @@ def lead_in_for_index(meta: Any, index: int) -> str | None:
     return text or None
 
 
+def spoken_text(lead_in: str | None, question: str | None) -> str:
+    """The ONE string the interviewer voice speaks for a turn (16 Oct 2026): the
+    lead-in and the question as a single clip. Two clips meant two voice round
+    trips in a row before every follow-up; one clip is one, and the server warms
+    exactly this string so the browser's request finds it ready. PURE."""
+    lead = " ".join(str(lead_in or "").split())
+    q = " ".join(str(question or "").split())
+    if not lead:
+        return q
+    if not q:
+        return lead
+    if lead[-1] not in ".!?…":
+        lead += "."
+    return f"{lead} {q}"
+
+
 # ---------------------------------------------------------------------------
 # Model calls (bounded, never raise)
 # ---------------------------------------------------------------------------

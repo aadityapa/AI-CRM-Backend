@@ -217,3 +217,39 @@ def test_the_draft_editor_shows_the_built_in_wording():
     assert any(e["event"] == oi.EVENT and e["kind"] == "candidate" for e in EVENTS)
     d = builtin_candidate_draft(oi.EVENT)
     assert "{role}" in d["subject"] and "{first_name}" in d["body"] and "{sender}" in d["body"]
+
+
+def test_bulk_send_mails_sourcing_rows_and_says_why_others_are_skipped(db):
+    """16 Oct 2026 — the mail is manual only; TA sends a batch from Sourcing."""
+    req, cand, p = _setup(db)
+    _req2, _cand2, p2 = _setup_second(db, req)
+    p2.pipeline_status = PS.SALES_SCREENING
+    db.flush()
+    sent, skipped = oi.send_opening_mails(db, [p, p2], TA)
+    assert [s["profile_id"] for s in sent] == [p.id]
+    assert skipped and skipped[0]["profile_id"] == p2.id and "Sourcing" in skipped[0]["reason"]
+    # A second press does not mail twice.
+    sent, skipped = oi.send_opening_mails(db, [p], TA)
+    assert not sent and "Already emailed" in skipped[0]["reason"]
+
+
+def test_no_upload_sends_the_opening_mail_on_its_own():
+    import inspect
+    import routers.crm.resumes as r
+    src = inspect.getsource(r.bulk_zip_upload)
+    assert "send_opening_email: bool = Form" not in src
+    assert 'user.email or "", False)' in src
+
+
+def test_call_notes_summary_counts_and_returns_the_latest(db):
+    """16 Oct 2026 — TA's call notes on the Applied Candidates row."""
+    from models import CandidateOutreach
+    from routers.crm.outreach import notes_summary
+    req, cand, p = _setup(db)
+    db.add_all([CandidateOutreach(candidate_id=cand.id, channel="Call", note="first", user_id=1),
+                CandidateOutreach(candidate_id=cand.id, channel="WhatsApp", note="second",
+                                  outcome="Call back later", user_id=1)])
+    db.flush()
+    out = notes_summary(db, [cand.id])[cand.id]
+    assert out["count"] == 2 and out["latest"]["note"] in ("first", "second")
+    assert notes_summary(db, []) == {}

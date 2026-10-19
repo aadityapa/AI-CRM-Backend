@@ -73,6 +73,10 @@ TABS: dict[str, str] = {
     # feedback form), scoped to the rounds whose employee IS the login. The
     # seeded "Interviewer" custom role grants this tab and nothing else.
     "my-interviews": "My Interviews (panel feedback)",
+    # 16 Oct 2026 — every candidate we have ever had, searched by skill (Phase 1
+    # over existing data). Read-only page, no form: applying reuses the
+    # candidate page's multi-apply. Defaults: TA · RMG · Sales Head.
+    "talent-pool": "Talent Pool",
 }
 
 # ------------------------------------------------------------------ Interview Platform tabs
@@ -106,6 +110,28 @@ IV_TAB_DEFAULT_ROLES: dict[str, tuple[str, ...]] = {
 #: lower-cased role name; `iv_tabs_for_roles` reads it through `IV_ROLE_ALIASES`.
 IV_ROLE_ALIASES: dict[str, tuple[str, ...]] = {"gm": ("RMG",)}
 TABS.update(IV_TABS)
+
+#: Tabs a page OPENS INTO (16 Oct 2026). A login granted the key on the right
+#: reaches the tab on the left through a link on that page, so it is granted at
+#: "view" whenever the template / custom role does not name it. Reported: a
+#: Finance login opened Customers ▸ Branches ▸ "Received amount" (the branch
+#: page's Received Amount tab) and got "You do not have access to the
+#: 'branch-policy' tab" — no role template had ever listed the branch page.
+#: Never LOWERS an explicit grant; only fills a gap.
+IMPLIED_TABS: dict[str, tuple[str, ...]] = {
+    "branch-policy": ("customers", "invoices"),
+}
+
+
+def with_implied_tabs(tabs: dict[str, str]) -> dict[str, str]:
+    """Return ``tabs`` plus every IMPLIED_TABS entry its grants open into (PURE)."""
+    out = dict(tabs or {})
+    for implied, sources in IMPLIED_TABS.items():
+        if implied in out:
+            continue
+        if any(out.get(src) for src in sources):
+            out[implied] = "view"
+    return out
 
 
 def is_iv_tab(key: str) -> bool:

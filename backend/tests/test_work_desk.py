@@ -648,3 +648,12 @@ def test_every_tax_invoice_is_listed_and_ticks_are_personal(db):
     assert "done" not in _tabs(db, other)["fin_invoices"]["items"][0]           # personal
     assert wd.set_marks(db, FINANCE.id, [key], False) == 1
     assert "done" not in _tabs(db, FINANCE)["fin_invoices"]["items"][0]
+
+
+def test_invoice_month_label_and_billing_facets_are_wired():
+    """16 Oct 2026 — invoices say their branch and the month they bill."""
+    import inspect
+    from services import work_desk as wd
+    from services.invoice_facets import month_label
+    assert month_label("2026-09") == "Sep 2026" and month_label(None) is None
+    assert "_fill_billing_facets(db, tabs)" in inspect.getsource(wd.fill_facets)

@@ -64,6 +64,8 @@ DEFAULTS = {
     #: Move a closed project's team to the bench the day after its last
     #: working day (services/project_closure.py). 25 Sep 2026.
     "scheduler.project_closures": "true",
+    #: Employees whose last working day has passed become Inactive (16 Oct 2026).
+    "scheduler.employee_separations": "true",
     #: Drop the heavy prompt/response text from AI call logs past the retention
     #: window and purge the expired response cache. Tokens, audio minutes, cost
     #: and interview attribution are KEPT — the cost report needs them for
@@ -606,6 +608,12 @@ def run_project_closures_job(db, today: date | None = None) -> dict:
     return run_project_closures(db, today or date.today())
 
 
+def run_employee_separations_job(db, today: date | None = None) -> dict:
+    """Employees past their last working day → Inactive (services/employee_separation)."""
+    from services.employee_separation import run_employee_separations
+    return run_employee_separations(db, today)
+
+
 def run_feedback_due_job(db=None) -> dict:
     """Interviews that are over with no verdict → remind their owner
     (`services/interview_followups`). Runs on EVERY pass — a reminder a day
@@ -648,6 +656,29 @@ def run_prompt_log_retention(db=None, today: date | None = None) -> dict:
     return out
 
 
+def run_talent_pool_index_job(db=None) -> dict:
+    """Talent Pool skill index (17 Oct 2026): every pass re-indexes the
+    candidates that changed; the first pass of each IST day rebuilds all of it
+    (services/talent_pool.run_index_job)."""
+    from services.talent_pool import run_index_job
+    return run_index_job(db)
+
+
+def run_talent_pool_alerts_job(db=None) -> dict:
+    """Saved-search alerts — once a day, one bell + email per search with new
+    matches (services/talent_saved_searches)."""
+    from services.talent_saved_searches import run_alerts
+    return run_alerts(db)
+
+
+def run_talent_pool_retention_job(db=None) -> dict:
+    """Talent Pool retention — warn 30 days ahead, then take inactive candidates
+    out of the pool; bring back anyone with new activity
+    (services/talent_retention)."""
+    from services.talent_retention import run_retention
+    return run_retention(db)
+
+
 JOBS = {
     "timesheet_reminders": ("scheduler.timesheet_reminders", run_timesheet_reminders),
     "revenue_month_close": ("scheduler.revenue_month_close", run_revenue_month_close),
@@ -656,14 +687,18 @@ JOBS = {
     "recurring_invoices": ("scheduler.recurring_invoices", run_recurring_invoices),
     "pe_leave_credit": ("scheduler.pe_leave_credit", run_pe_leave_credit_job),
     "project_closures": ("scheduler.project_closures", run_project_closures_job),
+    "employee_separations": ("scheduler.employee_separations", run_employee_separations_job),
     "prompt_log_retention": ("scheduler.prompt_log_retention", run_prompt_log_retention),
     "interview_feedback_due": ("scheduler.interview_feedback_due", run_feedback_due_job),
     "ai_interview_reminders": ("scheduler.ai_interview_reminders", run_ai_interview_reminders_job),
+    "talent_pool_index": ("scheduler.talent_pool_index", run_talent_pool_index_job),
+    "talent_pool_alerts": ("scheduler.talent_pool_alerts", run_talent_pool_alerts_job),
+    "talent_pool_retention": ("scheduler.talent_pool_retention", run_talent_pool_retention_job),
 }
 
 #: Jobs that run on every scheduler pass (≈15 min) rather than once a day after
 #: the run hour — each keeps its own "already told" record.
-EVERY_PASS_JOBS = frozenset({"interview_feedback_due", "ai_interview_reminders"})
+EVERY_PASS_JOBS = frozenset({"interview_feedback_due", "ai_interview_reminders", "talent_pool_index"})
 
 
 def run_due_jobs(*, force: bool = False, only: str | None = None) -> dict:

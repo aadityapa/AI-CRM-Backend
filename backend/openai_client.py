@@ -89,6 +89,33 @@ def openai_key_configured(purpose: OpenAIPurpose = "default") -> bool:
     return bool(key and key != "your_key_here")
 
 
+#: Calls a candidate waits on while the interview is live (16 Oct 2026). The SDK
+#: default is a 600-second timeout with two retries and back-off, so one stalled
+#: voice request held the next question silent for 30–60 seconds. A spoken
+#: question that cannot be produced in 20 s is better read by the browser voice
+#: (the client falls back on its own deadline). Override per purpose with
+#: OPENAI_<PURPOSE>_TIMEOUT_S / OPENAI_<PURPOSE>_MAX_RETRIES.
+_LIVE_LIMITS: dict[str, tuple[float, int]] = {"tts": (20.0, 1), "transcribe": (45.0, 1)}
+
+
+def _purpose_limits(purpose: str) -> tuple[float | None, int | None]:
+    """(timeout seconds, max retries) for a purpose, or (None, None) = SDK defaults."""
+    default = _LIVE_LIMITS.get(purpose)
+    if default is None:
+        return None, None
+    timeout, retries = default
+    up = purpose.upper()
+    try:
+        timeout = max(2.0, min(600.0, float(os.getenv(f"OPENAI_{up}_TIMEOUT_S") or timeout)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        retries = max(0, min(5, int(os.getenv(f"OPENAI_{up}_MAX_RETRIES") or retries)))
+    except (TypeError, ValueError):
+        pass
+    return timeout, retries
+
+
 @lru_cache(maxsize=8)
 def get_openai_client(purpose: OpenAIPurpose = "default") -> OpenAI:
     api_key = _resolve_api_key(purpose)
@@ -96,4 +123,8 @@ def get_openai_client(purpose: OpenAIPurpose = "default") -> OpenAI:
     kwargs: dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
+    timeout, retries = _purpose_limits(purpose)
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+        kwargs["max_retries"] = retries
     return OpenAI(**kwargs)

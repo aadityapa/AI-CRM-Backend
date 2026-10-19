@@ -28,6 +28,16 @@ router = APIRouter(prefix="/api/reports", tags=["CRM: Reports"])
 #: does not). The CEO revenue reports stay `role_required()`.
 REPORTS_READ = gated_read("reports")
 
+#: The money pages — Revenue report, its placements split, the Excel pack, and
+#: (in dashboards.py) the Dashboard's Finance tab. 19 Oct 2026 (user decision):
+#: Finance works them in full, the Sales family (Sales · Sales Head · the Sales
+#: Manager, who carries Sales) reads them, Admin / CEO always. By ROLE only — a
+#: template grant never widens a P&L view.
+FINANCE_VIEW_ROLES = ("Finance", "Sales", "Sales_Head")
+FINANCE_VIEW = role_required(*FINANCE_VIEW_ROLES)
+#: Changing what the CEO is measured against (targets) — Finance + Admin / CEO.
+FINANCE_EDIT = role_required("Finance")
+
 
 def _respond(rows: list[dict], format: str | None, filename: str):
     if (format or "").strip().lower() == "csv":
@@ -108,9 +118,9 @@ def revenue(
     customer_id: int | None = Query(None, ge=1, description="Narrow the whole report to one customer"),
     project_id: int | None = Query(None, ge=1, description="Narrow the whole report to one project"),
     db: Session = Depends(get_crm_db),
-    # CEO view (18 Sep 2026): Admin/CEO ONLY — role_required() with no roles is
-    # the admin-only gate; templates cannot widen it and no other role sees it.
-    user: CurrentUser = Depends(role_required()),
+    # CEO view (18 Sep 2026); since 19 Oct 2026 Finance + the Sales family read it
+    # too (FINANCE_VIEW, by role — templates cannot widen it).
+    user: CurrentUser = Depends(FINANCE_VIEW),
 ):
     """`month` is the ANCHOR at every zoom: `?month=2026-09&period=quarter` is
     the quarter containing September 2026, so existing `?month=` links (the
@@ -131,7 +141,7 @@ def revenue_placements(
     customer_id: int | None = Query(None, ge=1),
     project_id: int | None = Query(None, ge=1),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required()),   # Admin/CEO only, like the page
+    user: CurrentUser = Depends(FINANCE_VIEW),   # same readers as the page
 ):
     """Customer placements split internal (redeployed) vs external (new hire).
 
@@ -177,7 +187,7 @@ def _put_setting(db: Session, key: str, value: float | None, description: str) -
 def revenue_targets(
     body: RevenueTargetsIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required()),   # Admin/CEO only — same gate as the report
+    user: CurrentUser = Depends(FINANCE_EDIT),   # Finance + Admin/CEO; Sales only reads
 ):
     """Set the monthly / financial-year revenue targets the report measures against."""
     from datetime import date as _date
@@ -225,7 +235,7 @@ def revenue_export(
     customer_id: int | None = Query(None, ge=1),
     project_id: int | None = Query(None, ge=1),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required()),   # Admin/CEO only
+    user: CurrentUser = Depends(FINANCE_VIEW),   # whoever reads the page may take its workbook
 ):
     """Period-close workbook: every section of the report, one sheet each.
 

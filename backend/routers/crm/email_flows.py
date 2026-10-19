@@ -181,6 +181,18 @@ EVENTS: list[dict] = [
     # nobody could see or re-route them. Whatever the route says, everyone who
     # may Shortlist (RMG role · GM custom role · a template's Approvals) is
     # ALWAYS added — `candidate_profiles.screening_notify_user_ids`.
+    # Public application link (19 Oct 2026): a candidate applied via the link
+    # a TA posted on Naukri / LinkedIn — the position's assigned TAs hear first.
+    {"event": "apply_link.application",
+     "label": "Candidate applied via the public application link",
+     "description": "Sent to the TAs assigned to the position (every TA when none is assigned) when a "
+                    "candidate applies through the application link. The candidate waits at Sourcing.",
+     "default_roles": ["TA"]},
+    {"event": "profile.candidate_held",
+     "label": "Candidate put on hold / released",
+     "description": "Sent to the TAs who work the candidate when anyone (TA, RMG, Sales, HR) puts the "
+                    "candidate on hold with a reason, or releases the hold.",
+     "default_roles": ["TA"]},
     {"event": "profile.ta_closed",
      "label": "TA rejected / recorded a withdrawal",
      "description": "Sent when a TA rejects a candidate at Sourcing or records that the candidate withdrew. "
@@ -272,6 +284,24 @@ EVENTS: list[dict] = [
                     "that the candidate did not join: the reason and the panel's note go to the "
                     "candidate's TAs and the screeners (RMG / GM) so the round is booked again.",
      "default_roles": ["TA", "RMG", "GM"]},
+    {"event": "talent_pool.saved_search_alert",
+     "label": "Talent Pool — new matches for a saved search",
+     "description": "Once a day, to the owner of a saved Talent Pool search with alerts on, when people "
+                    "who did not match before now match (a new CV, a skill proven in an interview, someone "
+                    "back in the pool). One bell + one email per search, listing the new names.",
+     "default_roles": []},
+    {"event": "talent_pool.retention_warning",
+     "label": "Talent Pool — candidates about to leave the pool",
+     "description": "Daily digest to the TA who added candidates whose retention period ends in 30 days "
+                    "(no activity for a long time). Pressing Keep on the Talent Pool's Retention tab resets "
+                    "a candidate's clock.",
+     "default_roles": []},
+    {"event": "talent_pool.candidate_opted_out",
+     "label": "Talent Pool — a candidate asked to be removed",
+     "description": "To the TA who added the candidate, when the candidate used the “Remove me from your "
+                    "talent pool” link in one of our emails. They are no longer searched, suggested or sent "
+                    "opening emails.",
+     "default_roles": []},
     {"event": "interview.panel_assigned",
      "label": "You are taking this interview — panel member notified",
      "description": "Sent to the employee named as the interviewer of a Technical L1–L4 round, when "
@@ -814,6 +844,7 @@ def scheduler_status(db: Session = Depends(get_crm_db),
               "recurring_invoices": "Recurring invoice drafts",
               "pe_leave_credit": "Monthly leave credit",
               "project_closures": "Close projects after their last working day",
+              "employee_separations": "Mark employees Inactive after their last working day",
               "prompt_log_retention": "AI call log retention (keeps cost figures)"}
     runs = last_runs()
 

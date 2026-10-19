@@ -11,14 +11,22 @@ GET /api/finance/reports/customer-ledger?customer_id=&date_from=&date_to=
     a running balance, and closing balance.
 
 GET /api/finance/reports/receivables?as_of=
-    Per-customer outstanding rollup as of a date, with aging buckets keyed on
-    due_date (fallback: invoice_date): 0-30 / 31-60 / 61-90 / 90+ days.
+    Per-customer outstanding rollup as of a date. 19 Oct 2026 (CEO found the old
+    "0-30 / 31-60" columns confusing — 0-30 mixed money not yet due with money
+    a month late): every rupee owed is placed by HOW LATE it is against its due
+    date — Not yet due · 1–30 days late · 31–60 · 61–90 · 90+ days late. The due
+    date is the invoice's, else invoice date + 30 days (the Revenue report's
+    rule, so the two pages agree). Each customer carries its open invoices
+    (number, month billed, employee, due date, days late) for the drill-down.
 
-Read access mirrors invoices (Finance / Sales_Head; Admin & CEO implicit).
+Proformas are not issued invoices and are left out of both reports.
+
+Read access: Finance / Sales / Sales Head (+ Admin, CEO). 19 Oct 2026 — Sales
+reads the Financial Reports tab, Finance works it.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -29,11 +37,31 @@ from crm_deps import CurrentUser, gated_read, get_crm_db
 from models import (
     CreditNote, Customer, Invoice, InvoicePayment, Project, TdsRecord,
 )
+from models.finance import InvoiceKind
 from schemas.common import envelope
 
 router = APIRouter(prefix="/api/finance/reports", tags=["CRM: Finance Reports"])
 
-INV_READ = gated_read("invoices", "Finance", "Sales_Head")
+INV_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
+NOT_PROFORMA = Invoice.kind != InvoiceKind.PROFORMA.value
+#: Payment terms assumed when an invoice has no due date (revenue_report's rule).
+DEFAULT_TERMS_DAYS = 30
+#: The receivable columns, in order — key, label, (min, max) days late.
+LATE_BUCKETS: tuple[tuple[str, str, int, int | None], ...] = (
+    ("not_due", "Not yet due", -10**6, 0),
+    ("late_1_30", "1–30 days late", 1, 30),
+    ("late_31_60", "31–60 days late", 31, 60),
+    ("late_61_90", "61–90 days late", 61, 90),
+    ("late_90_plus", "Over 90 days late", 91, None),
+)
+
+
+def late_bucket(days_late: int) -> str:
+    """Which receivable column `days_late` belongs to. PURE."""
+    for key, _label, lo, hi in LATE_BUCKETS:
+        if days_late >= lo and (hi is None or days_late <= hi):
+            return key
+    return LATE_BUCKETS[-1][0]
 
 ZERO = Decimal("0")
 
@@ -46,7 +74,7 @@ def _customer_invoices(db: Session, customer_id: int) -> list[tuple[Invoice, Pro
     return db.execute(
         select(Invoice, Project)
         .join(Project, Project.id == Invoice.project_id)
-        .where(Project.customer_id == customer_id)
+        .where(Project.customer_id == customer_id, NOT_PROFORMA)
         .order_by(Invoice.invoice_date, Invoice.id)
     ).all()
 
@@ -169,7 +197,7 @@ def receivables(
         select(Invoice, Project, Customer)
         .join(Project, Project.id == Invoice.project_id)
         .join(Customer, Customer.id == Project.customer_id)
-        .where(Invoice.invoice_date <= as_of)
+        .where(Invoice.invoice_date <= as_of, NOT_PROFORMA)
     ).all()
     invoice_ids = [inv.id for inv, _, _ in inv_rows]
 
@@ -197,13 +225,20 @@ def receivables(
     ).scalars().all():
         cn_by_inv[cn.invoice_id] = cn_by_inv.get(cn.invoice_id, ZERO) + Decimal(cn.total_amount or 0)
 
-    buckets = ("b_0_30", "b_31_60", "b_61_90", "b_90_plus")
+    buckets = tuple(b[0] for b in LATE_BUCKETS)
+    from services.invoice_facets import invoice_facets
+    open_invoices = [inv for inv, _p, _c in inv_rows]
+    try:
+        facets = invoice_facets(db, open_invoices)
+    except Exception:  # noqa: BLE001 — the drill-down labels are a nicety
+        facets = {}
     rows: dict[int, dict] = {}
     for inv, prj, cust in inv_rows:
         row = rows.setdefault(cust.id, {
             "customer_id": cust.id, "customer_name": cust.name,
             "invoiced": ZERO, "received": ZERO, "tds": ZERO, "credit_notes": ZERO,
-            "outstanding": ZERO, "invoice_count": 0, "overdue_count": 0,
+            "outstanding": ZERO, "overdue": ZERO, "invoice_count": 0, "overdue_count": 0,
+            "oldest_days_late": 0, "open_invoices": [],
             **{b: ZERO for b in buckets},
         })
         total = Decimal(inv.grand_total or 0)
@@ -219,25 +254,31 @@ def receivables(
         if outstanding <= 0:
             continue
         row["outstanding"] += outstanding
-        anchor = inv.due_date or inv.invoice_date
-        overdue_days = (as_of - anchor).days
-        if overdue_days > 0:
+        due = inv.due_date or (inv.invoice_date + timedelta(days=DEFAULT_TERMS_DAYS))
+        days_late = (as_of - due).days
+        key = late_bucket(days_late)
+        row[key] += outstanding
+        if days_late > 0:
             row["overdue_count"] += 1
-        if overdue_days <= 30:
-            row["b_0_30"] += outstanding
-        elif overdue_days <= 60:
-            row["b_31_60"] += outstanding
-        elif overdue_days <= 90:
-            row["b_61_90"] += outstanding
-        else:
-            row["b_90_plus"] += outstanding
+            row["overdue"] += outstanding
+            row["oldest_days_late"] = max(row["oldest_days_late"], days_late)
+        f = facets.get(inv.id) or {}
+        row["open_invoices"].append({
+            "id": inv.id, "invoice_number": inv.invoice_number,
+            "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+            "month_label": f.get("month_label"), "branch_name": f.get("branch_name"),
+            "employee": f.get("employee"), "project": prj.name,
+            "due_date": due.isoformat(), "days_late": max(days_late, 0),
+            "bucket": key, "outstanding": _num(outstanding),
+        })
 
     out = []
     grand = {k: ZERO for k in ("invoiced", "received", "tds", "credit_notes", "outstanding",
-                               *buckets)}
+                               "overdue", *buckets)}
     for row in sorted(rows.values(), key=lambda r: -r["outstanding"]):
         for k in grand:
             grand[k] += row[k]
+        row["open_invoices"].sort(key=lambda i: -i["days_late"])
         out.append({
             **{k: (v if not isinstance(v, Decimal) else _num(v)) for k, v in row.items()},
         })
@@ -246,4 +287,6 @@ def receivables(
         "as_of": as_of.isoformat(),
         "customers": out,
         "totals": {k: _num(v) for k, v in grand.items()},
+        "buckets": [{"key": k, "label": label} for k, label, _lo, _hi in LATE_BUCKETS],
+        "terms_days": DEFAULT_TERMS_DAYS,
     }, message="Payment receivables")

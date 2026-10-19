@@ -11,7 +11,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (
@@ -20,6 +20,8 @@ from crm_deps import (
 )
 from models import (
     Customer,
+    CustomerBranch,
+    Employee,
     Invoice,
     InvoiceLine,
     InvoicePayment,
@@ -31,6 +33,7 @@ from models import (
     TdsPayment,
     TdsRecord,
     TdsStatus,
+    Timesheet,
     TimesheetActivityLog,
 )
 from models.finance import InvoiceKind
@@ -751,8 +754,17 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
                   po_id: int | None = None, customer_id: int | None = None,
                   kind: str | None = None,
                   customer_approved: bool | None = None,
+                  branch_id: int | None = None, employee_id: int | None = None,
+                  month: str | None = None,
                   pp: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
+    """16 Oct 2026 (user ask): `branch_id` (the project's branch, else the PO's
+    billing branch), `employee_id` (the billed timesheet's employee) and
+    `month` "YYYY-MM" (the timesheet period, else the invoice date) narrow the
+    list; search also matches the employee's name; every row says its branch,
+    month and employee (`services/invoice_facets`)."""
+    from services.invoice_facets import invoice_facets
+
     stmt = select(Invoice)
     if kind:
         # "Proforma" = Finance's review queue; "Tax" = issued invoices. Blank = both.
@@ -769,13 +781,39 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
     if project_id is not None:
         stmt = stmt.where(Invoice.project_id == project_id)
     if customer_id is not None:
-        # Customer hub tab: an invoice belongs to a customer via its project.
-        stmt = stmt.join(Project, Project.id == Invoice.project_id).where(
-            Project.customer_id == customer_id)
+        # Customer hub tab: an invoice belongs to a customer via its project, or
+        # via its PO (20 Oct 2026, user report "invoice not showing": the rows
+        # print the PO's customer, so the filter must find it by the PO too).
+        stmt = stmt.where(sa.or_(
+            Invoice.project_id.in_(select(Project.id).where(Project.customer_id == customer_id)),
+            Invoice.po_id.in_(select(PurchaseOrder.id).where(PurchaseOrder.customer_id == customer_id))))
     if po_id is not None:
         stmt = stmt.where(Invoice.po_id == po_id)
+    if branch_id is not None:
+        stmt = stmt.where(sa.or_(
+            Invoice.project_id.in_(select(Project.id).where(Project.branch_id == branch_id)),
+            sa.and_(Invoice.project_id.in_(select(Project.id).where(Project.branch_id.is_(None))),
+                    Invoice.po_id.in_(select(PurchaseOrder.id).where(PurchaseOrder.billing_branch_id == branch_id)))))
+    if employee_id is not None:
+        stmt = stmt.where(Invoice.timesheet_id.in_(
+            select(Timesheet.id).where(Timesheet.employee_id == employee_id)))
+    if month:
+        try:
+            y, m = int(month[:4]), int(month[5:7])
+            first = date(y, m, 1)
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+        nxt = date(y + (m == 12), 1 if m == 12 else m + 1, 1)
+        stmt = stmt.where(sa.or_(
+            Invoice.timesheet_id.in_(select(Timesheet.id).where(Timesheet.year == y, Timesheet.month == m)),
+            sa.and_(Invoice.timesheet_id.is_(None), Invoice.invoice_date >= first, Invoice.invoice_date < nxt)))
     if pp.search:
-        stmt = stmt.where(Invoice.invoice_number.ilike(f"%{pp.search}%"))
+        like = f"%{pp.search}%"
+        stmt = stmt.where(sa.or_(
+            Invoice.invoice_number.ilike(like), Invoice.proforma_number.ilike(like),
+            Invoice.timesheet_id.in_(select(Timesheet.id).join(Employee, Employee.id == Timesheet.employee_id)
+                                     .where(sa.or_(Employee.first_name.ilike(like), Employee.last_name.ilike(like),
+                                                   Employee.employee_code.ilike(like))))))
     stmt = stmt.order_by(Invoice.customer_approved_at.desc().nullslast(), Invoice.id.desc()) \
         if customer_approved else stmt.order_by(Invoice.id.desc())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
@@ -790,7 +828,9 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
     cust_ids = {inv.po.customer_id for inv in items if inv.po is not None and inv.po.customer_id} | set(proj_cust.values())
     cust_names = dict(db.execute(select(Customer.id, sa.func.coalesce(Customer.legal_entity_name, Customer.name))
                                  .where(Customer.id.in_(cust_ids))).all()) if cust_ids else {}
+    facets = invoice_facets(db, items)
     for inv, r in zip(items, rows):
+        r.update({k: v for k, v in (facets.get(inv.id) or {}).items()})
         cid = (inv.po.customer_id if inv.po is not None and inv.po.customer_id else proj_cust.get(inv.project_id))
         r["customer_id"] = cid
         r["customer_name"] = cust_names.get(cid)
@@ -799,6 +839,11 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
             # The IRN itself stays on the invoice page; the list says only whether it is in.
             r["irn_recorded"] = bool(inv.irn_number)
             r["ack_number"] = inv.ack_number
+    if customer_id is not None:
+        # The Branch filter's choices for this customer (any role reading invoices).
+        meta = {**(meta or {}), "branches": [{"id": b_id, "name": b_name} for b_id, b_name in db.execute(
+            select(CustomerBranch.id, CustomerBranch.branch_name)
+            .where(CustomerBranch.customer_id == customer_id).order_by(CustomerBranch.branch_name)).all()]}
     return envelope(data=rows, meta=meta)
 
 
@@ -826,8 +871,15 @@ def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
     block only for Finance / Admin / CEO (`invoice_approval.payload`)."""
     from services.revenue_report import _user_names
 
+    from services.invoice_facets import invoice_facets
+
     data.update(invoice_approval.payload(invoice, user,
                                          _user_names(db, invoice_approval.user_ids(invoice))))
+    # What the invoice is FOR — the work month, a cross-month period, the
+    # employee, the branch (20 Oct 2026, user ask: "show which month this
+    # invoice is" on the invoice page header).
+    data.update({k: v for k, v in (invoice_facets(db, [invoice]).get(invoice.id) or {}).items()
+                 if k not in data or data.get(k) is None})
     return data
 
 
@@ -839,6 +891,29 @@ class EInvoiceIn(BaseModel):
     irn: str = Field(min_length=1, max_length=80)
     ack_number: str = Field(min_length=1, max_length=40)
     ack_date: date | None = None
+
+
+class BulkCustomerApprovalIn(BaseModel):
+    invoice_ids: list[int] = Field(min_length=1, max_length=invoice_approval.MAX_BULK)
+    note: str | None = Field(default=None, max_length=500)
+
+
+# Literal path (three segments, literal second) — never shadowed by /{invoice_id}/….
+@router.post("/invoices/customer-approval/bulk")
+def confirm_customer_approval_bulk(body: BulkCustomerApprovalIn, db: Session = Depends(get_crm_db),
+                                   user: CurrentUser = Depends(INV_READ)):
+    """Sales Manager / Sales Head confirm the customer's approval of many tax
+    invoices at once from My Tasks (16 Oct 2026). Each refused one says why;
+    Finance gets ONE notice for the batch."""
+    invoices = db.execute(select(Invoice).where(Invoice.id.in_(set(body.invoice_ids)))
+                          .order_by(Invoice.invoice_date, Invoice.id)).scalars().all()
+    done, skipped = invoice_approval.confirm_many(db, invoices, user, body.note)
+    db.commit()
+    missing = set(body.invoice_ids) - {i.id for i in invoices}
+    skipped += [{"invoice_id": i, "invoice_number": None, "reason": "Invoice not found"} for i in sorted(missing)]
+    return envelope({"confirmed": [i.id for i in done], "skipped": skipped},
+                    f"{len(done)} invoice(s) confirmed as approved by the customer — Finance notified"
+                    + (f", {len(skipped)} skipped" if skipped else ""))
 
 
 @router.post("/invoices/{invoice_id}/customer-approval")
@@ -1122,17 +1197,10 @@ def record_tds(invoice_id: int, body: TdsCreateIn, db: Session = Depends(get_crm
     invoice = get_invoice_or_404(db, invoice_id)
     require_tax_invoice(invoice, "recording TDS")
     invoice_approval.require_payment_open(invoice)
-    if invoice.tds_record is not None:
-        raise HTTPException(status_code=409, detail="TDS record already exists for this invoice")
-    tds_amount = body.tds_amount if body.tds_amount is not None else tax.tds_amount(invoice.sub_total)
-    record = TdsRecord(
-        invoice_id=invoice.id,
-        tds_amount=tds_amount,
-        tds_paid=Decimal("0"),
-        tds_balance=tds_amount - Decimal("0"),
-        tds_status=TdsStatus.PENDING,
-    )
-    db.add(record)
+    from services import tds as tds_svc
+    figures = tds_svc.work_out(invoice, rate=body.tds_rate, base=body.tds_base,
+                               amount=body.tds_amount)
+    record = tds_svc.book(db, invoice, figures, section=body.section, user_id=user.id)
     db.commit()
     db.refresh(record)
     return envelope(serialize_tds(record, invoice_number=invoice.invoice_number), "TDS recorded")
@@ -1177,8 +1245,15 @@ def list_tds_payments(invoice_id: int, db: Session = Depends(get_crm_db),
 
 
 @router.get("/tds")
-def list_tds(tds_status: str | None = None, pp: PageParams = Depends(page_params),
+def list_tds(tds_status: str | None = None, customer_id: int | None = None,
+             pp: PageParams = Depends(page_params),
              db: Session = Depends(get_crm_db), user: CurrentUser = Depends(TDS_READ)):
+    """The TDS register (16 Oct 2026): what each customer withheld and whether
+    it is still pending from them (Form 16A not in yet). Rows carry the invoice,
+    customer, rate / base, the receipt it was booked with and how long it has
+    been pending; `meta.pending_total` is over the whole filter."""
+    from models import CustomerReceipt
+
     stmt = (
         select(TdsRecord)
         .join(Invoice, Invoice.id == TdsRecord.invoice_id)
@@ -1187,28 +1262,51 @@ def list_tds(tds_status: str | None = None, pp: PageParams = Depends(page_params
     )
     if tds_status:
         stmt = stmt.where(TdsRecord.tds_status == _enum_or_400(TdsStatus, tds_status, "tds_status"))
+    if customer_id is not None:
+        stmt = stmt.where(Project.customer_id == customer_id)
     if pp.search:
-        stmt = stmt.where(Invoice.invoice_number.ilike(f"%{pp.search}%"))
+        like = f"%{pp.search}%"
+        stmt = stmt.where(or_(Invoice.invoice_number.ilike(like), Customer.name.ilike(like)))
+    pending_total = db.execute(
+        stmt.with_only_columns(func.coalesce(func.sum(TdsRecord.tds_balance), 0)).order_by(None)
+    ).scalar()
     stmt = stmt.order_by(TdsRecord.id.desc())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
 
-    # Batch-resolve invoice numbers + customer names for the page of records.
     invoice_ids = {r.invoice_id for r in items}
     lookup: dict = {}
     if invoice_ids:
         rows = db.execute(
-            select(Invoice.id, Invoice.invoice_number, Customer.name)
+            select(Invoice, Customer.id, Customer.name)
             .join(Project, Project.id == Invoice.project_id)
             .join(Customer, Customer.id == Project.customer_id)
             .where(Invoice.id.in_(invoice_ids))
         ).all()
-        lookup = {row[0]: (row[1], row[2]) for row in rows}
-    data = [
-        serialize_tds(r,
-                      invoice_number=lookup.get(r.invoice_id, (None, None))[0],
-                      customer_name=lookup.get(r.invoice_id, (None, None))[1])
-        for r in items
-    ]
+        lookup = {row[0].id: row for row in rows}
+    receipt_ids = {r.receipt_id for r in items if getattr(r, "receipt_id", None)}
+    receipts = {rc.id: rc for rc in db.execute(
+        select(CustomerReceipt).where(CustomerReceipt.id.in_(receipt_ids))).scalars().all()} if receipt_ids else {}
+    today = date.today()
+    data = []
+    for r in items:
+        inv, cust_id, cust_name = lookup.get(r.invoice_id, (None, None, None))
+        row = serialize_tds(r, invoice_number=inv.invoice_number if inv else None, customer_name=cust_name)
+        rc = receipts.get(getattr(r, "receipt_id", None))
+        since = rc.received_date if rc is not None else (r.created_at.date() if getattr(r, "created_at", None)
+                                                          else (inv.invoice_date if inv else None))
+        row.update({
+            "customer_id": cust_id,
+            "invoice_date": inv.invoice_date.isoformat() if inv and inv.invoice_date else None,
+            "sub_total": float(inv.sub_total or 0) if inv else None,
+            "grand_total": float(inv.grand_total or 0) if inv else None,
+            "invoice_payment_status": getattr(inv.payment_status, "value", inv.payment_status) if inv else None,
+            "receipt_date": rc.received_date.isoformat() if rc is not None and rc.received_date else None,
+            "receipt_reference": rc.reference_number if rc is not None else None,
+            "deducted_on": since.isoformat() if since else None,
+            "pending_days": (today - since).days if since and float(r.tds_balance or 0) > 0 else None,
+        })
+        data.append(row)
+    meta = {**(meta or {}), "pending_total": float(pending_total or 0)}
     return envelope(data, meta=meta)
 
 
@@ -1232,7 +1330,8 @@ def delete_tds(
             detail=f"Cannot delete: {pay_count or 1} TDS payment(s) exist. Reverse payments first.",
         )
     invoice = record.invoice
-    db.delete(record)
+    from services import tds as tds_svc
+    tds_svc.unbook(db, record)  # the TDS goes back on the invoice balance
     commit_or_conflict(db, "Cannot delete: TDS record is still referenced by other records.")
     return envelope(
         data={"id": tds_id, "invoice_id": invoice.id if invoice else None},

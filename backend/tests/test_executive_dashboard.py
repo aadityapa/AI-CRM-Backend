@@ -205,10 +205,13 @@ def test_unknown_tab_is_a_value_error(book):
         ed.executive_dashboard(book, "hr", today=TODAY)
 
 
-def test_route_is_admin_only_and_tab_driven():
+def test_route_is_tab_driven_and_only_finance_opens_beyond_admin():
+    """19 Oct 2026: Finance + the Sales family read the Finance tab; Customer ·
+    Sales · People stay Admin / CEO."""
     from routers.crm import dashboards
     src = inspect.getsource(dashboards.ceo_dashboard)
-    assert "role_required()" in src and 'Query("finance"' in src
+    assert 'role_required("Finance", "Sales", "Sales_Head")' in src and 'Query("finance"' in src
+    assert 'if tab != "finance" and not user.is_admin' in src
 
 
 def test_the_people_route_is_hrs_desk_and_serves_the_people_tab_only():

@@ -54,9 +54,18 @@ KEYS: dict[str, tuple[str, str]] = {
     "scheduler.pe_leave_credit_lookback": ("", "12"),
     # Closed projects: team moves to the bench after the last working day (25 Sep 2026).
     "scheduler.project_closures": ("", "true"),
+    "scheduler.employee_separations": ("", "true"),
     "scheduler.prompt_log_retention": ("", "true"),
     "scheduler.interview_feedback_due": ("", "true"),
     "scheduler.ai_interview_reminders": ("", "true"),
+    # Talent Pool (17 Oct 2026): the skill index refresh (every pass), the daily
+    # saved-search alerts, and the daily retention pass.
+    "scheduler.talent_pool_index": ("", "true"),
+    "scheduler.talent_pool_alerts": ("", "true"),
+    "scheduler.talent_pool_retention": ("", "true"),
+    # Months after a candidate's last activity they stay in the Talent Pool
+    # (user left it open; 24 = the common recruitment norm). 6..120.
+    "talent_pool.retention_months": ("TALENT_POOL_RETENTION_MONTHS", "24"),
     # Emails to EMPLOYEES on the HR master (timesheet-due reminders, leave
     # decisions, approvals) — OFF by default since 1 Oct 2026 (user decision: a
     # project employee deployed at a customer must receive nothing from this
@@ -67,6 +76,12 @@ KEYS: dict[str, tuple[str, str]] = {
     "scheduler.revenue_month_close": ("", "true"),
     # Finance — an office move or a bank change must not be a code deploy.
     "finance.tds_rate_percent": ("TDS_RATE_PERCENT", "10"),
+    # Billing one timesheet on several POs (0141, 20 Oct 2026). Admin switches:
+    # the split itself, how many parts one sheet may have (2..10), and whether a
+    # PO past its end date that still has balance may be drawn (with a warning).
+    "billing.split_po_enabled": ("", "true"),
+    "billing.split_po_max_parts": ("", "10"),
+    "billing.allow_expired_po": ("", "true"),
     # AI spend (28 Sep 2026): OpenAI bills in USD; the CEO page prints rupees too.
     "ai.usd_inr_rate": ("USD_INR_RATE", "84"),
     # Seller (company) block on the Tax Invoice. DB row -> INVOICE_* env -> default.
@@ -146,6 +161,27 @@ _FORMATS: dict[str, tuple[re.Pattern, str]] = {
 }
 
 
+#: On / off switches whose value must read as a boolean.
+_BOOL_KEYS = ("billing.split_po_enabled", "billing.allow_expired_po")
+_BOOL_WORDS = ("1", "0", "true", "false", "yes", "no", "on", "off")
+#: The schema caps a split at 10 parts (`GenerateInvoiceIn.splits`).
+MAX_SPLIT_PARTS = 10
+
+
+def split_po_rules() -> dict:
+    """The admin's split-PO rules as the server enforces them and the Raise
+    Proforma dialog shows them. Never raises; a bad stored number falls back."""
+    try:
+        parts = int(setting("billing.split_po_max_parts") or MAX_SPLIT_PARTS)
+    except ValueError:
+        parts = MAX_SPLIT_PARTS
+    return {
+        "enabled": setting_bool("billing.split_po_enabled"),
+        "max_parts": max(2, min(MAX_SPLIT_PARTS, parts)),
+        "allow_expired_po": setting_bool("billing.allow_expired_po"),
+    }
+
+
 def normalize_value(key: str, value: str) -> str:
     """Trim; tax identifiers are upper-cased (they are printed as such)."""
     value = (value or "").strip()
@@ -159,6 +195,19 @@ def validation_error(key: str, value: str) -> str | None:
         from services.ai_models import validation_error as model_error
 
         return model_error(key, value)
+    if key == "talent_pool.retention_months":
+        from services.talent_retention import validate_months
+
+        return validate_months(value)
+    if key in _BOOL_KEYS and value and value.strip().lower() not in _BOOL_WORDS:
+        return "Use true or false"
+    if key == "billing.split_po_max_parts" and value:
+        try:
+            n = int(value)
+        except ValueError:
+            return "Enter a whole number from 2 to 10"
+        if not 2 <= n <= MAX_SPLIT_PARTS:
+            return "Enter a whole number from 2 to 10"
     fmt = _FORMATS.get(key)
     if not fmt or not value:
         return None

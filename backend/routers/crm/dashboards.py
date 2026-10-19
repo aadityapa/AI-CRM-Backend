@@ -130,6 +130,32 @@ def work_desk(
     return envelope(desk(db, user, max_items=FULL_MAX_ITEMS if full else MAX_ITEMS))
 
 
+@router.get("/billing")
+def billing_tracker(
+    customer_id: int | None = None,
+    month: str | None = Query(None, description="YYYY-MM — the month the work was done"),
+    stage: str | None = Query(None, description="a stage key, 'open', or blank for all"),
+    search: str | None = None,
+    page: int = 1,
+    limit: int = 25,
+    db: Session = Depends(get_crm_db),
+    # Finance by role, Admin / CEO always (role_required adds them). Not
+    # template-widenable: it prints every customer's billing.
+    user: CurrentUser = Depends(role_required("Finance")),
+):
+    """Every approved timesheet and every invoice, one row per piece of billed
+    work, filtered by customer / month / stage on the server — the Dashboard's
+    billing tracker for Finance, Admin and CEO (`services/billing_tracker`)."""
+    from services.billing_tracker import TrackerFilters, billing_tracker as build
+
+    try:
+        out = build(db, TrackerFilters(customer_id=customer_id, month=month, stage=stage,
+                                       search=search, page=page, limit=limit))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return envelope(data=out["rows"], meta=out["meta"])
+
+
 class DeskMarksIn(BaseModel):
     keys: list[str] = Field(min_length=1, max_length=500)
     done: bool = True
@@ -196,9 +222,11 @@ def ceo_dashboard(
     month: str | None = Query(None, description="YYYY-MM anchor; blank = current month"),
     period: str | None = Query(None, description="month | quarter | fy (default fy)"),
     db: Session = Depends(get_crm_db),
-    # Admin / CEO ONLY and not template-widenable: the Customer tab prints every
-    # customer's revenue and every employee's cost side by side.
-    user: CurrentUser = Depends(role_required()),
+    # The Finance tab (19 Oct 2026): Finance + the Sales family read it too
+    # (reports.FINANCE_VIEW_ROLES, by role). Customer · Sales · People stay
+    # Admin / CEO ONLY — the Customer tab prints every customer's revenue beside
+    # every employee's cost.
+    user: CurrentUser = Depends(role_required("Finance", "Sales", "Sales_Head")),
 ):
     """One tab of the CEO dashboard — Finance · Customer (→ project → employee) ·
     Sales (positions, internal vs external onboardings, pace) · People (headcount,
@@ -206,6 +234,8 @@ def ceo_dashboard(
     default zoom is the financial year."""
     from services.executive_dashboard import executive_dashboard
 
+    if tab != "finance" and not user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the CEO / Admin can open this tab")
     try:
         return envelope(executive_dashboard(db, tab, month, period))
     except ValueError as exc:

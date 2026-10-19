@@ -29,6 +29,7 @@ from models import (
     Timesheet,
 )
 from schemas.common import envelope
+from services.employee_separation import SEPARATION_FIELDS, apply_separation
 from schemas.employees import (
     EmployeeCreate,
     EmployeeEducationCreate,
@@ -319,9 +320,18 @@ def update_employee(employee_id: int, body: EmployeeUpdate, db: Session = Depend
 
     for field, value in data.items():
         setattr(emp, field, value)
+    message = "Employee updated"
+    # Separation recorded → Status follows it (16 Oct 2026): Inactive once the
+    # last working day has passed, else on notice until the daily job's turn.
+    if SEPARATION_FIELDS & set(data) and not ("is_active" in data and data["is_active"]):
+        if apply_separation(emp):
+            message = "Employee updated — marked Inactive (last working day has passed)"
+        elif emp.last_working_day and emp.is_active:
+            message = (f"Employee updated — stays Active until the last working day "
+                       f"({emp.last_working_day:%d %b %Y}), then becomes Inactive")
     db.commit()
     db.refresh(emp)
-    return envelope(serialize_employee(emp, db, detail=True), "Employee updated")
+    return envelope(serialize_employee(emp, db, detail=True), message)
 
 
 @router.delete("/{employee_id}")

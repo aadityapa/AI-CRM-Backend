@@ -86,9 +86,10 @@ def test_resolver_template_modes(db):
     db.add(UserProfile(user_id=5, access_template_id=t.id)); db.commit()
     acc = effective_access(db, 5, {"Sales"})
     assert acc["full"] is False and acc["source"] == "template"
-    assert acc["tabs"] == {"customers": "edit", "opportunities": "view"}
+    assert acc["tabs"] == {"customers": "edit", "opportunities": "view",
+                           "branch-policy": "view"}   # implied: Customers opens the branch page
     assert acc["fields"]["customers"]["status"] == "view"
-    assert acc["visible_tabs"] == ["customers", "opportunities"]
+    assert acc["visible_tabs"] == ["branch-policy", "customers", "opportunities"]
 
 
 def test_resolver_override_wins(db):
@@ -125,7 +126,7 @@ def test_resolver_legacy_crm_prefixed_override_normalizes(db):
     assert acc["tabs"]["opportunities"] == "create"
     assert acc["tabs"]["dashboard"] == "create"
     assert "crm:customers" not in acc["tabs"]
-    assert acc["visible_tabs"] == ["customers", "dashboard", "opportunities"]
+    assert acc["visible_tabs"] == ["branch-policy", "customers", "dashboard", "opportunities"]
 
 
 def test_resolver_inactive_template_falls_back_to_role_defaults(db):

@@ -73,17 +73,47 @@ def tds_amount(sub_total, rate=None) -> Decimal:
 
 # --- Balance recomputation (pure; models passed in, caller commits) ---
 
-def apply_invoice_payment(invoice, amount) -> None:
-    """Record a payment amount on an Invoice: updates paid/balance/status."""
-    invoice.paid_amount = (_d(invoice.paid_amount) + _d(amount)).quantize(TWO_PLACES)
-    invoice.balance_amount = (_d(invoice.grand_total) - _d(invoice.paid_amount)).quantize(TWO_PLACES)
+def refresh_invoice_balance(invoice) -> None:
+    """balance = grand_total − paid − TDS the customer withheld (16 Oct 2026).
+
+    TDS settles the invoice beside the cash: an invoice paid net of TDS reads
+    Paid, and the TDS itself is followed on its TdsRecord ("pending from
+    client" until the Form 16A is in)."""
+    paid = _d(invoice.paid_amount)
+    tds = _d(getattr(invoice, "tds_deducted", 0))
+    invoice.balance_amount = (_d(invoice.grand_total) - paid - tds).quantize(TWO_PLACES)
     if invoice.balance_amount <= 0:
         invoice.payment_status = "Paid"
         invoice.balance_amount = max(invoice.balance_amount, Decimal("0"))
-    elif _d(invoice.paid_amount) > 0:
+    elif paid > 0 or tds > 0:
         invoice.payment_status = "Partially_Paid"
     else:
         invoice.payment_status = "Unpaid"
+
+
+def apply_invoice_payment(invoice, amount) -> None:
+    """Record a payment amount on an Invoice: updates paid/balance/status."""
+    invoice.paid_amount = (_d(invoice.paid_amount) + _d(amount)).quantize(TWO_PLACES)
+    refresh_invoice_balance(invoice)
+
+
+def apply_tds_deduction(invoice, amount) -> None:
+    """The customer withheld `amount` as TDS on this invoice (negative = undo)."""
+    invoice.tds_deducted = max((_d(getattr(invoice, "tds_deducted", 0)) + _d(amount)).quantize(TWO_PLACES),
+                               Decimal("0"))
+    refresh_invoice_balance(invoice)
+
+
+TDS_BASES = ("taxable", "total")
+
+
+def tds_on(invoice, rate, base: str = "taxable") -> tuple[Decimal, Decimal]:
+    """(base amount, TDS) for `rate` %. "taxable" = the value before GST — the
+    usual base when GST is shown separately on the invoice (CBDT circular
+    23/2017); "total" = the invoice total incl. GST, for customers who deduct
+    on the gross."""
+    base_amt = _d(invoice.grand_total if base == "total" else invoice.sub_total)
+    return base_amt.quantize(TWO_PLACES), (base_amt * _d(rate) / 100).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
 
 def apply_tds_payment(tds_record, amount) -> None:

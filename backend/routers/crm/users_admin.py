@@ -147,7 +147,11 @@ def deactivate_user(user_id: int,
     updated = svc.set_user_active(db, user_id, False, actor_id=user.id, reason=payload.reason)
     audit.record(db, actor=user, action="user.deactivated", target_user_id=user_id,
                  before=before, after=audit.snapshot(db, user_id), reason=payload.reason)
-    return envelope(data=updated, message=f"User '{updated['username']}' deactivated")
+    n = int(updated.get("released_positions") or 0)
+    msg = f"User '{updated['username']}' deactivated"
+    if n:
+        msg += f" and taken off {n} position{'s' if n != 1 else ''}' sourcing team{'s' if n != 1 else ''}"
+    return envelope(data=updated, message=msg)
 
 
 @router.post("/users/{user_id}/access-source")

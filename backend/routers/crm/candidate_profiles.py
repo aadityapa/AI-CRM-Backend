@@ -67,6 +67,8 @@ rmg_roles = gated_write_action("profile.rmg_screening", "profiles")
 #: TA joined 6 Oct 2026 — but a TA-only login archives CLOSED candidacies only
 #: (rejected / withdrawn, any stage), see `archive_closed_only`.
 archive_gate = screener_or(gated_write("profiles", "RMG", "Sales", "Sales_Head", "TA"))
+#: Hold / release a candidacy — anyone who works the candidate (16 Oct 2026).
+hold_gate = screener_or(gated_write("profiles", "TA", "RMG", "Sales", "Sales_Head", "HR"))
 
 
 def archive_closed_only(db: Session, user) -> bool:
@@ -466,8 +468,11 @@ def list_profiles(pp: PageParams = Depends(page_params),
         meta = {**meta, "phase_counts": counts}
     rows = enrich_profiles_list(db, items)
     reasons = archive_reasons(db, [r.get("id") for r in rows])
+    from services.candidate_profiles import holds_for
+    held = holds_for(db, [r.get("id") for r in rows])
     for r in rows:
         r["archived"] = reasons.get(r.get("id"))   # "manual" | "hold" | None
+        r["hold"] = held.get(r.get("id"))
     if with_actions and items:
         from services.work_desk import pending_offers
         offers = pending_offers(db, [p.id for p in items])
@@ -1039,6 +1044,60 @@ def send_many_for_screening(payload: SendForScreeningIn,
                             + (f", {len(refused)} skipped" if refused else ""))
 
 
+class HoldIn(BaseModel):
+    action: str = Field(pattern="^(hold|release)$")
+    side: str | None = Field(default=None, max_length=16)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+@router.post("/{profile_id}/hold")
+def hold_candidate(profile_id: int, payload: HoldIn,
+                   db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(hold_gate)):
+    """Put a candidate on hold with a reason — or release them (16 Oct 2026).
+    TA, RMG / GM, Sales and HR may; `side` says whose hold it is (TA · RMG ·
+    Sales · Customer · HR). The stage never moves; the status reads
+    "On Hold – <side>" until released. The TAs who work the candidate hear."""
+    from services.candidate_profiles import set_candidate_hold
+
+    profile = get_profile_or_404(db, profile_id)
+    message = set_candidate_hold(db, profile, payload.action, payload.side, payload.reason, user)
+    name = _candidate_name(db, profile)
+    who = user.full_name or user.username
+    if payload.action == "hold":
+        _notify_ta(db, profile, f"On hold: {name}",
+                   f"{who} put {name} on hold ({payload.side or 'see reason'}): {(payload.reason or '').strip()}",
+                   "profile.candidate_held", user)
+    else:
+        _notify_ta(db, profile, f"Hold released: {name}", f"{who} released the hold on {name}.",
+                   "profile.candidate_held", user)
+    db.commit()
+    return envelope({"profile_id": profile.id}, message=message)
+
+
+class OpeningEmailManyIn(BaseModel):
+    profile_ids: list[int] = Field(min_length=1, max_length=200)
+    resend: bool = False
+
+
+@router.post("/opening-email")
+def send_many_opening_emails(payload: OpeningEmailManyIn,
+                             db: Session = Depends(get_crm_db),
+                             user: CurrentUser = Depends(gated_write("profiles", "TA"))):
+    """TA emails several Sourcing applicants about the opening at once (16 Oct
+    2026 — the mail is manual only; no upload sends it). Declared before every
+    `/{profile_id}/…` POST. Each skipped row says why."""
+    from services.opening_interest import send_opening_mails
+
+    profiles = db.execute(select(CandidateProfile).where(
+        CandidateProfile.id.in_(set(payload.profile_ids)))).scalars().all()
+    sent, skipped = send_opening_mails(db, list(profiles), user, resend=payload.resend)
+    db.commit()
+    return envelope({"sent": sent, "skipped": skipped},
+                    message=f"{len(sent)} opening email(s) sent"
+                            + (f", {len(skipped)} skipped" if skipped else ""))
+
+
 @router.post("/{profile_id}/skip-ai-l1")
 def skip_ai_l1(
     profile_id: int,
@@ -1307,6 +1366,9 @@ def send_opening_email(profile_id: int, payload: OpeningEmailIn,
                             detail="No usable email for this candidate — correct it with Edit, then send.")
     if res["status"] == "already_sent":
         raise HTTPException(status_code=409, detail="The opening email was already sent — use Resend.")
+    if res["status"] == "opted_out":
+        raise HTTPException(status_code=409, detail="This candidate asked to leave the talent pool — "
+                                                    "no opening emails. Call them instead.")
     if res["status"] != "sent":
         raise HTTPException(status_code=503,
                             detail="The email could not be queued — email may be switched off in Settings.")

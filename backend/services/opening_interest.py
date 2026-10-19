@@ -216,8 +216,8 @@ def send_opening_mail(db: Session, profile, candidate, req, user, *,
                       facts: dict | None = None, sender: dict | None = None,
                       resend: bool = False, to_email: str | None = None) -> dict:
     """Queue the mail for one candidacy. Returns {"status", "email"} where
-    status is sent · no_email · already_sent · not_sent (email off / outbox
-    declined). Writes `SENT_ACTION` when queued. Never raises; the caller
+    status is sent · no_email · already_sent · opted_out (the candidate left
+    the talent pool) · not_sent (email off / outbox declined). Writes `SENT_ACTION` when queued. Never raises; the caller
     commits (the mail leaves only if that commit happens).
 
     `to_email` — the address read from THIS CV, which wins over the candidate
@@ -249,6 +249,8 @@ def send_opening_mail(db: Session, profile, candidate, req, user, *,
             dedupe_key=None if resend else f"opening_interest:{profile.id}",
         )
         if not res.get("sent"):
+            if res.get("error") == "opted_out":
+                return {"status": "opted_out", "email": to}
             return {"status": "not_sent", "email": to, "error": res.get("error")}
         who = actor.full_name or "TA"
         log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, actor.id, SENT_ACTION,
@@ -258,6 +260,57 @@ def send_opening_mail(db: Session, profile, candidate, req, user, *,
     except Exception:
         logger.warning("opening mail failed for profile %s", getattr(profile, "id", None), exc_info=True)
         return {"status": "not_sent", "email": to, "error": "failed"}
+
+
+#: Why a bulk send skipped a candidacy (shown per row in the reply).
+_SKIP_WORDS = {
+    "no_email": "No usable email — correct it with Edit, then send.",
+    "already_sent": "Already emailed — use Resend on the row.",
+    "opted_out": "Asked to leave the talent pool — no opening emails.",
+    "not_sent": "Could not be queued — email may be switched off in Settings.",
+}
+
+
+def send_opening_mails(db: Session, profiles, user, *, resend: bool = False) -> tuple[list[dict], list[dict]]:
+    """TA's bulk "Email about the opening" (16 Oct 2026 — the mail is manual
+    only; an upload never sends it). Only candidacies at the derived Sourcing
+    stage are mailed; each send in its own savepoint, the facts and signature
+    built once per position. Returns (sent[{profile_id, email}],
+    skipped[{profile_id, reason}]). The caller commits."""
+    from models import Candidate, Requirement
+    from services.candidate_profiles import _ta_stage
+    from services.candidate_status import SOURCING_STAGE
+
+    profiles = [p for p in (profiles or []) if p is not None]
+    stages = _ta_stage(db, profiles) if profiles else {}
+    sender = sender_for(db, user)
+    facts_by_req: dict[int, dict] = {}
+    sent: list[dict] = []
+    skipped: list[dict] = []
+    for p in profiles:
+        if stages.get(p.id) != SOURCING_STAGE:
+            skipped.append({"profile_id": p.id, "reason": "Not at Sourcing — the opening email is for new applicants."})
+            continue
+        req = db.execute(select(Requirement).where(Requirement.opportunity_id == p.opportunity_id)
+                         .order_by(Requirement.id.desc()).limit(1)).scalar_one_or_none()
+        if req is None:
+            skipped.append({"profile_id": p.id, "reason": "This opportunity has no position to describe yet."})
+            continue
+        try:
+            with db.begin_nested():
+                if req.id not in facts_by_req:
+                    facts_by_req[req.id] = opening_facts(db, req)
+                res = send_opening_mail(db, p, db.get(Candidate, p.candidate_id), req, user,
+                                        facts=facts_by_req[req.id], sender=sender, resend=resend)
+        except Exception:
+            logger.warning("bulk opening mail failed for profile %s", p.id, exc_info=True)
+            res = {"status": "not_sent"}
+        if res.get("status") == "sent":
+            sent.append({"profile_id": p.id, "email": res.get("email")})
+        else:
+            skipped.append({"profile_id": p.id,
+                            "reason": _SKIP_WORDS.get(res.get("status"), _SKIP_WORDS["not_sent"])})
+    return sent, skipped
 
 
 def record_reply(db: Session, profile, interested: bool, note: str, user) -> None:

@@ -367,11 +367,13 @@ def apply_round_off(invoice: Invoice, enabled: bool) -> None:
         grand_total = exact
     invoice.grand_total = grand_total
     paid = Decimal(str(invoice.paid_amount or 0))
-    balance = (grand_total - paid).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    # TDS the customer withheld settles the invoice too (0136).
+    tds = Decimal(str(getattr(invoice, "tds_deducted", 0) or 0))
+    balance = (grand_total - paid - tds).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     invoice.balance_amount = max(balance, Decimal("0"))
-    if invoice.balance_amount <= 0 and paid > 0:
+    if invoice.balance_amount <= 0 and (paid > 0 or tds > 0):
         invoice.payment_status = PaymentStatus.PAID
-    elif paid > 0:
+    elif paid > 0 or tds > 0:
         invoice.payment_status = PaymentStatus.PARTIALLY_PAID
     else:
         invoice.payment_status = PaymentStatus.UNPAID
@@ -829,15 +831,32 @@ def serialize_tds_payment(payment: TdsPayment) -> dict:
     }
 
 
+#: What a TDS status means to Finance (16 Oct 2026): the customer withheld it,
+#: and it stays "pending from client" until the Form 16A / 26AS shows it.
+TDS_STATUS_LABELS = {
+    "Pending": "Pending from client",
+    "Partially_Paid": "Partly received",
+    "Paid": "Received (Form 16A)",
+}
+
+
 def serialize_tds(record: TdsRecord, invoice_number: str | None = None,
                   customer_name: str | None = None) -> dict:
+    status = _ev(record.tds_status)
     data = {
         "id": record.id,
         "invoice_id": record.invoice_id,
         "tds_amount": _num(record.tds_amount),
         "tds_paid": _num(record.tds_paid),
         "tds_balance": _num(record.tds_balance),
-        "tds_status": _ev(record.tds_status),
+        "tds_status": status,
+        "status_label": TDS_STATUS_LABELS.get(status, status),
+        "tds_rate": _num(record.tds_rate) if getattr(record, "tds_rate", None) is not None else None,
+        "tds_base": getattr(record, "tds_base", None),
+        "base_amount": _num(record.base_amount) if getattr(record, "base_amount", None) is not None else None,
+        "section": getattr(record, "section", None),
+        "receipt_id": getattr(record, "receipt_id", None),
+        "created_at": _iso(getattr(record, "created_at", None)),
     }
     if invoice_number is not None:
         data["invoice_number"] = invoice_number
@@ -940,6 +959,9 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         "po_id": invoice.po_id,
         "project_id": invoice.project_id,
         "timesheet_id": invoice.timesheet_id,
+        # 0141 — part N of a timesheet split across POs (null = the whole sheet).
+        "split_no": getattr(invoice, "split_no", None),
+        "split_qty": _num(invoice.split_qty) if getattr(invoice, "split_qty", None) is not None else None,
         "invoice_date": _iso(invoice.invoice_date),
         "due_date": _iso(invoice.due_date),
         "sub_total": _num(invoice.sub_total),
@@ -951,6 +973,8 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         "payment_status": _ev(invoice.payment_status),
         "paid_amount": _num(invoice.paid_amount),
         "balance_amount": _num(invoice.balance_amount),
+        # TDS the customer withheld — settles the invoice beside the cash (0136).
+        "tds_deducted": _num(getattr(invoice, "tds_deducted", 0) or 0),
         "invoice_pdf_url": invoice.invoice_pdf_url,
         # Proforma → Tax lifecycle (0107)
         "kind": invoice.kind or InvoiceKind.TAX.value,

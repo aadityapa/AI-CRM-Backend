@@ -208,3 +208,63 @@ def test_rmg_approval_assigns_the_team_in_the_same_click(db, monkeypatch):
                                                              ta_user_ids=[SALES_ID]), db, RMG)
     assert exc.value.status_code == 400
 
+
+
+def test_a_team_member_who_lost_the_ta_role_never_blocks_the_save(db, monkeypatch):
+    """14 Oct 2026, user report: "Only active TA logins can be assigned (unknown
+    id(s): 73)" — a TA already on the team was later deactivated / lost the TA
+    role, so EVERY save of the team was refused. Keeping or removing an existing
+    member is always allowed; only a NEW id must be an active TA login."""
+    import services.notify as notify
+    monkeypatch.setattr(notify, "notify_user", lambda *a, **kw: None)
+    req = _req(db)
+    svc.set_assignments(db, req, [TA_A, TA_INACTIVE], None, RMG)
+    db.commit()
+    # TA_INACTIVE drops out of the picker's choices…
+    monkeypatch.setattr(svc, "ta_options", lambda _db: [
+        {"id": TA_A, "name": "A"}, {"id": TA_B, "name": "B"}])
+    # …yet the team still saves with them on it,
+    out = svc.set_assignments(db, req, [TA_A, TA_INACTIVE, TA_B], None, RMG)
+    db.commit()
+    assert out["added"] == [TA_B] and out["removed"] == []
+    # and unticking them removes them,
+    out = svc.set_assignments(db, req, [TA_A, TA_B], None, RMG)
+    db.commit()
+    assert out["removed"] == [TA_INACTIVE]
+    # but they can never be ADDED back.
+    with pytest.raises(ValueError, match="Only active TA logins"):
+        svc.set_assignments(db, req, [TA_A, TA_B, TA_INACTIVE], None, RMG)
+
+
+def test_deactivating_a_login_takes_them_off_every_sourcing_team(db, monkeypatch):
+    """14 Oct 2026, user report: Sweety Falke left, her account was deactivated,
+    and she still read as a sourcing TA on her positions. Deactivation releases
+    the login from every team (logged per position), and a deactivated login is
+    never listed as a team member even if a row survives."""
+    import services.notify as notify
+    monkeypatch.setattr(notify, "notify_user", lambda *a, **kw: None)
+    req = _req(db)
+    svc.set_assignments(db, req, [TA_A, TA_B], None, RMG)
+    db.commit()
+
+    # Read side: once inactive, the row no longer shows as part of the team.
+    monkeypatch.setattr(svc, "inactive_user_ids", lambda _db: {TA_B})
+    assert [a["user_id"] for a in svc.assignments_by_requirement(db, [req.id])[req.id]] == [TA_A]
+
+    # Write side: release on deactivation.
+    touched = svc.release_user(db, TA_B, "Left the company", RMG.id)
+    db.commit()
+    assert touched == [req.id]
+    assert [a.user_id for a in db.query(RequirementTaAssignment).all()] == [TA_A]
+    logs = [r.comment for r in db.query(RequirementActivityLog)
+            .filter_by(action_type=svc.TA_ASSIGNED_ACTION).all()]
+    assert any("account deactivated: Left the company" in (c or "") for c in logs)
+    assert svc.release_user(db, TA_B, None, RMG.id) == []   # idempotent
+
+
+def test_set_user_active_releases_the_teams():
+    """Source pin: the deactivate path calls `release_user` and reports the count."""
+    import inspect
+    import services.users_admin as ua
+    src = inspect.getsource(ua.set_user_active)
+    assert "release_user(" in src and "released_positions" in src

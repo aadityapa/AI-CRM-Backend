@@ -63,3 +63,4 @@ from models.custom_roles import CustomRole, UserCustomRole  # noqa: F401
 from models.user_access_log import UserAccessLog  # noqa: F401
 from models.work_desk_marks import WorkDeskMark  # noqa: F401
 from models.candidate_resumes import CandidateResume  # noqa: F401
+from models.talent_pool import SkillSynonym, TalentSavedSearch, TalentSkillIndex  # noqa: F401

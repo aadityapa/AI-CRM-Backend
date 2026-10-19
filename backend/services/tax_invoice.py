@@ -185,8 +185,23 @@ def billing_breakdown_for_invoice(db, invoice) -> dict | None:
             qty_days = working_days if working_days else qty
         else:
             qty_days = qty
+        part_label = ""
+        if getattr(invoice, "split_no", None) is not None:
+            # 0141 — one part of a sheet split across POs: this document bills
+            # its own share, never the whole month's figures.
+            full = amount
+            amount = float(getattr(invoice, "sub_total", 0) or 0)
+            share = (amount / full) if full else 0.0
+            sq = getattr(invoice, "split_qty", None)
+            if unit in ("Hourly", "Daily") and sq is not None:
+                qty_days = float(sq)
+            elif working_days:
+                qty_days = round(working_days * share, 2)
+            leave_days = 0.0
+            part_label = f"Part {invoice.split_no}"
         from services.invoice_format import normalize_invoice_format
         return {
+            "part_label": part_label,
             "billing_unit": unit,
             "columns": cols,
             # The customer's column choice frozen on this document — the
@@ -1230,7 +1245,9 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "", ein
             item.monthly_cost = breakdown["monthly_cost"]
             item.leave_days = breakdown["leave_days"]
             item.rate_per_day = breakdown["rate_per_day"]
-            item.period_label = breakdown["period_label"]
+            item.period_label = (f"{breakdown['period_label']} · {breakdown['part_label']}"
+                                 if breakdown.get("part_label") and breakdown["period_label"]
+                                 else breakdown["period_label"])
             item.billing_hours = breakdown["qty"]
             item.amount_override = num(line.amount) if line.amount is not None else breakdown["amount"]
         items.append(item)

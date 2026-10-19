@@ -360,6 +360,10 @@ def effective_access(db: Session, user_id: int, roles: set[str]) -> dict:
                 fields[bare][f] = "edit"
 
     restricted = template_applied or (override_tabs is not None)
+    if restricted:
+        # A page's own links must not 403: Customers / Invoices open the branch
+        # page (Received Amount lives there) — `IMPLIED_TABS`.
+        tabs = access_registry.with_implied_tabs(tabs)
     visible_tabs = sorted(tabs.keys()) if restricted else None
     return {
         "full": False,

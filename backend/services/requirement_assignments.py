@@ -49,19 +49,23 @@ def _names(db: Session, ids) -> dict[int, str]:
         return {}
 
 
+def inactive_user_ids(db: Session) -> set[int]:
+    """Deactivated logins. An old stub without the `is_active` column → none."""
+    try:
+        with db.begin_nested():
+            return {int(r[0]) for r in db.execute(sa.text(
+                f"SELECT id FROM {USERS_TABLE} WHERE is_active IS FALSE")).all()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def ta_options(db: Session) -> list[dict]:
     """Every ACTIVE login holding the TA role — the picker's choices."""
     from services.notify import _user_ids_in_role
     ids = _user_ids_in_role(db, "TA")
     if not ids:
         return []
-    inactive: set[int] = set()
-    try:
-        with db.begin_nested():
-            inactive = {int(r[0]) for r in db.execute(sa.text(
-                f"SELECT id FROM {USERS_TABLE} WHERE is_active IS FALSE")).all()}
-    except Exception:  # noqa: BLE001 — an old stub without the column lists everyone
-        inactive = set()
+    inactive = inactive_user_ids(db)
     names = _names(db, ids)
     out = [{"id": int(i), "name": names.get(int(i), f"User #{i}")} for i in ids if int(i) not in inactive]
     return sorted(out, key=lambda r: r["name"].lower())
@@ -89,10 +93,41 @@ def assignments_by_requirement(db: Session, requirement_ids) -> dict[int, list[d
         .where(RequirementTaAssignment.requirement_id.in_(ids))
         .order_by(RequirementTaAssignment.assigned_at.asc(), RequirementTaAssignment.id.asc())
     ).scalars().all()
+    # A deactivated login is never shown as part of a team (14 Oct 2026 — Sweety
+    # Falke left, was deactivated, and still read as a sourcing TA on her positions).
+    gone = inactive_user_ids(db) if rows else set()
     out: dict[int, list[dict]] = {}
     for a in rows:
+        if int(a.user_id) in gone:
+            continue
         out.setdefault(int(a.requirement_id), []).append(serialize_assignment(a))
     return out
+
+
+def release_user(db: Session, user_id: int, reason: str | None, actor) -> list[int]:
+    """Take a login off EVERY position's sourcing team (no commit) — run when the
+    account is deactivated, so a person who left never stays on a team.
+
+    Each position gets a `TA_ASSIGNED` activity row ("removed X — account
+    deactivated: <reason>"). Returns the requirement ids touched. Nobody is
+    notified: the person cannot sign in, and RMG sees the change on the team."""
+    rows = db.execute(
+        select(RequirementTaAssignment).where(RequirementTaAssignment.user_id == int(user_id))
+    ).scalars().all()
+    if not rows:
+        return []
+    actor_id = getattr(actor, "id", None) if not isinstance(actor, int) else actor
+    why = (reason or "").strip()
+    touched: list[int] = []
+    for a in rows:
+        name = a.user_name or f"User #{a.user_id}"
+        log_activity(db, RequirementActivityLog, "requirement_id", a.requirement_id, actor_id,
+                     TA_ASSIGNED_ACTION,
+                     f"TA removed {name} — account deactivated" + (f": {why}" if why else ""))
+        touched.append(int(a.requirement_id))
+        db.delete(a)
+    db.flush()
+    return sorted(set(touched))
 
 
 def assigned_requirement_ids(db: Session, user_id: int) -> list[int]:
@@ -114,14 +149,19 @@ def set_assignments(db: Session, req: Requirement, user_ids: list[int], note: st
     """
     wanted = {int(u) for u in (user_ids or []) if u}
     allowed = {o["id"]: o["name"] for o in ta_options(db)}
-    unknown = sorted(wanted - set(allowed))
+    current = {int(a.user_id): a for a in db.execute(
+        select(RequirementTaAssignment).where(RequirementTaAssignment.requirement_id == req.id)
+    ).scalars().all()}
+    # 14 Oct 2026 (user report: "Only active TA logins can be assigned (unknown
+    # id(s): 73)" — the dialog could not be saved at all). Someone already on the
+    # team who has since been deactivated or lost the TA role is not a NEW
+    # assignment: keeping or removing them is always allowed. Only an id being
+    # ADDED must be an active TA login.
+    unknown = sorted(wanted - set(allowed) - set(current))
     if unknown:
         raise ValueError("Only active TA logins can be assigned (unknown id(s): "
                          + ", ".join(str(u) for u in unknown) + ")")
     note = (note or "").strip()[:MAX_NOTE] or None
-    current = {int(a.user_id): a for a in db.execute(
-        select(RequirementTaAssignment).where(RequirementTaAssignment.requirement_id == req.id)
-    ).scalars().all()}
     added = sorted(wanted - set(current))
     removed = sorted(set(current) - wanted)
     actor_id = getattr(actor, "id", None)

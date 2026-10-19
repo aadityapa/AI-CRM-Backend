@@ -3177,6 +3177,369 @@ configurable}` + top-level `candidate_stages` catalogue (stages + `PRESETS`); **
 (group roles) after the commit. ⚠️ This deliberately brings back what `PROFILE_VISIBILITY = {}` removed on 18 Aug 2026 —
 now as admin data; `visible_statuses_for` is untouched and still empty. Deploy: `python -m alembic upgrade head`, restart.
 
+**14 Oct 2026 — a TA who left the TA role no longer blocks the sourcing-team save (`tests/test_requirement_ta_assignments.py`
+now 6; no migration):** screenshot report — "Only active TA logins can be assigned (unknown id(s): 73)" and the Assign TAs
+dialog could not be saved. User 73 was already on the team and had since been deactivated / lost the TA role: the picker
+counted them ("2 picked") but never showed them, and `set_assignments` refused every save that still carried their id.
+Now only a NEWLY added id must be an active TA (`unknown = wanted − allowed − current`); an existing member can be kept or
+removed. F-V2 lists such a member in the dialog with "No longer an active TA — untick to remove" (see that repo's notes).
+
+**14 Oct 2026 (later) — deactivating a login takes them off every sourcing team, migration 0134, head is now 0134
+(`tests/test_requirement_ta_assignments.py` now 8):** reported — Sweety Falke left, her account was deactivated, and she
+still showed as a sourcing TA on C-2026-00101 (chip on the list row, counted in the Assign TAs dialog).
+`requirement_assignments.release_user(db, user_id, reason, actor)` deletes the login's `requirement_ta_assignments` rows
+and writes a `TA_ASSIGNED` row on each position ("TA removed X — account deactivated: <reason>"); nobody is notified.
+`users_admin.set_user_active(…, False)` calls it in a savepoint before the commit (a failure never blocks the
+deactivation) and returns `released_positions`; the deactivate route's message names the count, and `open_work`'s
+"Positions assigned to them" hint now says they are released automatically. Read side: `assignments_by_requirement`
+skips deactivated logins (`inactive_user_ids`, one query, shared with `ta_options`), so a stray row never shows as a team
+member and the next team save drops it. **0134** releases the logins deactivated BEFORE this change (Postgres; same
+activity row, attributed to whoever assigned them; downgrade no-op). Reactivating does NOT put anyone back. Deploy:
+`python -m alembic upgrade head`, restart.
+
+**16 Oct 2026 — nine asks in one round: manual opening email, separation → Inactive, calendar contact, call notes,
+Hold by anyone, branch-wise receipts, invoice facets, bulk customer approval; migration 0135, head is now 0135
+(`tests/test_employee_separation.py` 5; `test_opening_interest` +3, `test_ta_decision` +2, `test_interview_calendar` +1,
+`test_customer_receipts` +2, `test_invoice_customer_approval` +1, `test_work_desk` +1, `test_candidate_status` re-pinned):**
+(1) ⚠️ **The opening "are you interested?" email is MANUAL only** (user decision, reverses 1 Oct): `POST
+…/resumes/bulk-zip` no longer has the `send_opening_email` Form field and always passes False to the worker (an older
+client's field is ignored). TA sends it per row (`POST …/{id}/opening-email`, unchanged) or in bulk —
+**`POST /api/candidate-profiles/opening-email {profile_ids, resend?}`** (`gated_write("profiles","TA")`, declared before
+the `/{profile_id}/…` POSTs) → `opening_interest.send_opening_mails` (derived Sourcing stage only, facts + signature built
+once per position, each send savepointed, per-row skip reasons). (2) **Separation → Inactive** —
+`services/employee_separation.py`: PURE `separation_state(lwd, resignation, today)`; `apply_separation(emp)` (a past last
+working day → `is_active=False` now; a future one stays Active; any date → `is_resigned`; never re-activates) runs in
+`PUT /api/employees/{id}` when a `SEPARATION_FIELDS` key is sent (unless the same request sets `is_active` true — the reply
+message says which) and in the Excel import; daily job **`employee_separations`** (`scheduler.employee_separations`,
+default on) turns Inactive the day AFTER the last working day. (3) **Calendar contact block** —
+`interview_calendar._event` carries `candidate_phone / candidate_city / candidate_notice / ta_owner` and
+`candidate_email` through `clean_email` (placeholders → None); manual, AI and undated events alike. (4) **Call notes** —
+the same `candidate_outreach` store as the profile's Outreach tab: `routers/crm/outreach.notes_summary(db, ids)` (count +
+latest, one query + names) → `call_notes` on every Applied Candidates row (`resumes._with_call_notes`); the outreach routes
+use `OUTREACH_GATE` (the five roles + whoever `screens_as_rmg`; a plain function because `screener_or` calls `gate(user,
+db)` and `role_required`'s dep takes only `user`); list rows carry `user_name`. (5) **Hold by anyone, with a reason** —
+activity rows `CANDIDATE_HELD` / `CANDIDATE_RELEASED` (latest wins, no migration), comment `"[<side>] <who> put … (<side>):
+<reason>"`; `candidate_status.HOLD_SIDES` (TA · RMG · Sales · Customer · HR), PURE `parse_hold_comment`,
+`StatusFacts.hold`, status **`candidate_hold`** (catalogue label "On Hold – by request", derived label "On Hold –
+Customer", hint = the reason; checked right after the deal hold, never over a settled stage; group `parked`).
+`candidate_profiles.set_candidate_hold(db, profile, action, side, reason, user)` (reason ≥ 5, one hold at a time, 409 on a
+closed / joined candidacy) + `holds_for(db, ids)` + `default_hold_side(user)`; **`POST
+/api/candidate-profiles/{id}/hold {action: hold|release, side?, reason?}`** behind `hold_gate =
+screener_or(gated_write("profiles","TA","RMG","Sales","Sales_Head","HR"))`, tells the candidate's TAs (event
+**`profile.candidate_held`** in `email_flows.EVENTS`). Rows carry `hold` on Applied Candidates and the profiles list.
+TA's own Sourcing hold (`TA_Hold`) is unchanged. (6) **Branch-wise received amounts** — **0135**
+`customer_receipts.branch_id`; `services/invoice_facets.py` is THE "what is this invoice for" resolver (branch = project
+branch else PO billing branch — the due-date rule; month = the timesheet period else the invoice date; employee via the
+timesheet; four queries, savepointed; PURE `month_key` / `month_label`). `GET /api/customer-receipts/invoice-options`
+rows carry `branch_id / branch_name / month / month_label / due_date`, `?branch_id=` (0 = no branch) and
+`meta.branches` (+ `no_branch`) with open counts and balances; `ReceiptIn.branch_id` — every ticked invoice must belong to
+it (400 names the strays); the list filters `branch_id`, searches and sorts by branch name. (7) **Invoice facets
+everywhere** — `GET /api/invoices` rows carry the facets; `branch_id`, `employee_id`, `month=YYYY-MM` filters (SQL; month
+= timesheet period, else invoice-date range) and search matches the employee name / code and the PI number; with
+`customer_id`, `meta.branches`. `work_desk._fill_billing_facets` (inside `fill_facets`) gives every `invoices/<id>` item
+`branch`, `month` (the BILLED month), `for_month`, `employee`, `invoice_id`, and every `timesheets/<id>` item its
+`branch`; PO renewal items carry `po_start / po_end` and the period in the subtitle. (8) **Bulk customer approval** —
+`invoice_customer_approval.confirm_many(db, invoices, user, note)` (each in a savepoint, `notify=False` per invoice, ONE
+Finance notice via `_notify_finance_batch` linking `/admin/?view=crm&p=invoices&tab=Customer_Approved`, `MAX_BULK`=200) →
+**`POST /api/invoices/customer-approval/bulk {invoice_ids, note?}`** (`INV_READ`; the role check is the service's
+`may_confirm`). Deploy: `python -m alembic upgrade head` (0135), restart, rebuild F-V2. Suite: 2,079 pass, 3 skipped.
+
+**16 Oct 2026 (later) — TDS withheld by the customer, booked with the received amount, migration 0136, head is now 0136
+(`tests/test_customer_receipts.py` +4):** Finance ask — tick an invoice in Add received amount → say the TDS % the
+customer deducted → see what we should actually receive; follow the TDS separately as "pending from client".
+**`services/tds.py`** is the ONE way to book TDS: `work_out(invoice, rate=, base=, amount=)` (PURE; a rate wins over a
+typed amount; neither = Settings `finance.tds_rate_percent`; base **"taxable"** = value before GST — the default, CBDT
+circular 23/2017 — or "total"; rate 0..30) → `book(db, invoice, figures, section=, receipt_id=, user_id=)` (409 when a TDS
+record exists, 400 when the TDS is more than the open balance; creates the `TdsRecord` Pending and calls
+`tax.apply_tds_deduction`) and `unbook(db, record)` (409 once any of it was marked received). ⚠️ **TDS now SETTLES the
+invoice beside the cash**: **0136** adds `invoices.tds_deducted` and `tax.refresh_invoice_balance` (used by
+`apply_invoice_payment`, `apply_tds_deduction` and `finance.apply_round_off`) computes balance = grand_total − paid −
+tds_deducted, so an invoice paid net of TDS reads **Paid** (status Partially_Paid counts TDS too). The TDS itself is followed
+on its `TdsRecord`: Pending = **pending from client** until Finance marks it received (the existing `tds-payment` route =
+"Mark received (Form 16A)", certificate no. in `transaction_id`). 0136 also adds `tds_records.tds_rate / tds_base /
+base_amount / section / receipt_id / created_by / created_at` and `customer_receipts.tds_total`, and BACKFILLS every existing
+TDS record into `tds_deducted`, subtracting it from the STORED balance (credit-note adjustments kept) — invoices paid net of
+TDS before the deploy now read Paid. `services/finance.TDS_STATUS_LABELS` (Pending → "Pending from client", Partially_Paid →
+"Partly received", Paid → "Received (Form 16A)") → `serialize_tds` adds `status_label`, rate / base / section / receipt;
+`serialize_invoice` adds `tds_deducted`. **Receipts** (`routers/crm/customer_receipts.py`): `ReceiptIn.tds: [{invoice_id,
+tds_rate, tds_base, tds_amount?, section?}]` — each must name a ticked invoice, once; the TDS is booked FIRST, then the cash is
+allocated oldest-first on what is left (balance − TDS); message "…, TDS x pending from client". Receipt payload adds
+`tds_total` / `tds_pending`; `allocations` is one line per invoice (cash + `tds` + `tds_booked_here`; `payment_id` may be
+null for a TDS-only line). Delete reverses the TDS booked with it (409 if any was marked received). `invoice-options` rows add
+`sub_total`, `tax_amount`, `tds_deducted`, `tds`; meta adds `default_tds_rate` + `tds_sections` (194J 10 / 2, 194C 2 / 1).
+`POST /api/invoices/{id}/record-tds` takes `tds_rate` / `tds_base` / `section` and goes through `services/tds` (TDS now
+reduces the balance there too); `DELETE /api/tds/{id}` puts it back. **`GET /api/tds`** adds `customer_id` filter, search by
+customer name, rows with invoice date, sub / grand total, the receipt date + reference, `deducted_on`, `pending_days`, and
+`meta.pending_total`. Deploy: `python -m alembic upgrade head` (0136), restart.
+
+**16 Oct 2026 (later) — the branch page opens for every login that links to it, migration 0137, head is now 0137
+(`tests/test_role_template_defaults.py` +3; `test_access_templates` / `test_custom_roles` re-pinned):** screenshot report —
+a Finance login opened Customers ▸ Branches ▸ "Received amount" and got "You do not have access to the 'branch-policy'
+tab": the Received Amount tab lives on the branch page, and no role template had ever listed `branch-policy`.
+`access_registry.IMPLIED_TABS = {"branch-policy": ("customers", "invoices")}` + PURE `with_implied_tabs(tabs)` — a
+template / custom role / per-user override that grants Customers or Invoices also gets `branch-policy: view` when it names
+nothing for it (never lowers an explicit grant); applied in `access_templates.effective_access` for every restricted login,
+so `/api/me.access` and every `gated_*("branch-policy")` agree. `role_template_defaults` now lists `branch-policy` (Sales /
+Sales Head / HR edit, RMG / TA / Finance view). **0137** writes the same grant into SAVED `access_templates` and
+`custom_roles` rows (frozen `_IMPLIED`, pinned against the registry) so Access Control shows it ticked; downgrade no-op.
+⚠️ A new page that links into another tab must add the pair to `IMPLIED_TABS` (+ its own migration snapshot), or a templated
+login will 403 on the link. Deploy: `python -m alembic upgrade head` (0137), restart. No dashboard rebuild needed.
+
+**16 Oct 2026 (later) — the follow-up question's voice starts fast (`tests/test_followup_voice_speed.py`, 5;
+`test_ai_interview_costs` gains an autouse fixture; no migration):** reported — the next (follow-up) question appeared
+but the AI took 30 s – 1 min to start speaking. Three server causes: (1) **two voice requests in a row** — the page
+spoke the lead-in, waited for it to finish, THEN fetched the question's audio. `conversation.spoken_text(lead_in,
+question)` (PURE) is the ONE string spoken for a turn; `candidate/service.next_question_payload` adds it as
+**`speech_text`** whenever there is a lead-in, and `main._apply_conversation_turn` warms EXACTLY that string
+(lead-in + the next question, or the lead-in alone before a typed question — `interview_skill_bank.is_typed`), so the
+page's one request finds it ready. (2) **A request that arrived while the clip was still being pre-made paid for a second
+OpenAI call** — `tts_prewarm` keeps a `threading.Event` per in-flight clip (`_events`) and
+**`wait_for_inflight(text, voice, model, timeout_s=INFLIGHT_WAIT_S=4)`** returns the warm clip once it lands;
+`/candidate/tts` calls it (threadpool) after a cache miss and answers with `X-Karnex-TTS: inflight`; past 4 s it streams
+as before. (3) ⚠️ **The speech clients had OpenAI's default 600 s timeout with 2 retries**, so a stalled synthesis held
+the candidate for minutes: `openai_client._LIVE_LIMITS` = tts (20 s, 1 retry) · transcribe (45 s, 1 retry), env
+overrides `OPENAI_<PURPOSE>_TIMEOUT_S` / `_MAX_RETRIES`; every other purpose keeps the SDK defaults. Client half in F-V2
+`CLAUDE.md` (one clip + a 15 s request deadline → browser voice). Test note: suites that call interview handlers
+directly leave the attribution ContextVar set on the test thread; `test_ai_interview_costs` now resets it per test
+(`_no_leaked_interview_context`). Suite: 2,072 pass, 3 skipped (known-failure files excluded). Deploy: restart.
+
+**16 Oct 2026 (later) — Talent Pool, Phase 1, migration 0138, head is now 0138 (`tests/test_talent_pool.py`, 15 — also
+passed on a real Postgres 14):** one searchable pool of every candidate we have ever had, by skill, over EXISTING data (no
+new table, no index, no model call). User decisions: TA · RMG / GM · Sales Head · Admin open it; CTC is shown and
+filterable; bench employees are in it. **`services/talent_pool.py`**: a skill is on record from four sources, each an
+EVIDENCE level (`EVIDENCE_RANK`): `interview` (`skill_evaluations.reviewer_rated` ≥ `PROVEN_RATING`=3; below it =
+`interview_low`, shown, never proof) › `ats` (`resumes.ats_score_breakdown.matched` / `jd_keywords_matched` — ⚠️ never
+`missing`) › `cv` (`resume_parse_cache.parsed.skills` by file SHA through `resumes` AND `candidate_resumes`, plus
+`resumes.application_details.skills`) › `profile` (`candidate_skills`); `employee` = `employees.skills`. `_skill_rows(db,
+term, candidate_ids)` reads all four (each source in its own savepoint; JSON via `_json_key_text`: `->>` on Postgres,
+`json_extract` on SQLite); SQL narrows with `_like` (a 1–2 character term matches only a whole element/name — "C" is not
+"Embedded C"), Python decides with PURE `skill_matches` (key equality · the ATS alias table · whole word for 3+ chars).
+`search_pool(db, PoolFilters)`: must-have sets intersected → SQL filters on `candidates` (search · experience · location
+city/preferred · expected CTC ≤ lakh) capped at `SCAN_CAP`=5000 (`meta.truncated`) → derived filters in batched queries
+(`_profile_facts` live/joined, `_last_touch` = latest call note or candidacy activity, availability, notice bucket via
+`screening_desk.notice_bucket`, proven-only) → PURE `match_score` (selected skills on record, must-haves count double; no
+skills = no %) → sort (match · recent · experience) → `_details` for the PAGE only (merged skill chips via
+`merge_skill_rows`, applications with outcomes, latest call note via `outreach.notes_summary`, internal chip). PURE
+`availability_for`: live candidacy › active employee (Bench / Deployed via `deployment_by_employee`) › available (a past
+joiner who is no longer an employee counts as available). Bench employees with NO candidate record are their own entries
+(`kind: "employee"`) unless a CTC / notice / untouched filter is set. `skill_catalogue` (record + interview counts, one
+union query, cached 5 min — CV/ATS evidence is counted when a skill is searched), `pool_positions` (live positions via
+`screening_desk._live_positions`), `position_matches(db, req)` = `candidate_match.suggest_candidates` dressed with the
+pool's evidence + bench employees whose skills fit. **`routers/crm/talent_pool.py`** (`_MODULES` += it):
+`GET /api/talent-pool`, `GET …/meta`, `GET …/positions/{requirement_id}` (TA via `ensure_visible`, a screener sees all),
+all behind `POOL_READ = screener_or(gated_read("talent-pool", "TA", "RMG", "Sales_Head"))`. Read-only: applying reuses the
+candidate page's `multi-apply`. New registry tab **`talent-pool`** (no form — `NO_FORM`), in `role_template_defaults` for
+TA / RMG / Sales_Head. **0138** writes `talent-pool: view` into SAVED templates tagged with or assigned to people holding TA /
+RMG / Sales_Head (the 0124 member rule) and custom roles acting as one (`_ROLE_ALIASES` = `IV_ROLE_ALIASES`, pinned); an
+existing grant is never lowered. ⚠️ **`candidate_match` now uses the same evidence**: the first pool tier admits anyone
+holding a position skill by any source (`skill_holders`), and interview-proven + CV-parsed skill names join the corpus —
+before, a candidate rated 4/5 on AUTOSAR read "Missing optional: AUTOSAR" in Suggested Candidates. Phases 2–3 (skill
+index + synonyms; saved searches + alerts) and the retention / opt-out policy are NOT built. Suite: 2,087 pass, 3 skipped
+(known-failure files excluded). Deploy: `python -m alembic upgrade head` (0137 + 0138), restart, rebuild F-V2.
+
+**16 Oct 2026 (night) — an answer stored twice (`tests/test_transcript_dedupe.py`, 4; no migration):** screenshot report —
+the warm-up "Please introduce yourself." answer held the introduction TWICE, worded slightly differently ("Madhuisa" /
+"Madhvi Savarkar"). Cause was the candidate page (F-V2 `CLAUDE.md`): one recording sent to speech-to-text twice and the two
+results glued together. Server safety net for pages still open on the old code: PURE
+`utils/transcript_dedupe.collapse_repeated_transcript(text)` → `(text, collapsed)` — when the answer splits (35–65 % band)
+into two halves of ≥ `MIN_HALF_WORDS`=8 words whose normalised words match at difflib ratio ≥ `SAME_SPEECH_RATIO`=0.72, only
+the SECOND half (transcribed from the longer recording) is kept; `/answer` applies it to spoken answers only (`elif not
+typed_spec` — code may legitimately repeat) and logs `interview.answer.duplicate_collapsed`. Answers already stored
+doubled stay as they are (a Re-score does not rewrite the transcript). Deploy: restart.
+
+**16 Oct 2026 (night, later) — the warm-up's 60 s ends → question 1 at once (`tests/test_warmup_timeout_fast.py`, 6; no
+migration):** reported — at 0:00 the page sat for seconds before the first question. The client waited for the whole
+60-second recording to come back from speech-to-text before posting /answer (F-V2 `CLAUDE.md`); it now posts what it heard
+and moves on, and sends the full-recording transcript later to **`POST /candidate/warmup-answer {turn, ans}`** (bearer +
+device binding, `session_lock`, 10/min) → PURE `utils/warmup.apply_late_warmup_answer(session, turn, text)`: replaces
+`answers[turn]` ONLY for a warm-up index that is already answered (a scored answer can never change here — `not_warmup`),
+collapses a doubled transcript, refuses one shorter than `LATE_TRANSCRIPT_MIN_SHARE`=0.5 of the stored words, drops the
+warm-up's `skipped_turns` entry when a skip becomes an answer, stamps `meta.warmup_late_transcript`; persisted on
+`updated`; `{"status": "finished"}` once the interview is finalizing. `candidate/service.warmup_followed_by` — while on the
+warm-up with spoken lead-ins on (standard voice), question 1 is pre-warmed as `WARMUP_LEAD_IN` + the question (the exact
+clip it is spoken as), not the bare question, so it no longer waits for a fresh synthesis. Deploy: restart.
+
+**17 Oct 2026 — Talent Pool Phases 2 + 3 + retention / opt-out, migration 0139, head is now 0139
+(`tests/test_talent_pool_phase2_3.py` 13; `test_talent_pool` unchanged, 15):** user decisions — at expiry "hide, warn
+first"; opt-out = a link in every candidate email + a staff button; alerts = bell + one daily email per saved search; the
+retention period was left open → **assumed 24 months, Admin-editable** (`talent_pool.retention_months`, 6..120).
+**(1) Synonyms** (`services/talent_pool.py`): `BUILTIN_SYNONYMS` (automotive / embedded vocabulary — AUTOSAR CP ≈ AUTOSAR
+Classic, CAN Bus ≈ CAN, ISO 26262 ≈ FuSa, JS ≈ JavaScript, K8s …) + admin pairs in **`skill_synonyms`** merged by
+union-find (`build_synonym_map`, PURE; `synonym_map(db)` cached 60 s, `invalidate_synonyms`). `expand_term`;
+`skill_matches(query, name, synonyms=None)` tries every name of the group (a 1–2 character name still matches only as a
+whole name; `None` = built-ins). `add_synonym` (400: blank, itself, already the same skill, synonym attached elsewhere) /
+`remove_synonym` / `synonym_catalogue`. `_skill_rows` takes a term LIST (`_like_any`). **(2) The skill index**
+(`talent_skill_index`: one row per candidate · skill key · evidence, max rating; DERIVED): `index_rows_for` /
+`refresh_index(db, ids)` / `rebuild_index` (batches of `INDEX_BATCH`=400, a commit each, orphan rows dropped; the
+watermark is taken BEFORE the scan) / `update_index` (only `dirty_candidates`) / `run_index_job` (full once per IST day,
+else incremental). State in `app_settings`: `talent_pool.index_built_at` + `talent_pool.index_mark` (JSON `{at, cs, se}` —
+the time plus the max `candidate_skills` / `skill_evaluations` ids, the two sources with no timestamp).
+`dirty_candidates(db, state, cap=DIRTY_CAP=1500)` = record created/edited · resume added · `candidate_resumes` row ·
+CV parsed (`resume_parse_cache.created_at`) · candidacy activity · new typed skill / interview rating since the mark;
+`None` past the cap. ⚠️ **A search never trusts the index blindly** — `holder_context(db)` (ONCE per search):
+not built → the Phase 1 live scan; built → index rows for the expanded keys (exact + ILIKE for 3+ chars) EXCEPT dirty
+candidates, who are read live; too many dirty → live scan. A rating edited in place / a skill removed is caught by the
+daily full rebuild. `search_pool` now = `collect_entries` (all entries, sorted, + `HolderContext`) + paging;
+`entry_key` "c12" / "e5"; meta adds `synonyms` (what each skill also found) and `index {used, live_candidates}`.
+`skill_catalogue`: once built, a master skill's count is max(record + interview, index), and non-master skills held by ≥ 2
+people are listed under **"Found on CVs"** (`id: null`, `CV_ONLY_SKILLS`=60). Job **`talent_pool_index`** is an
+every-pass job. **(3) Saved searches** (`services/talent_saved_searches.py`, table `talent_saved_searches`: filters JSON,
+`alerts_enabled`, `seen_keys` (≤ `SEEN_CAP` 5000), `new_keys`, last checked / alert / result count): the ONE reading of a
+search's parameters is now `talent_pool.filters_from_params` (+ `filters_to_params`, `describe_filters`,
+`FILTER_PARAMS`) — the GET route and saved searches share it. Create seeds `seen_keys` with today's matches (no flood),
+refuses a search with no criterion, duplicate names (case-insensitive) and more than `MAX_PER_USER`=25; changing the
+criteria resets the baseline; `check` = newly MATCHING keys (whatever the reason; never new twice); daily job
+**`talent_pool_alerts`** → `run_alerts`: per search in a savepoint, ONE `notify_user` (event
+**`talent_pool.saved_search_alert`**, rows = the first 10 names, link `talent-pool&saved=<id>`, dedupe per search + day).
+Owner only (404). **(4) Retention + opt-out** (`services/talent_retention.py`; `candidates.pool_opt_out_at / _source /
+_reason / _by`, `pool_kept_at / _by / pool_keep_note`, `pool_expired_at`, `pool_expiry_warned_at`): `last_activity_map` =
+max(created / updated, Keep, call note, candidacy activity, candidacy created, resume uploaded) — grouped queries, no IN
+list for the whole book. PURE `add_months` / `retention_state` (active · expiring within `WARN_DAYS`=30 · expired).
+Daily job **`talent_pool_retention`** → `run_retention`: warn, then expire once the warning is `WARN_DAYS` old (ONE digest per owner = `Candidate.created_by_id`,
+event **`talent_pool.retention_warning`**, dedupe per owner + day; candidates with no owner are only on the Retention tab),
+revive anyone back inside the window. ⚠️ The job writes with a CORE update that keeps `updated_at` (`_stamp`) — expiring
+someone must never count as their activity. `pool_visible_clause()` (never NULL) is added to `_base_candidates`;
+`hidden_candidate_ids` is seeded into `suggest_candidates`' `seen` set, so opted-out / expired people are neither searched
+nor suggested (and Suggested Candidates' email refuses them as "not suggested"). Opt-out link: `opt_out_token` =
+`{id}.{hmac}` (scope `karnex-pool-optout:`, AUTH_SECRET), `email_footer(cid)` → `send_candidate_email` appends it to every
+candidate mail whose candidate it can resolve (`mail_guard`: by id, else by address) and **refuses `SOURCING_EVENTS`**
+(`candidate.opening_interest`, `candidate.hiring_interest`) for an opted-out candidate (`error: opted_out`; the opening
+email reports status `opted_out`, the row button answers 409). Mail about an application they are in (interview links,
+round invites, reminders) still goes. **Public page** `routers/crm/public_talent_pool.py` (`_MODULES` += it): `GET
+/api/public/talent-pool/opt-out/{token}` (first name only, GET changes nothing — mail scanners pre-fetch) and `POST` (opt
+out, idempotent, rate-limited, tells the owner — event **`talent_pool.candidate_opted_out`**). Staff: `keep_candidate`
+(refused for an opted-out one), `opt_out(source="staff", reason ≥ 5)`, `opt_in` (only when the candidate asked; reason ≥
+10, logged as a call note), `pool_status`, `retention_list(scope expiring · expired · opted_out)`, `scope_counts`.
+**Routes** (`routers/crm/talent_pool.py`, literal paths before `/positions/{id}` and the bare GET): `GET/POST /synonyms`,
+`DELETE /synonyms/{id}` (`POOL_CURATE = screener_or(gated_write("talent-pool","RMG","Sales_Head"))`), `GET /index`,
+`POST /index/rebuild` (Admin/CEO, background thread, 409 while running), `GET/POST /saved-searches`, `PUT/DELETE
+/saved-searches/{id}`, `POST /saved-searches/{id}/seen`, `GET /retention`, `PUT /retention/settings` (Admin/CEO),
+`GET /candidates/{id}/status`, `POST /candidates/{id}/keep | opt-out | opt-in` (`POOL_READ`). `/meta` adds `index`,
+`retention {months, warn_days, counts}`, `saved_search_limit`; the search reply adds `summary` + `filters`. Settings keys
+`scheduler.talent_pool_index / _alerts / _retention` (default on) + `talent_pool.retention_months`
+(`org_settings.validation_error` → `talent_retention.validate_months`). The three tables are in
+`data_backup.DATASETS["candidates"]`. Deploy: `python -m alembic upgrade head` (0139), restart — the first scheduler pass
+builds the index (searches use the live scan until then). ⚠️ **Nobody leaves without a warning at least `WARN_DAYS` old**:
+a candidate already past the period on the first run is warned then (ONE digest per TA) and leaves 30 days later unless
+someone presses Keep — so the first run after deploy sends each TA one big "leaving in 30 days" digest. Suite: 2,126 pass,
+3 skipped.
+
+**19 Oct 2026 — payment proof on received amounts, finance pages opened to Finance + Sales, receivables by
+"days late", migration 0140, head is now 0140 (`test_customer_receipts` +2; `test_revenue_report`,
+`test_executive_dashboard`, `test_placements_report` re-pinned):** (1) **Proof** — 0140 adds
+`customer_receipts.proof_url / proof_name`. `POST /api/customer-receipts/proof` (multipart, `PROOF_EXTENSIONS` images ·
+PDF · Excel · CSV · Word · txt, ≤ `PROOF_MAX_BYTES` 15 MB, `save_upload` folder) returns `{url, name}`; `ReceiptIn` takes
+them (`clean_proof_url`: only `/api/crm-files/…`, never `..`); every `InvoicePayment` the receipt makes carries the same file
+in its existing `attachment_url`, so the proof opens from the invoice too; `PUT /api/customer-receipts/{id}/proof` attaches /
+replaces / removes it later (and updates the payments). (2) **Access** (user rule: Finance does everything the CEO needs on
+these pages, Sales views, Admin / CEO all): `routers/crm/reports.py` `FINANCE_VIEW = role_required("Finance", "Sales",
+"Sales_Head")` on `GET /api/reports/revenue`, `/revenue/placements`, `/revenue/export.xlsx`; `FINANCE_EDIT =
+role_required("Finance")` on `PUT /api/reports/revenue/targets`. `GET /api/dashboard/ceo` admits the same three roles but
+**only `tab=finance`** for a non-admin (403 otherwise). By role (the Sales Manager implies Sales) — never template-widenable.
+`finance_reports.INV_READ` adds Sales. (3) **Receivables** (`GET /api/finance/reports/receivables`): Proformas are left out
+(`NOT_PROFORMA`, ledger too); the due date is the invoice's own, else invoice date + `DEFAULT_TERMS_DAYS` 30 (the Revenue
+report's rule — the old code fell back to the invoice date, so money still inside the terms showed as "0–30"); the buckets
+are now **days LATE**: `LATE_BUCKETS` not_due · late_1_30 · late_31_60 · late_61_90 · late_90_plus (PURE `late_bucket`).
+Rows add `overdue`, `oldest_days_late` and `open_invoices[]` (number · invoice date · billed month · branch · employee via
+`invoice_facets` · project · due · days late · bucket · amount, latest-late first); response adds `buckets` (labels) +
+`terms_days`. The old `b_0_30…` keys are gone. (4) `revenue_report._margin` adds `customers` — every customer's billed /
+cost / margin (`by_customer` stays the top 8) — for the Financial Reports Profit tab. Deploy: `python -m alembic upgrade head`
+(0140), restart, rebuild F-V2.
+
+**19 Oct 2026 (later) — timesheet periods may cross months (`tests/test_cross_month_timesheet.py` 5;
+`test_midmonth_timesheet` + `test_operational_reports` re-pinned; no migration):** user ask — the March timesheet runs
+20 Feb – 20 Mar, April 21 Mar – 20 Apr, and a long bridge sheet (May 21 Apr – 30 May) returns to calendar months.
+`services/timesheets.py` (all PURE unless noted): `MAX_PERIOD_DAYS`=62, `date_range`, `add_months` (clamps 31 Jan → 28
+Feb), `is_cross_month`, `period_window_error(year, month, start, end)` (end ≥ start · ≤ 62 days · must include ≥ 1 day of
+its own month), `billing_cycle_factor` (user decision: a window up to one month = ONE monthly rate; longer = one month +
+the extra days at rate ÷ cycle days, 21 Apr – 30 May → 40/30; an initial no-billing window comes off the same way),
+`sheet_billing_bounds` (calendar month, or the window when it crosses a month — rate rows split over it), DB helpers
+`overlapping_sheet` (another sheet of the same project + employee sharing a day), `follow_on_window` (a NEW sheet starts
+the day after last month's sheet ended; when that sheet was exactly one cross-month cycle the new one ends one cycle later
+— 21 Feb–20 Mar → 21 Mar–20 Apr), `holidays_for_project_range` / `sheet_holiday_dates` (holidays for every month the
+window touches). `PATCH /api/timesheets/{id}/period`: `period_window_error` → 400, overlap → **409** naming the other
+sheet's dates; the grid regenerates over `date_range` (not the calendar month). Create runs `follow_on_window` and
+generates the window's days (activity row says so). Entry upsert no longer requires the entry's month = the sheet's month
+(only the window). `timesheet_invoice_preview` Monthly: a cross-month window uses the window as the period and
+`presence_ratio = billing_cycle_factor` (not capped at 1; the `!= ONE` branch applies it); in-month windows are unchanged.
+`po-options` suggestion + rate panel use `sheet_billing_bounds`. Hourly / Daily bill the entries, so they needed nothing.
+⚠️ "Fill from file" / Excel import still read the sheet's calendar month only (days outside it in a cross-month sheet are
+typed in the grid). Deploy: restart.
+
+**19 Oct 2026 — Public application link on the opportunity (user ask: "when RMG approves, TA generates a link with a
+form to post on Naukri / LinkedIn; the resume & details land in that position at Sourcing; TA then moves them to
+Technical Screening — give this link in Opportunity Details"):** `routers/crm/apply.py` (the existing signed
+`/apply/{token}` form) — `GET /api/requirements/{id}/apply-link` is now `screener_or(gated_read("requirements", "TA",
+"RMG", "Sales", "Sales_Head"))` (was TA only) and also returns `req_number · title · applications` (Apply Link resumes)
+and `post_text` (ready-to-paste job post: title · experience range · location · work mode · RMG JD ≤1200 chars · the
+link). Base URL goes through `services.invite_links.resolve_invite_base` (Settings `email.public_base_url` → env →
+request) so a pasted link opens from the internet. The form shows the **RMG JD** (`rmg_jd_text`, else `description`)
+plus experience / location / work-mode chips and asks **Current location** (stored in `application_details` →
+`copy_locations_to_candidate` → `Candidate.city`). After commit `_notify_tas` tells the position's
+`RequirementTaAssignment` TAs (else every TA) — event **`apply_link.application`** (registered in `email_flows`,
+default TA), best-effort. The profile is still created at SOURCING by `ensure_sourcing_profile(source="apply_link")`;
+the TA's existing Technical Screening button moves it on. Tests: `tests/test_apply_link.py`.
+
+**20 Oct 2026 — billing tracker on the Dashboard, the work month everywhere, invoice customer filter fixed
+(`tests/test_billing_tracker.py`, 5; no migration):** user report — "an invoice approved is not showing there, same for
+timesheet", plus "show which month a timesheet / invoice is without opening it". Three causes of "not showing": the desk's
+billing tabs are windowed to-do lists (Finance's approved sheets only `FIN_TIMESHEET_DAYS`, now **180** (was 90)), My Tasks cut
+every tab at `FULL_MAX_ITEMS` (now **3000**, was 500 — "Tax invoices issued" lists EVERY invoice, so past 500 the oldest fell off
+before the month filter saw them), and ⚠️ `GET /api/invoices?customer_id=` joined only the PROJECT's customer while the row
+printed the PO's — it now matches either (`Invoice.project_id IN …customer's projects OR po_id IN …customer's POs`).
+**`services/billing_tracker.py`** — `billing_tracker(db, TrackerFilters)`: one row per piece of billed work = every APPROVED
+timesheet (+ its one invoice, `uq_invoice_timesheet`) and every invoice without an approved sheet (manual), NO time window;
+PURE `stage_of` → awaiting_proforma · returned · proforma · awaiting_customer · irn_pending · unpaid · paid (`STAGES`,
+`OPEN_STAGES`); customer = project's, else PO's; month = the timesheet's (year, month), else the invoice date; PURE
+`period_label(year, month, start, end)` names a window that is not the calendar month ("21 Apr – 30 May 2026"). Filters
+`customer_id` · `month` (YYYY-MM, the work month) · `stage` (a key, `open`, or blank) · `search`; counts per stage are over the
+customer / month / search set (the stage narrows rows only); `meta.options` lists EVERY customer and work month with billed
+work (`_options`, never shrunk by the current filter). Route **`GET /api/dashboard/billing`** (`role_required("Finance")` =
+Finance · Admin · CEO, not template-widenable). **Work month everywhere:** `invoice_facets` adds `period_label` +
+`timesheet_id`; `finance._with_approval` merges the facets into `GET /api/invoices/{id}` (month · period · employee · branch);
+`timesheets.timesheet_out` rows carry `month_label` + `period_label` (`_cross_month_label`); work-desk sheet titles read
+"Aakash Malwade · May 2026 (21 Apr – 30 May 2026)" (`work_desk._sheet_month`). F-V2: Dashboard billing tracker, payment
+breakdown redesign, month chips (see that repo's notes). Deploy: restart.
+
+**20 Oct 2026 (later) — one timesheet billed on several POs, migration 0141, head is now 0141
+(`tests/test_split_invoices.py`, 8); apply-link base warning (`test_apply_link` +1):** user flow — a customer's PO covers
+only part of a month, so one sheet becomes two Proformas → two tax invoices, each drawing its own PO. User decisions:
+split by hours / days on an Hourly / Daily rate, by amount on Monthly or a mid-month rate change; the UI fills the first
+PO to its balance and the rest on the next (editable); part now, the rest later is allowed; same-customer POs only, an
+expired PO with balance allowed with a warning. **0141** drops `uq_invoice_timesheet` (index kept) and adds
+`invoices.split_no` (NULL = the invoice bills the whole sheet) + `split_qty`. `services/timesheets`: `invoices_for` ·
+`live_invoices` (returned Proformas never count) · `sheet_billing_total` (frozen figures, else a live preview) ·
+**`billing_progress(db|None, ts, invoices)`** `{total, invoiced, remaining, total_qty, remaining_qty, billing_unit, rate,
+rate_split, split, fully_billed, parts, returned}` (a whole-sheet invoice = remaining 0) · `can_generate_invoice(ts, inv,
+progress)` true while money is left; `invoice_ref` adds `split_no / split_qty / po_id / po_number` (split parts only — one
+lazy read) `/ sub_total / grand_total`; detail, report rows, preview and `po-options` carry `billing_progress` (+ `invoices`).
+**`services/proforma.plan_splits`** (PURE) is the arithmetic: quantity only on Hourly / Daily without a rate split, the
+last part that finishes the sheet takes the exact remainder, refusals name the problem (PO twice, more than is left,
+quantity on a monthly rate). `POST /api/timesheets/{id}/generate-invoice {splits: [{po_id, quantity|amount}], invoice_format,
+round_off}` → `routers/crm/timesheets._raise_split_proformas`: one Proforma per PO (same customer, not cancelled,
+`ensure_po_covers` per part, allocation created when missing; returned Proformas replaced keeping their numbers;
+`split_no` continues; line "… — part N (PO X: 40 of 168 hours)"; GST per PO); qty / rate overrides refused in split mode;
+the single path answers 409 on a sheet that already has parts. Recalculate refuses any live invoice; reject / force delete
+handle every invoice. The tax-invoice renderers print only the part's share (`billing_breakdown_for_invoice` + "Part N");
+the billing tracker lists every part plus a **"Rest to bill"** row; the work desk shows "Part billed — ₹x still to bill".
+`GET /api/timesheets` rows now carry `invoice` + `billing {parts, split, fully_billed, remaining}` (one `_invoice_map`
+query) and `meta.status_counts` (every filter except status, one grouped query, best-effort). ⚠️ Known gap: dashboards /
+revenue "has an invoice" checks still treat a part-billed sheet as invoiced. **Apply link**: `invite_links.base_reach(base)`
+(public · private · unknown, PURE) + `base_source()`; `GET …/apply-link` adds `base_url / base_reach / base_source` — the
+link is computed on every read, so it follows Settings ▸ Organisation ▸ Email & links ▸ Public base URL (or
+`PUBLIC_BASE_URL`) after deploy; the token is HMAC'd with `AUTH_SECRET`, so a different production secret changes it too.
+Deploy: `python -m alembic upgrade head` (0141), restart. Full suite: 1,882 pass, 2 skipped.
+
+**20 Oct 2026 (later still) — Admin switches for the split-PO rules (`tests/test_split_invoices.py` now 10; no
+migration):** `org_settings.KEYS` += `billing.split_po_enabled` (default true), `billing.split_po_max_parts` (default 10,
+must be a whole number 2..`MAX_SPLIT_PARTS`=10) and `billing.allow_expired_po` (default true); booleans validated
+(`_BOOL_KEYS`). `split_po_rules()` → `{enabled, max_parts, allow_expired_po}` is the ONE reader. `po-options` returns
+`split_rules` and marks an expired PO `selectable: false` when expired POs are off. `_raise_split_proformas`: split off →
+**403** naming the setting; parts already raised + new parts over `max_parts` → 400; `_refuse_expired_po(po, rules)` on
+every part AND on the single-PO generate path → 400 "billing an expired PO is switched off". Every refusal names Settings ▸
+Organisation ▸ Billing. The defaults reproduce the earlier behaviour exactly, so nothing changes on deploy until Admin
+flips a switch.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 
@@ -3566,7 +3929,7 @@ docker compose up -d --build       # monolith + postgres on :2020
 docker compose --profile cache up -d   # + redis (used only by rate limiting)
 
 # Migrations
-cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0129
+cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0140
 
 # Tests — run from backend/, no live DB needed
 cd backend && python -m pytest -q

@@ -9,29 +9,53 @@ each invoice's balance; whatever is left stays on the receipt as
 working exactly as before; deleting a receipt reverses those payments.
 
 Endpoints (all enveloped):
-  GET    /api/customer-receipts                  list, filters customer_id / project_id / from / to / search
-  GET    /api/customer-receipts/invoice-options  open invoices for the picker (customer_id required)
+  GET    /api/customer-receipts                  list, filters customer_id / branch_id / project_id / from / to / search
+  GET    /api/customer-receipts/invoice-options  open invoices for the picker (customer_id required;
+                                                 branch_id narrows to one branch, 0 = no branch)
+
+16 Oct 2026 (user ask): a receipt belongs to ONE customer BRANCH — the branch
+that paid — and only that branch's employee invoices are offered; every
+invoice says the month it bills and the employee (`services/invoice_facets`).
+
+16 Oct 2026 (later, Finance ask): TDS. For each ticked invoice Finance may say
+the customer withheld TDS (`tds: [{invoice_id, tds_rate, tds_base}]`). The TDS
+is booked first (`services/tds.book` — it settles the invoice beside the cash
+and is followed as "pending from client"), then the cash is allocated on what
+is left, so the amount Finance expects in the bank is the invoice balance less
+the TDS. Deleting the receipt takes the TDS back off (409 once it was marked
+received).
   POST   /api/customer-receipts                  create + allocate
   DELETE /api/customer-receipts/{id}             reverse allocations, delete (Finance / Admin)
+
+19 Oct 2026 (user ask): the PROOF of the credit — a bank screenshot,
+remittance advice or UTR PDF. Upload first, then pass the url with the receipt
+(or attach it later):
+  POST   /api/customer-receipts/proof            upload a proof file → {url, name}
+  PUT    /api/customer-receipts/{id}/proof       attach / replace / clear the proof
+Every invoice payment the receipt makes carries the same file in
+`attachment_url`, so the proof also opens from the invoice.
 """
 from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, PageParams, gated_read, gated_write_action, get_crm_db, page_params
 from models import (
-    Customer, CustomerReceipt, Employee, Invoice, InvoicePayment, Project, Timesheet,
+    Customer, CustomerBranch, CustomerReceipt, Employee, Invoice, InvoicePayment, Project, Timesheet,
 )
+from models.finance import TdsRecord
 from models.finance import InvoiceKind
 from schemas.common import envelope
 from services import tax
-from services.crm_common import paginate
+from services.crm_common import paginate, save_upload
+from services import tds as tds_svc
+from services.finance import serialize_tds
 from services.invoice_customer_approval import payment_block
 
 router = APIRouter(prefix="/api/customer-receipts", tags=["customer-receipts"])
@@ -45,6 +69,8 @@ TWO = Decimal("0.01")
 
 class ReceiptIn(BaseModel):
     customer_id: int
+    #: The paying branch (16 Oct 2026). Every ticked invoice must belong to it.
+    branch_id: int | None = None
     received_date: date
     amount: Decimal = Field(gt=0)
     payment_mode: str | None = Field(default=None, max_length=64)
@@ -52,6 +78,46 @@ class ReceiptIn(BaseModel):
     notes: str | None = Field(default=None, max_length=4000)
     #: Invoices this money covers — allocated oldest-first up to each balance.
     invoice_ids: list[int] = Field(default_factory=list, max_length=100)
+    #: TDS the customer withheld, per ticked invoice (16 Oct 2026).
+    tds: list["ReceiptTdsIn"] = Field(default_factory=list, max_length=100)
+    #: Proof of the credit (19 Oct 2026) — the url `POST /proof` returned.
+    proof_url: str | None = Field(default=None, max_length=512)
+    proof_name: str | None = Field(default=None, max_length=255)
+
+
+class ProofIn(BaseModel):
+    proof_url: str | None = Field(default=None, max_length=512)
+    proof_name: str | None = Field(default=None, max_length=255)
+
+
+#: Proof files: images, PDFs, and the office / mail formats remittance advice
+#: arrives in.
+PROOF_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".xlsx", ".xls", ".csv",
+                    ".doc", ".docx", ".txt")
+PROOF_MAX_BYTES = 15 * 1024 * 1024
+
+
+def clean_proof_url(raw: str | None) -> str | None:
+    """Only a file this application stored may be a proof. PURE."""
+    url = (raw or "").strip()
+    if not url:
+        return None
+    if not url.startswith("/api/crm-files/") or ".." in url:
+        raise HTTPException(status_code=400, detail="Upload the proof first, then save the receipt")
+    return url
+
+
+class ReceiptTdsIn(BaseModel):
+    invoice_id: int
+    #: Percent the customer deducted; wins over tds_amount.
+    tds_rate: Decimal | None = Field(default=None, gt=0, le=30)
+    #: "taxable" (before GST — default) | "total".
+    tds_base: str | None = Field(default=None, max_length=16)
+    tds_amount: Decimal | None = Field(default=None, gt=0)
+    section: str | None = Field(default=None, max_length=16)
+
+
+ReceiptIn.model_rebuild()
 
 
 def _d(v) -> Decimal:
@@ -73,8 +139,19 @@ def _employee_names_by_invoice(db: Session, invoices: list[Invoice]) -> dict[int
     return {i.id: by_ts.get(i.timesheet_id) for i in invoices if i.timesheet_id}
 
 
+def _tds_by_invoice(db: Session, invoice_ids) -> dict[int, TdsRecord]:
+    ids = {i for i in invoice_ids if i}
+    if not ids:
+        return {}
+    return {t.invoice_id: t for t in db.execute(
+        select(TdsRecord).where(TdsRecord.invoice_id.in_(ids))).scalars().all()}
+
+
 def _invoice_brief(db: Session, invoices: list[Invoice]) -> list[dict]:
+    from services.invoice_facets import invoice_facets
     names = _employee_names_by_invoice(db, invoices)
+    facets = invoice_facets(db, invoices)
+    tds = _tds_by_invoice(db, [i.id for i in invoices])
     proj = {p.id: p for p in db.execute(
         select(Project).where(Project.id.in_({i.project_id for i in invoices}))
     ).scalars().all()} if invoices else {}
@@ -85,25 +162,46 @@ def _invoice_brief(db: Session, invoices: list[Invoice]) -> list[dict]:
         "project_id": i.project_id,
         "project_name": proj.get(i.project_id).name if proj.get(i.project_id) else None,
         "employee_name": names.get(i.id),
+        "sub_total": float(i.sub_total or 0),
+        "tax_amount": float(i.tax_amount or 0),
         "grand_total": float(i.grand_total or 0),
         "paid_amount": float(i.paid_amount or 0),
+        "tds_deducted": float(getattr(i, "tds_deducted", 0) or 0),
+        # The invoice's TDS (16 Oct 2026) — None = none recorded yet.
+        "tds": serialize_tds(tds[i.id]) if i.id in tds else None,
         "balance_amount": float(i.balance_amount or 0),
         "payment_status": getattr(i.payment_status, "value", i.payment_status),
         # Why money cannot be put on it yet — approval / IRN (8 Oct 2026); None = open.
         "payment_block": payment_block(i),
         "irn_recorded": bool(i.irn_number),
+        # What the invoice is for (16 Oct 2026): branch + the month it bills.
+        "branch_id": (facets.get(i.id) or {}).get("branch_id"),
+        "branch_name": (facets.get(i.id) or {}).get("branch_name"),
+        "month": (facets.get(i.id) or {}).get("month"),
+        "month_label": (facets.get(i.id) or {}).get("month_label"),
+        "due_date": i.due_date.isoformat() if getattr(i, "due_date", None) else None,
     } for i in invoices]
 
 
-def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None) -> dict:
+def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None,
+               branch_name: str | None = None) -> dict:
     payments = list(r.payments or [])
-    inv_ids = [p.invoice_id for p in payments]
+    booked = db.execute(select(TdsRecord).where(TdsRecord.receipt_id == r.id)).scalars().all()
+    tds_here = {t.invoice_id: t for t in booked}
+    inv_ids = list(dict.fromkeys([p.invoice_id for p in payments] + list(tds_here)))
     invoices = db.execute(select(Invoice).where(Invoice.id.in_(inv_ids))).scalars().all() if inv_ids else []
     briefs = {b["id"]: b for b in _invoice_brief(db, invoices)}
+    cash = {}
+    pay_id = {}
+    for p in payments:
+        cash[p.invoice_id] = cash.get(p.invoice_id, Decimal("0")) + _d(p.amount)
+        pay_id.setdefault(p.invoice_id, p.id)
     return {
         "id": r.id,
         "customer_id": r.customer_id,
         "customer_name": customer_name,
+        "branch_id": r.branch_id,
+        "branch_name": branch_name,
         "received_date": r.received_date.isoformat() if r.received_date else None,
         "amount": float(r.amount or 0),
         "payment_mode": r.payment_mode,
@@ -111,20 +209,31 @@ def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None
         "notes": r.notes,
         "unallocated_amount": float(r.unallocated_amount or 0),
         "allocated_amount": float(sum((_d(p.amount) for p in payments), Decimal("0"))),
+        "tds_total": float(getattr(r, "tds_total", 0) or 0),
+        "tds_pending": float(sum((_d(t.tds_balance) for t in booked), Decimal("0"))),
+        "proof_url": getattr(r, "proof_url", None),
+        "proof_name": getattr(r, "proof_name", None),
         "created_by": r.created_by,
         "created_at": r.created_at.isoformat() if r.created_at else None,
+        # One line per invoice: the cash it got from this receipt + the TDS the
+        # customer withheld on it (booked with this receipt).
         "allocations": [{
-            "payment_id": p.id, "invoice_id": p.invoice_id, "amount": float(p.amount or 0),
-            **{k: v for k, v in (briefs.get(p.invoice_id) or {}).items() if k != "id"},
-        } for p in payments],
+            **{k: v for k, v in (briefs.get(iid) or {}).items() if k not in ("id", "tds")},
+            "payment_id": pay_id.get(iid), "invoice_id": iid,
+            "amount": float(cash.get(iid, Decimal("0"))),
+            "tds": serialize_tds(tds_here[iid]) if iid in tds_here else (briefs.get(iid) or {}).get("tds"),
+            "tds_booked_here": iid in tds_here,
+        } for iid in inv_ids],
     }
 
 
 @router.get("/invoice-options")
-def invoice_options(customer_id: int, include_paid: bool = False,
+def invoice_options(customer_id: int, include_paid: bool = False, branch_id: int | None = None,
                     db: Session = Depends(get_crm_db), user: CurrentUser = Depends(RC_READ)):
     """Invoices of this customer's projects for the picker — open ones by
-    default, with the employee each one bills, oldest first."""
+    default, with the employee each one bills and its month, oldest first.
+    `branch_id` keeps one branch's invoices (0 = invoices with no branch);
+    `meta.branches` lists the customer's branches with their open count."""
     if db.get(Customer, customer_id) is None:
         raise HTTPException(status_code=404, detail="Customer not found")
     stmt = (select(Invoice).join(Project, Project.id == Invoice.project_id)
@@ -132,18 +241,44 @@ def invoice_options(customer_id: int, include_paid: bool = False,
     if not include_paid:
         stmt = stmt.where(Invoice.balance_amount > 0)
     invoices = db.execute(stmt.order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).scalars().all()
-    return envelope(data=_invoice_brief(db, invoices), message="Invoices")
+    rows = _invoice_brief(db, invoices)
+    branches = db.execute(select(CustomerBranch.id, CustomerBranch.branch_name)
+                          .where(CustomerBranch.customer_id == customer_id)
+                          .order_by(CustomerBranch.branch_name)).all()
+    counts: dict[int, int] = {}
+    balance: dict[int, float] = {}
+    for r in rows:
+        k = r["branch_id"] or 0
+        counts[k] = counts.get(k, 0) + 1
+        balance[k] = balance.get(k, 0.0) + r["balance_amount"]
+    meta = {"branches": [{"id": b.id, "name": b.branch_name, "invoices": counts.get(b.id, 0),
+                          "balance": round(balance.get(b.id, 0.0), 2)} for b in branches]}
+    if counts.get(0):
+        meta["no_branch"] = {"invoices": counts[0], "balance": round(balance.get(0, 0.0), 2)}
+    if branch_id is not None:
+        rows = [r for r in rows if (r["branch_id"] or 0) == branch_id]
+    # The TDS dialog's starting rate (Settings ▸ Finance), and the usual sections.
+    meta["default_tds_rate"] = float(tax.default_tds_rate())
+    meta["tds_sections"] = [{"section": "194J", "rate": 10, "label": "194J · professional / technical services"},
+                            {"section": "194J", "rate": 2, "label": "194J · technical services (2%)"},
+                            {"section": "194C", "rate": 2, "label": "194C · contract work (company)"},
+                            {"section": "194C", "rate": 1, "label": "194C · contract work (individual / HUF)"}]
+    return envelope(data=rows, message="Invoices", meta=meta)
 
 
 @router.get("")
 def list_receipts(customer_id: int | None = None, project_id: int | None = None,
+                  branch_id: int | None = None,
                   received_from: date | None = None, received_to: date | None = None,
                   payment_mode: str | None = None,
                   p: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(RC_READ)):
-    stmt = select(CustomerReceipt).join(Customer, Customer.id == CustomerReceipt.customer_id)
+    stmt = (select(CustomerReceipt).join(Customer, Customer.id == CustomerReceipt.customer_id)
+            .join(CustomerBranch, CustomerBranch.id == CustomerReceipt.branch_id, isouter=True))
     if customer_id is not None:
         stmt = stmt.where(CustomerReceipt.customer_id == customer_id)
+    if branch_id is not None:
+        stmt = stmt.where(CustomerReceipt.branch_id == branch_id)
     if project_id is not None:
         sub = (select(InvoicePayment.receipt_id).join(Invoice, Invoice.id == InvoicePayment.invoice_id)
                .where(Invoice.project_id == project_id, InvoicePayment.receipt_id.isnot(None)))
@@ -157,16 +292,21 @@ def list_receipts(customer_id: int | None = None, project_id: int | None = None,
     if p.search:
         like = f"%{p.search}%"
         stmt = stmt.where(or_(CustomerReceipt.reference_number.ilike(like),
-                              CustomerReceipt.notes.ilike(like), Customer.name.ilike(like)))
+                              CustomerReceipt.notes.ilike(like), Customer.name.ilike(like),
+                              CustomerBranch.branch_name.ilike(like)))
     sort_col = {"received_date": CustomerReceipt.received_date, "amount": CustomerReceipt.amount,
-                "customer_name": Customer.name}.get(p.sort_by or "", CustomerReceipt.received_date)
+                "customer_name": Customer.name, "branch_name": CustomerBranch.branch_name,
+                }.get(p.sort_by or "", CustomerReceipt.received_date)
     stmt = stmt.order_by(sort_col.asc() if p.sort_dir == "asc" else sort_col.desc(),
                          CustomerReceipt.id.desc())
     items, meta = paginate(db, stmt, p.page, p.limit)
     names = {c.id: c.name for c in db.execute(
         select(Customer).where(Customer.id.in_({r.customer_id for r in items}))
     ).scalars().all()} if items else {}
-    data = [_serialize(db, r, names.get(r.customer_id)) for r in items]
+    bnames = dict(db.execute(select(CustomerBranch.id, CustomerBranch.branch_name).where(
+        CustomerBranch.id.in_({r.branch_id for r in items if r.branch_id})
+    )).all()) if any(r.branch_id for r in items) else {}
+    data = [_serialize(db, r, names.get(r.customer_id), bnames.get(r.branch_id)) for r in items]
     total = db.execute(select(func.coalesce(func.sum(CustomerReceipt.amount), 0))
                        .where(CustomerReceipt.customer_id == customer_id) if customer_id
                        else select(func.coalesce(func.sum(CustomerReceipt.amount), 0))).scalar()
@@ -198,6 +338,11 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         raise HTTPException(status_code=404, detail="Customer not found")
     if body.payment_mode and body.payment_mode not in PAYMENT_MODES:
         raise HTTPException(status_code=400, detail=f"Payment mode must be one of: {', '.join(PAYMENT_MODES)}")
+    branch = None
+    if body.branch_id is not None:
+        branch = db.get(CustomerBranch, body.branch_id)
+        if branch is None or branch.customer_id != body.customer_id:
+            raise HTTPException(status_code=400, detail=f"That branch does not belong to {customer.name}")
     invoices: list[Invoice] = []
     if body.invoice_ids:
         invoices = db.execute(
@@ -208,6 +353,15 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         if missing:
             raise HTTPException(status_code=400,
                                 detail=f"Invoice(s) {sorted(missing)} do not belong to {customer.name}")
+        # One payment = one branch (16 Oct 2026, user decision).
+        if branch is not None:
+            from services.invoice_facets import invoice_facets
+            facets = invoice_facets(db, invoices)
+            other = [i.invoice_number or f"#{i.id}" for i in invoices
+                     if (facets.get(i.id) or {}).get("branch_id") != branch.id]
+            if other:
+                raise HTTPException(status_code=400,
+                                    detail=f"Not invoices of {branch.branch_name}: {', '.join(other)}")
         # Money is recorded against the e-invoice (8 Oct 2026): customer approval
         # + IRN first — the same rule as Record Payment on the invoice.
         waiting = [i.invoice_number or f"#{i.id}" for i in invoices if payment_block(i)]
@@ -215,30 +369,92 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
             raise HTTPException(status_code=409,
                                 detail=f"Not open for payment yet (customer approval / IRN pending): "
                                        f"{', '.join(waiting)}")
-    plan, left = allocate(body.amount, invoices)
+    # TDS lines must name ticked invoices; one per invoice.
+    by_id = {i.id: i for i in invoices}
+    tds_items = list(body.tds or [])
+    seen: set[int] = set()
+    for t in tds_items:
+        if t.invoice_id not in by_id:
+            raise HTTPException(status_code=400, detail="TDS can only be recorded on an invoice you ticked")
+        if t.invoice_id in seen:
+            raise HTTPException(status_code=400, detail="TDS is listed twice for one invoice")
+        seen.add(t.invoice_id)
     receipt = CustomerReceipt(
-        customer_id=body.customer_id, received_date=body.received_date, amount=_d(body.amount),
+        customer_id=body.customer_id, branch_id=getattr(branch, "id", None),
+        received_date=body.received_date, amount=_d(body.amount),
         payment_mode=body.payment_mode or None,
         reference_number=(body.reference_number or "").strip() or None,
         notes=(body.notes or "").strip() or None,
-        unallocated_amount=left, created_by=user.id,
+        unallocated_amount=Decimal("0"), created_by=user.id,
+        proof_url=clean_proof_url(body.proof_url),
+        proof_name=(body.proof_name or "").strip()[:255] or None,
     )
     db.add(receipt)
     db.flush()
+    # TDS first: it settles part of each invoice, so the cash is spread over
+    # what the customer actually owes in money (balance − TDS).
+    tds_total = Decimal("0")
+    for t in tds_items:
+        inv = by_id[t.invoice_id]
+        figures = tds_svc.work_out(inv, rate=t.tds_rate, base=t.tds_base, amount=t.tds_amount)
+        tds_svc.book(db, inv, figures, section=t.section, receipt_id=receipt.id, user_id=user.id)
+        tds_total += _d(figures["amount"])
+    receipt.tds_total = tds_total
+    plan, left = allocate(body.amount, invoices)
+    receipt.unallocated_amount = left
     for inv, take in plan:
         db.add(InvoicePayment(
             invoice_id=inv.id, payment_date=body.received_date, amount=take,
             payment_mode=body.payment_mode or None,
             reference_number=(body.reference_number or "").strip() or None,
             notes=f"From customer receipt #{receipt.id}", receipt_id=receipt.id,
+            attachment_url=receipt.proof_url,
         ))
         tax.apply_invoice_payment(inv, take)
     db.commit()
     db.refresh(receipt)
     msg = f"Received {float(receipt.amount):,.2f} recorded — {len(plan)} invoice(s) settled"
+    if tds_total > 0:
+        msg += f", TDS {float(tds_total):,.2f} pending from client"
     if left > 0:
         msg += f", {float(left):,.2f} left unallocated"
-    return envelope(data=_serialize(db, receipt, customer.name), message=msg)
+    return envelope(data=_serialize(db, receipt, customer.name, getattr(branch, "branch_name", None)),
+                    message=msg)
+
+
+@router.post("/proof")
+def upload_proof(file: UploadFile = File(...), user: CurrentUser = Depends(RC_WRITE)):
+    """Store the proof of a credit (screenshot / PDF) before the receipt is
+    saved; the returned url goes in the receipt's `proof_url`."""
+    name = (file.filename or "proof").strip()
+    if not name.lower().endswith(PROOF_EXTENSIONS):
+        raise HTTPException(status_code=400,
+                            detail="Upload an image (screenshot), PDF, Excel or Word file as the proof")
+    size = getattr(file, "size", None)
+    if size is not None and size > PROOF_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="The proof file is larger than 15 MB")
+    url = save_upload(file, "receipt_proofs")
+    return envelope({"url": url, "name": name[:255]}, message="Proof uploaded")
+
+
+@router.put("/{receipt_id}/proof")
+def set_proof(receipt_id: int, body: ProofIn, db: Session = Depends(get_crm_db),
+              user: CurrentUser = Depends(RC_WRITE)):
+    """Attach, replace or clear (null) the proof of a saved receipt — the
+    invoice payments it made follow."""
+    receipt = db.get(CustomerReceipt, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    receipt.proof_url = clean_proof_url(body.proof_url)
+    receipt.proof_name = ((body.proof_name or "").strip()[:255] or None) if receipt.proof_url else None
+    for pay in list(receipt.payments or []):
+        pay.attachment_url = receipt.proof_url
+    db.commit()
+    db.refresh(receipt)
+    customer = db.get(Customer, receipt.customer_id)
+    branch = db.get(CustomerBranch, receipt.branch_id) if receipt.branch_id else None
+    return envelope(_serialize(db, receipt, getattr(customer, "name", None), getattr(branch, "branch_name", None)),
+                    message="Proof saved" if receipt.proof_url else "Proof removed")
 
 
 @router.delete("/{receipt_id}")
@@ -248,6 +464,14 @@ def delete_receipt(receipt_id: int, db: Session = Depends(get_crm_db),
     receipt = db.get(CustomerReceipt, receipt_id)
     if receipt is None:
         raise HTTPException(status_code=404, detail="Receipt not found")
+    booked = db.execute(select(TdsRecord).where(TdsRecord.receipt_id == receipt.id)).scalars().all()
+    received = [t.invoice.invoice_number if t.invoice else f"#{t.invoice_id}" for t in booked
+                if _d(t.tds_paid) > 0 or list(t.payments or [])]
+    if received:
+        raise HTTPException(status_code=409,
+                            detail=f"TDS on {', '.join(received)} was already marked received — undo that first")
+    for t in booked:
+        tds_svc.unbook(db, t)
     for pay in list(receipt.payments or []):
         inv = db.get(Invoice, pay.invoice_id)
         if inv is not None:
@@ -255,4 +479,7 @@ def delete_receipt(receipt_id: int, db: Session = Depends(get_crm_db),
         db.delete(pay)
     db.delete(receipt)
     db.commit()
-    return envelope(data={"id": receipt_id}, message="Receipt removed and invoice balances restored")
+    msg = "Receipt removed and invoice balances restored"
+    if booked:
+        msg += f" (TDS on {len(booked)} invoice(s) removed too)"
+    return envelope(data={"id": receipt_id}, message=msg)

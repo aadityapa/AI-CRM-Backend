@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 import re
+from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -120,11 +121,75 @@ def customer_invoice_format(db: Session, project_id: int) -> dict[str, bool]:
 def replaceable_proforma(db: Session, ts: Timesheet) -> Invoice | None:
     """A RETURNED Proforma on this sheet may be raised again — the old document
     is replaced (same PI number) rather than sitting beside the new one."""
-    from services.timesheets import linked_invoice_for
-    inv = linked_invoice_for(db, ts)
-    if inv is not None and inv.is_proforma and inv.returned_at is not None:
-        return inv
-    return None
+    rows = returned_proformas(db, ts)
+    return rows[0] if rows else None
+
+
+QTY_UNITS = ("Hourly", "Daily")
+_C = Decimal("0.01")
+_Q4 = Decimal("0.0001")
+
+
+def plan_splits(splits: list[dict], *, remaining: Decimal, remaining_qty: Decimal | None,
+                rate: Decimal | None, unit: str | None, rate_split: bool = False) -> list[dict]:
+    """PURE — turn the GM's per-PO entries into parts {po_id, qty, amount} (0141).
+
+    * A quantity is accepted on an Hourly / Daily rate with one rate in force;
+      otherwise every part is an amount (a Monthly rate's quantity is a fraction
+      of a month, and a mid-month rate change has no single rate).
+    * amount = qty × rate (paise), or qty = amount ÷ rate (4 dp).
+    * The parts may leave something for later, never exceed what is left.
+    * When the parts finish the sheet, the LAST part takes the exact remainder,
+      so the parts always add back to the figure frozen at approval.
+    Raises ValueError with the sentence the GM sees."""
+    if not splits:
+        raise ValueError("Add at least one PO to the split")
+    seen: set[int] = set()
+    qty_ok = (unit in QTY_UNITS) and not rate_split and rate is not None and rate > 0
+    parts: list[dict] = []
+    for s in splits:
+        po_id = int(s["po_id"])
+        if po_id in seen:
+            raise ValueError("The same PO is listed twice — put its whole share in one line")
+        seen.add(po_id)
+        q, a = s.get("quantity"), s.get("amount")
+        if q is not None and a is None:
+            if not qty_ok:
+                raise ValueError("Enter the amount for each PO — this rate is not billed per hour or day")
+            qty = Decimal(str(q)).quantize(_Q4)
+            amount = (qty * rate).quantize(_C, rounding=ROUND_HALF_UP)
+        elif a is not None:
+            amount = Decimal(str(a)).quantize(_C, rounding=ROUND_HALF_UP)
+            qty = (amount / rate).quantize(_Q4, rounding=ROUND_HALF_UP) if rate else None
+        else:
+            raise ValueError("Each PO needs the hours / days or the amount it covers")
+        if amount <= 0:
+            raise ValueError("Each part must bill more than ₹0")
+        parts.append({"po_id": po_id, "qty": qty, "amount": amount})
+    total = sum((p["amount"] for p in parts), Decimal("0"))
+    if total > remaining + _C:
+        raise ValueError(f"The parts add up to ₹{total:,.2f} but only ₹{remaining:,.2f} is left to bill "
+                         "on this timesheet")
+    qty_sum = sum((p["qty"] or Decimal("0") for p in parts), Decimal("0"))
+    finishes = (abs(remaining - total) <= Decimal("1.00")
+                or (remaining_qty is not None and all(p["qty"] is not None for p in parts)
+                    and abs(remaining_qty - qty_sum) <= _Q4))
+    if finishes:
+        last = parts[-1]
+        others = parts[:-1]
+        last["amount"] = remaining - sum((p["amount"] for p in others), Decimal("0"))
+        if remaining_qty is not None and all(p["qty"] is not None for p in others):
+            last["qty"] = (remaining_qty - sum((p["qty"] for p in others), Decimal("0"))).quantize(_Q4)
+        if last["amount"] <= 0:
+            raise ValueError("The last part would bill nothing — remove it")
+    return parts
+
+
+def returned_proformas(db: Session, ts: Timesheet) -> list[Invoice]:
+    """Every RETURNED Proforma on the sheet (0141: a split sheet can have one per
+    part). Raising the sheet again replaces them, reusing their PI numbers."""
+    from services.timesheets import invoices_for
+    return [i for i in invoices_for(db, ts) if i.is_proforma and i.returned_at is not None]
 
 
 def _timesheet_line(ts: Timesheet) -> str:

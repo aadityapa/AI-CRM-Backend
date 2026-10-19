@@ -31,10 +31,11 @@ from services.finance import (
     karnex_gst_tax_and_grand, serialize_invoice,
 )
 from services.invoice_format import format_summary
+from services.org_settings import split_po_rules
 from services.notify import notify_employee, notify_role, notify_roles, notify_user
 from services.proforma import (
     PROFORMA_PREFIX, customer_invoice_format, invoice_credit_days, notify_proforma_ready,
-    replaceable_proforma, resolve_invoice_format,
+    plan_splits, replaceable_proforma, resolve_invoice_format, returned_proformas,
 )
 from services.timesheets import (
     BillingPolicy,
@@ -43,11 +44,14 @@ from services.timesheets import (
     ensure_project_branch_id, freeze_invoice_figures, resolve_timesheet_display_branch,
     reverse_timesheet_ledger_effects,
     employee_display_name, employee_for_user, entry_out, for_submission_report_rows,
-    get_timesheet_or_404, holidays_for_project_period, leave_billable_by_type_map,
-    linked_invoice_for, list_attachments, month_days, period_label, persist_recomputed_entries,
+    get_timesheet_or_404, leave_billable_by_type_map,
+    billing_progress, invoices_for, live_invoices,
+    linked_invoice_for, list_attachments, period_label, persist_recomputed_entries,
     resolve_entry_fields, validate_timesheet_leave_balances,
     timesheet_detail_out, timesheet_invoice_preview, timesheet_out, timesheet_summary,
     _due_rows, _project_branch,
+    date_range, follow_on_window, holidays_for_project_range, overlapping_sheet,
+    period_window_error, sheet_holiday_dates,
 )
 
 router = APIRouter(prefix="/api/timesheets", tags=["CRM: Timesheets"])
@@ -210,6 +214,15 @@ def create_timesheet(
         year=body.year,
         status=TimesheetStatus.DRAFT,
     )
+    # Follow on from last month's sheet (19 Oct 2026): when it ended on the
+    # 20th (a 21st–20th cycle), this one starts on the 21st of last month —
+    # nobody has to remember to move the start date, and no day falls between.
+    follow = follow_on_window(db, body.project_id, body.employee_id,
+                              body.year, body.month, assignment)
+    follow_start = follow[0] if follow else None
+    if follow is not None:
+        ts.period_start_date = follow[0]
+        ts.period_end_date = follow[1]
     db.add(ts)
     db.flush()
     # The sheet's leave choices are the assignment's leave rows — bring them onto
@@ -217,25 +230,26 @@ def create_timesheet(
     # the project after the employee was mapped never reached the timesheet).
     _sync_assignment_leave(db, assignment, project)
     if body.generate_days:
-        holiday_dates = holidays_for_project_period(db, project, body.year, body.month)
         pe = assignment
+        from services.timesheets import sheet_period_bounds
+        window_start, window_end = sheet_period_bounds(ts, pe)
+        holiday_dates = holidays_for_project_range(db, project, window_start, window_end)
         ensure_project_branch_id(db, project, pe=pe)
         policy = effective_billing_policy(db, project, pe=pe)
         branch = resolve_timesheet_display_branch(db, project, pe=pe)
         # Mid-month join/exit: generate ONLY the days the employee was on the
         # project. A full-month grid for a 10th-of-the-month joiner both looks
-        # wrong and bills wrong (Monthly rates count the padded days).
-        from services.timesheets import pe_period_bounds
-        window_start, window_end = pe_period_bounds(body.year, body.month, pe)
-        for d in month_days(body.year, body.month):
-            if not (window_start <= d <= window_end):
-                continue
+        # wrong and bills wrong (Monthly rates count the padded days). A
+        # follow-on start (above) may begin in the previous month.
+        for d in date_range(window_start, window_end):
             db.add(build_generated_entry(
                 timesheet_id=ts.id, d=d, holiday_dates=holiday_dates,
                 project=project, policy=policy, branch=branch,
             ))
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_CREATED",
-                 f"Timesheet created for {period_label(body.year, body.month)}")
+                 f"Timesheet created for {period_label(body.year, body.month)}"
+                 + (f" — starts {follow_start.strftime('%d-%b-%Y')}, the day after last "
+                    "month's timesheet ended" if follow_start is not None else ""))
     db.commit()
     db.refresh(ts)
     entries = db.execute(
@@ -275,13 +289,37 @@ def list_timesheets(
         stmt = stmt.where(Timesheet.month == month)
     if year is not None:
         stmt = stmt.where(Timesheet.year == year)
+    # Status pills (20 Oct 2026 list redesign): counts over every filter EXCEPT
+    # the status, so each pill says what clicking it lists. One grouped query.
+    base_for_counts = stmt
     if status:
         try:
             stmt = stmt.where(Timesheet.status == TimesheetStatus(status))
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
     items, meta = paginate(db, stmt, params.page, params.limit)
+    try:
+        sub = base_for_counts.order_by(None).subquery()
+        grouped = db.execute(select(sub.c.status, func.count()).group_by(sub.c.status)).all()
+        meta = {**(meta or {}), "status_counts": {
+            getattr(s, "value", s): int(n) for s, n in grouped}}
+    except Exception:  # noqa: BLE001 — counts are a convenience, never a failure
+        pass
     rows = [timesheet_out(ts) for ts in items]
+    # Invoice state on every row (one query): the list shows the Proforma /
+    # invoice number, or the parts and what is left on a split sheet (0141).
+    from services.timesheets import _invoice_map, billing_progress, invoice_ref, live_invoices
+    inv_map = _invoice_map(db, [ts.id for ts in items])
+    by_id = {ts.id: ts for ts in items}
+    for r in rows:
+        invs = inv_map.get(r["id"], [])
+        first = (live_invoices(invs) or invs or [None])[0]
+        r["invoice"] = invoice_ref(first)
+        if invs:
+            prog = billing_progress(None, by_id[r["id"]], invs)
+            r["billing"] = {"parts": len([i for i in invs if i.split_no is not None]),
+                            "split": prog["split"], "fully_billed": prog["fully_billed"],
+                            "remaining": prog["remaining"]}
     # Names on LIST rows, server-side (31 Aug 2026, user bug report): the page
     # used to resolve names from a client fetch of /api/employees?limit=100 —
     # with 289 employees, anyone past the first page rendered as "#400".
@@ -310,7 +348,6 @@ def list_timesheets(
 # ---------------------------------------------------------------- period
 
 from pydantic import BaseModel as _PeriodBase  # noqa: E402
-from services.timesheets import period_bounds  # noqa: E402
 
 
 class PeriodIn(_PeriodBase):
@@ -740,7 +777,7 @@ def _reclassify_sheet_days(db: Session, ts: Timesheet, user: CurrentUser) -> int
     pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
     branch = resolve_timesheet_display_branch(db, project, pe=pe)
     policy = effective_billing_policy(db, project, pe=pe, branch=branch)
-    holiday_dates = holidays_for_project_period(db, project, ts.year, ts.month)
+    holiday_dates = sheet_holiday_dates(db, project, ts, pe)
     entries = db.execute(
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
     ).scalars().all()
@@ -817,7 +854,7 @@ def update_period(
       and comp-off is re-accrued so a removed weekend claws its credit back.
     """
     from services.timesheets import (
-        holidays_for_project_period, pe_period_bounds, sheet_period_bounds,
+        pe_period_bounds, sheet_period_bounds,
     )
 
     ts = get_timesheet_or_404(db, timesheet_id)
@@ -826,14 +863,21 @@ def update_period(
         raise HTTPException(status_code=400,
                             detail="The period can only be edited while the timesheet is Draft or Rejected")
 
-    month_start, month_end = period_bounds(ts.year, ts.month)
-    if not (month_start <= body.start_date <= month_end
-            and month_start <= body.end_date <= month_end):
+    # Cross-month periods are allowed (19 Oct 2026): "the March timesheet runs
+    # 20 Feb – 20 Mar". The window must still touch its own month, stay within
+    # MAX_PERIOD_DAYS and never share a day with another sheet of this
+    # employee on this project — one day, one sheet.
+    problem = period_window_error(ts.year, ts.month, body.start_date, body.end_date)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    clash = overlapping_sheet(db, ts, body.start_date, body.end_date)
+    if clash is not None:
+        other, o_start, o_end = clash
         raise HTTPException(
-            status_code=400,
-            detail=f"Both dates must fall inside {period_label(ts.year, ts.month)}")
-    if body.end_date < body.start_date:
-        raise HTTPException(status_code=400, detail="End date cannot be before the start date")
+            status_code=409,
+            detail=(f"{period_label(other.year, other.month)} timesheet already covers "
+                    f"{o_start.strftime('%d-%b-%Y')} to {o_end.strftime('%d-%b-%Y')} — "
+                    "change that sheet's period first so the two do not overlap"))
 
     pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
     old_start, old_end = sheet_period_bounds(ts, pe)
@@ -858,12 +902,12 @@ def update_period(
             removed += 1
     added = 0
     if project is not None:
-        holiday_dates = holidays_for_project_period(db, project, ts.year, ts.month)
+        holiday_dates = holidays_for_project_range(db, project, body.start_date, body.end_date)
         ensure_project_branch_id(db, project, pe=pe)
         policy = effective_billing_policy(db, project, pe=pe)
         branch = resolve_timesheet_display_branch(db, project, pe=pe)
-        for d in month_days(ts.year, ts.month):
-            if body.start_date <= d <= body.end_date and d not in existing:
+        for d in date_range(body.start_date, body.end_date):
+            if d not in existing:
                 db.add(build_generated_entry(
                     timesheet_id=ts.id, d=d, holiday_dates=holiday_dates,
                     project=project, policy=policy, branch=branch,
@@ -966,7 +1010,7 @@ def upsert_entries(
     policy = effective_billing_policy(db, project, pe=pe) if project else BillingPolicy()
     # Project-scoped leave-type → billable map (same for every employee on this project).
     leave_by_type = leave_billable_by_type_map(db, project, pe=pe) if project else {}
-    holiday_dates = holidays_for_project_period(db, project, ts.year, ts.month)
+    holiday_dates = sheet_holiday_dates(db, project, ts, pe)
     existing = {
         e.entry_date: e
         for e in db.execute(
@@ -984,7 +1028,7 @@ def upsert_entries(
     seen = set()
     for item in entries:
         d = item.entry_date
-        if d.month != ts.month or d.year != ts.year or not (win_start <= d <= win_end):
+        if not (win_start <= d <= win_end):
             raise HTTPException(
                 status_code=400,
                 detail=f"Entry date {d.isoformat()} is outside the timesheet period "
@@ -1180,11 +1224,11 @@ def recalculate_timesheet(
     ts = get_timesheet_or_404(db, timesheet_id)
     if ts.status != TimesheetStatus.APPROVED:
         raise HTTPException(status_code=400, detail="Only Approved timesheets can be recalculated")
-    linked = linked_invoice_for(db, ts)
-    if linked is not None:
+    live = live_invoices(invoices_for(db, ts))
+    if live:
         raise HTTPException(status_code=409, detail=(
-            f"Invoice {linked.invoice_number} was generated from this sheet — request a change on the "
-            f"invoice instead (or undo the invoice first)"))
+            f"Invoice {', '.join(i.invoice_number for i in live)} was generated from this sheet — request "
+            f"a change on the invoice instead (or undo the invoice first)"))
     entries = db.execute(
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
         .order_by(TimesheetEntry.entry_date)
@@ -1299,18 +1343,25 @@ def reject_timesheet(
         reason = body.validated_reason()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    linked = linked_invoice_for(db, ts) if ts.status == TimesheetStatus.APPROVED else None
+    # 0141: a split sheet has several invoices — every one blocks, every one is undone.
+    linked_all = invoices_for(db, ts) if ts.status == TimesheetStatus.APPROVED else []
+    linked = linked_all[0] if linked_all else None
     undo_summary: dict | None = None
     if linked is not None:
         if body.undo_invoice and user.is_admin:
             from services.crm_delete import undo_invoice_admin
+            for extra in linked_all[1:]:
+                undo_invoice_admin(db, extra)               # 409s on credit notes
             undo_summary = undo_invoice_admin(db, linked)   # 409s on credit notes
+            if len(linked_all) > 1:
+                undo_summary = {**(undo_summary or {}),
+                                "invoice_number": ", ".join(i.invoice_number for i in linked_all)}
         elif body.undo_invoice:
             raise HTTPException(status_code=403,
                                 detail="Only Admin/CEO can undo an invoice that was already generated.")
         else:
             raise HTTPException(status_code=409,
-                                detail=f"Invoice {linked.invoice_number} was already generated from this "
+                                detail=f"Invoice {', '.join(i.invoice_number for i in linked_all)} was already generated from this "
                                        "timesheet, so it cannot be rejected any more. Admin/CEO can undo "
                                        "the invoice together with the sheet; otherwise cancel that invoice "
                                        "first (Finance → Invoices) — or raise a credit note if it has "
@@ -1499,7 +1550,8 @@ def delete_timesheet(
 
     ts = get_timesheet_or_404(db, timesheet_id)
     _require_owner_or(db, user, ts, "HR", "Finance", "RMG", "Sales", "Sales_Head")
-    linked = linked_invoice_for(db, ts)
+    linked_all = invoices_for(db, ts)
+    linked = linked_all[0] if linked_all else None
     if linked is not None:
         # Force delete (cascade the invoice too) is allowed for Sales / Sales_Head
         # / RMG plus Admin/CEO (Admin/CEO satisfy every gate implicitly).
@@ -1511,14 +1563,15 @@ def delete_timesheet(
                 status_code=409,
                 detail=(
                     f"Cannot delete: timesheet is linked to invoice "
-                    f"{linked.invoice_number}. Delete that invoice first, or use "
+                    f"{', '.join(i.invoice_number for i in linked_all)}. Delete that invoice first, or use "
                     f"Force delete to remove both."
                 ),
             )
         # Force path (Admin/CEO): cascade the invoice — reverses PO consumption,
         # still blocks on the invoice's own payments/TDS/credit notes.
         from services.crm_delete import cascade_delete_invoice
-        cascade_delete_invoice(db, linked)
+        for inv in linked_all:
+            cascade_delete_invoice(db, inv)
     # DECISION (ISSUE-2): Submitted/Approved may have leave + comp-off ledger rows;
     # reverse is idempotent for Draft/Rejected (no prior deltas).
     reverse_timesheet_ledger_effects(db, ts)
@@ -1611,7 +1664,7 @@ def timesheet_po_options(
     """
     from services.project_employee_billing import RateRow, rate_for_date, split_period_by_rate
     from services.project_employees import load_rate_rows
-    from services.timesheets import get_assignment_or_400, period_bounds
+    from services.timesheets import get_assignment_or_400, sheet_billing_bounds
 
     ts = get_timesheet_or_404(db, timesheet_id)
     project = db.get(Project, ts.project_id)
@@ -1663,15 +1716,17 @@ def timesheet_po_options(
         ).all():
             billed_before[int(po_id)] = int(n or 0)
 
+    allow_expired = split_po_rules()["allow_expired_po"]
     po_rows = []
     for po in pos:
         status = getattr(po.status, "value", po.status)
         expired = bool(po.end_date and po.end_date < today)
         # An EXPIRED PO stays selectable by request — many customers keep
-        # billing against a PO past its end date while the renewal is signed.
-        # The dropdown labels it "(expired)"; only a cancelled PO is off the
-        # menu, and a zero balance is caught by the balance check on generate.
-        selectable = status != POStatus.CANCELLED.value
+        # billing against a PO past its end date while the renewal is signed —
+        # unless Admin switched that off (`billing.allow_expired_po`). The
+        # dropdown labels it "(expired)"; a cancelled PO is never on the menu,
+        # and a zero balance is caught by the balance check on generate.
+        selectable = status != POStatus.CANCELLED.value and (allow_expired or not expired)
         # Cancelled POs that never funded this project are noise, not options.
         if status == POStatus.CANCELLED.value and po.id not in alloc_by_po:
             continue
@@ -1709,7 +1764,8 @@ def timesheet_po_options(
     # Open PO, treated as live). Prefer a live employee-tagged PO whose dates
     # cover this timesheet's month (per-employee monthly POs); fall back to a
     # single live tagged PO. Never guess between several — the reviewer picks.
-    sug_start, sug_end = period_bounds(ts.year, ts.month)
+    _pe_sug = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
+    sug_start, sug_end = sheet_billing_bounds(ts, _pe_sug)
 
     def _live(r):
         return (r["selectable"] and not r["expired"] and r["status"] == "Active"
@@ -1727,7 +1783,7 @@ def timesheet_po_options(
 
     # ---- the month's rate from Commercial Details ---------------------------
     assignment = get_assignment_or_400(db, ts)
-    period_start, period_end = period_bounds(ts.year, ts.month)
+    period_start, period_end = sheet_billing_bounds(ts, assignment)
     rate_rows = load_rate_rows(db, assignment.id)
     unit = getattr(assignment.billing_unit, "value", assignment.billing_unit)
     if not rate_rows:
@@ -1786,6 +1842,12 @@ def timesheet_po_options(
             {"invoice_number": returned.invoice_number, "reason": returned.returned_reason,
              "returned_at": returned.returned_at.isoformat() if returned.returned_at else None}
             if (returned := replaceable_proforma(db, ts)) is not None else None),
+        # 0141 — how much of the sheet is already raised, and what is left, so
+        # the dialog can split the rest across POs.
+        "billing_progress": billing_progress(db, ts),
+        # Admin's split-PO rules (Settings ▸ Organisation ▸ Billing): the
+        # dialog hides the split, caps the lines and marks expired POs off.
+        "split_rules": split_po_rules(),
     })
 
 
@@ -1814,12 +1876,19 @@ def generate_invoice_from_timesheet(
     if ts.status != TimesheetStatus.APPROVED:
         raise HTTPException(status_code=400,
                             detail="Only Approved timesheets can be invoiced")
+    if body is not None and body.splits:
+        return _raise_split_proformas(db, ts, body, user)
     # A Proforma Finance RETURNED is replaced by this call (same PI number);
     # anything else already on the sheet blocks a second document.
-    returned = replaceable_proforma(db, ts)
-    if returned is None and linked_invoice_for(db, ts) is not None:
+    live = live_invoices(invoices_for(db, ts))
+    if live:
+        if any(i.split_no is not None for i in live):
+            raise HTTPException(status_code=409, detail=(
+                "This timesheet is split across POs — raise what is left from the "
+                "\"Split across POs\" section"))
         raise HTTPException(status_code=409,
                             detail="An invoice has already been generated for this timesheet")
+    returned = replaceable_proforma(db, ts)
 
     preview = timesheet_invoice_preview(db, ts)  # 400s when no assignment exists
     if _apply_frozen_figures(ts, preview):
@@ -1867,6 +1936,7 @@ def generate_invoice_from_timesheet(
                                 detail="Selected PO does not belong to this project's customer")
         if getattr(po.status, "value", po.status) == POStatus.CANCELLED.value:
             raise HTTPException(status_code=400, detail="Selected PO is cancelled")
+        _refuse_expired_po(po, split_po_rules())
         alloc = db.execute(
             select(POProjectAllocation).where(
                 POProjectAllocation.po_id == po.id,
@@ -1979,6 +2049,147 @@ def generate_invoice_from_timesheet(
     return envelope(
         data={"invoice": serialize_invoice(invoice, detail=True, db=db), "timesheet_id": ts.id},
         message=f"Proforma invoice {proforma_number} raised — Finance has been notified",
+    )
+
+
+def _refuse_expired_po(po: PurchaseOrder, rules: dict) -> None:
+    """A PO past its end date may be drawn only while Admin allows it
+    (Settings ▸ Organisation ▸ Billing, `billing.allow_expired_po`)."""
+    if not rules.get("allow_expired_po", True) and po.end_date and po.end_date < date.today():
+        raise HTTPException(status_code=400, detail=(
+            f"PO {po.po_number} ended on {po.end_date:%d %b %Y} — billing an expired PO is "
+            "switched off. Renew the PO, or ask Admin to allow it in Settings ▸ Organisation ▸ Billing"))
+
+
+def _raise_split_proformas(db: Session, ts: Timesheet, body: GenerateInvoiceIn,
+                           user: CurrentUser):
+    """0141 — one Proforma per PO for an Approved sheet whose month one PO
+    cannot cover. Each part: its own PI number, PO, GST and due date; the
+    parts add back to the figure frozen at approval (`plan_splits` — the last
+    part of a finishing split takes the exact remainder). A part may be raised
+    later (the rest stays "to bill"). Returned parts are replaced, their PI
+    numbers reused. No PO balance moves here — conversion draws each part."""
+    rules = split_po_rules()
+    if not rules["enabled"]:
+        raise HTTPException(status_code=403, detail=(
+            "Splitting a timesheet across POs is switched off — Admin can turn it on in "
+            "Settings ▸ Organisation ▸ Billing"))
+    if body.quantity is not None or body.rate_per_unit is not None:
+        raise HTTPException(status_code=400, detail=(
+            "Qty / rate overrides cannot be combined with a split — fix the rate in "
+            "Commercial Details, then split"))
+    invs = invoices_for(db, ts)
+    live_parts = [i for i in live_invoices(invs) if i.split_no is not None]
+    if len(live_parts) + len(body.splits) > rules["max_parts"]:
+        raise HTTPException(status_code=400, detail=(
+            f"A timesheet may be split into at most {rules['max_parts']} parts "
+            f"({len(live_parts)} already raised) — Admin sets this in Settings ▸ Organisation ▸ Billing"))
+    if any(i.split_no is None for i in live_invoices(invs)):
+        raise HTTPException(status_code=409,
+                            detail="An invoice for the whole timesheet already exists")
+    preview = timesheet_invoice_preview(db, ts)
+    _apply_frozen_figures(ts, preview)
+    li = (preview.get("line_items") or [{}])[0]
+    progress = billing_progress(db, ts, invs)
+    total = Decimal(str(preview["totals"]["sub_total"]))
+    live = live_invoices(invs)
+    already = sum((Decimal(str(i.sub_total or 0)) for i in live), Decimal("0"))
+    remaining = max(Decimal("0"), total - already)
+    if remaining <= Decimal("0.01"):
+        raise HTTPException(status_code=409, detail="Nothing is left to bill on this timesheet")
+    total_qty = Decimal(str(li.get("total_billed_qty") or 0))
+    used_qty = sum((Decimal(str(i.split_qty or 0)) for i in live), Decimal("0"))
+    rate = Decimal(str(li["rate_per_unit"])) if li.get("rate_per_unit") else None
+    try:
+        parts = plan_splits(
+            [s.model_dump() for s in body.splits], remaining=remaining,
+            remaining_qty=max(Decimal("0"), total_qty - used_qty) if total_qty else None,
+            rate=rate, unit=str(li.get("billing_unit") or progress.get("billing_unit") or ""),
+            rate_split=bool(li.get("rate_split")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    project = db.get(Project, ts.project_id)
+    pos: dict[int, PurchaseOrder] = {}
+    for p in parts:
+        po = db.get(PurchaseOrder, p["po_id"])
+        if po is None or project is None or po.customer_id != project.customer_id:
+            raise HTTPException(status_code=400,
+                                detail="A selected PO does not belong to this project's customer")
+        if getattr(po.status, "value", po.status) == POStatus.CANCELLED.value:
+            raise HTTPException(status_code=400, detail=f"PO {po.po_number} is cancelled")
+        _refuse_expired_po(po, rules)
+        ensure_po_covers(po, po_draw_amount(p["amount"]))   # names the PO in its 400
+        pos[po.id] = po
+        if db.execute(select(POProjectAllocation).where(
+                POProjectAllocation.po_id == po.id,
+                POProjectAllocation.project_id == ts.project_id)).scalars().first() is None:
+            db.add(POProjectAllocation(po_id=po.id, project_id=ts.project_id,
+                                       allocated_amount=Decimal(str(po.balance_value or 0)),
+                                       consumed_amount=Decimal("0")))
+            db.flush()
+
+    # Returned parts go; their PI numbers are reused in order.
+    reuse = [r.proforma_number or r.invoice_number for r in returned_proformas(db, ts)]
+    for r in returned_proformas(db, ts):
+        db.delete(r)
+    db.flush()
+    next_no = max([i.split_no or 0 for i in live] + [0]) + 1
+    unit = str(li.get("billing_unit") or "")
+    unit_word = {"Hourly": "hours", "Daily": "days"}.get(unit, "of the month")
+    invoice_format = resolve_invoice_format(db, ts.project_id, getattr(body, "invoice_format", None))
+    created: list[Invoice] = []
+    for p in parts:
+        po = pos[p["po_id"]]
+        if reuse:
+            number = reuse.pop(0)
+        else:
+            number = next_sequence_number(db, Invoice, Invoice.invoice_number, PROFORMA_PREFIX)
+            ensure_unique_invoice_number(db, number)
+        qty = p["qty"]
+        share = (f"{qty.normalize():f} of {total_qty.normalize():f} {unit_word}"
+                 if qty is not None and total_qty and unit in ("Hourly", "Daily")
+                 else f"₹{p['amount']:,.2f} of ₹{total:,.2f}")
+        desc = f"{li.get('description') or 'Services'} — part {next_no} (PO {po.po_number}: {share})"
+        tax_amount, grand_total, _gst = karnex_gst_tax_and_grand(
+            db, po=po, project_id=ts.project_id, lines=[], sub_total=p["amount"])
+        invoice_dt = date.today()
+        inv = Invoice(
+            invoice_number=number, proforma_number=number, kind=InvoiceKind.PROFORMA.value,
+            invoice_format=invoice_format, po_id=po.id, project_id=ts.project_id,
+            timesheet_id=ts.id, split_no=next_no, split_qty=qty,
+            invoice_date=invoice_dt,
+            due_date=invoice_dt + timedelta(days=invoice_credit_days(db, ts.project_id, po)[0]),
+            sub_total=p["amount"], tax_amount=tax_amount, grand_total=grand_total,
+            paid_amount=Decimal("0"), balance_amount=grand_total, payment_status=PaymentStatus.UNPAID,
+            lines=[InvoiceLine(s_no=1, description=desc[:500],
+                               qty=qty if qty is not None else Decimal("1"),
+                               rate=rate if (rate is not None and qty is not None) else p["amount"],
+                               amount=p["amount"])],
+        )
+        apply_round_off(inv, bool(getattr(body, "round_off", False)))
+        db.add(inv)
+        db.flush()
+        created.append(inv)
+        log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PROFORMA_GENERATED",
+                     f"Proforma {number} raised for part {next_no} on PO {po.po_number}: "
+                     f"{share} = {float(p['amount']):,.2f} before GST ({format_summary(invoice_format)})")
+        notify_proforma_ready(db, inv, ts, user)
+        next_no += 1
+    db.commit()
+    for inv in created:
+        db.refresh(inv)
+    progress = billing_progress(db, ts)
+    left = progress.get("remaining") or 0
+    msg = (f"{len(created)} Proforma{'s' if len(created) > 1 else ''} raised "
+           f"({', '.join(i.invoice_number for i in created)}) — Finance has been notified")
+    if left > 0.01:
+        msg += f". ₹{left:,.2f} of this timesheet is still to bill."
+    return envelope(
+        data={"invoices": [serialize_invoice(i, detail=True, db=db) for i in created],
+              "invoice": serialize_invoice(created[0], detail=True, db=db),
+              "timesheet_id": ts.id, "billing_progress": progress},
+        message=msg,
     )
 
 

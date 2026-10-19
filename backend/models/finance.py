@@ -141,8 +141,15 @@ class Invoice(Base):
     invoice_number = sa.Column(sa.String(64), nullable=False, unique=True)
     po_id = sa.Column(sa.Integer, sa.ForeignKey("purchase_orders.id"), nullable=True, index=True)
     project_id = sa.Column(sa.Integer, sa.ForeignKey("projects.id"), nullable=False, index=True)
-    # Source timesheet when the invoice was generated from Tab 9 (one invoice per timesheet).
-    timesheet_id = sa.Column(sa.Integer, sa.ForeignKey("timesheets.id"), nullable=True)
+    # Source timesheet when the invoice was generated from a timesheet. Since
+    # 0141 a sheet may carry SEVERAL invoices — one per PO, when one PO covers
+    # only part of the month (`split_no` / `split_qty` below).
+    timesheet_id = sa.Column(sa.Integer, sa.ForeignKey("timesheets.id"), nullable=True, index=True)
+    #: Part number of a split sheet (1, 2 …). NULL = the invoice bills the WHOLE sheet.
+    split_no = sa.Column(sa.Integer, nullable=True)
+    #: The share of the sheet's billed quantity this part carries (hours / days,
+    #: or the fraction of a month on a Monthly rate). NULL on a whole-sheet invoice.
+    split_qty = sa.Column(sa.Numeric(12, 4), nullable=True)
     invoice_date = sa.Column(sa.Date, nullable=False)
     due_date = sa.Column(sa.Date, nullable=True)
     sub_total = sa.Column(sa.Numeric(14, 2), nullable=False)
@@ -185,7 +192,10 @@ class Invoice(Base):
     ack_date = sa.Column(sa.Date, nullable=True)
     irn_recorded_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
     irn_recorded_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
-    __table_args__ = (sa.UniqueConstraint("timesheet_id", name="uq_invoice_timesheet"),)
+    #: TDS the customer withheld (0136, 16 Oct 2026). It settles the invoice
+    #: beside the cash — balance = grand_total − paid − tds_deducted — and is
+    #: followed as "pending from client" on the TdsRecord until Form 16A is in.
+    tds_deducted = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
 
     @property
     def is_proforma(self) -> bool:
@@ -249,6 +259,9 @@ class CustomerReceipt(Base):
     __tablename__ = "customer_receipts"
     id = sa.Column(sa.Integer, primary_key=True)
     customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"), nullable=False, index=True)
+    #: The customer branch that paid (0135, 16 Oct 2026). NULL = before that, or
+    #: invoices with no branch on record.
+    branch_id = sa.Column(sa.Integer, sa.ForeignKey("customer_branches.id"), nullable=True, index=True)
     received_date = sa.Column(sa.Date, nullable=False, index=True)
     amount = sa.Column(sa.Numeric(14, 2), nullable=False)
     payment_mode = sa.Column(sa.String(64), nullable=True)
@@ -256,6 +269,11 @@ class CustomerReceipt(Base):
     notes = sa.Column(sa.Text, nullable=True)
     #: Part of the amount not applied to any invoice (advance / on account).
     unallocated_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    #: TDS the customer withheld on the invoices this receipt settles (0136).
+    tds_total = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    #: Proof of the credit — bank screenshot / remittance advice (0140).
+    proof_url = sa.Column(sa.String(512), nullable=True)
+    proof_name = sa.Column(sa.String(255), nullable=True)
     created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 
@@ -271,6 +289,19 @@ class TdsRecord(Base):
     tds_balance = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     tds_status = sa.Column(pg_enum(TdsStatus, "tds_status"), nullable=False,
                            server_default=TdsStatus.PENDING.value)
+    # ---- How it was worked out (0136, 16 Oct 2026) -------------------------
+    #: Percent the customer deducted; NULL = an amount typed by hand.
+    tds_rate = sa.Column(sa.Numeric(5, 2), nullable=True)
+    #: "taxable" (before GST — the default) | "total" (incl. GST).
+    tds_base = sa.Column(sa.String(16), nullable=True)
+    base_amount = sa.Column(sa.Numeric(14, 2), nullable=True)
+    #: Income-tax section, e.g. 194J / 194C (optional, for the register).
+    section = sa.Column(sa.String(16), nullable=True)
+    #: The customer receipt it was booked with; NULL = recorded on the invoice.
+    receipt_id = sa.Column(sa.Integer, sa.ForeignKey("customer_receipts.id", ondelete="SET NULL"),
+                           nullable=True, index=True)
+    created_by = sa.Column(sa.Integer, nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=True, server_default=sa.func.now())
 
     invoice = relationship("Invoice", back_populates="tds_record")
     payments = relationship("TdsPayment", back_populates="tds_record",

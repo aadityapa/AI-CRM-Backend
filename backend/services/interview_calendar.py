@@ -200,6 +200,21 @@ def _candidate_name(candidate: Candidate | None, fallback_id) -> str:
     return name or f"Candidate #{candidate.id}"
 
 
+def _real_email(raw) -> str | None:
+    """A displayable address, or None for a blank / placeholder / malformed one."""
+    try:
+        from services.resume_parse import clean_email
+        return clean_email(raw) or None
+    except Exception:  # pragma: no cover — display only
+        return None
+
+
+def _contact(cand) -> dict:
+    return {"candidate_phone": (getattr(cand, "phone", None) or "").strip() or None,
+            "candidate_city": (getattr(cand, "city", None) or "").strip() or None,
+            "candidate_notice": (getattr(cand, "notice_period", None) or "").strip() or None}
+
+
 def _event(**kwargs) -> dict:
     """Common calendar-event shape. Every source produces exactly this."""
     return {
@@ -212,7 +227,14 @@ def _event(**kwargs) -> dict:
         "raw_when": kwargs.get("raw_when"),
         "candidate_id": kwargs.get("candidate_id"),
         "candidate_name": kwargs.get("candidate_name"),
-        "candidate_email": kwargs.get("candidate_email"),
+        # Contact block (16 Oct 2026, user ask): so TA can reach a candidate who
+        # did not join without opening the profile. Placeholder addresses
+        # (resume-…@noemail.karnex.local) never reach the screen.
+        "candidate_email": _real_email(kwargs.get("candidate_email")),
+        "candidate_phone": kwargs.get("candidate_phone"),
+        "candidate_city": kwargs.get("candidate_city"),
+        "candidate_notice": kwargs.get("candidate_notice"),
+        "ta_owner": kwargs.get("ta_owner"),
         "profile_id": kwargs.get("profile_id"),
         "opportunity_id": kwargs.get("opportunity_id"),
         "opportunity_title": kwargs.get("opportunity_title"),
@@ -258,7 +280,8 @@ def _manual_round_events(db: Session, window: CalendarRange) -> list[dict]:
         .order_by(InterviewEvent.scheduled_at.asc())
     ).all()
 
-    organisers = _organiser_names(db, [ev.created_by for ev, *_ in rows])
+    organisers = _organiser_names(db, [ev.created_by for ev, *_ in rows]
+                                  + [getattr(p, "ta_owner_id", None) for _e, _c, p, *_r in rows])
 
     out: list[dict] = []
     for ev, cand, profile, opp, customer, panelist in rows:
@@ -290,6 +313,8 @@ def _manual_round_events(db: Session, window: CalendarRange) -> list[dict]:
             candidate_id=ev.candidate_id,
             candidate_name=name,
             candidate_email=getattr(cand, "email", None),
+            **_contact(cand),
+            ta_owner=organisers.get(getattr(profile, "ta_owner_id", None)),
             profile_id=ev.profile_id,
             opportunity_id=getattr(opp, "id", None),
             opportunity_title=getattr(opp, "title", None),
@@ -328,7 +353,12 @@ def _ai_interview_events(db: Session, window: CalendarRange) -> list[dict]:
         return []
 
     schedules = _legacy_schedules([link.invite_token for link, *_ in rows])
-    organisers = _organiser_names(db, [link.scheduled_by for link, *_ in rows])
+    owner_by_profile = dict(db.execute(
+        select(CandidateProfile.id, CandidateProfile.ta_owner_id).where(
+            CandidateProfile.id.in_({link.profile_id for link, *_ in rows if link.profile_id}))
+    ).all()) if any(link.profile_id for link, *_ in rows) else {}
+    organisers = _organiser_names(db, [link.scheduled_by for link, *_ in rows]
+                                  + list(owner_by_profile.values()))
 
     out: list[dict] = []
     for link, cand, opp, customer in rows:
@@ -350,6 +380,8 @@ def _ai_interview_events(db: Session, window: CalendarRange) -> list[dict]:
             candidate_name=name,
             candidate_email=(str(row.get("candidate_email") or "").strip()
                              or getattr(cand, "email", None)),
+            **_contact(cand),
+            ta_owner=organisers.get(owner_by_profile.get(link.profile_id)),
             profile_id=link.profile_id,
             opportunity_id=link.opportunity_id,
             opportunity_title=getattr(opp, "title", None),
@@ -423,6 +455,8 @@ def undated_rounds(db: Session, limit: int = 50) -> list[dict]:
             raw_when=ev.raw_when,
             candidate_id=ev.candidate_id,
             candidate_name=_candidate_name(cand, ev.candidate_id),
+            candidate_email=getattr(cand, "email", None),
+            **_contact(cand),
             profile_id=ev.profile_id,
             kind=ev.kind,
             round_label=_round_display(ev.kind, ev.interview_category, ev.stage),

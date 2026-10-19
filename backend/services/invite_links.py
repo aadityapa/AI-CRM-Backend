@@ -92,6 +92,38 @@ def base_from_request(request) -> str:
     return raw
 
 
+def base_reach(base: str) -> str:
+    """'public' · 'private' (LAN / localhost — opens only inside the office
+    network) · 'unknown'. PURE. A link posted on a job portal must be public."""
+    host = (urlparse((base or "").strip()).hostname or "").lower()
+    if not host:
+        return "unknown"
+    if host in _LOCAL_HOSTS or host.endswith(".local") or host.endswith(".lan"):
+        return "private"
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return "public" if "." in host else "private"
+    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+        return "private"
+    return "public"
+
+
+def base_source() -> str:
+    """Where the public base comes from: 'settings' · 'environment' · 'request'."""
+    try:
+        from services.org_settings import setting
+        val = (setting("email.public_base_url") or "").strip()
+        if val and val.lower() != "auto":
+            return "settings"
+    except Exception:
+        pass
+    env = (os.getenv("PUBLIC_BASE_URL") or "").strip()
+    if env and env.lower() != "auto":
+        return "environment"
+    return "request"
+
+
 def resolve_invite_base(request=None) -> str:
     """Configured base → request-derived base → last seen base → ''."""
     global _last_seen_base

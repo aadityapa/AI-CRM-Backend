@@ -519,3 +519,30 @@ def test_a_jd_change_rescores_live_applicants_but_never_a_decision(db, monkeypat
     assert sorted(seen) == sorted([r_live.id, again.id])
     assert done.id not in seen and closed.id not in seen
     assert res["scored"] == 2
+
+
+def test_anyone_who_works_the_candidate_can_hold_with_a_reason_and_release(db):
+    """16 Oct 2026 — Hold with a reason (TA · RMG · Sales · Customer · HR)."""
+    sales = CurrentUser(id=1, username="s", full_name="Neha Rao", roles={"Sales"})
+    p = _profile(db, stage=PS.CUSTOMER_SCREENING)
+    with pytest.raises(HTTPException) as e:
+        cp.set_candidate_hold(db, p, "hold", "Customer", "no", sales)
+    assert e.value.status_code == 400
+    cp.set_candidate_hold(db, p, "hold", "Customer", "Client froze hiring till Nov", sales)
+    st = _status(db, p)
+    assert st["key"] == "candidate_hold" and st["label"] == "On Hold – Customer"
+    assert "Client froze hiring" in st["hint"]
+    assert st["stage"]["key"] == "customer_screening"           # the stage never moves
+    assert cp.holds_for(db, [p.id])[p.id]["side"] == "Customer"
+    with pytest.raises(HTTPException):
+        cp.set_candidate_hold(db, p, "hold", "TA", "second hold", sales)   # one at a time
+    cp.set_candidate_hold(db, p, "release", None, None, sales)
+    assert _status(db, p)["key"] != "candidate_hold" and not cp.holds_for(db, [p.id])
+    assert cp.default_hold_side(CurrentUser(id=2, username="h", roles={"HR"})) == "HR"
+
+
+def test_a_closed_candidacy_cannot_be_held(db):
+    p = _profile(db, stage=PS.JOINED)
+    with pytest.raises(HTTPException) as e:
+        cp.set_candidate_hold(db, p, "hold", "TA", "valid reason", TA)
+    assert e.value.status_code == 409

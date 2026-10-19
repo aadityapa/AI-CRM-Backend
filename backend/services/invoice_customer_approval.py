@@ -133,7 +133,8 @@ def _log(db: Session, invoice: Invoice, user_id: int | None, action: str, note: 
     log_activity(db, TimesheetActivityLog, "timesheet_id", invoice.timesheet_id, user_id or 0, action, note)
 
 
-def confirm_customer_approval(db: Session, invoice: Invoice, user, note: str | None = None) -> Invoice:
+def confirm_customer_approval(db: Session, invoice: Invoice, user, note: str | None = None,
+                              *, notify: bool = True) -> Invoice:
     """The Sales Manager / Sales Head confirms the customer accepted the invoice
     as issued. Stamps it, logs it and tells Finance. Idempotence: a second
     confirmation is a 409 (the first one stands)."""
@@ -150,8 +151,68 @@ def confirm_customer_approval(db: Session, invoice: Invoice, user, note: str | N
     db.flush()
     _log(db, invoice, getattr(user, "id", None), "INVOICE_CUSTOMER_APPROVED",
          f"Customer approved invoice {invoice.invoice_number}" + (f": {note}" if note else ""))
-    _notify_finance(db, invoice, user, note)
+    if notify:
+        _notify_finance(db, invoice, user, note)
     return invoice
+
+
+#: How many invoices one bulk confirmation may carry.
+MAX_BULK = 200
+
+
+def confirm_many(db: Session, invoices: list[Invoice], user, note: str | None = None
+                 ) -> tuple[list[Invoice], list[dict]]:
+    """Bulk "customer approved" from My Tasks (16 Oct 2026, user ask: select
+    many, confirm without opening each). Each invoice in its own savepoint —
+    one refusal never blocks the rest; Finance hears ONCE with the list.
+    Returns (confirmed, skipped[{invoice_id, invoice_number, reason}])."""
+    if not may_confirm(user):
+        raise HTTPException(status_code=403,
+                            detail="Only the Sales Manager or Sales Head confirms a customer's approval.")
+    done: list[Invoice] = []
+    skipped: list[dict] = []
+    for inv in invoices:
+        try:
+            with db.begin_nested():
+                confirm_customer_approval(db, inv, user, note, notify=False)
+            done.append(inv)
+        except HTTPException as exc:
+            skipped.append({"invoice_id": inv.id, "invoice_number": inv.invoice_number,
+                            "reason": str(exc.detail)})
+    if done:
+        _notify_finance_batch(db, done, user, note)
+    return done, skipped
+
+
+def _notify_finance_batch(db: Session, invoices: list[Invoice], user, note: str | None) -> None:
+    if len(invoices) == 1:
+        _notify_finance(db, invoices[0], user, note)
+        return
+    from services.notify import notify_role
+
+    who = getattr(user, "full_name", None) or getattr(user, "username", None) or "Sales"
+    total = sum(float(i.grand_total or 0) for i in invoices)
+    numbers = ", ".join(i.invoice_number or f"#{i.id}" for i in invoices[:20])
+    more = f" and {len(invoices) - 20} more" if len(invoices) > 20 else ""
+    try:
+        with db.begin_nested():
+            notify_role(
+                db, "Finance",
+                f"Customer approved {len(invoices)} invoices — add the IRNs",
+                f"{who} confirmed the customer accepted {len(invoices)} invoices "
+                f"(₹{total:,.2f} incl. GST) without changes: {numbers}{more}. "
+                "Record each e-invoice IRN and Acknowledgement No."
+                + (f" Note: {note}" if note else ""),
+                "/admin/?view=crm&p=invoices&tab=Customer_Approved", exclude_user_id=getattr(user, "id", None),
+                event=EVENT_CUSTOMER_APPROVED, actor=user,
+                dedupe_prefix=f"{EVENT_CUSTOMER_APPROVED}:bulk:{min(i.id for i in invoices)}:{len(invoices)}",
+                related_type="invoice", related_id=invoices[0].id,
+                rows=[("Invoices", str(len(invoices))), ("Amount", f"₹{total:,.2f}"), ("Confirmed by", who)],
+            )
+    except Exception:  # noqa: BLE001 — a mail problem never undoes the confirmations
+        import logging
+
+        logging.getLogger("karnex.crm.invoices").warning("bulk customer-approval notice failed", exc_info=True)
 
 
 def withdraw_customer_approval(db: Session, invoice: Invoice, user) -> Invoice:

@@ -44,6 +44,21 @@ class GenerateInvoiceIn(BaseModel):
     #: the document AND saved to the customer's billing policy for next time.
     #: None = the customer's saved format (or every column).
     invoice_format: dict[str, bool] | None = None
+    #: Split the sheet across several POs (0141, 20 Oct 2026): one Proforma per
+    #: entry. Each names its PO and EITHER a quantity (hours / days — Hourly /
+    #: Daily rates) OR an amount (before GST — any rate; the only choice on a
+    #: Monthly rate or a mid-month rate change). The parts may cover only part
+    #: of what is left; the rest is raised later. None = the old single invoice.
+    splits: list["InvoiceSplitIn"] | None = Field(default=None, max_length=10)
+
+
+class InvoiceSplitIn(BaseModel):
+    po_id: int
+    quantity: float | None = Field(default=None, gt=0)
+    amount: float | None = Field(default=None, gt=0)
+
+
+GenerateInvoiceIn.model_rebuild()
 
 
 class TimesheetEntryIn(BaseModel):

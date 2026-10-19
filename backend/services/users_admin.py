@@ -512,9 +512,22 @@ def set_user_active(db: Session, user_id: int, active: bool, actor_id: int | Non
         sa.text("UPDATE registration_data SET is_active = :a WHERE id = :i"),
         {"a": active, "i": user_id},
     )
+    released: list[int] = []
+    if not active:
+        # 14 Oct 2026 — a person who left must not stay on any position's sourcing
+        # team (reported: Sweety Falke, deactivated, still listed on C-2026-00101).
+        try:
+            from services.requirement_assignments import release_user
+            with db.begin_nested():
+                released = release_user(db, user_id, reason, actor_id)
+        except Exception:  # noqa: BLE001 — the deactivation itself must still go through
+            released = []
     db.commit()
     row = _require_user_row(db, user_id)
-    return _user_out(row, _roles_map(db, [user_id]).get(user_id, []))
+    out = _user_out(row, _roles_map(db, [user_id]).get(user_id, []))
+    if not active:
+        out["released_positions"] = len(released)
+    return out
 
 
 def _table_has_column(db: Session, table: str, column: str) -> bool:
@@ -718,7 +731,7 @@ def open_work(db: Session, user_id: int) -> list[dict]:
         live = [RequirementStatus.OPEN_FOR_SOURCING, RequirementStatus.POSTED_ON_PORTALS,
                 RequirementStatus.IN_PROGRESS, RequirementStatus.PENDING_ENGINEERING_REVIEW]
         _add("positions", "Positions assigned to them",
-             "Change the sourcing team on these positions.",
+             "They are taken off these sourcing teams automatically — assign another TA if needed.",
              select(_f.count()).select_from(RequirementTaAssignment)
              .join(Requirement, Requirement.id == RequirementTaAssignment.requirement_id)
              .where(RequirementTaAssignment.user_id == user_id, Requirement.status.in_(live)))

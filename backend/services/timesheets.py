@@ -504,6 +504,171 @@ def sheet_period_bounds(ts, pe) -> tuple[date, date]:
     return start, end
 
 
+# ---- custom (cross-month) periods (19 Oct 2026) ----------------------------
+# Some customers bill on a cycle that is not the calendar month — "the March
+# timesheet runs 20 Feb – 20 Mar", and a one-off long sheet bridges back to
+# calendar months ("May runs 21 Apr – 30 May, June is 1–30 June"). A sheet's
+# period may therefore START in an earlier month or END in a later one, as long
+# as it still touches its own month, is at most MAX_PERIOD_DAYS long and does
+# not overlap another sheet of the same employee on the same project.
+
+MAX_PERIOD_DAYS = 62
+
+
+def date_range(start: date, end: date) -> list[date]:
+    """Every day from start to end inclusive (empty when end < start)."""
+    from datetime import timedelta
+    n = (end - start).days
+    return [start + timedelta(days=i) for i in range(n + 1)] if n >= 0 else []
+
+
+def add_months(d: date, months: int) -> date:
+    """Same day N months later, clamped to the month's last day (31 Jan + 1 = 28/29 Feb)."""
+    y, m = divmod(d.month - 1 + months, 12)
+    year, month = d.year + y, m + 1
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
+
+
+def is_cross_month(year: int, month: int, start: date, end: date) -> bool:
+    """True when the window reaches outside the sheet's own calendar month."""
+    m_start, m_end = period_bounds(year, month)
+    return start < m_start or end > m_end
+
+
+def period_window_error(year: int, month: int, start: date, end: date) -> str | None:
+    """Why a period cannot be saved on the (year, month) sheet, or None. PURE."""
+    if end < start:
+        return "End date cannot be before the start date"
+    days = (end - start).days + 1
+    if days > MAX_PERIOD_DAYS:
+        return (f"A timesheet period can be at most {MAX_PERIOD_DAYS} days long "
+                f"({start.strftime('%d-%b-%Y')} to {end.strftime('%d-%b-%Y')} is {days} days)")
+    m_start, m_end = period_bounds(year, month)
+    if end < m_start or start > m_end:
+        return (f"The period must include at least one day of {period_label(year, month)} — "
+                "this is that month's timesheet")
+    return None
+
+
+def billing_cycle_factor(win_start: date, win_end: date, billed_start: date | None = None) -> Decimal:
+    """How many monthly rates a CROSS-MONTH window bills. PURE.
+
+    A window up to one month long (20 Feb – 20 Mar, 21 Mar – 20 Apr) is ONE
+    billing cycle → 1.0. A longer one (21 Apr – 30 May) bills one month plus the
+    extra days at rate ÷ days of that cycle (21 Apr – 20 May = 30 days, +10 days
+    → 1.3333). ``billed_start`` moves the start for an initial no-billing window:
+    the free days come off the same way.
+    """
+    from datetime import timedelta
+    billed_start = max(billed_start or win_start, win_start)
+    if win_end < billed_start:
+        return ZERO
+    cycle_end = add_months(win_start, 1) - timedelta(days=1)
+    cycle_len = Decimal((cycle_end - win_start).days + 1)
+    full_len = Decimal((win_end - win_start).days + 1)
+    billed_len = Decimal((win_end - billed_start).days + 1)
+    base = full_len if full_len <= cycle_len else cycle_len
+    return billed_len / base if base > ZERO else ZERO
+
+
+def sheet_billing_bounds(ts, pe) -> tuple[date, date]:
+    """The span rate rows are split over: the calendar month, or — for a
+    cross-month window — the window itself (so 20–28 Feb hours find a rate)."""
+    m_start, m_end = period_bounds(ts.year, ts.month)
+    w_start, w_end = sheet_period_bounds(ts, pe)
+    if is_cross_month(ts.year, ts.month, w_start, w_end):
+        return w_start, w_end
+    return m_start, m_end
+
+
+def _assignment_filter(project_id: int, employee_id: int):
+    return (Timesheet.project_id == project_id, Timesheet.employee_id == employee_id)
+
+
+def overlapping_sheet(db: Session, ts, start: date, end: date):
+    """Another sheet of the same employee on the same project whose period shares
+    a day with start..end, or None. Neighbouring months only (a window is ≤ 62 days)."""
+    keys = set()
+    for delta in (-3, -2, -1, 0, 1, 2, 3):
+        d = add_months(date(ts.year, ts.month, 1), delta)
+        keys.add((d.year, d.month))
+    rows = db.execute(
+        select(Timesheet).where(*_assignment_filter(ts.project_id, ts.employee_id),
+                                Timesheet.id != ts.id)
+    ).scalars().all()
+    for other in rows:
+        if (other.year, other.month) not in keys:
+            continue
+        pe = db.get(ProjectEmployee, other.project_employee_id) if other.project_employee_id else None
+        o_start, o_end = sheet_period_bounds(other, pe)
+        if o_start <= end and start <= o_end:
+            return other, o_start, o_end
+    return None
+
+
+def follow_on_window(db: Session, project_id: int, employee_id: int,
+                     year: int, month: int, pe) -> tuple[date, date | None] | None:
+    """(start, end) for a NEW sheet when the previous month's sheet of the same
+    employee + project ended somewhere other than its month end — a 21st–20th
+    cycle. Start = the day after it ended. End = one cycle later when the
+    previous sheet was itself exactly one cycle (21 Feb – 20 Mar → 21 Mar –
+    20 Apr), else None (the month end). None when the ordinary window already
+    follows on."""
+    from datetime import timedelta
+    prev_first = add_months(date(year, month, 1), -1)
+    prev = db.execute(
+        select(Timesheet).where(*_assignment_filter(project_id, employee_id),
+                                Timesheet.year == prev_first.year,
+                                Timesheet.month == prev_first.month)
+    ).scalars().first()
+    if prev is None:
+        return None
+    prev_pe = db.get(ProjectEmployee, prev.project_employee_id) if prev.project_employee_id else pe
+    prev_start, prev_end = sheet_period_bounds(prev, prev_pe)
+    candidate = prev_end + timedelta(days=1)
+    onboarding = getattr(pe, "onboarding_date", None) if pe is not None else None
+    if onboarding and candidate < onboarding:
+        candidate = onboarding
+    derived_start, derived_end = pe_period_bounds(year, month, pe)
+    if candidate == derived_start or candidate > derived_end:
+        return None
+    end = None
+    prev_was_cycle = (is_cross_month(prev.year, prev.month, prev_start, prev_end)
+                      and prev_end == add_months(prev_start, 1) - timedelta(days=1))
+    if prev_was_cycle:
+        cycle_end = add_months(candidate, 1) - timedelta(days=1)
+        m_start, _m_end = period_bounds(year, month)
+        if m_start <= cycle_end <= derived_end:
+            end = cycle_end
+    if ((end or derived_end) - candidate).days + 1 > MAX_PERIOD_DAYS:
+        return None
+    return candidate, end
+
+
+def holidays_for_project_range(db: Session, project, start: date, end: date) -> set[date]:
+    """Holiday dates for every month the start..end span touches, kept to the span."""
+    out: set[date] = set()
+    if project is None or end < start:
+        return out
+    cur = date(start.year, start.month, 1)
+    while cur <= end:
+        out |= {d for d in holidays_for_project_period(db, project, cur.year, cur.month)
+                if start <= d <= end}
+        cur = add_months(cur, 1)
+    return out
+
+
+def sheet_holiday_dates(db: Session, project, ts, pe=None) -> set[date]:
+    """Holidays a sheet needs: its own month plus any days its window reaches into."""
+    if project is None:
+        return set()
+    if pe is None and getattr(ts, "project_employee_id", None):
+        pe = db.get(ProjectEmployee, ts.project_employee_id)
+    w_start, w_end = sheet_period_bounds(ts, pe)
+    m_start, m_end = period_bounds(ts.year, ts.month)
+    return holidays_for_project_range(db, project, min(w_start, m_start), max(w_end, m_end))
+
+
 def classify_calendar_day(
     d: date,
     holiday_dates: set[date],
@@ -877,7 +1042,7 @@ def live_entries_from_policy(
     # served to the UI). A day whose holiday status changed is recomputed here
     # so both display day_type AND billables stay correct.
     current_holidays = (
-        set(holidays_for_project_period(db, project, ts.year, ts.month)) if project else set()
+        sheet_holiday_dates(db, project, ts) if project else set()
     )
     live: list = []
     for e in entries:
@@ -1396,7 +1561,21 @@ def timesheet_out(ts: Timesheet) -> dict:
         "file_attachment_url": ts.file_attachment_url,
         "created_at": ts.created_at.isoformat() if getattr(ts, "created_at", None) else None,
         "date": _report_date(ts),
+        # The month the sheet bills, and its window when that is not the
+        # calendar month (20 Oct 2026, user ask: "which month is this
+        # timesheet, without opening it") — the same words the invoices use.
+        "month_label": f"{calendar.month_abbr[ts.month]} {ts.year}" if ts.month and ts.year else None,
+        "period_label": _cross_month_label(ts),
     }
+
+
+def _cross_month_label(ts) -> str | None:
+    from services.billing_tracker import period_label as window_label
+
+    if not ts.month or not ts.year:
+        return None
+    return window_label(ts.year, ts.month, getattr(ts, "period_start_date", None),
+                        getattr(ts, "period_end_date", None))
 
 
 def period_label(year: int, month: int) -> str:
@@ -1503,7 +1682,7 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
     data["billing_policy"]["working_hours_per_day"] = (
         float(policy.working_hours_per_day) if policy.working_hours_per_day is not None else None)
     data["holiday_dates"] = sorted(
-        d.isoformat() for d in holidays_for_project_period(db, project, ts.year, ts.month)
+        d.isoformat() for d in sheet_holiday_dates(db, project, ts, pe)
     ) if project else []
     data["entries"] = [entry_out(e, full_day_hours(policy)) for e in live]  # type: ignore[arg-type]
     data["summary"] = timesheet_summary(db, ts, entries)
@@ -1511,9 +1690,13 @@ def timesheet_detail_out(db: Session, ts: Timesheet, entries: list[TimesheetEntr
     # The linked invoice, so the detail page can say WHY an approved sheet
     # can no longer be rejected (3 Sep 2026: the button was offered, the
     # server 409'd, and the message never reached the screen).
-    invoice = linked_invoice_for(db, ts)
+    invs = invoices_for(db, ts)
+    progress = billing_progress(db, ts, invs)
+    invoice = (live_invoices(invs) or invs or [None])[0]
     data["invoice"] = invoice_ref(invoice)
-    data["can_generate_invoice"] = can_generate_invoice(ts, invoice)
+    data["invoices"] = progress["parts"]
+    data["billing_progress"] = progress
+    data["can_generate_invoice"] = can_generate_invoice(ts, invoice, progress)
     data["can_reject"] = (
         ts.status == TimesheetStatus.SUBMITTED
         or (ts.status == TimesheetStatus.APPROVED and invoice is None)
@@ -2167,16 +2350,21 @@ def _entries_for_timesheets(db: Session, ids: list[int]) -> dict[int, list[Times
     return out
 
 
-def _invoice_map(db: Session, ids: list[int]) -> dict[int, Invoice]:
+def _invoice_map(db: Session, ids: list[int]) -> dict[int, list[Invoice]]:
+    """Every invoice per sheet (0141: a split sheet has several) — one query."""
     if not ids:
         return {}
     rows = db.execute(select(Invoice).where(Invoice.timesheet_id.in_(ids))).scalars().all()
-    return {inv.timesheet_id: inv for inv in rows if inv.timesheet_id is not None}
+    out: dict[int, list[Invoice]] = {}
+    for inv in sorted(rows, key=lambda i: (i.split_no is not None, i.split_no or 0, i.id)):
+        if inv.timesheet_id is not None:
+            out.setdefault(inv.timesheet_id, []).append(inv)
+    return out
 
 
 def timesheet_report_out(db: Session, ts: Timesheet,
                          entries: list[TimesheetEntry] | None = None,
-                         invoice: Invoice | None = None) -> dict:
+                         invoice: Invoice | list[Invoice] | None = None) -> dict:
     """Enriched row for list/report endpoints (display fields + report-only math)."""
     data = timesheet_out(ts)
     project = db.get(Project, ts.project_id)
@@ -2225,10 +2413,18 @@ def timesheet_report_out(db: Session, ts: Timesheet,
         "total_loss_of_pay_days": summary["total_loss_of_pay_days"],
         "attachments": list_attachments(db, ts),
     })
-    if invoice is None:
-        invoice = linked_invoice_for(db, ts)
-    data["invoice"] = invoice_ref(invoice)
-    data["can_generate_invoice"] = can_generate_invoice(ts, invoice)
+    if isinstance(invoice, list):
+        invs = invoice
+    elif invoice is not None:
+        invs = [invoice]
+    else:
+        invs = invoices_for(db, ts)
+    progress = billing_progress(db, ts, invs)
+    first = (live_invoices(invs) or invs or [None])[0]
+    data["invoice"] = invoice_ref(first)
+    data["invoices"] = progress["parts"]
+    data["billing_progress"] = progress
+    data["can_generate_invoice"] = can_generate_invoice(ts, first, progress)
     return data
 
 
@@ -2379,7 +2575,7 @@ def approvals_report_rows(db: Session) -> list[dict]:
     inv_map = _invoice_map(db, ids)
     return [
         timesheet_report_out(db, ts, entries=entries_map.get(ts.id, []),
-                             invoice=inv_map.get(ts.id))
+                             invoice=inv_map.get(ts.id, []))
         for ts in sheets
     ]
 
@@ -2403,10 +2599,95 @@ def get_assignment_or_400(db: Session, ts: Timesheet) -> ProjectEmployee:
     return assignment
 
 
+def invoices_for(db: Session, ts: Timesheet) -> list[Invoice]:
+    """Every invoice raised from this sheet (0141: one per PO when the month is
+    split across POs), whole-sheet first, then part 1, 2 …"""
+    rows = db.execute(select(Invoice).where(Invoice.timesheet_id == ts.id)).scalars().all()
+    return sorted(rows, key=lambda i: (i.split_no is not None, i.split_no or 0, i.id))
+
+
+def _is_returned(inv: Invoice) -> bool:
+    return bool(inv.is_proforma and inv.returned_at is not None)
+
+
+def live_invoices(invoices: list[Invoice]) -> list[Invoice]:
+    """The documents that count: a Proforma Finance RETURNED is waiting to be
+    raised again, so its share is still to bill."""
+    return [i for i in invoices if not _is_returned(i)]
+
+
 def linked_invoice_for(db: Session, ts: Timesheet) -> Invoice | None:
-    return db.execute(
-        select(Invoice).where(Invoice.timesheet_id == ts.id)
-    ).scalars().first()
+    """The sheet's first live invoice, else a returned Proforma, else None."""
+    invs = invoices_for(db, ts)
+    live = live_invoices(invs)
+    return (live or invs or [None])[0]
+
+
+def _frozen_line(ts: Timesheet) -> dict:
+    items = ((ts.approved_figures or {}).get("line_items") or [])
+    return items[0] if items else {}
+
+
+def sheet_billing_total(db: Session | None, ts: Timesheet) -> tuple[Decimal | None, dict]:
+    """(sub-total, line) the sheet bills: the figures frozen at approval, else a
+    live preview (sheets approved before 0075). (None, {}) when unknown."""
+    totals = (ts.approved_figures or {}).get("totals") or {}
+    if totals.get("sub_total") is not None:
+        return Decimal(str(totals["sub_total"])), _frozen_line(ts)
+    if db is None:
+        return None, {}
+    try:
+        prev = timesheet_invoice_preview(db, ts)
+        items = prev.get("line_items") or []
+        return Decimal(str(prev["totals"]["sub_total"])), (items[0] if items else {})
+    except Exception:
+        return None, {}
+
+
+def billing_progress(db: Session | None, ts: Timesheet,
+                     invoices: list[Invoice] | None = None) -> dict:
+    """How much of the sheet is invoiced and what is left (0141).
+
+    A whole-sheet invoice (split_no NULL) bills everything; split parts bill
+    their own sub-totals. Returned Proformas do not count — their share is
+    raised again. Quantities follow the frozen line: hours / days, or the
+    fraction of a month on a Monthly rate."""
+    invs = invoices if invoices is not None else (invoices_for(db, ts) if db is not None else [])
+    live = live_invoices(invs)
+    whole = any(i.split_no is None for i in live)
+    # The live preview fallback (sheets frozen before 0075) runs only when split
+    # parts need a total — never once per row of a list.
+    has_split = any(i.split_no is not None for i in invs)
+    total, line = sheet_billing_total(db if has_split else None, ts)
+    invoiced = sum((Decimal(str(i.sub_total or 0)) for i in live), Decimal("0"))
+    split_qty_used = sum((Decimal(str(i.split_qty or 0)) for i in live if i.split_no is not None),
+                         Decimal("0"))
+    total_qty = Decimal(str(line.get("total_billed_qty") or 0)) if line else None
+    if whole:
+        remaining = Decimal("0")
+        remaining_qty = Decimal("0")
+    elif total is None:
+        remaining = None
+        remaining_qty = None
+    else:
+        remaining = max(Decimal("0"), total - invoiced)
+        remaining_qty = (max(Decimal("0"), total_qty - split_qty_used)
+                         if total_qty is not None else None)
+    fully = whole or (remaining is not None and remaining <= Decimal("0.01") and bool(live))
+    return {
+        "total": float(total) if total is not None else None,
+        "invoiced": float(invoiced),
+        "remaining": float(remaining) if remaining is not None else None,
+        "total_qty": float(total_qty) if total_qty is not None else None,
+        "remaining_qty": float(remaining_qty) if remaining_qty is not None else None,
+        "billing_unit": line.get("billing_unit") if line else None,
+        "rate": float(line["rate_per_unit"]) if line and line.get("rate_per_unit") is not None else None,
+        "rate_split": bool(line.get("rate_split")) if line else False,
+        "split": any(i.split_no is not None for i in invs),
+        "fully_billed": bool(fully),
+        "parts": [invoice_ref(i) for i in invs],
+        "returned": [invoice_ref(i) for i in invs if _is_returned(i)],
+    }
 
 
 def freeze_invoice_figures(db: Session, ts: Timesheet, entries: list[TimesheetEntry],
@@ -2447,7 +2728,9 @@ def refreeze_uninvoiced_sheets(db: Session, pe: ProjectEmployee, user_id: int | 
     ).scalars().all()
     moved: list[dict] = []
     for ts in sheets:
-        if not can_generate_invoice(ts, linked_invoice_for(db, ts)):
+        # Only a sheet with NO live invoice is re-frozen — once a part is billed
+        # (0141 splits included) the figures are committed.
+        if ts.status != TimesheetStatus.APPROVED or live_invoices(invoices_for(db, ts)):
             continue
         entries = db.execute(
             select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)
@@ -2476,14 +2759,32 @@ def invoice_ref(invoice: Invoice | None) -> dict | None:
         "kind": invoice.kind or "Tax",
         "returned_at": invoice.returned_at.isoformat() if invoice.returned_at else None,
         "returned_reason": invoice.returned_reason,
+        # 0141: a split part says which part and how much of the sheet it bills.
+        "split_no": invoice.split_no,
+        "split_qty": float(invoice.split_qty) if invoice.split_qty is not None else None,
+        "po_id": invoice.po_id,
+        # Only a split part names its PO (one lazy read, and only for those) —
+        # a whole-sheet invoice keeps the list query flat.
+        "po_number": (getattr(getattr(invoice, "po", None), "po_number", None)
+                      if invoice.po_id and invoice.split_no else None),
+        "sub_total": float(invoice.sub_total) if invoice.sub_total is not None else None,
+        "grand_total": float(invoice.grand_total) if invoice.grand_total is not None else None,
     }
 
 
-def can_generate_invoice(ts: Timesheet, invoice: Invoice | None) -> bool:
-    """An Approved sheet with no document — or whose Proforma Finance RETURNED,
-    which the GM raises again (the returned one is replaced)."""
+def can_generate_invoice(ts: Timesheet, invoice: Invoice | None = None,
+                         progress: dict | None = None) -> bool:
+    """An Approved sheet with something left to bill: no document yet, a
+    Proforma Finance RETURNED (raised again), or — 0141 — split parts that do
+    not yet cover the whole sheet."""
     if ts.status != TimesheetStatus.APPROVED:
         return False
+    if progress is not None:
+        if progress.get("returned"):
+            return True
+        if progress.get("fully_billed"):
+            return False
+        return progress.get("remaining") is None or progress["remaining"] > 0.005
     return invoice is None or (invoice.is_proforma and invoice.returned_at is not None)
 
 
@@ -2589,7 +2890,11 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
     unit = assignment.billing_unit
     period_month = f"{calendar.month_abbr[ts.month]} {ts.year}"
     employee_name = employee_display_name(emp) or f"Employee #{ts.employee_id}"
-    period_start, period_end = period_bounds(ts.year, ts.month)
+    # Calendar month — or, for a cross-month window (20 Feb – 20 Mar), the
+    # window itself, so every day of it finds its rate and the Monthly maths
+    # below measures the cycle, not a calendar month it only half overlaps.
+    period_start, period_end = sheet_billing_bounds(ts, assignment)
+    cross_month = is_cross_month(ts.year, ts.month, period_start, period_end)
 
     fallback_rate = Decimal(assignment.billing_rate or 0)
     if not rate_rows:
@@ -2612,16 +2917,24 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
     # PRESENT fraction of the month, not the whole month. Hourly/Daily need no
     # ratio — their quantities come from the (already clamped) entries.
     window_start, window_end = sheet_period_bounds(ts, assignment)
+    full_window_start = window_start
     # The no-billing window shortens the BILLED window exactly like a
     # mid-month join: a Monthly rate bills only the fraction after it ends.
     if nb_end is not None and nb_end > window_start:
         window_start = nb_end
-    month_len = Decimal((period_end - period_start).days + 1)
-    window_len = (Decimal((window_end - window_start).days + 1)
-                  if window_end >= window_start else ZERO)
-    presence_ratio = (window_len / month_len) if month_len > ZERO else ONE
-    if presence_ratio > ONE:
-        presence_ratio = ONE
+    if cross_month:
+        # A cycle that is not the calendar month (19 Oct 2026): up to one
+        # month long = one monthly rate; longer = one month + the extra days
+        # at rate ÷ cycle days. Never capped at 1 — the long bridge sheet
+        # (21 Apr – 30 May) really is more than a month of work.
+        presence_ratio = billing_cycle_factor(full_window_start, window_end, window_start)
+    else:
+        month_len = Decimal((period_end - period_start).days + 1)
+        window_len = (Decimal((window_end - window_start).days + 1)
+                      if window_end >= window_start else ZERO)
+        presence_ratio = (window_len / month_len) if month_len > ZERO else ONE
+        if presence_ratio > ONE:
+            presence_ratio = ONE
 
     def _entry_in_range(e: TimesheetEntry, start: date, end: date) -> bool:
         return start <= e.entry_date <= end
@@ -2711,8 +3024,9 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
                 else:
                     ratio = ZERO
                 amount = (rate * ratio).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
-        if presence_ratio < ONE:
-            # Present a fraction of the month -> bill that fraction.
+        if presence_ratio != ONE:
+            # Present a fraction of the month -> bill that fraction. A long
+            # cross-month window (factor > 1) bills its extra days the same way.
             amount = (amount * presence_ratio).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
         # LOSS OF PAY reduces a Monthly bill (fix, Aug 2026). The leave-
@@ -2812,10 +3126,14 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
             "Monthly" if unit == BillingUnit.YEARLY else getattr(unit, "value", str(unit)),
             current_rate, per_hour),
     }
-    linked = linked_invoice_for(db, ts)
+    invs = invoices_for(db, ts)
+    linked = (live_invoices(invs) or invs or [None])[0]
+    progress = billing_progress(None, ts, invs)
     return {
         "line_items": [line],
         "totals": {"sub_total": float(amount)},
         "linked_invoice": invoice_ref(linked),
-        "can_generate": can_generate_invoice(ts, linked),
+        "invoices": [invoice_ref(i) for i in invs],
+        "billing_progress": progress,
+        "can_generate": can_generate_invoice(ts, linked, progress if invs else None),
     }

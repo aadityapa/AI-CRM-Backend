@@ -55,6 +55,7 @@ def test_the_three_operational_reports_follow_the_reports_tab_grant():
     for route in ('@router.get("/opportunities")', '@router.get("/candidate-profiles")', '@router.get("/recruiter-productivity")'):
         body = src.split(route, 1)[1].split("@router.", 1)[0]
         assert "Depends(REPORTS_READ)" in body, route
-    # The CEO reports stay Admin/CEO only — no template can widen them.
+    # The CEO reports are read by ROLE (Finance · Sales · Sales Head + Admin/CEO,
+    # 19 Oct 2026) — no template can widen them.
     body = src.split('@router.get("/revenue")', 1)[1].split("@router.", 1)[0]
-    assert "role_required()" in body
+    assert "Depends(FINANCE_VIEW)" in body

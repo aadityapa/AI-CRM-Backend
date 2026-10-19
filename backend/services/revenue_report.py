@@ -860,6 +860,9 @@ def _margin(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
         "heads_without_ctc": missing_ctc,
         "loss_making": [r for r in rows if r["margin"] < 0 and r["billed"] > 0][:TOP_CUSTOMERS],
         "by_customer": sorted(rows, key=lambda r: r["billed"], reverse=True)[:TOP_CUSTOMERS],
+        # Every customer (19 Oct 2026) — the Financial Reports ▸ Profit view
+        # lists all of them, not the dashboard's top eight.
+        "customers": sorted(rows, key=lambda r: r["billed"], reverse=True),
     }
 
 

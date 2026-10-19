@@ -3909,6 +3909,36 @@ async def candidate_skill_selection(request: Request):
                 "plan": meta["skill_bank"]["plan"], "ai_filled": ai_written}
 
 
+@app.post("/candidate/warmup-answer")
+@_rl.limit("10/minute")
+def candidate_warmup_answer(request: Request, turn: str = Form(""), ans: str = Form("")):
+    """16 Oct 2026: the introduction's clock ran out, the page saved what it had
+    heard and moved straight to question 1; this is the full recording's
+    transcript, sent from the background. It only ever replaces a WARM-UP
+    answer (never scored) — a scored answer cannot be changed here."""
+    payload, auth_err = _require_user(request, {"hr", "candidate"})
+    if auth_err:
+        return auth_err
+    device_err = _enforce_invite_device_binding(request, payload)
+    if device_err:
+        return device_err
+    from utils.warmup import apply_late_warmup_answer
+
+    sk = _session_key_from_payload(payload)
+    with session_lock(sk):
+        s = sessions.get(sk)
+        if not s:
+            return JSONResponse({"error": "No active session.", "code": "no_session"}, status_code=404)
+        if s.get("finalizing") or s.get("completed"):
+            return {"status": "finished"}
+        result = apply_late_warmup_answer(s, _parse_client_turn(turn), ans)
+        if result == "updated":
+            _persist_interview_progress(s, status=_progress_status_for_session(s))
+        logger.info("interview.warmup.late_transcript",
+                    extra={"event": "interview.warmup.late_transcript", "status": result})
+        return {"status": result}
+
+
 @app.post("/candidate/conversation/clarify")
 @_rl.limit("20/minute")
 def candidate_conversation_clarify(request: Request, mode: str = Form("repeat")):
@@ -4149,7 +4179,7 @@ async def candidate_tts(
     _, auth_err = _require_user(request, {"hr", "candidate"})
     if auth_err:
         return auth_err
-    from services.tts_prewarm import get_cached, normalize_tts_text, tts_voice_and_model
+    from services.tts_prewarm import get_cached, normalize_tts_text, tts_voice_and_model, wait_for_inflight
 
     payload = normalize_tts_text(text)
     if not payload:
@@ -4163,6 +4193,13 @@ async def candidate_tts(
     if cached is not None:
         return Response(content=cached, media_type="audio/mpeg",
                         headers={"X-Karnex-TTS": "cache"})
+    # A follow-up / lead-in is warmed at the END of /answer, a moment before the
+    # browser asks for it: wait for that clip rather than start a second OpenAI
+    # call for the same text (16 Oct 2026).
+    warmed = await run_in_threadpool(wait_for_inflight, payload, tts_voice, tts_model)
+    if warmed:
+        return Response(content=warmed, media_type="audio/mpeg",
+                        headers={"X-Karnex-TTS": "inflight"})
 
     # Stream rather than buffer. `.read()` waited for the whole MP3 before a
     # single byte reached the browser, which put a 2-3s silence in front of
@@ -4406,9 +4443,17 @@ def _apply_conversation_turn(
         from services.tts_prewarm import prewarm_tts
 
         conv.set_lead_in(meta, idx_next, lead_in or "")
-        for text in ([lead_in] if lead_in else []) + ([follow_up] if inserted else []):
+        # Warm the clip the candidate will hear next (16 Oct 2026): the lead-in
+        # and the next question as ONE string — `next_question_payload` sends the
+        # same `speech_text`, so /candidate/tts finds it cached or in flight. A
+        # pseudo-code / coding question is never spoken.
+        questions_now = list(session.get("questions") or [])
+        next_q = str(questions_now[idx_next] or "") if idx_next < len(questions_now) else ""
+        spoken_next = "" if interview_skill_bank.is_typed(meta, idx_next) else next_q
+        warm = conv.spoken_text(lead_in, spoken_next) if (lead_in or inserted) else ""
+        if warm:
             try:
-                prewarm_tts(text)
+                prewarm_tts(warm)
             except Exception:
                 pass
         if inserted:
@@ -4896,6 +4941,17 @@ def answer(
                 question_text=previous_question,
                 reason=str(skip_reason or "").strip() or "Candidate skipped manually",
             )
+        elif not typed_spec:
+            # A spoken answer holding the same speech twice (an older candidate
+            # page transcribed one recording twice, 16 Oct 2026) keeps one copy.
+            from utils.transcript_dedupe import collapse_repeated_transcript
+            ans_clean, _collapsed = collapse_repeated_transcript(ans_clean)
+            if _collapsed:
+                logger.info(
+                    "interview.answer.duplicate_collapsed",
+                    extra={"event": "interview.answer.duplicate_collapsed", "session_key": sk,
+                           "current_index": turn_index, "answer_len": len(ans_clean)},
+                )
 
         s["answers"].append(ans_clean)
         _append_answer_audit(

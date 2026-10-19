@@ -7,13 +7,22 @@ against that requirement (source_portal = "Apply Link"), exactly like a manual
 upload — so ATS scan / shortlist / AI L1 all work unchanged.
 
 Paths:
-  GET  /api/requirements/{id}/apply-link  (auth: TA/Admin) -> signed link
+  GET  /api/requirements/{id}/apply-link  (auth: TA · RMG · Sales · Sales Head · GM) -> signed link
   GET  /apply/{token}                     (public)         -> HTML form
   POST /api/apply/{token}                 (public)         -> submit application
 
 The token is an HMAC of the requirement id (no DB table needed). A link stays
 valid only while the requirement is open for sourcing; closing/fulfilling the
 requirement closes the form.
+
+19 Oct 2026 (user ask): "when RMG approves an opportunity it goes to TA for
+sourcing — generate a link with a form TA can put on Naukri / LinkedIn / any
+job portal; the candidate's resume & details land straight in that position at
+the Sourcing stage; TA then moves them to Technical Screening. Give this link
+in the Opportunity Details section." The link is shown on the opportunity's
+Details tab (F-V2 `ApplyLinkCard`) as soon as RMG approves (Open_For_Sourcing);
+the response carries ready-to-paste post text, the form shows the RMG JD, and
+the position's assigned TAs (else every TA) hear about each application.
 """
 from __future__ import annotations
 
@@ -27,9 +36,12 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, get_crm_db, role_required
+from crm_deps import CurrentUser, gated_read, get_crm_db, screener_or
 import rate_limit as _rl
-from models import Requirement, RequirementActivityLog, RequirementStatus, Resume
+from models import (
+    Location, Opportunity, Requirement, RequirementActivityLog, RequirementStatus,
+    RequirementTaAssignment, Resume,
+)
 from schemas.common import envelope
 from services.crm_common import log_activity, save_upload_hashed
 from auth_secret import auth_secret as _shared_auth_secret
@@ -75,10 +87,61 @@ def parse_apply_token(token: str) -> int | None:
 
 
 def _base_url(request: Request) -> str:
+    """The ONE public-base resolver (services.invite_links): Settings
+    `email.public_base_url` → PUBLIC_BASE_URL → the request origin (LAN-aware).
+    A link pasted on Naukri must open from the internet, so the configured
+    public address wins over whatever host the TA happens to browse on."""
+    try:
+        from services.invite_links import resolve_invite_base
+        base = resolve_invite_base(request)
+        if base:
+            return base.rstrip("/")
+    except Exception:
+        pass
     pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
     if pub:
         return pub
     return str(request.base_url).rstrip("/")
+
+
+def _num(v) -> str:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    return str(int(f)) if f == int(f) else f"{f:g}"
+
+
+def _role_facts(db: Session, req: Requirement) -> dict:
+    """Experience range · work mode · location — the lines a job post needs."""
+    lo, hi = _num(req.experience_min), _num(req.experience_max)
+    exp = f"{lo}–{hi} yrs" if lo and hi else (f"{lo}+ yrs" if lo else (f"up to {hi} yrs" if hi else ""))
+    mode = getattr(req.work_mode, "value", req.work_mode) or ""
+    loc = ""
+    if req.location_id:
+        row = db.get(Location, req.location_id)
+        if row is not None:
+            loc = ", ".join(x for x in (row.city, row.state) if x)
+    return {"experience": exp, "work_mode": str(mode).replace("_", " "), "location": loc}
+
+
+def _jd_text(req: Requirement) -> str:
+    """RMG's JD is the approved one; the Sales description is the fallback."""
+    return ((req.rmg_jd_text or "").strip() or (req.description or "").strip())
+
+
+def _post_text(db: Session, req: Requirement, url: str) -> str:
+    """Ready-to-paste job post (Naukri / LinkedIn / WhatsApp)."""
+    f = _role_facts(db, req)
+    lines = [f"We're hiring: {req.title}"]
+    for label, key in (("Experience", "experience"), ("Location", "location"), ("Work mode", "work_mode")):
+        if f[key]:
+            lines.append(f"{label}: {f[key]}")
+    jd = _jd_text(req)
+    if jd:
+        lines += ["", jd[:1200].rstrip() + ("…" if len(jd) > 1200 else "")]
+    lines += ["", f"Apply here (upload your resume): {url}"]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------- TA: get link
@@ -87,20 +150,44 @@ def get_apply_link(
     requirement_id: int,
     request: Request,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(role_required("TA")),
+    # TA posts it; RMG / Sales / Sales Head / GM (by grant) see the same link on
+    # the opportunity's Details tab (19 Oct 2026).
+    user: CurrentUser = Depends(screener_or(gated_read("requirements", "TA", "RMG", "Sales", "Sales_Head"))),
 ):
     req = db.get(Requirement, requirement_id)
     if req is None:
         raise HTTPException(status_code=404, detail="Requirement not found")
     token = make_apply_token(req.id)
     apply_path = f"/apply/{token}"
+    base = _base_url(request)
+    apply_url = f"{base}{apply_path}"
+    # The link is BUILT on every read (never stored): after a deploy it follows
+    # Settings ▸ Email & links ▸ Public base URL (else PUBLIC_BASE_URL, else the
+    # address the page was opened on). A private address must not be posted on
+    # a job portal — the card warns when it is (20 Oct 2026).
+    try:
+        from services.invite_links import base_reach, base_source
+        reach, source = base_reach(base), base_source()
+    except Exception:
+        reach, source = "unknown", "request"
+    applications = db.execute(
+        select(func.count()).select_from(Resume).where(
+            Resume.requirement_id == req.id, Resume.source_portal == "Apply Link")
+    ).scalar() or 0
     return envelope(
         data={
             "token": token,
             "apply_path": apply_path,
-            "apply_url": f"{_base_url(request)}{apply_path}",
+            "apply_url": apply_url,
             "is_open": req.status in _OPEN_STATUSES,
             "requirement_status": req.status.value if hasattr(req.status, "value") else str(req.status),
+            "req_number": req.req_number,
+            "title": req.title,
+            "applications": int(applications),
+            "post_text": _post_text(db, req, apply_url),
+            "base_url": base,
+            "base_reach": reach,
+            "base_source": source,
         },
         message="Application link ready",
     )
@@ -138,6 +225,9 @@ def _page(title: str, body: str, *, status: int = 200) -> HTMLResponse:
   .msg {{ padding:12px 14px; border-radius:12px; font-size:14px; margin-top:14px; }}
   .err {{ background:#fef2f2; color:#b91c1c; border:1px solid #fecaca; }}
   .ok {{ background:#ecfdf5; color:#047857; border:1px solid #a7f3d0; }}
+  .chips {{ display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 4px; }}
+  .chip {{ font-size:12px; font-weight:700; padding:4px 10px; border-radius:999px; background:#eef2ff; color:#4338ca; }}
+  .jd summary {{ cursor:pointer; font-size:13px; font-weight:700; margin-top:10px; }}
 </style></head>
 <body><div class="wrap">
   <div class="brand">KARNEX <span>Careers</span></div>
@@ -147,7 +237,7 @@ def _page(title: str, body: str, *, status: int = 200) -> HTMLResponse:
 
 
 @router.get("/apply/{token}", response_class=HTMLResponse)
-def apply_form(token: str, db: Session = Depends(get_crm_db)):
+def apply_form(token: str, db: Session = Depends(get_crm_db)):  # noqa: C901 — one HTML page
     rid = parse_apply_token(token)
     req = db.get(Requirement, rid) if rid else None
     if req is None:
@@ -158,11 +248,17 @@ def apply_form(token: str, db: Session = Depends(get_crm_db)):
                      '<div class="msg err">Applications for this role are currently closed.</div></div>', status=200)
 
     jd_html = ""
-    if (req.description or "").strip():
-        jd_html = f'<div class="sub" style="white-space:pre-wrap;margin:8px 0 4px">{escape(req.description.strip())}</div>'
+    jd = _jd_text(req)
+    if jd:
+        jd_html = ('<details class="jd" open><summary>Job description</summary>'
+                   f'<div class="sub" style="white-space:pre-wrap;margin:8px 0 4px">{escape(jd)}</div></details>')
+    facts = _role_facts(db, req)
+    chips = "".join(f'<span class="chip">{escape(v)}</span>'
+                    for v in (facts["experience"], facts["location"], facts["work_mode"]) if v)
     body = f"""
   <div class="card">
     <h1>{escape(req.title)}</h1>
+    {f'<div class="chips">{chips}</div>' if chips else ''}
     {jd_html}
     <div class="sub">Apply below. Fields marked <span class="req">*</span> are required.</div>"""
     body += f"""
@@ -187,6 +283,8 @@ def apply_form(token: str, db: Session = Depends(get_crm_db)):
       <input name="current_ctc" required maxlength="40" placeholder="e.g. 12 LPA"/>
       <label>Expected CTC <span class="req">*</span></label>
       <input name="expected_ctc" required maxlength="40" placeholder="e.g. 18 LPA"/>
+      <label>Current location <span class="req">*</span></label>
+      <input name="current_location" required maxlength="120" placeholder="e.g. Bengaluru"/>
       <label>Preferred location <span class="req">*</span></label>
       <input name="preferred_location" required maxlength="120" placeholder="e.g. Pune / Remote"/>
       <label>Resume <span class="req">*</span></label>
@@ -232,6 +330,7 @@ def submit_application(
     current_ctc: str = Form("", max_length=40),
     expected_ctc: str = Form("", max_length=40),
     preferred_location: str = Form("", max_length=120),
+    current_location: str = Form("", max_length=120),
     file: UploadFile = File(...),
     db: Session = Depends(get_crm_db),
 ):
@@ -258,6 +357,7 @@ def submit_application(
         "current_ctc": (current_ctc or "").strip() or None,
         "expected_ctc": (expected_ctc or "").strip() or None,
         "preferred_location": (preferred_location or "").strip() or None,
+        "current_location": (current_location or "").strip() or None,
     }
     details = {k: v for k, v in details.items() if v}
     file_url, file_sha256, file_size = save_upload_hashed(file, "resumes")
@@ -316,4 +416,35 @@ def submit_application(
         log_activity(db, RequirementActivityLog, "requirement_id", req.id, req.created_by,
                      "STATUS_CHANGED", "Auto-moved Posted_On_Portals -> In_Progress (first application received)")
     db.commit()
+    _notify_tas(db, req, resume, name)
     return envelope(data={"received": True}, message="Application received")
+
+
+def _notify_tas(db: Session, req: Requirement, resume: Resume, name: str) -> None:
+    """Bell + mail to the position's assigned TAs (else every TA): a candidate
+    applied through the public link and is waiting at Sourcing. Best-effort —
+    the application is already committed; a mail failure must not 500 it."""
+    try:
+        from services.notify import notify_role, notify_user
+        opp = db.get(Opportunity, req.opportunity_id)
+        label = f"{getattr(opp, 'opp_id', '') or req.req_number} — {req.title}".strip(" —")
+        title = f"New application via link: {name}"
+        msg = (f"{name} applied to {label} through the public application link. "
+               "They are in the Applicants tab at Sourcing — review and move them to Technical Screening.")
+        link = (f"/admin/?view=crm&p=opportunities/{req.opportunity_id}" if req.opportunity_id
+                else f"/admin/?view=crm&p=requirements/{req.id}")
+        ta_ids = db.execute(
+            select(RequirementTaAssignment.user_id).where(RequirementTaAssignment.requirement_id == req.id)
+        ).scalars().all()
+        if ta_ids:
+            for uid in dict.fromkeys(ta_ids):
+                notify_user(db, uid, title, msg, link, event="apply_link.application",
+                            dedupe_key=f"apply_link:{resume.id}:{uid}",
+                            related_type="requirement", related_id=req.id)
+        else:
+            notify_role(db, "TA", title, msg, link, event="apply_link.application",
+                        dedupe_prefix=f"apply_link:{resume.id}",
+                        related_type="requirement", related_id=req.id)
+        db.commit()
+    except Exception:
+        db.rollback()

@@ -49,6 +49,21 @@ class Candidate(Base, TimestampMixin):
     #: from the earliest profile.
     created_by_id = sa.Column(sa.Integer, nullable=True, index=True)
     created_by_name = sa.Column(sa.String(255), nullable=True)
+    # --- Talent Pool retention + opt-out (0139, 17 Oct 2026) -----------------
+    #: The candidate asked to leave the talent pool (email link) or staff marked
+    #: it after a call. Never searched, suggested or sent a sourcing email.
+    pool_opt_out_at = sa.Column(sa.DateTime(timezone=True), nullable=True, index=True)
+    pool_opt_out_source = sa.Column(sa.String(16), nullable=True)      # candidate | staff
+    pool_opt_out_reason = sa.Column(sa.String(500), nullable=True)
+    pool_opt_out_by = sa.Column(sa.Integer, nullable=True)
+    #: "Keep in the pool" — resets the retention clock (TA after a fresh call).
+    pool_kept_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    pool_kept_by = sa.Column(sa.Integer, nullable=True)
+    pool_keep_note = sa.Column(sa.String(500), nullable=True)
+    #: Retention ran out: out of the pool (record + history stay). Cleared by
+    #: any new activity or a Keep.
+    pool_expired_at = sa.Column(sa.DateTime(timezone=True), nullable=True, index=True)
+    pool_expiry_warned_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
 
     education = relationship("CandidateEducation", back_populates="candidate", cascade="all, delete-orphan")
     experience = relationship("CandidateExperience", back_populates="candidate", cascade="all, delete-orphan")

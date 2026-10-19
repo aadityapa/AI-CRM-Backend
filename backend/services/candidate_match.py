@@ -224,6 +224,13 @@ def suggest_candidates(db: Session, opp: Opportunity, basis: dict | None = None)
     }
     ordered: list[int] = []
     seen: set[int] = set(already_applied)
+    # Opted out of the talent pool, or past its retention: never suggested
+    # (17 Oct 2026, services/talent_retention).
+    try:
+        from services.talent_pool import hidden_candidate_ids
+        seen |= hidden_candidate_ids(db)
+    except Exception:  # noqa: BLE001
+        pass
 
     def take(rows) -> None:
         for (cid,) in rows:
@@ -236,6 +243,16 @@ def suggest_candidates(db: Session, opp: Opportunity, basis: dict | None = None)
             select(CandidateSkill.candidate_id).distinct()
             .where(CandidateSkill.skill_id.in_(all_skill_ids))
         ))
+        # Anyone who holds a position skill by ANY evidence (rated in an
+        # interview, found by the ATS, read off a CV) belongs in the first
+        # tier too (16 Oct 2026, the Talent Pool's sources).
+        try:
+            from services.talent_pool import holder_context, skill_holders
+            ctx = holder_context(db)
+            for sid in sorted(all_skill_ids, key=lambda i: (not skills[i]["mandatory"], i)):
+                take([(cid,) for cid in sorted(skill_holders(db, skill_names[sid], ctx))])
+        except Exception:  # noqa: BLE001 — extra evidence, never a reason to fail the tab
+            pass
     take(db.execute(
         select(CandidateProfile.candidate_id).distinct()
         .join(Opportunity, Opportunity.id == CandidateProfile.opportunity_id)
@@ -318,6 +335,18 @@ def suggest_candidates(db: Session, opp: Opportunity, basis: dict | None = None)
                 latest_ats[cid] = (float(score), rid)
             key = (cid, req_id)
             ats_by_requirement[key] = max(ats_by_requirement.get(key, 0.0), float(score))
+
+    # Skills proven in an interview (rated at or above the Talent Pool's proof
+    # level) and skills the resume parser read off a CV (16 Oct 2026). Without
+    # them a candidate rated 4/5 on AUTOSAR read "Missing optional: AUTOSAR"
+    # here while the Talent Pool showed the proof — one engine, one answer.
+    try:
+        from services.talent_pool import _skill_rows
+        for cid, name, evidence, _rating in _skill_rows(db, None, pool_ids):
+            if evidence in ("interview", "cv") and name:
+                cand_skill_names.setdefault(cid, []).append(name)
+    except Exception:  # noqa: BLE001 — extra evidence, never a reason to fail the tab
+        pass
 
     history: dict[int, list] = {}
     profiles: list[CandidateProfile] = []

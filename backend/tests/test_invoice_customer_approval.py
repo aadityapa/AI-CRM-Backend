@@ -123,3 +123,16 @@ def test_the_routes_and_the_desk_tabs_are_wired():
     assert '"fin_customer_approved"' in desk and '"inv_confirm"' in desk
     flows = (root / "routers/crm/email_flows.py").read_text(encoding="utf-8")
     assert '"invoice.customer_approved"' in flows
+
+
+def test_bulk_confirmation_skips_the_refused_and_tells_finance_once(monkeypatch, _quiet):
+    """16 Oct 2026 — Sales Manager / Sales Head approve many from My Tasks."""
+    batches = []
+    monkeypatch.setattr(ica, "_notify_finance_batch", lambda db, invs, user, note: batches.append([i.id for i in invs]))
+    a, b, c = _invoice(id=1), _invoice(id=2, is_proforma=True), _invoice(id=3)
+    done, skipped = ica.confirm_many(_Db(), [a, b, c], _user("Sales_Head"), "Mailed")
+    assert [i.id for i in done] == [1, 3] and skipped[0]["invoice_id"] == 2
+    assert batches == [[1, 3]] and _quiet == []          # one batch notice, no per-invoice mail
+    with pytest.raises(HTTPException) as e:
+        ica.confirm_many(_Db(), [_invoice(id=4)], _user("Sales"))
+    assert e.value.status_code == 403

@@ -262,6 +262,9 @@ def next_question_payload(session: dict) -> dict:
         lead_in = conv.lead_in_for_index(meta, cur_idx)
         if lead_in:
             out["lead_in"] = lead_in
+            # Speak the lead-in and the question as ONE clip — the exact string
+            # /answer already warmed (16 Oct 2026).
+            out["speech_text"] = conv.spoken_text(lead_in, out.get("question"))
 
     # Start synthesising the FOLLOWING question now, while the candidate is
     # still listening to and answering this one. By the time they submit, its
@@ -302,12 +305,34 @@ def upcoming_question_text(session: dict) -> str | None:
         return None
 
 
+def warmup_followed_by(session: dict, next_question: str) -> str:
+    """What the candidate will HEAR after the warm-up (16 Oct 2026).
+
+    With spoken lead-ins on, question 1 is read as the fixed warm-up lead-in
+    plus the question (`_apply_conversation_turn`), so warming the bare
+    question missed the cache and the first question waited for a fresh
+    synthesis. The lead-in is fixed, so the exact clip can be made while the
+    candidate is still introducing themselves.
+    """
+    try:
+        meta = session.get("meta", {}) or {}
+        if not is_warmup_index(meta, session.get("current") or 0):
+            return next_question
+        cfg = conv.conversation_of(meta)
+        if not (cfg.get("enabled") and cfg.get("acknowledge") and cfg.get("voice_mode") != conv.VOICE_LIVE):
+            return next_question
+        return conv.spoken_text(conv.WARMUP_LEAD_IN, next_question)
+    except Exception:
+        return next_question
+
+
 def _prewarm_following_question(session: dict) -> None:
     """Fire-and-forget TTS warm for the next question. Never raises."""
     try:
         text = upcoming_question_text(session)
         if not text:
             return
+        text = warmup_followed_by(session, text)
         from services.tts_prewarm import prewarm_tts
         prewarm_tts(text)
     except Exception:

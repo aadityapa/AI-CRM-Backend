@@ -174,6 +174,11 @@ class PaymentIn(BaseModel):
 
 class TdsCreateIn(BaseModel):
     tds_amount: Decimal | None = Field(default=None, gt=0)
+    #: Percent the customer deducted (16 Oct 2026) — wins over tds_amount.
+    tds_rate: Decimal | None = Field(default=None, gt=0, le=30)
+    #: "taxable" (before GST, default) | "total".
+    tds_base: str | None = Field(default=None, max_length=16)
+    section: str | None = Field(default=None, max_length=16)
 
 
 class TdsPaymentIn(BaseModel):

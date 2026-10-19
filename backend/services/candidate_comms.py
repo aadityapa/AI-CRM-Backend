@@ -48,6 +48,21 @@ def send_candidate_email(to: str, subject: str, text: str, html: str | None = No
         to = (to or "").strip()
         if not to:
             return {"sent": False, "error": "no_email"}
+        # Talent Pool opt-out (17 Oct 2026, services/talent_retention): a
+        # candidate who asked to leave the pool gets no SOURCING mail; every
+        # other candidate mail carries the "remove me" link at its foot.
+        try:
+            from services.talent_retention import email_footer, mail_guard
+            candidate_id, opted_out, refuse = mail_guard(db, candidate_id, to, event)
+            if refuse:
+                return {"sent": False, "error": "opted_out"}
+            if candidate_id and not opted_out:
+                foot_text, foot_html = email_footer(candidate_id)
+                text = (text or "") + foot_text
+                if html:
+                    html = html + foot_html
+        except Exception:  # noqa: BLE001 — the footer never costs a candidate their mail
+            logger.debug("opt-out footer skipped", exc_info=True)
         if db is not None and not attachments:
             try:
                 from services.email_outbox import queue_email

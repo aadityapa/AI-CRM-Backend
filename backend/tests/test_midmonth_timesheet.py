@@ -218,9 +218,10 @@ def test_editable_period_overrides_and_syncs_grid(db):
         select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)).scalars())
     assert len(dates) == 28
 
-    # Outside the month → refused.
+    # A window that never touches February is not February's timesheet → refused.
+    # (Crossing the month IS allowed since 19 Oct 2026 — test_cross_month_timesheet.)
     r = client.patch(f"/api/timesheets/{ts.id}/period",
-                     json={"start_date": "2026-01-25", "end_date": "2026-02-28"})
+                     json={"start_date": "2026-01-01", "end_date": "2026-01-25"})
     assert r.status_code == 400
 
 

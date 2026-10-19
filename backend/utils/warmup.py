@@ -177,6 +177,57 @@ def extract_and_strip_intro(
         }
 
 
+_SKIP_TOKENS = {"skip", "skipped", "[skipped]"}
+#: A late transcript must keep at least this share of the words already stored —
+#: a truncated speech-to-text result never overwrites a fuller answer.
+LATE_TRANSCRIPT_MIN_SHARE = 0.5
+
+
+def apply_late_warmup_answer(session: dict | None, turn: int, text: str) -> str:
+    """Replace the stored warm-up answer with the full-recording transcript.
+
+    16 Oct 2026: when the introduction's 60-second clock runs out, the candidate
+    page saves what it has already heard and moves to question 1 at once; the
+    whole recording is transcribed in the background and arrives here. Pure —
+    the caller holds the session lock and persists. Returns ``"updated"``,
+    ``"not_warmup"``, ``"not_answered"``, ``"empty"``, ``"shorter"`` or
+    ``"unchanged"``.
+    """
+    if not isinstance(session, dict):
+        return "not_answered"
+    meta = session.setdefault("meta", {})
+    try:
+        idx = int(turn)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "not_warmup"
+    if not is_warmup_index(meta, idx):
+        return "not_warmup"
+    answers = session.get("answers")
+    if not isinstance(answers, list) or idx >= len(answers):
+        return "not_answered"
+    from utils.transcript_dedupe import collapse_repeated_transcript
+
+    new_text, _ = collapse_repeated_transcript(" ".join(str(text or "").split()))
+    if not new_text:
+        return "empty"
+    old = str(answers[idx] or "").strip()
+    old_was_skip = old.lower() in _SKIP_TOKENS
+    if new_text == old:
+        return "unchanged"
+    if old and not old_was_skip and len(new_text.split()) < LATE_TRANSCRIPT_MIN_SHARE * len(old.split()):
+        return "shorter"
+    answers[idx] = new_text
+    if old_was_skip:
+        turns = meta.get("skipped_turns")
+        if isinstance(turns, list):
+            meta["skipped_turns"] = [
+                t for t in turns
+                if not (isinstance(t, dict) and int(t.get("question_index") or 0) == idx + 1)
+            ]
+    meta["warmup_late_transcript"] = {"index": idx, "words": len(new_text.split())}
+    return "updated"
+
+
 def filter_out_warmups(
     questions: Iterable[str] | None,
     answers: Iterable[str] | None,

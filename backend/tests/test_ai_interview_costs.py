@@ -134,6 +134,15 @@ def test_env_override_changes_a_rate_without_a_deploy(monkeypatch):
 
 # ------------------------------------------------------------------ logger
 
+@pytest.fixture(autouse=True)
+def _no_leaked_interview_context():
+    """Other suites call interview handlers directly on this thread, and those set
+    the attribution ContextVar for the rest of the thread. Start each test clean."""
+    token = pl._interview_ctx.set(None)
+    yield
+    pl._interview_ctx.reset(token)
+
+
 @pytest.fixture()
 def log_db(tmp_path):
     db = str(tmp_path / "auth.db")

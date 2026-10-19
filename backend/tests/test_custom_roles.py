@@ -171,15 +171,15 @@ def test_grants_resolve_like_an_authoritative_template(db):
     _gm(db, uid=2)
     acc = effective_access(db, 2, {"GM"})
     assert acc["source"] == "custom_role"
-    assert acc["tabs"] == {"invoices": "edit", "pos": "view"}
-    assert acc["visible_tabs"] == ["invoices", "pos"]
+    assert acc["tabs"] == {"invoices": "edit", "pos": "view", "branch-policy": "view"}
+    assert acc["visible_tabs"] == ["branch-policy", "invoices", "pos"]
 
 
 def test_two_roles_merge_with_the_higher_mode_winning(db):
     _gm(db, uid=2, tabs={"invoices": "view"}, name="GM")
     _gm(db, uid=2, tabs={"invoices": "create", "tds": "view"}, name="Auditor")
     acc = effective_access(db, 2, {"GM", "Auditor"})
-    assert acc["tabs"] == {"invoices": "create", "tds": "view"}
+    assert acc["tabs"] == {"invoices": "create", "tds": "view", "branch-policy": "view"}
 
 
 def test_an_explicit_template_outranks_the_role(db):

@@ -394,6 +394,9 @@ def import_workbook(db: Session, file_bytes: bytes) -> dict:
                     last_working_day=lwd,
                     is_resigned=lwd is not None,
                 )
+                # A past last working day imports as Inactive (16 Oct 2026).
+                from services.employee_separation import apply_separation
+                apply_separation(emp)
                 db.add(emp)
                 db.flush()
             created.append({"row": row_no, "id": emp.id, "label": label})

@@ -17,7 +17,7 @@ ROLE_TEMPLATE_DEFAULTS: dict[str, dict[str, str]] = {
         "requirements": "view", "candidates": "edit", "profiles": "edit",
         "template-requests": "view", "calendar": "view", "emails": "view",
         "activity-log": "view", "projects": "view", "my-leave": "view",
-        "timesheets": "edit", "reports": "view",
+        "timesheets": "edit", "reports": "view", "branch-policy": "edit",
     },
     "Sales_Head": {
         "dashboard": "view", "customers": "create", "opportunities": "create",
@@ -26,21 +26,23 @@ ROLE_TEMPLATE_DEFAULTS: dict[str, dict[str, str]] = {
         "activity-log": "view", "projects": "edit", "project-employees": "edit",
         "my-leave": "view", "timesheets": "edit", "pos": "view",
         "invoices": "view", "tds": "view", "finance-reports": "view",
-        "reports": "view", "rate-cards": "edit",
+        "reports": "view", "rate-cards": "edit", "branch-policy": "edit",
+        "talent-pool": "view",
     },
     "RMG": {
         "dashboard": "view", "customers": "view", "opportunities": "view",
         "requirements": "edit", "candidates": "edit", "profiles": "edit",
         "template-requests": "edit", "calendar": "edit", "emails": "edit",
         "activity-log": "view", "projects": "view", "my-leave": "view",
-        "timesheets": "edit", "reports": "view",
+        "timesheets": "edit", "reports": "view", "branch-policy": "view",
+        "talent-pool": "view",
     },
     "TA": {
         "dashboard": "view", "customers": "view", "opportunities": "view",
         "requirements": "edit", "candidates": "create", "profiles": "create",
         "template-requests": "create", "calendar": "edit", "emails": "create",
         "activity-log": "view", "my-leave": "view", "timesheets": "view",
-        "reports": "view",
+        "reports": "view", "branch-policy": "view", "talent-pool": "view",
     },
     "HR": {
         "dashboard": "view", "candidates": "view", "profiles": "view",
@@ -48,7 +50,7 @@ ROLE_TEMPLATE_DEFAULTS: dict[str, dict[str, str]] = {
         "activity-log": "view", "projects": "edit", "project-employees": "edit",
         "my-leave": "view", "leave-applications": "edit", "holidays": "create",
         "timesheets": "edit", "employees": "create", "payroll": "view",
-        "reports": "view",
+        "reports": "view", "branch-policy": "edit",
     },
     "Finance": {
         "dashboard": "view", "customers": "view", "opportunities": "view",
@@ -56,6 +58,7 @@ ROLE_TEMPLATE_DEFAULTS: dict[str, dict[str, str]] = {
         "my-leave": "view", "timesheets": "create", "pos": "create",
         "invoices": "create", "tds": "create", "finance-reports": "view",
         "payroll": "view", "employees": "view", "reports": "view",
+        "branch-policy": "view",
     },
 }
 

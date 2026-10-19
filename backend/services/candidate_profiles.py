@@ -2839,3 +2839,86 @@ def set_applied_archive(db: Session, profile: CandidateProfile, archived: bool, 
                  ARCHIVED_ACTION if archived else RESTORED_ACTION,
                  f"{actor} {'moved the candidate to Archive' if archived else 'restored the candidate to Applied Candidates'}")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Hold a candidacy — anyone who works it, with a reason (16 Oct 2026, user ask)
+# ---------------------------------------------------------------------------
+
+HOLD_MIN_REASON = 5
+#: The side a hold is booked to when the caller does not say (by role, first match).
+_DEFAULT_SIDE_BY_ROLE = (("HR", "HR"), ("RMG", "RMG"), ("Sales_Head", "Sales"),
+                         ("Sales", "Sales"), ("TA", "TA"))
+
+
+def default_hold_side(user) -> str:
+    roles = set(getattr(user, "roles", ()) or ())
+    for role, side in _DEFAULT_SIDE_BY_ROLE:
+        if role in roles:
+            return side
+    return "RMG"   # a screener by approval (GM)
+
+
+def holds_for(db: Session, profile_ids) -> dict[int, dict]:
+    """{profile id: {side, reason, by_id, at}} for candidacies currently held —
+    the latest of CANDIDATE_HELD / CANDIDATE_RELEASED wins. One query."""
+    from services.candidate_status import CANDIDATE_HELD, CANDIDATE_RELEASED, parse_hold_comment
+
+    ids = [int(i) for i in (profile_ids or ()) if i]
+    if not ids:
+        return {}
+    latest: dict[int, dict | None] = {}
+    for pid, action, comment, uid, ts in db.execute(
+        select(CandidateProfileActivityLog.profile_id, CandidateProfileActivityLog.action_type,
+               CandidateProfileActivityLog.comment, CandidateProfileActivityLog.user_id,
+               CandidateProfileActivityLog.timestamp)
+        .where(CandidateProfileActivityLog.profile_id.in_(ids),
+               CandidateProfileActivityLog.action_type.in_((CANDIDATE_HELD, CANDIDATE_RELEASED)))
+        .order_by(CandidateProfileActivityLog.id)
+    ).all():
+        if action == CANDIDATE_RELEASED:
+            latest[pid] = None
+        else:
+            side, reason = parse_hold_comment(comment)
+            latest[pid] = {"side": side, "reason": reason, "by_id": uid,
+                           "at": ts.isoformat() if ts else None}
+    return {pid: h for pid, h in latest.items() if h}
+
+
+def set_candidate_hold(db: Session, profile, action: str, side: str | None,
+                       reason: str | None, user) -> str:
+    """Put a live candidacy on hold (side + reason) or release it. The stage is
+    never touched — the derived status reads "On Hold – <side>" until released.
+    Returns the message; raises 400 / 409. The caller commits."""
+    from services.candidate_status import (
+        CANDIDATE_HELD, CANDIDATE_RELEASED, HOLD_SIDES, SETTLED_PIPELINES,
+    )
+
+    stage = getattr(profile.pipeline_status, "value", profile.pipeline_status)
+    current = holds_for(db, [profile.id]).get(profile.id)
+    who = getattr(user, "full_name", None) or getattr(user, "username", None) or "Someone"
+    if action == "release":
+        if not current:
+            raise HTTPException(status_code=409, detail="This candidate is not on hold.")
+        note = (reason or "").strip()
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     CANDIDATE_RELEASED, f"{who} released the hold" + (f": {note}" if note else ""))
+        return "Hold released — the candidate continues where they were"
+    if action != "hold":
+        raise HTTPException(status_code=400, detail="action must be hold or release")
+    if stage in SETTLED_PIPELINES:
+        raise HTTPException(status_code=409,
+                            detail="This candidacy is closed or joined — there is nothing to hold.")
+    if current:
+        raise HTTPException(status_code=409,
+                            detail=f"Already on hold ({current['side'] or 'no side'}) — release it first.")
+    side = (side or default_hold_side(user)).strip()
+    if side not in HOLD_SIDES:
+        raise HTTPException(status_code=400, detail=f"side must be one of: {', '.join(HOLD_SIDES)}")
+    why = (reason or "").strip()
+    if len(why) < HOLD_MIN_REASON:
+        raise HTTPException(status_code=400,
+                            detail=f"Give a reason (at least {HOLD_MIN_REASON} characters).")
+    log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id, CANDIDATE_HELD,
+                 f"[{side}] {who} put the candidate on hold ({side}): {why}")
+    return f"Candidate on hold ({side})"
