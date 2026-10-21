@@ -56,7 +56,7 @@ from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser
 from models import (
-    Candidate, CandidateProfile, CandidateProfileActivityLog, Customer, Employee,
+    Candidate, CandidateProfile, CandidateProfileActivityLog, Customer, CustomerStatus, Employee,
     Opportunity, PipelineStatus, Requirement, RequirementStatus, Resume,
 )
 from services.candidate_status import TA_HOLD
@@ -1041,7 +1041,9 @@ def _options(db: Session) -> dict:
     customers = [
         {"id": cid, "name": name, "on_desk": by_cust.get(cid, 0)}
         for cid, name in db.execute(
-            select(Customer.id, Customer.name).where(Customer.id.in_(cust_ids)).order_by(Customer.name)
+            select(Customer.id, Customer.name)
+            .where(Customer.id.in_(cust_ids), Customer.status == CustomerStatus.ACTIVE)   # 22 Oct 2026: active only
+            .order_by(Customer.name)
         ).all()
     ] if cust_ids else []
     tas: dict[int, dict] = {}

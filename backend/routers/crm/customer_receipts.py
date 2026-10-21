@@ -34,6 +34,16 @@ remittance advice or UTR PDF. Upload first, then pass the url with the receipt
   PUT    /api/customer-receipts/{id}/proof       attach / replace / clear the proof
 Every invoice payment the receipt makes carries the same file in
 `attachment_url`, so the proof also opens from the invoice.
+
+22 Oct 2026 (Finance ask, screenshot): money often arrives BEFORE Finance
+knows which invoices it pays — it is recorded "on account" first and mapped
+later. A saved receipt can now be worked on:
+  PUT    /api/customer-receipts/{id}                       edit date / amount / mode / reference / notes / branch
+  POST   /api/customer-receipts/{id}/allocate              map the unallocated amount onto invoices (+ TDS)
+  DELETE /api/customer-receipts/{id}/allocations/{inv}     unmap one invoice — its money goes back on account
+The amount can never drop below what is already applied; mapping follows the
+same rules as Add (same customer, the receipt's branch, customer approval + IRN
+in); a receipt with no branch takes the branch of the invoices it is mapped to.
 """
 from __future__ import annotations
 
@@ -118,6 +128,31 @@ class ReceiptTdsIn(BaseModel):
 
 
 ReceiptIn.model_rebuild()
+
+
+class ReceiptUpdate(BaseModel):
+    """Edit a saved receipt (22 Oct 2026). Only the fields sent change."""
+    received_date: date | None = None
+    amount: Decimal | None = Field(default=None, gt=0)
+    payment_mode: str | None = Field(default=None, max_length=64)
+    reference_number: str | None = Field(default=None, max_length=128)
+    notes: str | None = Field(default=None, max_length=4000)
+    #: The paying branch; null clears it (only while nothing mapped belongs elsewhere).
+    branch_id: int | None = None
+
+
+class AllocateItemIn(BaseModel):
+    invoice_id: int
+    #: Cash to put on this invoice; None = as much as is left, oldest first.
+    amount: Decimal | None = Field(default=None, gt=0)
+
+
+class AllocateIn(BaseModel):
+    """Map a receipt's unallocated amount onto invoices (22 Oct 2026)."""
+    items: list[AllocateItemIn] = Field(default_factory=list, max_length=100)
+    tds: list[ReceiptTdsIn] = Field(default_factory=list, max_length=100)
+    #: For a receipt with no branch yet: the branch these invoices belong to.
+    branch_id: int | None = None
 
 
 def _d(v) -> Decimal:
@@ -330,6 +365,37 @@ def allocate(amount: Decimal, invoices: list[Invoice]) -> tuple[list[tuple[Invoi
     return out, left
 
 
+def plan_mapping(available: Decimal, items: list[tuple[Invoice, Decimal | None]]
+                 ) -> tuple[list[tuple[Invoice, Decimal]], Decimal]:
+    """How much cash each invoice gets when a receipt is mapped (PURE, tested).
+    Explicit amounts first (each ≤ the invoice's balance), then the open ones
+    oldest-first from what is left. Raises ValueError with the reason."""
+    left = _d(available)
+    out: dict[int, Decimal] = {}
+    explicit = [(inv, _d(a)) for inv, a in items if a is not None]
+    for inv, amt in explicit:
+        num = inv.invoice_number or f"#{inv.id}"
+        if amt > _d(inv.balance_amount):
+            raise ValueError(f"{float(amt):,.2f} on {num} is more than its balance {float(_d(inv.balance_amount)):,.2f}")
+        if amt > left:
+            raise ValueError(f"Only {float(left):,.2f} is left on this receipt to map")
+        out[inv.id] = amt
+        left = (left - amt).quantize(TWO)
+    auto = [inv for inv, a in items if a is None]
+    plan, left = allocate(left, auto)
+    for inv, take in plan:
+        out[inv.id] = take
+    by_id = {inv.id: inv for inv, _ in items}
+    ordered = sorted(out.items(), key=lambda kv: (by_id[kv[0]].invoice_date or date.min, kv[0]))
+    return [(by_id[i], a) for i, a in ordered if a > 0], left
+
+
+def _receipt_payload(db: Session, receipt: CustomerReceipt) -> dict:
+    customer = db.get(Customer, receipt.customer_id)
+    branch = db.get(CustomerBranch, receipt.branch_id) if receipt.branch_id else None
+    return _serialize(db, receipt, getattr(customer, "name", None), getattr(branch, "branch_name", None))
+
+
 @router.post("")
 def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(RC_WRITE)):
@@ -408,7 +474,7 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
             payment_mode=body.payment_mode or None,
             reference_number=(body.reference_number or "").strip() or None,
             notes=f"From customer receipt #{receipt.id}", receipt_id=receipt.id,
-            attachment_url=receipt.proof_url,
+            attachment_url=receipt.proof_url, created_by=user.id,
         ))
         tax.apply_invoice_payment(inv, take)
     db.commit()
@@ -455,6 +521,188 @@ def set_proof(receipt_id: int, body: ProofIn, db: Session = Depends(get_crm_db),
     branch = db.get(CustomerBranch, receipt.branch_id) if receipt.branch_id else None
     return envelope(_serialize(db, receipt, getattr(customer, "name", None), getattr(branch, "branch_name", None)),
                     message="Proof saved" if receipt.proof_url else "Proof removed")
+
+
+@router.put("/{receipt_id}")
+def update_receipt(receipt_id: int, body: ReceiptUpdate, db: Session = Depends(get_crm_db),
+                   user: CurrentUser = Depends(RC_WRITE)):
+    """Edit a saved receipt. The amount may not drop below what is already
+    applied to invoices; the invoice payments follow date / mode / reference."""
+    receipt = db.get(CustomerReceipt, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    sent = body.model_fields_set
+    payments = list(receipt.payments or [])
+    applied = sum((_d(p.amount) for p in payments), Decimal("0"))
+    if "payment_mode" in sent and body.payment_mode and body.payment_mode not in PAYMENT_MODES:
+        raise HTTPException(status_code=400, detail=f"Payment mode must be one of: {', '.join(PAYMENT_MODES)}")
+    if "amount" in sent and body.amount is not None:
+        new_amt = _d(body.amount)
+        if new_amt < applied:
+            raise HTTPException(status_code=400,
+                                detail=f"{float(applied):,.2f} of this receipt is already applied to invoices — "
+                                       f"unmap an invoice first, or enter at least that amount")
+        receipt.amount = new_amt
+        receipt.unallocated_amount = (new_amt - applied).quantize(TWO)
+    if "received_date" in sent and body.received_date is not None:
+        receipt.received_date = body.received_date
+    if "payment_mode" in sent:
+        receipt.payment_mode = body.payment_mode or None
+    if "reference_number" in sent:
+        receipt.reference_number = (body.reference_number or "").strip() or None
+    if "notes" in sent:
+        receipt.notes = (body.notes or "").strip() or None
+    if "branch_id" in sent and body.branch_id != receipt.branch_id:
+        if body.branch_id is not None:
+            branch = db.get(CustomerBranch, body.branch_id)
+            if branch is None or branch.customer_id != receipt.customer_id:
+                raise HTTPException(status_code=400, detail="That branch does not belong to this customer")
+            if payments:
+                from services.invoice_facets import invoice_facets
+                invs = db.execute(select(Invoice).where(Invoice.id.in_({p.invoice_id for p in payments}))).scalars().all()
+                facets = invoice_facets(db, invs)
+                other = [i.invoice_number or f"#{i.id}" for i in invs
+                         if (facets.get(i.id) or {}).get("branch_id") != branch.id]
+                if other:
+                    raise HTTPException(status_code=400,
+                                        detail=f"Mapped invoices of another branch: {', '.join(other)} — unmap them first")
+        receipt.branch_id = body.branch_id
+    for pay in payments:
+        pay.payment_date = receipt.received_date
+        pay.payment_mode = receipt.payment_mode
+        pay.reference_number = receipt.reference_number
+    db.commit()
+    db.refresh(receipt)
+    return envelope(_receipt_payload(db, receipt), message="Receipt updated")
+
+
+@router.post("/{receipt_id}/allocate")
+def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(get_crm_db),
+                     user: CurrentUser = Depends(RC_WRITE)):
+    """Map the receipt's unallocated amount onto invoices (and record the TDS
+    the customer withheld on them). Same rules as Add received amount."""
+    receipt = db.get(CustomerReceipt, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="Tick at least one invoice to map")
+    ids = [it.invoice_id for it in body.items]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(status_code=400, detail="An invoice is listed twice")
+    customer = db.get(Customer, receipt.customer_id)
+    invoices = db.execute(
+        select(Invoice).join(Project, Project.id == Invoice.project_id)
+        .where(Invoice.id.in_(set(ids)), Project.customer_id == receipt.customer_id)
+    ).scalars().all()
+    missing = set(ids) - {i.id for i in invoices}
+    if missing:
+        raise HTTPException(status_code=400,
+                            detail=f"Invoice(s) {sorted(missing)} do not belong to {getattr(customer, 'name', 'this customer')}")
+    proforma = [i.invoice_number or f"#{i.id}" for i in invoices
+                if getattr(i.kind, "value", i.kind) == InvoiceKind.PROFORMA.value]
+    if proforma:
+        raise HTTPException(status_code=400, detail=f"A Proforma takes no money: {', '.join(proforma)}")
+    waiting = [i.invoice_number or f"#{i.id}" for i in invoices if payment_block(i)]
+    if waiting:
+        raise HTTPException(status_code=409,
+                            detail=f"Not open for payment yet (customer approval / IRN pending): {', '.join(waiting)}")
+    # One receipt = one branch.
+    from services.invoice_facets import invoice_facets
+    facets = invoice_facets(db, invoices)
+    inv_branches = {(facets.get(i.id) or {}).get("branch_id") for i in invoices}
+    branch_id = receipt.branch_id
+    if branch_id is None:
+        if body.branch_id is not None:
+            b = db.get(CustomerBranch, body.branch_id)
+            if b is None or b.customer_id != receipt.customer_id:
+                raise HTTPException(status_code=400, detail="That branch does not belong to this customer")
+            branch_id = b.id
+        elif len(inv_branches) == 1 and None not in inv_branches:
+            branch_id = next(iter(inv_branches))
+    if branch_id is not None:
+        bname = db.get(CustomerBranch, branch_id).branch_name
+        other = [i.invoice_number or f"#{i.id}" for i in invoices
+                 if (facets.get(i.id) or {}).get("branch_id") != branch_id]
+        if other:
+            raise HTTPException(status_code=400, detail=f"Not invoices of {bname}: {', '.join(other)}")
+    receipt.branch_id = branch_id
+    by_id = {i.id: i for i in invoices}
+    seen: set[int] = set()
+    for t in body.tds or []:
+        if t.invoice_id not in by_id:
+            raise HTTPException(status_code=400, detail="TDS can only be recorded on an invoice you ticked")
+        if t.invoice_id in seen:
+            raise HTTPException(status_code=400, detail="TDS is listed twice for one invoice")
+        seen.add(t.invoice_id)
+    tds_added = Decimal("0")
+    for t in body.tds or []:
+        inv = by_id[t.invoice_id]
+        figures = tds_svc.work_out(inv, rate=t.tds_rate, base=t.tds_base, amount=t.tds_amount)
+        tds_svc.book(db, inv, figures, section=t.section, receipt_id=receipt.id, user_id=user.id)
+        tds_added += _d(figures["amount"])
+    try:
+        plan, left = plan_mapping(_d(receipt.unallocated_amount),
+                                  [(by_id[it.invoice_id], it.amount) for it in body.items])
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not plan and tds_added <= 0:
+        db.rollback()
+        raise HTTPException(status_code=400,
+                            detail="Nothing to map — the receipt has no unallocated amount, or the ticked invoices are already paid")
+    for inv, take in plan:
+        db.add(InvoicePayment(
+            invoice_id=inv.id, payment_date=receipt.received_date, amount=take,
+            payment_mode=receipt.payment_mode, reference_number=receipt.reference_number,
+            notes=f"From customer receipt #{receipt.id}", receipt_id=receipt.id,
+            attachment_url=receipt.proof_url, created_by=user.id,
+        ))
+        tax.apply_invoice_payment(inv, take)
+    receipt.unallocated_amount = left
+    receipt.tds_total = _d(getattr(receipt, "tds_total", 0)) + tds_added
+    db.commit()
+    db.refresh(receipt)
+    applied = sum((a for _, a in plan), Decimal("0"))
+    msg = f"Mapped {float(applied):,.2f} to {len(plan)} invoice(s)"
+    if tds_added > 0:
+        msg += f", TDS {float(tds_added):,.2f} pending from client"
+    msg += f" — {float(left):,.2f} still on account" if left > 0 else " — nothing left on account"
+    return envelope(_receipt_payload(db, receipt), message=msg)
+
+
+@router.delete("/{receipt_id}/allocations/{invoice_id}")
+def unmap_invoice(receipt_id: int, invoice_id: int, db: Session = Depends(get_crm_db),
+                  user: CurrentUser = Depends(RC_WRITE)):
+    """Take one invoice off the receipt: its cash goes back on account and the
+    TDS booked with this receipt on it is removed (409 once received)."""
+    receipt = db.get(CustomerReceipt, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    pays = [p for p in (receipt.payments or []) if p.invoice_id == invoice_id]
+    tds = db.execute(select(TdsRecord).where(TdsRecord.receipt_id == receipt.id,
+                                             TdsRecord.invoice_id == invoice_id)).scalars().first()
+    if not pays and tds is None:
+        raise HTTPException(status_code=404, detail="That invoice is not mapped to this receipt")
+    inv = db.get(Invoice, invoice_id)
+    tds_back = Decimal("0")
+    if tds is not None:
+        tds_back = _d(tds.tds_amount)
+        tds_svc.unbook(db, tds)
+    cash = Decimal("0")
+    for pay in pays:
+        cash += _d(pay.amount)
+        if inv is not None:
+            tax.apply_invoice_payment(inv, -_d(pay.amount))
+        db.delete(pay)
+    receipt.unallocated_amount = (_d(receipt.unallocated_amount) + cash).quantize(TWO)
+    receipt.tds_total = max(_d(getattr(receipt, "tds_total", 0)) - tds_back, Decimal("0"))
+    db.commit()
+    db.refresh(receipt)
+    num = getattr(inv, "invoice_number", None) or f"#{invoice_id}"
+    msg = f"{num} unmapped — {float(cash):,.2f} back on account"
+    if tds_back > 0:
+        msg += f" (TDS {float(tds_back):,.2f} removed)"
+    return envelope(_receipt_payload(db, receipt), message=msg)
 
 
 @router.delete("/{receipt_id}")

@@ -42,7 +42,7 @@ def test_the_einvoice_prints_irn_ack_and_date_in_a_band_with_its_qr():
     assert ti.einvoice_rows(inv) == [("IRN", IRN), ("Ack No.", "112410012345678"), ("Ack Date", "07-10-2026")]
     html = ti.render_invoice_html(inv)
     assert "e-Invoice" in html and IRN in html and "112410012345678" in html and "07-10-2026" in html
-    assert "Scan to view<br/>this e-invoice" in html
+    assert "Scan to view this e-invoice" in html and "<div class='einv-qr'>" in html   # alt text + the band QR
     assert ti.pdf_filename(inv).startswith("EInvoice_")
     plain = ti.Invoice(invoice_no="X", share_url="https://x/view")
     assert not plain.is_einvoice and ti.einvoice_rows(plain) == []

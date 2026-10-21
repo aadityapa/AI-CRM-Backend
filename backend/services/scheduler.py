@@ -373,6 +373,8 @@ def run_recurring_invoices(db, *, today: date | None = None) -> dict:
             )
             db.add(invoice)
             db.flush()
+            from services.invoice_parties import freeze as freeze_parties
+            freeze_parties(db, invoice)          # 0143 — the address of the day stays on it
             consume_po_for_invoice(db, invoice, po, None)   # base value (sub-total) only
             notify_roles(
                 db, ["Finance"],

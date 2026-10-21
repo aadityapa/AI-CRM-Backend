@@ -146,6 +146,19 @@ def test_invoice_detail_carries_public_links_and_a_qr(world):
     assert share["pdf_url"].endswith(f"/api/public/invoices/{tok}/pdf")
     assert share["qr_target"] == share["view_url"]          # no viewer configured → our page
     assert share["qr_svg"].startswith("data:image/svg+xml;base64,")
+    # No IRN yet → no e-invoice QR (its page 404s until Finance records it).
+    assert "einvoice_qr_svg" not in share
+
+
+def test_invoice_detail_carries_the_einvoice_qr_once_the_irn_exists(world):
+    """22 Oct 2026: the e-invoice is the same on-screen sheet + an e-Invoice
+    band, whose QR opens the public e-invoice page."""
+    client, s, inv = world
+    inv.irn_number = "a" * 64
+    s.commit()
+    share = client.get(f"/api/invoices/{inv.id}").json()["data"]["share"]
+    assert share["einvoice_url"].endswith(f"/api/public/invoices/{share_token(inv.id)}/einvoice")
+    assert share["einvoice_qr_svg"].startswith("data:image/svg+xml;base64,")
 
 
 def test_public_endpoints_need_no_login_and_hide_internal_finance(world):

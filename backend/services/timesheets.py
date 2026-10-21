@@ -553,11 +553,15 @@ def period_window_error(year: int, month: int, start: date, end: date) -> str | 
 def billing_cycle_factor(win_start: date, win_end: date, billed_start: date | None = None) -> Decimal:
     """How many monthly rates a CROSS-MONTH window bills. PURE.
 
-    A window up to one month long (20 Feb – 20 Mar, 21 Mar – 20 Apr) is ONE
-    billing cycle → 1.0. A longer one (21 Apr – 30 May) bills one month plus the
-    extra days at rate ÷ days of that cycle (21 Apr – 20 May = 30 days, +10 days
-    → 1.3333). ``billed_start`` moves the start for an initial no-billing window:
-    the free days come off the same way.
+    One full cycle (21 Feb – 20 Mar = 28 days, 21 Mar – 20 Apr = 31 days) is
+    ONE monthly rate → 1.0, whatever its length. A longer window (21 Apr – 30
+    May) bills one month plus the extra days at rate ÷ days of that cycle
+    (21 Apr – 20 May = 30 days, +10 days → 1.3333). A SHORTER window bills its
+    share of the cycle (20 Oct 2026, reported "amount wrong": a 13-day
+    25 Feb – 10 Mar window, or a cycle cut by an exit, used to bill a whole
+    month) — the same rule a mid-month joiner gets on a calendar month.
+    ``billed_start`` moves the start for an initial no-billing window: the free
+    days come off the same way.
     """
     from datetime import timedelta
     billed_start = max(billed_start or win_start, win_start)
@@ -565,10 +569,8 @@ def billing_cycle_factor(win_start: date, win_end: date, billed_start: date | No
         return ZERO
     cycle_end = add_months(win_start, 1) - timedelta(days=1)
     cycle_len = Decimal((cycle_end - win_start).days + 1)
-    full_len = Decimal((win_end - win_start).days + 1)
     billed_len = Decimal((win_end - billed_start).days + 1)
-    base = full_len if full_len <= cycle_len else cycle_len
-    return billed_len / base if base > ZERO else ZERO
+    return billed_len / cycle_len if cycle_len > ZERO else ZERO
 
 
 def sheet_billing_bounds(ts, pe) -> tuple[date, date]:
@@ -604,6 +606,96 @@ def overlapping_sheet(db: Session, ts, start: date, end: date):
         if o_start <= end and start <= o_end:
             return other, o_start, o_end
     return None
+
+
+def overlapping_sheets(db: Session, ts, start: date, end: date) -> list:
+    """EVERY other sheet of this employee + project sharing a day with
+    start..end, as (sheet, its start, its end), earliest first."""
+    out = []
+    rows = db.execute(
+        select(Timesheet).where(*_assignment_filter(ts.project_id, ts.employee_id),
+                                Timesheet.id != ts.id)
+    ).scalars().all()
+    for other in rows:
+        pe = db.get(ProjectEmployee, other.project_employee_id) if other.project_employee_id else None
+        o_start, o_end = sheet_period_bounds(other, pe)
+        if o_start <= end and start <= o_end:
+            out.append((other, o_start, o_end))
+    return sorted(out, key=lambda t: t[1])
+
+
+def sheet_is_open(db: Session, ts) -> bool:
+    """A sheet whose days may still move: Draft / Rejected with no live invoice."""
+    if ts.status not in (TimesheetStatus.DRAFT, TimesheetStatus.REJECTED):
+        return False
+    return not live_invoices(invoices_for(db, ts))
+
+
+def assignment_window(pe) -> tuple[date | None, date | None]:
+    """The employee's first and last day on the project (None = open)."""
+    if pe is None:
+        return None, None
+    return getattr(pe, "onboarding_date", None), getattr(pe, "exit_date", None)
+
+
+def assignment_window_error(pe, start: date, end: date, employee: str = "The employee") -> str | None:
+    """Why start..end reaches outside the employee's time on the project. PURE."""
+    a_start, a_end = assignment_window(pe)
+    if a_start and start < a_start:
+        return (f"{employee} joined this project on {a_start.strftime('%d-%b-%Y')} — the period "
+                "cannot start before that (days before joining would be billed)")
+    if a_end and end > a_end:
+        return (f"{employee} left this project on {a_end.strftime('%d-%b-%Y')} — the period "
+                "cannot end after that")
+    return None
+
+
+def period_options(db: Session, ts) -> dict:
+    """What the Change-period dialog needs to stay out of trouble: the sheets
+    on either side, the employee's dates on the project, and the free span
+    this sheet may use without touching a sheet that is already locked."""
+    from datetime import timedelta
+    pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
+    cur_start, cur_end = sheet_period_bounds(ts, pe)
+    lo = add_months(date(ts.year, ts.month, 1), -3)
+    hi = add_months(date(ts.year, ts.month, 1), 4)
+    neighbours = []
+    for other, o_start, o_end in overlapping_sheets(db, ts, lo, hi):
+        neighbours.append({
+            "id": other.id,
+            "label": period_label(other.year, other.month),
+            "year": other.year,
+            "month": other.month,
+            "start": o_start.isoformat(),
+            "end": o_end.isoformat(),
+            "status": getattr(other.status, "value", other.status),
+            "open": sheet_is_open(db, other),
+        })
+    before = [n for n in neighbours if date.fromisoformat(n["end"]) < cur_start]
+    after = [n for n in neighbours if date.fromisoformat(n["start"]) > cur_end]
+    previous = before[-1] if before else None
+    nxt = after[0] if after else None
+    a_start, a_end = assignment_window(pe)
+    # The free span: the day after a LOCKED previous sheet ends / the day
+    # before a LOCKED next sheet starts. An open neighbour can give days up.
+    free_start = (date.fromisoformat(previous["end"]) + timedelta(days=1)
+                  if previous and not previous["open"] else None)
+    free_end = (date.fromisoformat(nxt["start"]) - timedelta(days=1)
+                if nxt and not nxt["open"] else None)
+    if a_start and (free_start is None or a_start > free_start):
+        free_start = a_start
+    if a_end and (free_end is None or a_end < free_end):
+        free_end = a_end
+    return {
+        "current": {"start": cur_start.isoformat(), "end": cur_end.isoformat()},
+        "previous": previous,
+        "next": nxt,
+        "joined_on": a_start.isoformat() if a_start else None,
+        "left_on": a_end.isoformat() if a_end else None,
+        "free_start": free_start.isoformat() if free_start else None,
+        "free_end": free_end.isoformat() if free_end else None,
+        "max_days": MAX_PERIOD_DAYS,
+    }
 
 
 def follow_on_window(db: Session, project_id: int, employee_id: int,
@@ -2762,6 +2854,9 @@ def invoice_ref(invoice: Invoice | None) -> dict | None:
         # 0141: a split part says which part and how much of the sheet it bills.
         "split_no": invoice.split_no,
         "split_qty": float(invoice.split_qty) if invoice.split_qty is not None else None,
+        # 0142 — the days a part bills when the sheet was split by dates.
+        "split_start": invoice.split_start.isoformat() if getattr(invoice, "split_start", None) else None,
+        "split_end": invoice.split_end.isoformat() if getattr(invoice, "split_end", None) else None,
         "po_id": invoice.po_id,
         # Only a split part names its PO (one lazy read, and only for those) —
         # a whole-sheet invoice keeps the list query flat.

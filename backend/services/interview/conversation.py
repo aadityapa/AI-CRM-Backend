@@ -53,7 +53,7 @@ VOICE_LIVE = "live"
 VOICE_MODES = (VOICE_STANDARD, VOICE_LIVE)
 
 DEFAULT_MAX_FOLLOWUPS = 2
-MAX_FOLLOWUPS_CAP = 5
+MAX_FOLLOWUPS_CAP = 20  # 21 Oct 2026: the author types any number 0..20
 #: An answer this short (in words) earns a probe when D is on.
 SHORT_ANSWER_WORDS = 15
 #: Clarify / repeat requests honoured per question (a loop is not a conversation).

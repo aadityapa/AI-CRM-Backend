@@ -511,8 +511,13 @@ def interview_cost_report(db_target: str, crm_db=None, *, date_from: str | None 
     for row in every:
         used = sorted(per_models.get(row["interview_id"], []), key=lambda m: -m["cost_usd"])
         row["models"] = [model_label(m["model"]) for m in used if m["model"] != "unknown"]
+    active_ids: set[int] = set()
+    if crm_db is not None:                      # 22 Oct 2026: active customers only
+        from services.customers import active_customer_ids
+        active_ids = active_customer_ids(crm_db)
     options = {
-        "customers": sorted({(r["customer_id"], r["customer_name"]) for r in every if r.get("customer_id")},
+        "customers": sorted({(r["customer_id"], r["customer_name"]) for r in every
+                             if r.get("customer_id") and (not active_ids or r["customer_id"] in active_ids)},
                             key=lambda x: (x[1] or "")),
         "ta_owners": sorted({r["ta_owner_name"] for r in every if r.get("ta_owner_name")}),
         "templates": sorted({r["template_name"] for r in every if r.get("template_name")}),

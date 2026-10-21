@@ -374,7 +374,7 @@ def test_customer_approval_then_finance_records_the_irn(world):
     r = client.post(f"/api/invoices/{inv.id}/customer-approval", json={"note": "Mailed to AP on 4 Oct"})
     assert r.status_code == 200, r.text
     body = r.json()["data"]
-    assert body["customer_approval"]["approved"] and "einvoice" not in body
+    assert body["customer_approval"]["approved"] and body["einvoice"]["can_edit"] is False
     assert client.put(f"/api/invoices/{inv.id}/einvoice",
                       json={"irn": irn, "ack_number": "112010036563310"}).status_code == 403
 
@@ -389,5 +389,12 @@ def test_customer_approval_then_finance_records_the_irn(world):
 
     as_user(3, "Balasaheb", "Sales", "Sales Manager")
     detail = client.get(f"/api/invoices/{inv.id}").json()["data"]
-    assert "einvoice" not in detail and detail["customer_approval"]["can_withdraw"] is False
-    assert "irn_recorded" not in client.get("/api/invoices").json()["data"][0]
+    # 21 Oct 2026: Sales reads the e-invoice (never edits it) and has the E-invoice tab.
+    assert detail["einvoice"]["irn"] == irn and detail["einvoice"]["can_edit"] is False
+    assert detail["customer_approval"]["can_withdraw"] is False
+    tab = client.get("/api/invoices", params={"einvoice": "true"}).json()["data"]
+    assert [x["id"] for x in tab] == [inv.id] and tab[0]["irn_number"] == irn
+    assert tab[0]["ack_date"] == "2026-10-05" and "irn_recorded_by_name" in tab[0]
+    assert client.get("/api/invoices", params={"einvoice": "true", "irn_from": "2026-10-06"}).json()["data"] == []
+    as_user(5, "ta", "TA")
+    assert client.get("/api/invoices", params={"einvoice": "true"}).status_code == 403

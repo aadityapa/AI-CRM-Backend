@@ -32,6 +32,12 @@ def register_crm_routers(app) -> None:
     """Register every CRM router, isolating failures to the module that caused them."""
     loaded: dict[str, object] = {}
     failed: list[tuple[str, str]] = []
+    # The customer Activity Log writes itself on every flush (0143).
+    try:
+        from services.customer_activity import register as _register_customer_activity
+        _register_customer_activity()
+    except Exception:  # noqa: BLE001
+        log.exception("customer activity listener not registered")
 
     for name in _MODULES:
         try:

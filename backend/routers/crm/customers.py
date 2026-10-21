@@ -2,7 +2,10 @@
 
 Writes: Sales / Sales_Head (Admin implicit). Contact create/update also allows Finance
 (PO Header quick-add). Reads: any CRM role.
-No activity-log table exists for customers, so mutations are not logged here.
+Every change to a customer, its branches, contacts, documents and policies is
+written to `customer_activity_log` by the flush listener in
+services/customer_activity.py (0143) — routes here need not log by hand.
+`GET /{customer_id}/activity` is the customer's whole history.
 """
 from __future__ import annotations
 
@@ -57,6 +60,9 @@ from services.customers import (
 )
 
 router = APIRouter(prefix="/api/customers", tags=["CRM: Customers"])
+
+from services.customer_activity import register as _register_activity  # noqa: E402
+_register_activity()
 
 read_customers = gated_read("customers")
 write_customers = gated_write("customers", "Sales", "Sales_Head")
@@ -266,6 +272,35 @@ def get_customer(
 ):
     customer = get_customer_or_404(db, customer_id)
     return envelope(data=serialize_customer(customer, db, detail=True), message="Customer fetched")
+
+
+@router.get("/{customer_id}/activity")
+def customer_activity(
+    customer_id: int,
+    kind: str | None = None,
+    search: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    page: int = 1,
+    limit: int = 50,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(read_customers),
+):
+    """Everything that happened with this customer, newest first (0143):
+    changes to the customer / branches / contacts / documents / policies (with
+    old → new values), the opportunity, position, candidate, PO and timesheet
+    logs, invoices (raised, approved by the customer, IRN, address corrected)
+    and amounts received. `kind` = CSV of account · opportunity · requirement ·
+    candidate · po · timesheet · invoice · payment; `meta.counts` per kind."""
+    from services.customer_activity import activity_feed
+    get_customer_or_404(db, customer_id)
+    kinds = [k.strip() for k in (kind or "").split(",") if k.strip()]
+    try:
+        out = activity_feed(db, customer_id, kinds=kinds or None, search=search,
+                            date_from=date_from, date_to=date_to, page=page, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return envelope(data=out["data"], message="Customer activity", meta=out["meta"])
 
 
 @router.put("/{customer_id}")

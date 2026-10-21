@@ -3540,6 +3540,186 @@ every part AND on the single-PO generate path → 400 "billing an expired PO is 
 Organisation ▸ Billing. The defaults reproduce the earlier behaviour exactly, so nothing changes on deploy until Admin
 flips a switch.
 
+**20 Oct 2026 — Change period next to another sheet; Fill from file on a cross-month sheet; the short-period amount
+(`tests/test_timesheet_period_neighbours.py` 7, `test_cross_month_timesheet` re-pinned; no migration):** reported after
+the deploy — March → 21 Feb – 20 Mar answered "February 2026 timesheet already covers 01-Feb-2026 to 28-Feb-2026", some
+sheets that did move showed a wrong amount, and "Fill from file" did nothing useful. (1) **Neighbours**
+(`services/timesheets`): `overlapping_sheets` (every clash), `sheet_is_open` (Draft / Rejected and no live invoice),
+`assignment_window` / `assignment_window_error` (a period may not start before the PE's onboarding or end after its exit —
+those days used to be billed), `period_options(db, ts)` → previous / next sheet `{id, label, start, end, status, open}`,
+`joined_on`, `left_on`, `free_start` / `free_end` (bounded by LOCKED neighbours and the assignment). `PATCH …/period`
+takes `adjust_neighbours` (an OPEN neighbour gives up the overlapping days — its window shrinks and those entries are
+RE-POINTED to this sheet with their hours / leave, comp-off re-accrued; without the flag → 409 "confirm moving those
+days"; a LOCKED neighbour → 409 naming the day this sheet can start / end) and `hand_over_removed` (days the change drops
+go to the open sheet right next to them, with their hours, instead of being deleted). `GET …/{id}/period-options`
+(TS_VIEW). (2) ⚠️ **Amount**: `billing_cycle_factor` = billed days ÷ the cycle that starts on the window's first day
+(a FULL cycle is still 1, longer = one month + extra days) — a window shorter than a cycle used to bill a whole month.
+(3) **Fill from file**: `bulk-import` takes `timesheet_id` (must be editable, 409 otherwise) — every day inside THAT
+sheet's window lands on it; days outside are reported in `failed_rows`. Before, rows were grouped by CALENDAR month, so
+21–28 Feb created / filled a February sheet. `timesheet_import._window_run` + `window=` on `_date_columns` /
+`find_matrix` / `find_token_stream` / `read_day_marks` read bare day numbers "21 … 28 1 … 20" across the month end.
+
+**21 Oct 2026 — split a timesheet across POs BY DATES, migration 0142, head is now 0142
+(`tests/test_split_by_dates.py` 4):** reported — March 2026: PO A has money for 1–29 March only, so 1–29 March is one
+invoice on PO A and 30–31 March another on PO B; the 0141 split (hours / amount) did not answer that and the user did not
+find it. `GenerateInvoiceIn.splits[]` entries take `start_date` / `end_date`. PURE `services/proforma.plan_date_splits(splits,
+days=, window=, total=, taken=)`: each part = the sheet's total (frozen at approval) × (weight in its dates ÷ weight of the
+whole window), weight = `billable_hours` on an Hourly rate else `billable_days` (calendar days only when nothing is billable);
+refuses dates outside the window, To before From, a day on two parts (incl. parts already raised), a range with nothing
+billable, the same PO twice. The amounts then go through `plan_splits`, so the part that finishes the sheet takes the exact
+remainder. `routers/crm/timesheets.split_day_weights(db, ts, unit)` → (window, [(date, weight)]). A sheet split one way
+continues that way (409 for mixing). **0142** adds `invoices.split_start` / `split_end`; carried by `invoice_ref`,
+`serialize_invoice`, the part's line ("… part 1 (PO A: 01 Mar 2026 to 29 Mar 2026, 29 days)"), the printed period
+(`billing_breakdown_for_invoice`), `invoice_facets.period_label` and the billing tracker rows. `po-options` adds
+`split_days {start, end, basis, days[{date, weight}], taken[{start, end, split_no, invoice_number}]}`. Deploy:
+`python -m alembic upgrade head` (0141 + 0142), restart, rebuild F-V2.
+
+**21 Oct 2026 (later) — issued invoices keep their address; the customer Activity Log, migration 0143, head is now 0143
+(`tests/test_invoice_address_snapshot.py`, 4 — also passed on Postgres 14):** reported with a screenshot: a customer's
+address changed, and every invoice already generated started printing the NEW address. ⚠️ Cause: every renderer
+(`serialize_invoice`, `map_crm_invoice_to_tax_invoice` → HTML / reportlab / Word / e-invoice / public QR page) read the
+customer branch LIVE.
+- **The fix.** `invoices.party_snapshot` (JSON) stores the RAW branch / customer columns the invoice printed with, so the
+  existing formatting code runs unchanged on `SimpleNamespace`s. Shape: `{v:1, captured_at, source issued|converted|
+  backfill|corrected, customer{…}, billing{…}, delivery{…}|null, corrected{at, by, by_name, reason}|null}`.
+- **`services/invoice_parties.py` is the one module.** It holds `freeze(db, inv, source, force)` (never raises),
+  `snapshot_of` / `as_namespaces` / `resolve_live` / `capture` / `print_address`, the correction forms
+  (`buyer_form` / `shipping_form` / `po_form` / `branch_from_form`), `address_key`, `same_address_invoices` and `correct`.
+- **The billing branch** is picked in this order: the PO's billing branch, else the project's branch, else the primary
+  branch. The delivery address comes from the PO.
+- **When an invoice is frozen.** At creation, every path: Proforma raise (whole sheet and each split part), manual
+  `POST /api/invoices`, and the recurring-billing job. Proforma → Tax conversion re-freezes with `force=True` (the
+  original invoice prints the address of the day it is issued), unless Finance corrected it.
+- **What reads the snapshot.** `serialize_invoice` and the tax-invoice mapper use it when present. GST
+  (intra / inter-state) follows the frozen branch too. Payload `party_snapshot {frozen, captured_at, source, corrected,
+  customer_address_changed}`.
+- **0143 backfill.** It snapshots every existing invoice from TODAY's data (raw SQL, same branch rule). Invoices issued
+  before an address change therefore carry the new address, and Finance corrects them once:
+  - `GET /api/invoices/{id}/parties` (INV_READ): printed vs current, the PO's typed address, and `same_address` (earlier
+    invoices of the customer printing exactly the same key, never a later one).
+  - `PUT …/parties {buyer, shipping|null, reason ≥ 10, apply_to:[ids]}` is `role_required("Finance")`. A stray id gets a
+    400. Correcting rewrites only the snapshot, never the branch, and is logged on the customer's Activity Log.
+- **Customer Activity Log** (`customer_activity_log` table, `services/customer_activity.py`):
+  - A global SQLAlchemy `before_flush` / `after_flush` listener (registered in `register_crm_routers` + `customers.py`)
+    writes created / updated / deleted rows, with old → new per field. It covers Customer, CustomerBranch,
+    ContactPerson, CustomerDocument, CustomerBillingPolicy, CustomerRateCard and CustomerLeavePolicy.
+    `BRANCH_ADDRESS_CHANGED` carries the note that issued invoices keep their address.
+  - Inserts are Core statements inside a SAVEPOINT. The actor comes from `session.info["actor_id"/"actor_name"]`, which
+    `crm_deps.get_current_user` sets.
+  - `before_flush` reads the old values of expired attributes. Without it, a change made after a commit logged
+    `None → new`.
+  - `session.info["skip_customer_audit"]` turns the listener off.
+  - `record(db, customer_id, action, comment, …)` is the manual entry.
+  - `activity_feed(db, cid, kinds=, search=, date_from=, date_to=, page=, limit=)` is ONE `UNION ALL` over that table plus
+    customer and project creation, opportunity / requirement / profile / PO / timesheet activity logs, invoice issued /
+    customer-approved / IRN and receipts. `KINDS` = account · opportunity · requirement · candidate · po · timesheet ·
+    invoice · payment, with per-kind `counts`.
+  - ⚠️ Timestamps use `sa.type_coerce`, never `CAST(… AS DATETIME)`, which breaks SQLite. Literal strings are CAST so
+    Postgres can type the union.
+  - Route `GET /api/customers/{id}/activity` (`read_customers`; an unknown kind gets a 400).
+  - The table is in `data_backup.DATASETS["customers"]`.
+  - The customer's own changes are recorded from this deploy on; everything else goes back to the start.
+
+Deploy: `python -m alembic upgrade head` (0141–0143), restart, rebuild F-V2. Then Finance opens an invoice issued before
+the move ▸ **Correct address** ▸ "Use the address on PO …" (or type it) ▸ tick the earlier invoices ▸ save.
+
+**21 Oct 2026 (later still) — the e-invoice opens, fits one page, downloads as PDF / Word, and names Finance's people,
+migration 0144, head is now 0144 (`tests/test_einvoice_one_page.py`, 9; `test_einvoice_flow` re-pinned):** screenshot
+report. (1) ⚠️ **One page**: a 3-line e-invoice printed on two pages. The e-Invoice band is compact now (IRN on its own
+line, Ack No. · Ack Date side by side, 64 px QR), and `ti._pdf_via_weasyprint` renders, counts pages and re-renders with
+`_FIT_TIERS` added one at a time (`_with_fit_css`: tighter spacing, no filler rows → smaller type → last resort) until it
+fits one A4 page. Every value stays; only whitespace and type size change. This applies to every WeasyPrint invoice, not only
+e-invoices. `logger.warning` fires if it still spills. The GRAND TOTAL label printed dark on navy; `.grand .lab` is now
+white. (2) **Word**: `GET /api/invoices/{id}/einvoice.docx`; `tax_invoice_docx` prints the same band (E-INVOICE · IRN ·
+Ack No. · Ack Date + QR) under the header, and the declaration's QR is skipped. It shares `_einvoice_model` (Finance / Admin /
+CEO, IRN required) with the PDF route. (3) **Who did it** (0144):
+- `invoices.issued_by / issued_at` are stamped by `finance.consume_po_for_invoice` (every tax invoice passes there; never
+  overwritten). The backfill takes the earliest PO-activity `INVOICE_CREATED` row.
+- `invoice_payments.created_by / created_at` are set by `record-payment` and customer receipts. The backfill takes the
+  receipt's author. `created_at` was added WITHOUT a default and the default set afterwards, so old direct payments do not
+  all read "today".
+- `finance._with_approval` adds `issued {by, by_name, at}`, each payment's `recorded_by_name` and the TDS record's
+  `created_by_name`, all from ONE `_user_names` call.
+F-V2 opens the e-invoice through the public signed inline URL (`share.einvoice_pdf_url`) — see its notes for why the blob
+tab stayed blank. Deploy: `python -m alembic upgrade head` (0144), restart, rebuild F-V2.
+
+**22 Oct 2026 — the e-invoice is the ordinary invoice sheet + an e-Invoice band (`test_public_invoice_qr` +1; no
+migration):** user ask with screenshots — the e-invoice must look exactly like the normal invoice (the on-screen sheet the
+"Tax Invoice (PDF)" button captures), with one added block: e-Invoice · IRN · Ack No. · Ack Date + QR. The server
+renderers (WeasyPrint / reportlab) produced a different layout. `serialize_invoice` now adds `share.einvoice_qr_svg` (QR of
+the public `einvoice_url`) once `irn_number` is set, so the React sheet can draw the band; everything else is F-V2 (see that
+repo's notes). The server `GET /api/invoices/{id}/einvoice.pdf` stays for API use and the public QR PDF; the dashboard no
+longer calls it. `/einvoice.docx` is still the Word download.
+
+**21 Oct 2026 (night) — e-invoices for Sales, joiners stay listed, AI report on the position's skills + L2
+questions, follow-ups to 20, defensive /hr/dashboard (`test_l2_questions_and_grounded_sw.py` 5,
+`test_profiles_joined_bucket` +1, `test_invoice_customer_approval` / `test_proforma_flow` / `test_einvoice_one_page`
+re-pinned; no migration):** (1) **E-invoice for every Sales rung**: `invoice_customer_approval.EINVOICE_VIEW_ROLES`
+(Finance · Sales · Sales_Head · Sales Manager) + `may_view_einvoice(user)` — the payload's `einvoice` block (with
+`can_edit` now `may_see_irn` AND approved), the list's `irn_recorded`, and `_einvoice_model` (PDF / Word) all use it;
+RECORDING the IRN stays `may_see_irn` (Finance / Admin / CEO). `GET /api/invoices` gains `einvoice` (true = Tax with an
+IRN, ordered by IRN date; false = approved, IRN missing; 403 for anyone else) and `irn_from` / `irn_to` (ack date, else
+the recorded day); `einvoice=true` rows carry `irn_number` · `ack_date` · `irn_recorded_at` · `irn_recorded_by_name`.
+(2) ⚠️ **Joined candidates on closed deals were hidden**: closing a deal Won hides its profiles
+(`_set_profiles_hidden`), the joiner with them, so the Joined chip read 1 of 3. `candidate_profiles._not_hidden_clause()`
+= not hidden OR Joined, used by the list and the export. (3) **Follow-ups**: `conversation.MAX_FOLLOWUPS_CAP` = 20; the
+rules page reports follow-ups for a question-bank template too (`_interview_format`). (4) **AI report on the position's
+skills**: `utils/strengths_weaknesses_analysis` v3 (`SW_ANALYSIS_VERSION`) — `position_grounded_lists(report, q, a,
+position_skills)` rebuilds `overall_strengths` / `overall_weaknesses` from `ai_interview_summary.evidence_report`
+(a skill answered well = strength with the answer's own point; weak / not tested = improvement area; skills the AI
+named that the position does not ask for are dropped); the AI's own lists stay as `ai_notes_*`, the per-skill rows as
+`position_skills`. `attach_strengths_weaknesses_analysis(..., position_skills=)` is fed `jd_skills` at submit and
+`rec["skills"]` on the on-demand / exclusion paths; a v2 analysis is rebuilt on the next open. (5) **Ten L2 questions**:
+`services/l2_questions.py` (PURE `build_prompt` / `parse_questions` — ≤ 10, distinct, '?', skill mapped onto the
+position's list, never invented; `generate` = ONE GPT-5.5 call, `call_type` `l2_questions`, env
+`L2_QUESTIONS_MODEL`). `GET` / `POST /hr/candidates/{cid}/interviews/{iid}/l2-questions[?regenerate=true]`
+(`_require_interview_report_reader`); stored on `report.l2_questions`, paid once. (6) `/hr/dashboard` and `/hr/schedules`
+never 500 on one bad record: housekeeping, the snapshot and each record row are wrapped and logged
+(`hr.dashboard.*`, `hr.schedules.row_enrich_failed`). Suite: 2,187 pass, 3 skipped (+ the known public-QR failure).
+
+**22 Oct 2026 — map a receipt to invoices AFTER it is recorded; edit it; unmap one invoice (`tests/test_customer_receipts.py`
+now 15; no migration):** Finance ask with a screenshot — every receipt was saved "on account" (the credit lands before
+anyone knows which invoices it pays) and there was no way to map it later; clicking a row did nothing visible.
+`routers/crm/customer_receipts.py` (all behind `RC_WRITE`): **`PUT /api/customer-receipts/{id}`** (`ReceiptUpdate`, only
+the fields SENT change — `model_fields_set`): date · amount · mode · reference · notes · branch; the amount may never drop
+below what is already applied to invoices (400 "unmap an invoice first"), `unallocated_amount` = amount − applied, the
+receipt's invoice payments follow date / mode / reference, a branch change is refused while a mapped invoice belongs to
+another branch. **`POST /api/customer-receipts/{id}/allocate`** (`AllocateIn {items: [{invoice_id, amount|null}], tds:
+[ReceiptTdsIn], branch_id?}`): the same rules as Add — same customer, no Proforma, `payment_block` (approval + IRN) → 409,
+one receipt = one branch; a receipt with no branch takes `body.branch_id`, else the single branch of the mapped invoices.
+TDS is booked first, then PURE **`plan_mapping(available, [(invoice, amount|None)])`** — typed amounts first (each ≤ the
+invoice balance, total ≤ on account → ValueError → 400), the rest oldest-first via `allocate`. **`DELETE
+/api/customer-receipts/{id}/allocations/{invoice_id}`**: the invoice's cash from this receipt goes back on account, the TDS
+booked with this receipt on it is unbooked (409 once marked received), `tds_total` follows. All three answer the updated
+receipt (`_receipt_payload`). F-V2: the receipt workbench (see that repo's notes). Deploy: restart.
+
+**22 Oct 2026 (later) — active customers only in the dropdowns, the ledger opens its invoices, sub-tab grants on
+every page (`tests/test_subtab_access.py` 16, `test_customer_receipts` +1; report tests re-pinned; no migration):**
+three screenshot asks. (1) **Customer dropdowns list ACTIVE customers** (user rule, supersedes the 12 Oct "filters keep
+everyone" note): `services/customers.active_customer_ids(db)` (never raises); the Billing Tracker options, the Screening
+Desk options, `GET /api/candidate-profiles/customers` and the AI Costs filter are active-only; the Revenue report's
+`_filter_options` keeps an INACTIVE customer only when it billed in the window (otherwise the period's totals could not
+be explained). Name LOOKUPS (`/api/customers/names` without `status`) still return everyone — old rows must not read
+"Customer #id". (2) **Customer ledger** (`routers/crm/finance_reports.customer_ledger`): every entry carries
+`invoice_id` / `invoice_number` (+ `receipt_id`, `credit_note_id`); `_customer_invoices` now also finds an invoice on
+one of the customer's POs whose project sits under another customer record (outer join + `po_id IN` the customer's
+POs). (3) ⚠️ **Sub-tabs are grantable** (reported: "Access Templates miss tabs and sub-tabs — Finance should get only
+Financial Reports + Revenue under Reports"). `access_registry.SUB_TABS` lists every page section (reports ·
+finance-reports · customers · branch-policy · opportunities · requirements · profiles · candidates · projects ·
+project-employees · timesheets · invoices · employees · talent-pool); each becomes a `tab:<key>` entry of the tab's
+field map (the 25 Aug storage — no migration). `registry()` tabs carry `subtabs` and their `fields` no longer list
+`tab:*`. The old Reports fields `opportunities / profiles / productivity` are gone (`_strip_removed_keys` drops them on
+the next save). PURE **`subtab_choice(tab_fields, sub)`**: no sub-tab of the tab set to view → "default" (role rules,
+only an explicit "hidden" hides — templates saved before today are unchanged); any set to view → the template decides
+that tab's sub-tabs alone ("show" / "hide"). `crm_deps.subtab_choice_for(db, user, tab, sub)` + **`subtab_gate(tab,
+subs, base)`**: any of `subs` shown → allowed (a tick may open Revenue for a non-Finance login), all hidden → 403,
+otherwise `base`. Wired: `reports.OPP_REPORT_READ / PROFILE_REPORT_READ / PRODUCTIVITY_READ` (on `REPORTS_READ`),
+**`REVENUE_READ = subtab_gate("reports", ("revenue", "financial"), FINANCE_VIEW)`** on revenue · placements · export
+(Financial Reports ▸ Profit reads revenue, hence either tick), `finance_reports.LEDGER_READ / RECEIVABLES_READ`
+(finance-reports sub-tab → reports/financial → `INV_READ`). Custom roles merge sub-tab ticks as a union
+(`_custom_role_grants`: a role that shows never loses to one that hides). Other pages' sub-tabs are enforced in the UI
+only (their data routes keep their tab gates). Deploy: restart; rebuild F-V2.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 
@@ -3929,7 +4109,7 @@ docker compose up -d --build       # monolith + postgres on :2020
 docker compose --profile cache up -d   # + redis (used only by rate limiting)
 
 # Migrations
-cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0140
+cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0144
 
 # Tests — run from backend/, no live DB needed
 cd backend && python -m pytest -q

@@ -743,6 +743,8 @@ def create_invoice(body: InvoiceCreate, db: Session = Depends(get_crm_db),
     )
     db.add(invoice)
     db.flush()
+    from services.invoice_parties import freeze as freeze_parties
+    freeze_parties(db, invoice)          # 0143 — the address of the day stays on it
     consume_po_for_invoice(db, invoice, po, user.id)
     db.commit()
     db.refresh(invoice)
@@ -756,6 +758,8 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
                   customer_approved: bool | None = None,
                   branch_id: int | None = None, employee_id: int | None = None,
                   month: str | None = None,
+                  einvoice: bool | None = None,
+                  irn_from: date | None = None, irn_to: date | None = None,
                   pp: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
     """16 Oct 2026 (user ask): `branch_id` (the project's branch, else the PO's
@@ -775,6 +779,18 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
         stmt = stmt.where(Invoice.kind == InvoiceKind.TAX.value,
                           Invoice.customer_approved_at.isnot(None) if customer_approved
                           else Invoice.customer_approved_at.is_(None))
+    if einvoice is not None:
+        # 21 Oct 2026: the Invoices ▸ E-invoice tab (true) = every tax invoice
+        # with its IRN in; false = approved by the customer, IRN still to add.
+        if einvoice and not invoice_approval.may_view_einvoice(user):
+            raise HTTPException(status_code=403, detail="Only Finance and Sales open the e-invoices.")
+        stmt = stmt.where(Invoice.kind == InvoiceKind.TAX.value,
+                          Invoice.irn_number.isnot(None) if einvoice
+                          else sa.and_(Invoice.irn_number.is_(None), Invoice.customer_approved_at.isnot(None)))
+    if irn_from is not None:
+        stmt = stmt.where(sa.func.coalesce(Invoice.ack_date, sa.cast(Invoice.irn_recorded_at, sa.Date)) >= irn_from)
+    if irn_to is not None:
+        stmt = stmt.where(sa.func.coalesce(Invoice.ack_date, sa.cast(Invoice.irn_recorded_at, sa.Date)) <= irn_to)
     if payment_status:
         stmt = stmt.where(
             Invoice.payment_status == _enum_or_400(PaymentStatus, payment_status, "payment_status"))
@@ -814,11 +830,15 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
             Invoice.timesheet_id.in_(select(Timesheet.id).join(Employee, Employee.id == Timesheet.employee_id)
                                      .where(sa.or_(Employee.first_name.ilike(like), Employee.last_name.ilike(like),
                                                    Employee.employee_code.ilike(like))))))
-    stmt = stmt.order_by(Invoice.customer_approved_at.desc().nullslast(), Invoice.id.desc()) \
-        if customer_approved else stmt.order_by(Invoice.id.desc())
+    if einvoice:
+        stmt = stmt.order_by(Invoice.irn_recorded_at.desc().nullslast(), Invoice.id.desc())
+    elif customer_approved:
+        stmt = stmt.order_by(Invoice.customer_approved_at.desc().nullslast(), Invoice.id.desc())
+    else:
+        stmt = stmt.order_by(Invoice.id.desc())
     items, meta = paginate(db, stmt, pp.page, pp.limit)
     rows = [serialize_invoice(inv) for inv in items]
-    see_irn = invoice_approval.may_see_irn(user)
+    see_irn = invoice_approval.may_view_einvoice(user)
     # Customer on every LIST row (14 Sep 2026): the Projects hub groups the
     # tab by customer. One batched query for the page — via the PO when the
     # invoice has one (the billed party), else the project's customer.
@@ -839,6 +859,18 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
             # The IRN itself stays on the invoice page; the list says only whether it is in.
             r["irn_recorded"] = bool(inv.irn_number)
             r["ack_number"] = inv.ack_number
+            if einvoice:
+                # The E-invoice tab prints the IRN, the dates and who recorded it.
+                r["irn_number"] = inv.irn_number
+                r["ack_date"] = inv.ack_date.isoformat() if inv.ack_date else None
+                r["irn_recorded_at"] = inv.irn_recorded_at.isoformat() if inv.irn_recorded_at else None
+                r["irn_recorded_by"] = inv.irn_recorded_by
+    if einvoice and see_irn:
+        from services.revenue_report import _user_names
+        rec_ids = {r.get("irn_recorded_by") for r in rows if r.get("irn_recorded_by")}
+        rec_names = _user_names(db, rec_ids) if rec_ids else {}
+        for r in rows:
+            r["irn_recorded_by_name"] = rec_names.get(r.get("irn_recorded_by") or 0)
     if customer_id is not None:
         # The Branch filter's choices for this customer (any role reading invoices).
         meta = {**(meta or {}), "branches": [{"id": b_id, "name": b_name} for b_id, b_name in db.execute(
@@ -873,8 +905,28 @@ def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
 
     from services.invoice_facets import invoice_facets
 
-    data.update(invoice_approval.payload(invoice, user,
-                                         _user_names(db, invoice_approval.user_ids(invoice))))
+    # Who did each Finance step (21 Oct 2026, user ask: "show the name of who
+    # took the Finance action, like Customer approved"): the tax invoice issuer
+    # (0144), every payment's recorder (0144) and whoever booked the TDS.
+    payments = list(getattr(invoice, "payments", None) or [])
+    tds = getattr(invoice, "tds_record", None)
+    ids = set(invoice_approval.user_ids(invoice))
+    ids |= {i for i in [getattr(invoice, "issued_by", None),
+                        getattr(tds, "created_by", None) if tds is not None else None,
+                        *[getattr(p, "created_by", None) for p in payments]] if i}
+    names = _user_names(db, ids) if ids else {}
+    data.update(invoice_approval.payload(invoice, user, names))
+    issued_at = getattr(invoice, "issued_at", None)
+    data["issued"] = {
+        "by": getattr(invoice, "issued_by", None),
+        "by_name": names.get(getattr(invoice, "issued_by", None) or 0),
+        "at": issued_at.isoformat() if issued_at is not None else None,
+    }
+    if isinstance(data.get("payments"), list):
+        for row in data["payments"]:
+            row["recorded_by_name"] = names.get(row.get("created_by") or 0)
+    if isinstance(data.get("tds_record"), dict) and tds is not None:
+        data["tds_record"]["created_by_name"] = names.get(getattr(tds, "created_by", None) or 0)
     # What the invoice is FOR — the work month, a cross-month period, the
     # employee, the branch (20 Oct 2026, user ask: "show which month this
     # invoice is" on the invoice page header).
@@ -953,6 +1005,123 @@ def record_einvoice(invoice_id: int, body: EInvoiceIn, db: Session = Depends(get
     db.refresh(invoice)
     return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
                     f"IRN saved on {invoice.invoice_number}")
+
+
+# ---------------------------------------------------------------------------
+# The address printed on an invoice (0143, 21 Oct 2026)
+# ---------------------------------------------------------------------------
+
+_PBase, _PField = BaseModel, Field
+PARTY_FIX = role_required("Finance")      # Finance + Admin / CEO
+
+
+class _PartyIn(_PBase):
+    name: str | None = _PField(default=None, max_length=255)
+    line1: str | None = _PField(default=None, max_length=1000)
+    line2: str | None = _PField(default=None, max_length=255)
+    city: str | None = _PField(default=None, max_length=120)
+    state: str | None = _PField(default=None, max_length=120)
+    pincode: str | None = _PField(default=None, max_length=16)
+    country: str | None = _PField(default=None, max_length=120)
+    gstin: str | None = _PField(default=None, max_length=15)
+    pan: str | None = _PField(default=None, max_length=10)
+
+
+class InvoicePartiesIn(_PBase):
+    buyer: _PartyIn
+    shipping: _PartyIn | None = None
+    reason: str = _PField(min_length=1, max_length=1000)
+    #: Also put this address on these other invoices (ids from GET …/parties
+    #: `same_address`) — the earlier invoices of the customer that print the
+    #: same address as this one.
+    apply_to: list[int] = _PField(default_factory=list, max_length=500)
+
+
+def _parties_payload(db: Session, invoice) -> dict:
+    from services import invoice_parties as ip
+    snap = ip.snapshot_of(invoice)
+    live_c, live_b, live_d = ip.resolve_live(db, invoice)
+    if snap is not None:
+        c, b, d = ip.as_namespaces(snap)
+        c = c or live_c
+    else:
+        c, b, d = live_c, live_b, live_d
+    frozen_buyer = ip.buyer_form(b, c)
+    current_buyer = ip.buyer_form(live_b, live_c)
+    po = invoice.po or (db.get(PurchaseOrder, invoice.po_id) if invoice.po_id else None)
+    same = ip.same_address_invoices(db, invoice, ip.customer_id_of(db, invoice))
+    return {
+        "invoice_id": invoice.id, "invoice_number": invoice.invoice_number,
+        "invoice_date": invoice.invoice_date.isoformat() if invoice.invoice_date else None,
+        "kind": invoice.kind, "irn_recorded": bool(getattr(invoice, "irn_number", None)),
+        "frozen": snap is not None,
+        "captured_at": (snap or {}).get("captured_at"), "source": (snap or {}).get("source"),
+        "corrected": (snap or {}).get("corrected"),
+        "printed": {"buyer": frozen_buyer, "shipping": ip.shipping_form(d, frozen_buyer["name"])},
+        "current": {"buyer": current_buyer, "shipping": ip.shipping_form(live_d, current_buyer["name"]),
+                    "branch_id": live_b.id if live_b is not None else None,
+                    "branch_name": live_b.branch_name if live_b is not None else None},
+        "customer_address_changed": ip.address_key(snap) != ip.address_key(ip.capture(db, invoice))
+        if snap is not None else False,
+        "po": ({"po_number": po.po_number, "billing": ip.po_form(po, "billing"),
+                "delivery": ip.po_form(po, "delivery")} if po is not None else None),
+        "same_address": [{"id": o.id, "invoice_number": o.invoice_number,
+                          "invoice_date": o.invoice_date.isoformat() if o.invoice_date else None,
+                          "kind": o.kind} for o in same],
+    }
+
+
+@router.get("/invoices/{invoice_id}/parties")
+def get_invoice_parties(invoice_id: int, db: Session = Depends(get_crm_db),
+                        user: CurrentUser = Depends(INV_READ)):
+    """The buyer / shipping details this invoice prints, the customer's records
+    today, the PO's own address, and the earlier invoices printing the same
+    address — what the "Address on this invoice" card and its correction dialog
+    show (services/invoice_parties.py)."""
+    invoice = get_invoice_or_404(db, invoice_id)
+    return envelope(_parties_payload(db, invoice), "Invoice address")
+
+
+@router.put("/invoices/{invoice_id}/parties")
+def correct_invoice_parties(invoice_id: int, body: InvoicePartiesIn, db: Session = Depends(get_crm_db),
+                            user: CurrentUser = Depends(PARTY_FIX)):
+    """Finance corrects the address printed on an issued invoice — typically to
+    put back the address it was really sent with before the customer moved —
+    and may apply the same address to the earlier invoices listed by GET.
+    Logged on the customer's Activity Log with before → after."""
+    from services import invoice_parties as ip
+    from services.customer_activity import record as record_customer_event
+    invoice = get_invoice_or_404(db, invoice_id)
+    customer_id = ip.customer_id_of(db, invoice)
+    allowed = {o.id for o in ip.same_address_invoices(db, invoice, customer_id)} if body.apply_to else set()
+    stray = [i for i in body.apply_to if i not in allowed]
+    if stray:
+        raise HTTPException(status_code=400, detail=(
+            "Only earlier invoices of this customer that print the same address can be corrected "
+            f"together — not {', '.join(str(i) for i in stray)}"))
+    targets = [invoice] + [get_invoice_or_404(db, i) for i in body.apply_to]
+    buyer = body.buyer.model_dump()
+    shipping = body.shipping.model_dump() if body.shipping else None
+    result = None
+    for inv in targets:
+        result = ip.correct(db, inv, buyer=buyer, shipping=shipping, reason=body.reason, actor=user)
+    if customer_id and result is not None:
+        numbers = ", ".join(i.invoice_number for i in targets)
+        before, after = result["before"], result["after"]
+        record_customer_event(
+            db, customer_id, "INVOICE_ADDRESS_CORRECTED",
+            f"Address printed on {numbers} corrected: {body.reason.strip()}",
+            entity="invoice", entity_id=invoice.id, subject=invoice.invoice_number, user=user,
+            changes={"Buyer": [before[0] if before else None, after[0] if after else None],
+                     "Address": [before[1] if before else None, after[1] if after else None],
+                     "GSTIN": [before[2] if before else None, after[2] if after else None],
+                     "Shipping address": [before[3] if before else None, after[3] if after else None],
+                     "Invoices": [None, numbers]})
+    db.commit()
+    db.refresh(invoice)
+    n = len(targets)
+    return envelope(_parties_payload(db, invoice),
+                    f"Address corrected on {n} invoice{'s' if n > 1 else ''}")
 
 
 @router.api_route("/invoices/{invoice_id}", methods=["PUT", "PATCH"])
@@ -1165,6 +1334,7 @@ def record_payment(invoice_id: int, body: PaymentIn, db: Session = Depends(get_c
         reference_number=body.reference_number,
         notes=body.notes,
         attachment_url=body.attachment_url,
+        created_by=user.id,
     )
     db.add(payment)
     tax.apply_invoice_payment(invoice, body.amount)

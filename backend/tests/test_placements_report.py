@@ -216,7 +216,7 @@ def test_route_is_admin_only_and_the_workbook_carries_the_split(book):
     from openpyxl import load_workbook
     from io import BytesIO
     from routers.crm import reports
-    assert "FINANCE_VIEW" in inspect.getsource(reports.revenue_placements)
+    assert "REVENUE_READ" in inspect.getsource(reports.revenue_placements)
     from services.revenue_export import _placement_sheets
     from openpyxl import Workbook
     wb = Workbook()

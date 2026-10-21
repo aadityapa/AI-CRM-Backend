@@ -47,3 +47,19 @@ def test_an_unknown_bucket_is_refused(db):
     with pytest.raises(HTTPException) as exc:
         _list(db, bucket="hired")
     assert exc.value.status_code == 400 and "joined" in exc.value.detail
+
+
+def test_a_joiner_on_a_closed_won_deal_stays_on_the_joined_chip(db):
+    """21 Oct 2026 (user report: two joined, the Joined chip showed one). Closing
+    a deal as Won hides its profiles; the person who JOINED must stay listed."""
+    shown = _profile(db, PS.JOINED)
+    won = _profile(db, PS.JOINED)
+    other = _profile(db, PS.SALES_SCREENING)
+    won.is_hidden = True
+    other.is_hidden = True
+    db.commit()
+
+    assert {r["id"] for r in _list(db, bucket="joined")["data"]} == {shown.id, won.id}
+    assert other.id not in {r["id"] for r in _list(db)["data"]}, "a hidden live candidacy stays hidden"
+    counts = _list(db, bucket="joined", with_phase_counts=True)["meta"]["phase_counts"]
+    assert counts["joined"] == 2

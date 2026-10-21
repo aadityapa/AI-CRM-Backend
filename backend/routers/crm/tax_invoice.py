@@ -119,16 +119,44 @@ def crm_einvoice_pdf(
 ):
     """The e-invoice (8 Oct 2026): the Tax Invoice with its e-Invoice band —
     IRN · Ack No. · Ack Date — and a QR to the public e-invoice page. Finance /
-    Admin / CEO (the IRN is theirs), and only once the IRN is recorded."""
-    from services.invoice_customer_approval import may_see_irn
-    if not may_see_irn(user):
-        raise HTTPException(status_code=403, detail="Only Finance opens the e-invoice.")
+    Admin / CEO (the IRN is theirs), and only once the IRN is recorded.
+    Always ONE A4 page (21 Oct 2026, `ti._pdf_via_weasyprint`)."""
+    tax_inv = _einvoice_model(db, invoice_id, request, user)
+    return _pdf_response(ti.render_pdf(tax_inv))
+
+
+def _einvoice_model(db: Session, invoice_id: int, request: Request, user: CurrentUser) -> ti.Invoice:
+    from services.invoice_customer_approval import may_view_einvoice
+    if not may_view_einvoice(user):
+        raise HTTPException(status_code=403, detail="Only Finance and Sales open the e-invoice.")
     invoice = get_invoice_or_404(db, invoice_id)
     if invoice.is_proforma or not invoice.irn_number:
         raise HTTPException(status_code=409, detail="Add the IRN and Ack No. first — the e-invoice is built from them.")
-    tax_inv = ti.map_crm_invoice_to_tax_invoice(
+    return ti.map_crm_invoice_to_tax_invoice(
         db, invoice, share_base_url=str(request.base_url).rstrip("/"), einvoice=True)
-    return _pdf_response(ti.render_pdf(tax_inv))
+
+
+@router.get("/api/invoices/{invoice_id}/einvoice.docx")
+def crm_einvoice_docx(
+    invoice_id: int,
+    request: Request,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(INV_READ),
+):
+    """The e-invoice as a Word document (21 Oct 2026) — the Word export with the
+    e-Invoice band (IRN · Ack No. · Ack Date + QR). Same gate as the PDF."""
+    from services.tax_invoice_docx import build_invoice_docx, docx_filename
+    tax_inv = _einvoice_model(db, invoice_id, request, user)
+    try:
+        content = build_invoice_docx(tax_inv)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("e-invoice Word export failed for invoice %s", invoice_id)
+        raise HTTPException(status_code=500, detail=f"Could not build the Word file: {exc}") from exc
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{docx_filename(tax_inv)}"'},
+    )
 
 
 @router.get("/api/invoices/{invoice_id}/tax-invoice.docx")

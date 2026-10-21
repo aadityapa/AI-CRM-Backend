@@ -5,7 +5,7 @@ reuses services/tax_invoice.py — this module wraps that engine for CRM invoice
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -617,7 +617,12 @@ def consume_po_for_invoice(db: Session, invoice: Invoice, po: PurchaseOrder | No
     customer can read without a PO moving. Balance is re-checked at this
     moment (not when the Proforma was raised) because other invoices may have
     drawn on the same PO in between. No commit.
+
+    Also stamps who issued the tax invoice (0144) — every path ends here.
     """
+    if getattr(invoice, "issued_at", None) is None:
+        invoice.issued_by = user_id
+        invoice.issued_at = datetime.now(timezone.utc)
     if po is None:
         return
     draw = po_draw_amount(invoice.sub_total)
@@ -815,6 +820,9 @@ def serialize_payment(payment: InvoicePayment) -> dict:
         "reference_number": payment.reference_number,
         "attachment_url": payment.attachment_url,
         "notes": payment.notes,
+        "receipt_id": payment.receipt_id,
+        "created_by": getattr(payment, "created_by", None),
+        "created_at": _iso(getattr(payment, "created_at", None)),
     }
 
 
@@ -962,6 +970,9 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         # 0141 — part N of a timesheet split across POs (null = the whole sheet).
         "split_no": getattr(invoice, "split_no", None),
         "split_qty": _num(invoice.split_qty) if getattr(invoice, "split_qty", None) is not None else None,
+        # 0142 — the days this part bills (split by dates).
+        "split_start": _iso(getattr(invoice, "split_start", None)),
+        "split_end": _iso(getattr(invoice, "split_end", None)),
         "invoice_date": _iso(invoice.invoice_date),
         "due_date": _iso(invoice.due_date),
         "sub_total": _num(invoice.sub_total),
@@ -1087,12 +1098,36 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         data["customer_name"] = (
             (customer.legal_entity_name or customer.name) if customer else None
         )
+        # 0143 — an issued invoice prints the address it was ISSUED with, not
+        # whatever the customer branch says today (services/invoice_parties).
+        from services import invoice_parties as _ip
+        snap = _ip.snapshot_of(invoice)
+        party_customer = customer
+        if snap is not None:
+            snap_customer, billing_branch, delivery_branch = _ip.as_namespaces(snap)
+            party_customer = snap_customer or customer
+            live_key = None
+            if db is not None:
+                try:
+                    live_key = _ip.address_key(_ip.capture(db, invoice))
+                except Exception:  # noqa: BLE001
+                    live_key = None
+            data["party_snapshot"] = {
+                "frozen": True,
+                "captured_at": snap.get("captured_at"),
+                "source": snap.get("source"),
+                "corrected": snap.get("corrected"),
+                # The customer's records moved since — this invoice keeps its own.
+                "customer_address_changed": bool(live_key and live_key != _ip.address_key(snap)),
+            }
+        else:
+            data["party_snapshot"] = {"frozen": False}
         override = invoice.buyer_state_code
         data["buyer"] = _party_from_branch(
-            billing_branch, customer, use_delivery=False, state_code_override=override,
+            billing_branch, party_customer, use_delivery=False, state_code_override=override,
         )
         data["shipping"] = _party_from_branch(
-            delivery_branch, customer, use_delivery=True, state_code_override=override,
+            delivery_branch, party_customer, use_delivery=True, state_code_override=override,
         )
         data["sac_code"] = sac_code
         # Standardize descriptions to Tax Invoice format for View + preview parity.
@@ -1147,6 +1182,11 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         from services.invoice_share import qr_svg_data_url, share_links
         links = share_links(invoice.id, invoice.invoice_number, base_url=share_base_url or "")
         data["share"] = {**links, "qr_svg": qr_svg_data_url(links["qr_target"])}
+        # The e-invoice (22 Oct 2026): the same sheet with an e-Invoice band
+        # (IRN · Ack No. · Ack Date + a QR to the public e-invoice page).
+        # The QR is only drawn once the IRN exists — the page 404s before.
+        if getattr(invoice, "irn_number", None):
+            data["share"]["einvoice_qr_svg"] = qr_svg_data_url(links["einvoice_url"])
     return data
 
 

@@ -211,7 +211,11 @@ def billing_tracker(db: Session, f: TrackerFilters) -> dict:
         cid = pcid or (po_cust.get(inv.po_id) if inv is not None and inv.po_id else None)
         if ts is not None:
             mkey = month_key(ts.year, ts.month)
-            period = period_label(ts.year, ts.month, ts.period_start_date, ts.period_end_date)
+            if inv is not None and getattr(inv, "split_start", None) and getattr(inv, "split_end", None):
+                # 0142 — a part split BY DATES names its own days.
+                period = period_label(ts.year, ts.month, inv.split_start, inv.split_end)
+            else:
+                period = period_label(ts.year, ts.month, ts.period_start_date, ts.period_end_date)
         else:
             mkey = month_key(inv.invoice_date.year, inv.invoice_date.month) if inv.invoice_date else None
             period = None
@@ -277,6 +281,12 @@ def billing_tracker(db: Session, f: TrackerFilters) -> dict:
     # never only those left after the current filter (a chosen month must not
     # make the other months disappear from its own dropdown).
     customers_seen, months_seen = _options(db, projects, po_cust, cust_names)
+    # Active customers only in the dropdown (22 Oct 2026, user rule); the rows of
+    # an inactive customer still show under "All customers".
+    from services.customers import active_customer_ids
+    active_ids = active_customer_ids(db)
+    if active_ids:
+        customers_seen = {cid: n for cid, n in customers_seen.items() if cid in active_ids}
     # Customer + search narrow everything (counts included); the stage narrows the rows only.
     if f.customer_id is not None:
         rows = [r for r in rows if r["customer_id"] == f.customer_id]

@@ -35,8 +35,9 @@ from services.org_settings import split_po_rules
 from services.notify import notify_employee, notify_role, notify_roles, notify_user
 from services.proforma import (
     PROFORMA_PREFIX, customer_invoice_format, invoice_credit_days, notify_proforma_ready,
-    plan_splits, replaceable_proforma, resolve_invoice_format, returned_proformas,
+    plan_date_splits, plan_splits, replaceable_proforma, resolve_invoice_format, returned_proformas,
 )
+from services.invoice_parties import freeze as freeze_parties
 from services.timesheets import (
     BillingPolicy,
     accrue_comp_off, approvals_report_rows, attachment_out, build_generated_entry,
@@ -52,6 +53,7 @@ from services.timesheets import (
     _due_rows, _project_branch,
     date_range, follow_on_window, holidays_for_project_range, overlapping_sheet,
     period_window_error, sheet_holiday_dates,
+    assignment_window_error, overlapping_sheets, period_options, sheet_is_open,
 )
 
 router = APIRouter(prefix="/api/timesheets", tags=["CRM: Timesheets"])
@@ -353,6 +355,14 @@ from pydantic import BaseModel as _PeriodBase  # noqa: E402
 class PeriodIn(_PeriodBase):
     start_date: date
     end_date: date
+    # 20 Oct 2026: when an OPEN neighbouring sheet (Draft / Rejected, nothing
+    # invoiced) already covers some of these days, shorten it and MOVE those
+    # days — hours, leave and all — onto this sheet instead of refusing.
+    adjust_neighbours: bool = False
+    # 20 Oct 2026: days this change REMOVES go to the open sheet right next to
+    # them (April takes 21–31 Mar when March shrinks to 20 Mar) instead of
+    # being deleted with their hours.
+    hand_over_removed: bool = False
 
 
 # --- Excel bulk import (26 Aug 2026) ---------------------------------------
@@ -468,11 +478,17 @@ def timesheet_bulk_import(
     file: UploadFile = File(...),
     year: int | None = None,
     month: int | None = None,
+    timesheet_id: int | None = None,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(get_current_user),
     _acc: CurrentUser = Depends(TS_EDIT),
 ):
     """Import timesheet data for ONE employee on ONE project.
+
+    ``timesheet_id`` (20 Oct 2026, "Fill from file" on a sheet): every day the
+    file gives inside THAT sheet's period goes onto that sheet — a 21 Feb –
+    20 Mar sheet takes its February days too, instead of them being pushed
+    onto the February sheet by calendar month.
 
     An .xlsx (template or customer matrix) is PARSED: rows may span months;
     each month becomes (or reuses) a Draft sheet with its full day grid
@@ -503,6 +519,21 @@ def timesheet_bulk_import(
         return _attach_only_import(db, user, _acc, file, content, project_id, employee_id, year, month)
     if month is not None and not 1 <= month <= 12:
         raise HTTPException(status_code=400, detail="Month must be 1–12")
+
+    target: Timesheet | None = None
+    target_window: tuple[date, date] | None = None
+    if timesheet_id is not None:
+        from services.timesheets import sheet_period_bounds as _bounds
+        target = get_timesheet_or_404(db, timesheet_id)
+        if target.project_id != project_id or target.employee_id != employee_id:
+            raise HTTPException(status_code=400, detail="That timesheet belongs to another employee or project")
+        if target.status not in EDITABLE_STATUSES:
+            raise HTTPException(status_code=409, detail=(
+                f"This timesheet is {getattr(target.status, 'value', target.status)} — "
+                "it can only be filled while Draft or Rejected"))
+        _t_pe = db.get(ProjectEmployee, target.project_employee_id) if target.project_employee_id else None
+        target_window = _bounds(target, _t_pe)
+        year, month = target.year, target.month
 
     ws = None
     if is_xlsx:
@@ -543,7 +574,7 @@ def timesheet_bulk_import(
     parsed: dict[tuple[int, int], list[TimesheetEntryIn]] = {}
     failed_rows: list[dict] = []
 
-    day_marks = [] if is_template else tsi.read_day_marks(grids, year, month)
+    day_marks = [] if is_template else tsi.read_day_marks(grids, year, month, window=target_window)
     for mark in day_marks:
         d, code = mark.day, mark.code
         mapped = tsi.status_for(code) if code else None
@@ -653,6 +684,24 @@ def timesheet_bulk_import(
                     f"File dates said {period_label(_y, _m)} but the header says "
                     f"{_hy} — imported as {period_label(_hy, _hm)}")
 
+    if target is not None:
+        # One sheet: every day of the file inside its period, whatever the
+        # calendar month. Days outside the period are named, not lost silently.
+        every = [it for items in parsed.values() for it in items]
+        inside = [it for it in every if target_window[0] <= it.entry_date <= target_window[1]]
+        outside = len(every) - len(inside)
+        parsed = {(target.year, target.month): inside} if inside else {}
+        if outside:
+            failed_rows.append({"row": 0, "error": (
+                f"{outside} day(s) in the file fall outside this sheet's period "
+                f"({target_window[0].strftime('%d-%b-%Y')} – {target_window[1].strftime('%d-%b-%Y')}) "
+                "and were left alone")})
+        if not inside:
+            raise HTTPException(status_code=400, detail=(
+                "None of the days in this file fall inside this sheet's period "
+                f"({target_window[0].strftime('%d-%b-%Y')} – {target_window[1].strftime('%d-%b-%Y')})"))
+        year_corrections = {}
+
     # ---- one month at a time: get-or-create the Draft sheet, apply rows ----
     months: list[dict] = []
     for (year, month) in sorted(parsed.keys()):
@@ -661,12 +710,15 @@ def timesheet_bulk_import(
         if (year, month) in year_corrections:
             label = f"{label} ({year_corrections[(year, month)]})"
         try:
-            created = create_timesheet(
-                TimesheetCreate(project_id=project_id, employee_id=employee_id,
-                                year=year, month=month, generate_days=True),
-                db=db, user=user, _acc=_acc,
-            )
-            ts_id = created["data"]["id"]
+            if target is not None:
+                ts_id = target.id
+            else:
+                created = create_timesheet(
+                    TimesheetCreate(project_id=project_id, employee_id=employee_id,
+                                    year=year, month=month, generate_days=True),
+                    db=db, user=user, _acc=_acc,
+                )
+                ts_id = created["data"]["id"]
             ts = db.get(Timesheet, ts_id)
             if ts.status not in EDITABLE_STATUSES:
                 months.append({"period": label, "timesheet_id": ts_id, "applied": 0,
@@ -870,17 +922,19 @@ def update_period(
     problem = period_window_error(ts.year, ts.month, body.start_date, body.end_date)
     if problem:
         raise HTTPException(status_code=400, detail=problem)
-    clash = overlapping_sheet(db, ts, body.start_date, body.end_date)
-    if clash is not None:
-        other, o_start, o_end = clash
-        raise HTTPException(
-            status_code=409,
-            detail=(f"{period_label(other.year, other.month)} timesheet already covers "
-                    f"{o_start.strftime('%d-%b-%Y')} to {o_end.strftime('%d-%b-%Y')} — "
-                    "change that sheet's period first so the two do not overlap"))
-
     pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
+    # Days before the employee joined / after they left would be pre-filled as
+    # working days and billed (20 Oct 2026, "amount wrong").
+    emp_row = db.get(Employee, ts.employee_id)
+    out_of_assignment = assignment_window_error(
+        pe, body.start_date, body.end_date, employee_display_name(emp_row) or "The employee")
+    if out_of_assignment:
+        raise HTTPException(status_code=400, detail=out_of_assignment)
     old_start, old_end = sheet_period_bounds(ts, pe)
+    handed = (_hand_over_removed_days(db, user, ts, old_start, old_end, body.start_date, body.end_date)
+              if body.hand_over_removed else [])
+    moved_in = _take_days_from_neighbours(db, user, ts, body.start_date, body.end_date,
+                                          allowed=body.adjust_neighbours)
     # Store NULL when the override equals the derived window — the sheet then
     # keeps following the PE record if HR later corrects onboarding/exit.
     derived = pe_period_bounds(ts.year, ts.month, pe)
@@ -920,15 +974,169 @@ def update_period(
     ).scalars().all()
     # Removed weekend work must claw back its real-time comp-off credit.
     accrue_comp_off(db, ts, entries)
+    moved_note = "".join(f"; {n} day{'s' if n != 1 else ''} moved from {label}"
+                         for label, n in moved_in)
+    moved_note += "".join(f"; {n} day{'s' if n != 1 else ''} handed to {label}"
+                          for label, n in handed)
     log_activity(
         db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PERIOD_CHANGED",
         f"Period {old_start.isoformat()}–{old_end.isoformat()} → "
         f"{body.start_date.isoformat()}–{body.end_date.isoformat()} "
-        f"(+{added} day{'s' if added != 1 else ''}, -{removed})")
+        f"(+{added} day{'s' if added != 1 else ''}, -{removed}{moved_note})")
     db.commit()
     db.refresh(ts)
-    return envelope(data=timesheet_detail_out(db, ts, entries),
-                    message="Timesheet period updated")
+    message = "Timesheet period updated"
+    notes = ([f"{n} day{'s' if n != 1 else ''} moved over from {label}" for label, n in moved_in]
+             + [f"{n} day{'s' if n != 1 else ''} handed to {label} with their hours" for label, n in handed])
+    if notes:
+        message += " — " + ", ".join(notes)
+    return envelope(data=timesheet_detail_out(db, ts, entries), message=message)
+
+
+def _hand_over_removed_days(db: Session, user: CurrentUser, ts: Timesheet, old_start: date, old_end: date,
+                            start: date, end: date) -> list[tuple[str, int]]:
+    """Days the new period drops go to the OPEN sheet right next to them, with
+    what was typed on them: the tail (after ``end``) to the next sheet when it
+    starts the day after ``old_end``, the head (before ``start``) to the
+    previous sheet when it ends the day before ``old_start``. A locked or
+    absent neighbour → nothing moves (the days are deleted as before)."""
+    from datetime import timedelta
+
+    from services.timesheets import pe_period_bounds
+    out: list[tuple[str, int]] = []
+    sides = []
+    if end < old_end:
+        sides.append(("tail", end + timedelta(days=1), old_end))
+    if start > old_start:
+        sides.append(("head", old_start, start - timedelta(days=1)))
+    for side, d_from, d_to in sides:
+        probe = (old_end + timedelta(days=1)) if side == "tail" else (old_start - timedelta(days=1))
+        hit = next((t for t in overlapping_sheets(db, ts, probe, probe)), None)
+        if hit is None:
+            continue
+        other, o_start, o_end = hit
+        if not sheet_is_open(db, other):
+            continue
+        label = period_label(other.year, other.month)
+        new_start, new_end = (d_from, o_end) if side == "tail" else (o_start, d_to)
+        problem = period_window_error(other.year, other.month, new_start, new_end)
+        if problem:
+            raise HTTPException(status_code=409, detail=(
+                f"{label} timesheet cannot take {d_from.strftime('%d-%b-%Y')} – {d_to.strftime('%d-%b-%Y')}: "
+                f"{problem}. Untick “give the removed days to {label}” to delete them instead"))
+        o_pe = db.get(ProjectEmployee, other.project_employee_id) if other.project_employee_id else None
+        derived = pe_period_bounds(other.year, other.month, o_pe)
+        other.period_start_date = None if new_start == derived[0] else new_start
+        other.period_end_date = None if new_end == derived[1] else new_end
+        theirs = {e.entry_date for e in db.execute(
+            select(TimesheetEntry).where(TimesheetEntry.timesheet_id == other.id)).scalars()}
+        count = 0
+        for row in db.execute(select(TimesheetEntry).where(
+                TimesheetEntry.timesheet_id == ts.id,
+                TimesheetEntry.entry_date >= d_from, TimesheetEntry.entry_date <= d_to)).scalars().all():
+            if row.entry_date in theirs:
+                continue
+            row.timesheet_id = other.id
+            count += 1
+        db.flush()
+        rest = db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == other.id)
+                          .order_by(TimesheetEntry.entry_date)).scalars().all()
+        accrue_comp_off(db, other, rest)
+        log_activity(
+            db, TimesheetActivityLog, "timesheet_id", other.id, user.id, "PERIOD_CHANGED",
+            f"Period {o_start.isoformat()}–{o_end.isoformat()} → {new_start.isoformat()}–"
+            f"{new_end.isoformat()} ({count} day{'s' if count != 1 else ''} handed over from "
+            f"{period_label(ts.year, ts.month)})")
+        out.append((label, count))
+    return out
+
+
+@router.get("/{timesheet_id}/period-options")
+def get_period_options(
+    timesheet_id: int,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(get_current_user),
+    _acc: CurrentUser = Depends(TS_VIEW),
+):
+    """The sheets either side, the employee's dates on the project and the
+    free span — so the Change-period dialog never offers a period that would
+    be refused."""
+    ts = get_timesheet_or_404(db, timesheet_id)
+    return envelope(data=period_options(db, ts))
+
+
+def _take_days_from_neighbours(db: Session, user: CurrentUser, ts: Timesheet,
+                               start: date, end: date, *, allowed: bool) -> list[tuple[str, int]]:
+    """Make start..end free for ``ts``. A LOCKED neighbour (submitted,
+    approved or invoiced) refuses with the dates that are free; an OPEN one is
+    shortened — only when ``allowed`` — and its days in the span are MOVED to
+    ``ts`` with their hours and leave, never re-typed. Returns
+    [(neighbour label, days moved)]."""
+    from datetime import timedelta
+
+    from services.timesheets import pe_period_bounds
+
+    clashes = overlapping_sheets(db, ts, start, end)
+    if not clashes:
+        return []
+    for other, o_start, o_end in clashes:
+        label = period_label(other.year, other.month)
+        if not sheet_is_open(db, other):
+            status = getattr(other.status, "value", other.status)
+            if o_end < date(ts.year, ts.month, 1):
+                hint = f"start this sheet on {(o_end + timedelta(days=1)).strftime('%d-%b-%Y')} or later"
+            else:
+                hint = f"end this sheet on {(o_start - timedelta(days=1)).strftime('%d-%b-%Y')} or earlier"
+            raise HTTPException(status_code=409, detail=(
+                f"{label} timesheet ({status}) already covers {o_start.strftime('%d-%b-%Y')} to "
+                f"{o_end.strftime('%d-%b-%Y')} — those days are already billed there, so {hint}"))
+        if not allowed:
+            raise HTTPException(status_code=409, detail=(
+                f"{label} timesheet already covers {o_start.strftime('%d-%b-%Y')} to "
+                f"{o_end.strftime('%d-%b-%Y')} — confirm moving those days to this sheet"))
+
+    moved: list[tuple[str, int]] = []
+    for other, o_start, o_end in clashes:
+        label = period_label(other.year, other.month)
+        if o_start < start:          # the neighbour sits before: it now ends the day before
+            new_start, new_end = o_start, start - timedelta(days=1)
+        elif o_end > end:            # the neighbour sits after: it now starts the day after
+            new_start, new_end = end + timedelta(days=1), o_end
+        else:
+            raise HTTPException(status_code=409, detail=(
+                f"This period would swallow the whole {label} timesheet "
+                f"({o_start.strftime('%d-%b-%Y')} – {o_end.strftime('%d-%b-%Y')}) — delete or shorten that sheet first"))
+        problem = period_window_error(other.year, other.month, new_start, new_end)
+        if problem:
+            raise HTTPException(status_code=409, detail=(
+                f"{label} timesheet cannot give up those days: {problem}"))
+        o_pe = db.get(ProjectEmployee, other.project_employee_id) if other.project_employee_id else None
+        derived = pe_period_bounds(other.year, other.month, o_pe)
+        other.period_start_date = None if new_start == derived[0] else new_start
+        other.period_end_date = None if new_end == derived[1] else new_end
+        mine = {e.entry_date for e in db.execute(
+            select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)).scalars()}
+        count = 0
+        for row in db.execute(
+                select(TimesheetEntry).where(TimesheetEntry.timesheet_id == other.id)).scalars().all():
+            if new_start <= row.entry_date <= new_end:
+                continue
+            if row.entry_date in mine or not (start <= row.entry_date <= end):
+                db.delete(row)       # cannot happen in practice; never two rows for one day
+                continue
+            row.timesheet_id = ts.id  # the day moves with what was typed on it
+            count += 1
+        db.flush()
+        rest = db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == other.id)
+                          .order_by(TimesheetEntry.entry_date)).scalars().all()
+        accrue_comp_off(db, other, rest)
+        log_activity(
+            db, TimesheetActivityLog, "timesheet_id", other.id, user.id, "PERIOD_CHANGED",
+            f"Period {o_start.isoformat()}–{o_end.isoformat()} → {new_start.isoformat()}–"
+            f"{new_end.isoformat()} ({count} day{'s' if count != 1 else ''} moved to "
+            f"{period_label(ts.year, ts.month)})")
+        moved.append((label, count))
+    return moved
 
 
 # ---------------------------------------------------------------- entries
@@ -1823,6 +2031,20 @@ def timesheet_po_options(
 
     ts_emp = db.get(Employee, ts.employee_id) if ts.employee_id else None
     customer = db.get(Customer, project.customer_id) if project.customer_id else None
+    progress = billing_progress(db, ts)
+    # 0142 — what the dialog needs to split the sheet BY DATES and show each
+    # part's amount before it is raised (the server prices it the same way).
+    split_unit = progress.get("billing_unit") or unit
+    s_window, s_days = split_day_weights(db, ts, split_unit)
+    split_days = {
+        "start": s_window[0].isoformat(), "end": s_window[1].isoformat(),
+        "basis": "hours" if split_unit == "Hourly" else "days",
+        "days": [{"date": d.isoformat(), "weight": float(w)} for d, w in s_days],
+        "taken": [{"start": i.split_start.isoformat(), "end": i.split_end.isoformat(),
+                   "split_no": i.split_no, "invoice_number": i.invoice_number}
+                  for i in live_invoices(invoices_for(db, ts))
+                  if i.split_no is not None and i.split_start is not None and i.split_end is not None],
+    }
     return envelope(data={
         "pos": po_rows,
         # Names for the dialog's header (30 Sep 2026): the GM confirms WHOSE
@@ -1844,7 +2066,8 @@ def timesheet_po_options(
             if (returned := replaceable_proforma(db, ts)) is not None else None),
         # 0141 — how much of the sheet is already raised, and what is left, so
         # the dialog can split the rest across POs.
-        "billing_progress": billing_progress(db, ts),
+        "billing_progress": progress,
+        "split_days": split_days,
         # Admin's split-PO rules (Settings ▸ Organisation ▸ Billing): the
         # dialog hides the split, caps the lines and marks expired POs off.
         "split_rules": split_po_rules(),
@@ -2040,6 +2263,7 @@ def generate_invoice_from_timesheet(
     grand_total = invoice.grand_total
     db.add(invoice)
     db.flush()
+    freeze_parties(db, invoice)          # 0143 — the address of the day stays on it
     log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PROFORMA_GENERATED",
                  f"Proforma invoice {proforma_number} raised for {float(grand_total):,.2f} "
                  f"({format_summary(invoice_format)})")
@@ -2059,6 +2283,28 @@ def _refuse_expired_po(po: PurchaseOrder, rules: dict) -> None:
         raise HTTPException(status_code=400, detail=(
             f"PO {po.po_number} ended on {po.end_date:%d %b %Y} — billing an expired PO is "
             "switched off. Renew the PO, or ask Admin to allow it in Settings ▸ Organisation ▸ Billing"))
+
+
+def split_day_weights(db: Session, ts: Timesheet, unit: str | None) -> tuple[tuple, list[tuple]]:
+    """0142 — (window, [(date, weight)]) for splitting a sheet BY DATES.
+
+    Weight = billable hours on an Hourly rate, else billable days — the same
+    billed days the sheet's invoice counts, so a Monthly rate is shared by
+    them. Every day of the window is listed (0 where nothing is billable)."""
+    from services.timesheets import sheet_period_bounds as _bounds
+    pe = db.get(ProjectEmployee, ts.project_employee_id) if ts.project_employee_id else None
+    window = _bounds(ts, pe)
+    rows = db.execute(select(TimesheetEntry).where(TimesheetEntry.timesheet_id == ts.id)).scalars().all()
+    by_day: dict[date, Decimal] = {}
+    for e in rows:
+        w = e.billable_hours if unit == "Hourly" else e.billable_days
+        by_day[e.entry_date] = by_day.get(e.entry_date, Decimal("0")) + Decimal(str(w or 0))
+    days = []
+    d = window[0]
+    while d <= window[1]:
+        days.append((d, by_day.get(d, Decimal("0"))))
+        d += timedelta(days=1)
+    return window, days
 
 
 def _raise_split_proformas(db: Session, ts: Timesheet, body: GenerateInvoiceIn,
@@ -2100,9 +2346,30 @@ def _raise_split_proformas(db: Session, ts: Timesheet, body: GenerateInvoiceIn,
     total_qty = Decimal(str(li.get("total_billed_qty") or 0))
     used_qty = sum((Decimal(str(i.split_qty or 0)) for i in live), Decimal("0"))
     rate = Decimal(str(li["rate_per_unit"])) if li.get("rate_per_unit") else None
+    unit_name = str(li.get("billing_unit") or progress.get("billing_unit") or "")
+    raw = [s.model_dump() for s in body.splits]
+    dated = any(s.get("start_date") or s.get("end_date") for s in raw)
+    ranges: dict[int, dict] = {}
+    if dated:
+        # 0142 — split BY DATES: the server prices each date range.
+        if any(i.split_start is None for i in live if i.split_no is not None):
+            raise HTTPException(status_code=409, detail=(
+                "This timesheet was already split by hours / amount — raise the rest the same way"))
+        window, days = split_day_weights(db, ts, unit_name)
+        taken = [(i.split_start, i.split_end) for i in live
+                 if i.split_no is not None and i.split_start is not None]
+        try:
+            dparts = plan_date_splits(raw, days=days, window=window, total=total, taken=taken)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        ranges = {p["po_id"]: p for p in dparts}
+        raw = [{"po_id": p["po_id"], "amount": float(p["amount"])} for p in dparts]
+    elif any(i.split_start is not None for i in live if i.split_no is not None):
+        raise HTTPException(status_code=409, detail=(
+            "This timesheet was split by dates — give the remaining days a date range"))
     try:
         parts = plan_splits(
-            [s.model_dump() for s in body.splits], remaining=remaining,
+            raw, remaining=remaining,
             remaining_qty=max(Decimal("0"), total_qty - used_qty) if total_qty else None,
             rate=rate, unit=str(li.get("billing_unit") or progress.get("billing_unit") or ""),
             rate_split=bool(li.get("rate_split")))
@@ -2147,9 +2414,14 @@ def _raise_split_proformas(db: Session, ts: Timesheet, body: GenerateInvoiceIn,
             number = next_sequence_number(db, Invoice, Invoice.invoice_number, PROFORMA_PREFIX)
             ensure_unique_invoice_number(db, number)
         qty = p["qty"]
-        share = (f"{qty.normalize():f} of {total_qty.normalize():f} {unit_word}"
-                 if qty is not None and total_qty and unit in ("Hourly", "Daily")
-                 else f"₹{p['amount']:,.2f} of ₹{total:,.2f}")
+        rng = ranges.get(p["po_id"])
+        if rng is not None:
+            share = (f"{rng['start']:%d %b %Y} to {rng['end']:%d %b %Y}, "
+                     f"{rng['days']} day{'s' if rng['days'] != 1 else ''}")
+        else:
+            share = (f"{qty.normalize():f} of {total_qty.normalize():f} {unit_word}"
+                     if qty is not None and total_qty and unit in ("Hourly", "Daily")
+                     else f"₹{p['amount']:,.2f} of ₹{total:,.2f}")
         desc = f"{li.get('description') or 'Services'} — part {next_no} (PO {po.po_number}: {share})"
         tax_amount, grand_total, _gst = karnex_gst_tax_and_grand(
             db, po=po, project_id=ts.project_id, lines=[], sub_total=p["amount"])
@@ -2158,6 +2430,7 @@ def _raise_split_proformas(db: Session, ts: Timesheet, body: GenerateInvoiceIn,
             invoice_number=number, proforma_number=number, kind=InvoiceKind.PROFORMA.value,
             invoice_format=invoice_format, po_id=po.id, project_id=ts.project_id,
             timesheet_id=ts.id, split_no=next_no, split_qty=qty,
+            split_start=rng["start"] if rng else None, split_end=rng["end"] if rng else None,
             invoice_date=invoice_dt,
             due_date=invoice_dt + timedelta(days=invoice_credit_days(db, ts.project_id, po)[0]),
             sub_total=p["amount"], tax_amount=tax_amount, grand_total=grand_total,
@@ -2170,6 +2443,7 @@ def _raise_split_proformas(db: Session, ts: Timesheet, body: GenerateInvoiceIn,
         apply_round_off(inv, bool(getattr(body, "round_off", False)))
         db.add(inv)
         db.flush()
+        freeze_parties(db, inv)          # 0143 — the address of the day stays on it
         created.append(inv)
         log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "PROFORMA_GENERATED",
                      f"Proforma {number} raised for part {next_no} on PO {po.po_number}: "

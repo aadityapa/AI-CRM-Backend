@@ -452,17 +452,21 @@ def _filter_options(db: Session, start: date, end: date) -> dict:
     def _live(value) -> bool:
         return str(getattr(value, "value", value) or "").lower() != "inactive"
 
+    # 22 Oct 2026 (user rule: "only active customers in every dropdown"): an
+    # INACTIVE customer is listed only when it billed in this window — otherwise
+    # the period's totals could not be explained — and its projects follow it.
+    shown = {c[0] for c in customers if _live(c[2]) or c[0] in billed_customers}
     return {
         "customers": sorted(
             ({"id": c[0], "name": c[1] or f"#{c[0]}",
               "billed": c[0] in billed_customers, "active": _live(c[2])}
-             for c in customers),
+             for c in customers if c[0] in shown),
             key=lambda r: (r["name"] or "").lower(),
         ),
         "projects": sorted(
             ({"id": p[0], "name": p[1] or f"#{p[0]}", "customer_id": p[2],
               "billed": p[0] in billed_projects, "active": _live(p[3])}
-             for p in projects),
+             for p in projects if p[2] in shown or p[0] in billed_projects),
             key=lambda r: (r["name"] or "").lower(),
         ),
     }

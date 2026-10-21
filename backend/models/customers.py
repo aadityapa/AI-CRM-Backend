@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
-from models.base import Base, TimestampMixin, pg_enum
+from models.base import USERS_FK, Base, TimestampMixin, pg_enum
 
 
 class CustomerStatus(str, enum.Enum):
@@ -228,6 +228,40 @@ class CustomerRateCard(Base):
     )
 
     customer = relationship("Customer")
+
+
+class CustomerActivityLog(Base):
+    """Everything that changed on a customer's own records (0143, 21 Oct 2026).
+
+    Written by the flush listener in `services/customer_activity.py` for the
+    customer, its branches, contacts, documents, billing / branch policy, rate
+    cards and leave policies — so an address change, say, is on record with the
+    old and the new value — plus explicit events (an invoice's printed address
+    corrected). The customer's Activity Log tab merges these rows with the
+    opportunity / requirement / candidate / PO / timesheet logs and the invoice
+    and payment history of the customer.
+
+    `branch_id` has no FK on purpose: the history of a deleted branch stays.
+    """
+
+    __tablename__ = "customer_activity_log"
+    id = sa.Column(sa.Integer, primary_key=True)
+    customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id", ondelete="CASCADE"),
+                            nullable=False, index=True)
+    branch_id = sa.Column(sa.Integer, nullable=True, index=True)
+    #: customer | branch | contact | document | policy | rate_card | leave_policy | invoice
+    entity = sa.Column(sa.String(32), nullable=False)
+    entity_id = sa.Column(sa.Integer, nullable=True)
+    #: What the row is about, as it was named then ("Pune HQ", "Ravi (Finance)").
+    subject = sa.Column(sa.String(255), nullable=True)
+    user_id = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    user_name = sa.Column(sa.String(255), nullable=True)
+    action_type = sa.Column(sa.String(64), nullable=False)
+    comment = sa.Column(sa.Text, nullable=True)
+    #: {field: [old, new]} for an edit.
+    changes = sa.Column(JSONB, nullable=True)
+    timestamp = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),
+                          nullable=False, index=True)
 
 
 class ContactPerson(Base):

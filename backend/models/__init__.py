@@ -9,8 +9,8 @@ from models.masters import (  # noqa: F401
     FinancialYear, LeavePolicyType, Location, Skill, TaxRate, UserTablePreference
 )
 from models.customers import (  # noqa: F401
-    BranchHolidayYear, ContactPerson, Customer, CustomerBillingPolicy, CustomerBranch, CustomerDocument,
-    CustomerRateCard, CustomerStatus,
+    BranchHolidayYear, ContactPerson, Customer, CustomerActivityLog, CustomerBillingPolicy, CustomerBranch,
+    CustomerDocument, CustomerRateCard, CustomerStatus,
 )
 from models.opportunities import (  # noqa: F401
     Opportunity, OpportunityActivityLog, OpportunityApprovalStatus, OpportunityAttachment,

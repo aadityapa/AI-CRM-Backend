@@ -182,7 +182,7 @@ def test_route_is_finance_and_sales_by_role_only():
     from routers.crm import reports
     import inspect
     src = inspect.getsource(reports.revenue)
-    assert "FINANCE_VIEW" in src
+    assert "REVENUE_READ" in src
     assert reports.FINANCE_VIEW_ROLES == ("Finance", "Sales", "Sales_Head")
     mod = inspect.getsource(reports)
     assert 'FINANCE_VIEW = role_required(*FINANCE_VIEW_ROLES)' in mod
@@ -296,7 +296,7 @@ def test_targets_are_finance_and_export_follows_the_page():
     import inspect
     from routers.crm import reports
     assert "FINANCE_EDIT" in inspect.getsource(reports.revenue_targets)
-    assert "FINANCE_VIEW" in inspect.getsource(reports.revenue_export)
+    assert "REVENUE_READ" in inspect.getsource(reports.revenue_export)
 
 
 def test_month_close_job_mails_admin_and_ceo_once(ledger, monkeypatch):
@@ -459,7 +459,7 @@ def test_route_accepts_the_new_parameters():
     src = inspect.getsource(reports.revenue)
     for name in ("period", "customer_id", "project_id"):
         assert f"{name}:" in src
-    assert "FINANCE_VIEW" in src          # Finance + Sales family, by role
+    assert "REVENUE_READ" in src          # Finance + Sales family by role, or the sub-tab
     with pytest.raises(ValueError):
         Period.parse("decade", None, TODAY)
 

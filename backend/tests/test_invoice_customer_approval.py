@@ -104,11 +104,16 @@ def test_a_proforma_is_never_confirmed():
     assert e.value.status_code == 400
 
 
-def test_the_irn_block_reaches_finance_admin_and_ceo_only():
+def test_the_irn_block_reaches_finance_sales_admin_and_ceo():
+    """21 Oct 2026: every Sales rung READS the e-invoice; only Finance /
+    Admin / CEO may edit it; anyone else never receives the key."""
     inv = _invoice(irn_number=IRN, ack_number="112010036563310")
-    for roles in (("Sales_Head",), ("Sales", "Sales Manager"), ("GM",), ("Sales",)):
+    for roles in (("GM",), ("TA",), ("HR",)):
         out = ica.payload(inv, _user(*roles))
         assert "einvoice" not in out and "customer_approval" in out
+    for roles in (("Sales_Head",), ("Sales", "Sales Manager"), ("Sales",)):
+        block = ica.payload(inv, _user(*roles))["einvoice"]
+        assert block["irn"] == IRN and block["can_edit"] is False
     for roles in (("Finance",), ("Admin",), ("CEO",)):
         assert ica.payload(inv, _user(*roles))["einvoice"]["irn"] == IRN
 

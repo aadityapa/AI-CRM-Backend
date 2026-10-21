@@ -328,6 +328,43 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
 
     _gap(doc)
 
+    # ---- e-Invoice band (21 Oct 2026): IRN · Ack No. · Ack Date + its QR,
+    #      the same band the PDF prints under the header -----------------------
+    band_qr_done = False
+    if inv.is_einvoice:
+        cells = dict(ti.einvoice_rows(inv))
+        qr_w = 2.4
+        band = _table(doc, 1, 2, [USABLE - qr_w, qr_w], margins=(0.1, 0.1, 0.25, 0.2))
+        _table_borders(band, color="1D4ED8", inside=False)
+        bl, br = band.rows[0].cells
+        _shade(bl, "EFF6FF")
+        _shade(br, "EFF6FF")
+        _cell(bl, "E-INVOICE", bold=True, size=7.5, color=RGBColor(0x1D, 0x4E, 0xD8),
+              valign=WD_CELL_VERTICAL_ALIGNMENT.CENTER)
+        p = _line(bl, "", before=2)
+        _run(p, "IRN : ", bold=True, size=8, color=NAVY_RGB)
+        _run(p, cells.get("IRN") or "—", size=7.5)
+        p = _line(bl, "", before=1)
+        _run(p, "Ack No. : ", bold=True, size=8, color=NAVY_RGB)
+        _run(p, cells.get("Ack No.") or "—", size=8)
+        _run(p, "        Ack Date : ", bold=True, size=8, color=NAVY_RGB)
+        _run(p, cells.get("Ack Date") or "—", size=8)
+        qp = _cell(br, align=WD_ALIGN_PARAGRAPH.CENTER)
+        if getattr(inv, "share_url", None):
+            try:
+                from services.invoice_share import qr_png_bytes
+                png = qr_png_bytes(inv.share_url)
+                if png:
+                    qp.add_run().add_picture(io.BytesIO(png), height=Cm(1.7))
+                    _line(br, "Scan to view", size=6.5, color=MUTED_RGB, align=WD_ALIGN_PARAGRAPH.CENTER)
+                    band_qr_done = True
+            except Exception:
+                band_qr_done = False
+        if not band_qr_done and getattr(inv, "share_url", None):
+            _hyperlink(qp, inv.share_url, "View online", color=NAVY, size=8, bold=False)
+            band_qr_done = True
+        _gap(doc)
+
     # ---- buyer / shipping cards ------------------------------------------
     b = inv.buyer
     cards = _table(doc, 2, 2, [half, half], margins=(0.1, 0.1, 0.25, 0.25))
@@ -484,7 +521,7 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
         except Exception:
             pass
     qr_embedded = False
-    if getattr(inv, "share_url", None):
+    if getattr(inv, "share_url", None) and not band_qr_done:   # an e-invoice has its QR in the band
         try:
             from services.invoice_share import qr_png_bytes
             png = qr_png_bytes(inv.share_url)
@@ -497,7 +534,7 @@ def build_invoice_docx(inv: ti.Invoice) -> bytes:
     sig = _line(dc, "Authorized Signatory", size=8, color=MUTED_RGB, before=2)
     if qr_embedded:
         _run(sig, "                     Scan to view", size=7, color=MUTED_RGB)
-    elif getattr(inv, "share_url", None):
+    elif getattr(inv, "share_url", None) and not band_qr_done:
         _run(sig, "   ·   ", size=7.5, color=MUTED_RGB)
         _hyperlink(sig, inv.share_url, "view this invoice online", color=NAVY, size=8, bold=False)
 

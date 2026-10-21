@@ -32,6 +32,9 @@ EVENT_CUSTOMER_APPROVED = "invoice.customer_approved"   # → Finance
 
 CONFIRM_ROLES = ("Sales_Head", "Sales Manager")
 IRN_ROLES = ("Finance",)
+# 21 Oct 2026 (user ask): every Sales rung READS the e-invoice (IRN, Ack No.,
+# the PDF / Word) from the Invoices ▸ E-invoice tab; only Finance records it.
+EINVOICE_VIEW_ROLES = ("Finance", "Sales", "Sales_Head", "Sales Manager")
 ADMIN_ROLES = ("Admin", "CEO")
 
 #: A GST e-invoice IRN is the 64-character SHA-256 hex digest the IRP returns.
@@ -59,6 +62,12 @@ def may_confirm(user) -> bool:
 def may_see_irn(user) -> bool:
     """Finance / Admin / CEO — by role. Everyone else never gets the IRN."""
     return _has(user, IRN_ROLES + ADMIN_ROLES)
+
+
+def may_view_einvoice(user) -> bool:
+    """Finance + every Sales rung + Admin / CEO — read the IRN and open the
+    e-invoice. Recording / correcting it stays `may_see_irn` (Finance)."""
+    return _has(user, EINVOICE_VIEW_ROLES + ADMIN_ROLES)
 
 
 def is_approved(invoice: Invoice) -> bool:
@@ -310,7 +319,7 @@ def payload(invoice: Invoice, user, names: dict[int, str] | None = None) -> dict
             "block": confirm_block(invoice),
         },
     }
-    if may_see_irn(user):
+    if may_view_einvoice(user):
         out["einvoice"] = {
             "irn": invoice.irn_number,
             "ack_number": invoice.ack_number,
@@ -318,7 +327,7 @@ def payload(invoice: Invoice, user, names: dict[int, str] | None = None) -> dict
             "recorded_at": iso(invoice.irn_recorded_at),
             "recorded_by": invoice.irn_recorded_by,
             "recorded_by_name": names.get(invoice.irn_recorded_by or 0),
-            "can_edit": (not invoice.is_proforma) and is_approved(invoice),
+            "can_edit": may_see_irn(user) and (not invoice.is_proforma) and is_approved(invoice),
         }
     # Whether the e-invoice exists — a yes/no for every reader (the IRN itself
     # stays Finance / Admin / CEO only); drives the invoice page's journey.

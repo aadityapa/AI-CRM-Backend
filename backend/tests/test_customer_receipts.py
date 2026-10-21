@@ -342,3 +342,91 @@ def test_receivables_say_how_late_the_money_is_and_leave_proformas_out(db):
     assert row["oldest_days_late"] == 80
     assert [i["invoice_number"] for i in row["open_invoices"]] == ["OLD", "NEW"]
     assert [b["key"] for b in data["buckets"]][0] == "not_due"
+
+
+# ---------------------------------------------------------------------------
+# 22 Oct 2026 — money recorded "on account" first, mapped to invoices later.
+# ---------------------------------------------------------------------------
+
+def test_plan_mapping_takes_typed_amounts_then_fills_oldest_first():
+    from routers.crm.customer_receipts import plan_mapping
+    a = SimpleNamespace(id=1, invoice_number="A", invoice_date=date(2026, 8, 1), balance_amount=Decimal("100"))
+    b = SimpleNamespace(id=2, invoice_number="B", invoice_date=date(2026, 8, 5), balance_amount=Decimal("300"))
+    plan, left = plan_mapping(Decimal("250"), [(b, Decimal("200")), (a, None)])
+    assert [(i.id, float(x)) for i, x in plan] == [(1, 50.0), (2, 200.0)] and left == 0
+    with pytest.raises(ValueError):
+        plan_mapping(Decimal("50"), [(b, Decimal("100"))])          # more than is left
+    with pytest.raises(ValueError):
+        plan_mapping(Decimal("500"), [(a, Decimal("150"))])         # more than the balance
+
+
+def test_an_on_account_receipt_is_mapped_edited_and_unmapped(db):
+    from fastapi import HTTPException
+    from routers.crm.customer_receipts import (
+        AllocateIn, AllocateItemIn, ReceiptTdsIn, ReceiptUpdate,
+        allocate_receipt, unmap_invoice, update_receipt,
+    )
+    cust, a = _open_invoice(db, "INV-M1", 1000, 180, day=2)
+    _, b = _open_invoice(db, "INV-M2", 1000, 180, day=6)
+    # Finance records the credit first, no invoice ticked → all on account.
+    rid = create_receipt(ReceiptIn(customer_id=cust.id, received_date=date(2026, 10, 1), amount=Decimal("2000"),
+                                   payment_mode="NEFT", reference_number="UTR9"), db=db, user=FIN)["data"]["id"]
+
+    # Map: INV-M1 with 10 % TDS (100) → cash 1,080 by default; INV-M2 gets the rest (920).
+    res = allocate_receipt(rid, AllocateIn(items=[AllocateItemIn(invoice_id=a.id), AllocateItemIn(invoice_id=b.id)],
+                                           tds=[ReceiptTdsIn(invoice_id=a.id, tds_rate=Decimal("10"))]),
+                           db=db, user=FIN)
+    body = res["data"]
+    db.refresh(a); db.refresh(b)
+    assert float(a.balance_amount) == 0 and float(b.balance_amount) == 260
+    assert body["unallocated_amount"] == 0 and body["tds_total"] == 100 and body["allocated_amount"] == 2000
+    assert "nothing left on account" in res["message"]
+
+    # The amount can't drop below what is applied; the rest of the details edit freely.
+    with pytest.raises(HTTPException) as err:
+        update_receipt(rid, ReceiptUpdate(amount=Decimal("1500")), db=db, user=FIN)
+    assert err.value.status_code == 400
+    out = update_receipt(rid, ReceiptUpdate(amount=Decimal("2500"), reference_number="UTR10",
+                                            received_date=date(2026, 10, 2)), db=db, user=FIN)["data"]
+    assert out["unallocated_amount"] == 500 and out["reference_number"] == "UTR10"
+    from models import InvoicePayment
+    assert {p.reference_number for p in db.query(InvoicePayment).filter_by(receipt_id=rid)} == {"UTR10"}
+
+    # Unmap INV-M1: its cash goes back on account, its TDS comes off.
+    out = unmap_invoice(rid, a.id, db=db, user=FIN)["data"]
+    db.refresh(a)
+    assert out["unallocated_amount"] == 1580 and out["tds_total"] == 0
+    assert float(a.balance_amount) == 1180 and a.tds_record is None
+    assert [x["invoice_number"] for x in out["allocations"]] == ["INV-M2"]
+
+    # Nothing to map once the invoice is already paid off.
+    with pytest.raises(HTTPException):
+        unmap_invoice(rid, a.id, db=db, user=FIN)
+
+
+def test_ledger_lists_po_only_invoices_and_every_line_opens_its_invoice(db):
+    """22 Oct 2026: the Customer ledger names the invoice behind every line (so
+    the page can open it) and also finds an invoice raised on the customer's PO
+    whose project sits under another customer record."""
+    from models import PurchaseOrder
+    from routers.crm.finance_reports import customer_ledger
+    cust = Customer(name="APTIV")
+    db.add(cust); db.flush()
+    other = Customer(name="APTIV (old record)")
+    db.add(other); db.flush()
+    proj = Project(name="P1", customer_id=cust.id, status="Active", billing_frequency="Monthly")
+    proj2 = Project(name="P2", customer_id=other.id, status="Active", billing_frequency="Monthly")
+    po = PurchaseOrder(po_number="PO-9", customer_id=cust.id, total_value=1000)
+    db.add_all([proj, proj2, po]); db.flush()
+    a = Invoice(invoice_number="INV-A", project_id=proj.id, invoice_date=date(2026, 8, 1),
+                sub_total=100, tax_amount=0, grand_total=100, paid_amount=0, balance_amount=100,
+                payment_status="Unpaid")
+    b = Invoice(invoice_number="INV-B", project_id=proj2.id, po_id=po.id, invoice_date=date(2026, 8, 5),
+                sub_total=50, tax_amount=0, grand_total=50, paid_amount=0, balance_amount=50,
+                payment_status="Unpaid")
+    db.add_all([a, b]); db.commit()
+    data = customer_ledger(customer_id=cust.id, date_from=None, date_to=None, db=db, user=FIN)["data"]
+    by_ref = {e["ref"]: e for e in data["entries"]}
+    assert set(by_ref) == {"INV-A", "INV-B"}
+    assert by_ref["INV-A"]["invoice_id"] == a.id and by_ref["INV-B"]["invoice_id"] == b.id
+    assert data["closing_balance"] == 150

@@ -54,8 +54,13 @@ def test_the_three_operational_reports_follow_the_reports_tab_grant():
     assert 'REPORTS_READ = gated_read("reports")' in src
     for route in ('@router.get("/opportunities")', '@router.get("/candidate-profiles")', '@router.get("/recruiter-productivity")'):
         body = src.split(route, 1)[1].split("@router.", 1)[0]
-        assert "Depends(REPORTS_READ)" in body, route
-    # The CEO reports are read by ROLE (Finance · Sales · Sales Head + Admin/CEO,
-    # 19 Oct 2026) — no template can widen them.
+        assert "_READ)" in body, route
+    # 22 Oct 2026: each report is its own sub-tab; the base gate stays the tab grant.
+    assert 'OPP_REPORT_READ = subtab_gate("reports", "opportunities", REPORTS_READ)' in src
+    assert 'PROFILE_REPORT_READ = subtab_gate("reports", "profiles", REPORTS_READ)' in src
+    assert 'PRODUCTIVITY_READ = subtab_gate("reports", "productivity", REPORTS_READ)' in src
+    # Revenue: Finance · Sales · Sales Head by role, or a template that shows the
+    # Revenue / Financial Reports sub-tab explicitly.
     body = src.split('@router.get("/revenue")', 1)[1].split("@router.", 1)[0]
-    assert "Depends(FINANCE_VIEW)" in body
+    assert "Depends(REVENUE_READ)" in body
+    assert 'REVENUE_READ = subtab_gate("reports", ("revenue", "financial"), FINANCE_VIEW)' in src

@@ -2263,6 +2263,7 @@ def _evaluate_and_store_report(session: dict, *, evaluation_model: str | None = 
         q_answered,
         a_answered,
         model=model,
+        position_skills=list(jd_skills or []),
     )
 
     evaluated_ist = _now_ist_parts()
@@ -5761,8 +5762,16 @@ def hr_dashboard(request: Request, limit: int = 500):
     if auth_err:
         return auth_err
     hr_user = str((user or {}).get("sub", "hr")).strip().lower() or "hr"
-    _cleanup_expired_integrity_rows(hr_user)
-    _kick_recovery_async()
+    # Housekeeping must never cost the reader the page (21 Oct 2026: the
+    # Dashboard tab answered "Internal server error" in production).
+    try:
+        _cleanup_expired_integrity_rows(hr_user)
+    except Exception:
+        logger.exception("hr.dashboard.cleanup_failed", extra={"event": "hr.dashboard.cleanup_failed"})
+    try:
+        _kick_recovery_async()
+    except Exception:
+        logger.exception("hr.dashboard.recovery_kick_failed", extra={"event": "hr.dashboard.recovery_kick_failed"})
 
     bucket_limit = max(1, min(int(limit or 500), 1000))
     role_key = str((user or {}).get("role") or "hr").lower()
@@ -5773,7 +5782,11 @@ def hr_dashboard(request: Request, limit: int = 500):
             if cached and (time.monotonic() - cached[0]) < _HR_DASHBOARD_TTL_S:
                 return cached[1]
 
-    snap = get_database_snapshot(AUTH_DB_TARGET, limit=bucket_limit)
+    try:
+        snap = get_database_snapshot(AUTH_DB_TARGET, limit=bucket_limit)
+    except Exception:
+        logger.exception("hr.dashboard.snapshot_failed", extra={"event": "hr.dashboard.snapshot_failed"})
+        snap = {}
     rows = (((snap or {}).get("tables", {}) or {}).get("interview_records", {}) or {}).get("rows", []) or []
 
     candidates_by_key: dict[str, dict] = {}
@@ -5818,88 +5831,37 @@ def hr_dashboard(request: Request, limit: int = 500):
             bucket["date"] = date
 
     for row in rows:
-        payload = row.get("payload", None)
-        record: dict | None = None
-        if isinstance(payload, dict):
-            record = payload
-        elif isinstance(payload, str):
-            record = _safe_json_loads(payload)
-        if not record:
-            continue
-
-        candidate_profile = record.get("candidate_profile", {}) or {}
-        name = str(record.get("candidate_name") or candidate_profile.get("name") or "Candidate").strip() or "Candidate"
-        email = str(record.get("candidate_email") or candidate_profile.get("email") or "Not available").strip() or "Not available"
-        role = str(candidate_profile.get("role_hint") or record.get("candidate_role") or record.get("role") or "Candidate").strip() or "Candidate"
-
-        key = (email.lower() if email != "Not available" else name.lower()) or "candidate"
-        if key not in candidates_by_key:
-            candidates_by_key[key] = {"id": key, "name": name, "email": email, "role": role, "interviews": []}
-
-        rid = str(record.get("id") or row.get("id") or "").strip()
-        difficulty = str(record.get("difficulty") or "Interview").strip()
-        created_date = str(record.get("created_date_ist") or "").strip()
-        created_at_ist = str(record.get("created_at_ist") or "").strip()
-        date = created_date or (created_at_ist[:10] if created_at_ist else "")
-        report = record.get("report") if isinstance(record.get("report"), dict) else {}
-        skills = record.get("skills") if isinstance(record.get("skills"), list) else []
-
-        template_id, template_title = _template_key(record, default_label=f"{role} • {difficulty}".strip())
-        jid = str(record.get("job_id") or "").strip()
-        crm = _job_crm_fields_for_job_id(jid, job_crm_cache) if jid else {"opportunityId": "", "customerName": ""}
-
-        interview = {
-            "id": rid,
-            "sessionName": template_title,
-            "templateId": template_id,
-            "templateTitle": template_title,
-            "opportunityId": crm.get("opportunityId") or "",
-            "customerName": crm.get("customerName") or "",
-            "date": date,
-            "scheduled_at_local": str(record.get("scheduled_at_local") or "").strip(),
-            "completed_at_ist": str(record.get("updated_at_ist") or record.get("updated_at") or "").strip(),
-            "invite_token": str(record.get("invite_token") or "").strip(),
-            "skills": skills,
-            "score": _dash_score_from_report(report),
-            "status": _effective_interview_status(record, report),
-            "completion_status": _report_completion_status(record, report),
-            "final_status": str(record.get("final_status") or "").strip(),
-            "report_status": str(record.get("report_status") or ("ready" if report else "pending")).strip(),
-            **_dash_report_extras(record, report),
-        }
-        candidates_by_key[key]["interviews"].append(interview)
-        _add_session_attendee(
-            template_id,
-            template_title,
-            date,
-            key,
-            opportunity_id=crm.get("opportunityId") or "",
-            customer_name=crm.get("customerName") or "",
-        )
-
-    # Fallback: if DB snapshot has no usable interview_records yet, use file-based HR records.
-    if not candidates_by_key:
         try:
-            file_records = load_hr_records(DATA_FILE)
-        except Exception:
-            file_records = []
-        for record in file_records or []:
+            payload = row.get("payload", None)
+            record: dict | None = None
+            if isinstance(payload, dict):
+                record = payload
+            elif isinstance(payload, str):
+                record = _safe_json_loads(payload)
+            if not record:
+                continue
+
             candidate_profile = record.get("candidate_profile", {}) or {}
             name = str(record.get("candidate_name") or candidate_profile.get("name") or "Candidate").strip() or "Candidate"
             email = str(record.get("candidate_email") or candidate_profile.get("email") or "Not available").strip() or "Not available"
             role = str(candidate_profile.get("role_hint") or record.get("candidate_role") or record.get("role") or "Candidate").strip() or "Candidate"
+
             key = (email.lower() if email != "Not available" else name.lower()) or "candidate"
             if key not in candidates_by_key:
                 candidates_by_key[key] = {"id": key, "name": name, "email": email, "role": role, "interviews": []}
 
-            rid = str(record.get("id") or "").strip()
-            date = str(record.get("created_date_ist") or (record.get("created_at_ist") or "")[:10] or "").strip()
+            rid = str(record.get("id") or row.get("id") or "").strip()
+            difficulty = str(record.get("difficulty") or "Interview").strip()
+            created_date = str(record.get("created_date_ist") or "").strip()
+            created_at_ist = str(record.get("created_at_ist") or "").strip()
+            date = created_date or (created_at_ist[:10] if created_at_ist else "")
             report = record.get("report") if isinstance(record.get("report"), dict) else {}
             skills = record.get("skills") if isinstance(record.get("skills"), list) else []
-            difficulty = str(record.get("difficulty") or "Interview").strip()
+
             template_id, template_title = _template_key(record, default_label=f"{role} • {difficulty}".strip())
             jid = str(record.get("job_id") or "").strip()
             crm = _job_crm_fields_for_job_id(jid, job_crm_cache) if jid else {"opportunityId": "", "customerName": ""}
+
             interview = {
                 "id": rid,
                 "sessionName": template_title,
@@ -5908,6 +5870,9 @@ def hr_dashboard(request: Request, limit: int = 500):
                 "opportunityId": crm.get("opportunityId") or "",
                 "customerName": crm.get("customerName") or "",
                 "date": date,
+                "scheduled_at_local": str(record.get("scheduled_at_local") or "").strip(),
+                "completed_at_ist": str(record.get("updated_at_ist") or record.get("updated_at") or "").strip(),
+                "invite_token": str(record.get("invite_token") or "").strip(),
                 "skills": skills,
                 "score": _dash_score_from_report(report),
                 "status": _effective_interview_status(record, report),
@@ -5925,6 +5890,63 @@ def hr_dashboard(request: Request, limit: int = 500):
                 opportunity_id=crm.get("opportunityId") or "",
                 customer_name=crm.get("customerName") or "",
             )
+        except Exception:
+            # One malformed record must never take the whole dashboard down (21 Oct 2026).
+            logger.exception("hr.dashboard.record_skipped", extra={"event": "hr.dashboard.record_skipped", "row_id": str((row or {}).get("id") or "")})
+            continue
+
+    # Fallback: if DB snapshot has no usable interview_records yet, use file-based HR records.
+    if not candidates_by_key:
+        try:
+            file_records = load_hr_records(DATA_FILE)
+        except Exception:
+            file_records = []
+        for record in file_records or []:
+            try:
+                candidate_profile = record.get("candidate_profile", {}) or {}
+                name = str(record.get("candidate_name") or candidate_profile.get("name") or "Candidate").strip() or "Candidate"
+                email = str(record.get("candidate_email") or candidate_profile.get("email") or "Not available").strip() or "Not available"
+                role = str(candidate_profile.get("role_hint") or record.get("candidate_role") or record.get("role") or "Candidate").strip() or "Candidate"
+                key = (email.lower() if email != "Not available" else name.lower()) or "candidate"
+                if key not in candidates_by_key:
+                    candidates_by_key[key] = {"id": key, "name": name, "email": email, "role": role, "interviews": []}
+
+                rid = str(record.get("id") or "").strip()
+                date = str(record.get("created_date_ist") or (record.get("created_at_ist") or "")[:10] or "").strip()
+                report = record.get("report") if isinstance(record.get("report"), dict) else {}
+                skills = record.get("skills") if isinstance(record.get("skills"), list) else []
+                difficulty = str(record.get("difficulty") or "Interview").strip()
+                template_id, template_title = _template_key(record, default_label=f"{role} • {difficulty}".strip())
+                jid = str(record.get("job_id") or "").strip()
+                crm = _job_crm_fields_for_job_id(jid, job_crm_cache) if jid else {"opportunityId": "", "customerName": ""}
+                interview = {
+                    "id": rid,
+                    "sessionName": template_title,
+                    "templateId": template_id,
+                    "templateTitle": template_title,
+                    "opportunityId": crm.get("opportunityId") or "",
+                    "customerName": crm.get("customerName") or "",
+                    "date": date,
+                    "skills": skills,
+                    "score": _dash_score_from_report(report),
+                    "status": _effective_interview_status(record, report),
+                    "completion_status": _report_completion_status(record, report),
+                    "final_status": str(record.get("final_status") or "").strip(),
+                    "report_status": str(record.get("report_status") or ("ready" if report else "pending")).strip(),
+                    **_dash_report_extras(record, report),
+                }
+                candidates_by_key[key]["interviews"].append(interview)
+                _add_session_attendee(
+                    template_id,
+                    template_title,
+                    date,
+                    key,
+                    opportunity_id=crm.get("opportunityId") or "",
+                    customer_name=crm.get("customerName") or "",
+                )
+            except Exception:
+                logger.exception("hr.dashboard.record_skipped", extra={"event": "hr.dashboard.record_skipped"})
+                continue
 
     for c in candidates_by_key.values():
         c["interviews"].sort(key=lambda x: str(x.get("date", "")), reverse=True)
@@ -6555,6 +6577,7 @@ def _ensure_interview_strengths_weaknesses_record(rec: dict, *, force: bool = Fa
             answers,
             model=model,
             force_regenerate=force,
+            position_skills=list(rec.get("skills") or []),
         )
     if updated is not report:
         rec = dict(rec)
@@ -6593,6 +6616,62 @@ def hr_candidate_strengths_weaknesses(request: Request, candidate_id: str, inter
     rec = _ensure_interview_strengths_weaknesses_record(rec)
     analysis = (rec.get("report") or {}).get("strengths_weaknesses_analysis") or {}
     return {"analysis": analysis, "cached": cached}
+
+
+# ---------------------------------------------------------------- L2 questions
+# 21 Oct 2026 (user ask): ten questions for a human L2 round, written by GPT-5.5
+# from the position's skills + the weak / untested L1 answers. Stored on the
+# report, so they are paid for once (`regenerate` writes them again on purpose).
+@app.get("/hr/candidates/{candidate_id}/interviews/{interview_id}/l2-questions")
+def hr_l2_questions(request: Request, candidate_id: str, interview_id: str):
+    _, auth_err = _require_interview_report_reader(request)
+    if auth_err:
+        return auth_err
+    rec, err = _record_for_candidate(candidate_id, interview_id)
+    if err:
+        return err
+    block = (rec.get("report") or {}).get("l2_questions") if isinstance(rec.get("report"), dict) else None
+    return {"l2_questions": block if isinstance(block, dict) else None}
+
+
+@app.post("/hr/candidates/{candidate_id}/interviews/{interview_id}/l2-questions")
+def hr_generate_l2_questions(request: Request, candidate_id: str, interview_id: str,
+                             regenerate: bool = False):
+    from services import l2_questions as l2
+
+    payload, auth_err = _require_interview_report_reader(request)
+    if auth_err:
+        return auth_err
+    rec, err = _record_for_candidate(candidate_id, interview_id)
+    if err:
+        return err
+    report = rec.get("report") if isinstance(rec.get("report"), dict) else {}
+    existing = report.get("l2_questions")
+    if isinstance(existing, dict) and existing.get("questions") and not regenerate:
+        return {"l2_questions": existing, "cached": True}
+    if not report:
+        return JSONResponse({"error": "This interview has no report yet."}, status_code=409)
+    by = str((payload or {}).get("full_name") or (payload or {}).get("sub") or "")
+    try:
+        with interview_context(interview_id=str(rec.get("id") or interview_id),
+                               candidate_id=str(rec.get("candidate_email") or ""),
+                               candidate_name=str(rec.get("candidate_name") or ""),
+                               template_name=str(rec.get("job_title") or "")):
+            block = l2.generate(rec, by=by)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception:  # noqa: BLE001
+        logger.exception("hr.l2_questions.failed", extra={"event": "hr.l2_questions.failed"})
+        return JSONResponse({"error": "Could not write the L2 questions — try again."}, status_code=502)
+    rec = dict(rec)
+    rec["report"] = {**report, "l2_questions": block}
+    upsert_interview_record_snapshot(AUTH_DB_TARGET, rec)
+    try:
+        _persist_hr_record_mirror(rec)
+    except Exception:  # noqa: BLE001
+        pass
+    invalidate_hr_dashboard_cache()
+    return {"l2_questions": block, "cached": False}
 
 
 # ---------------------------------------------------------------- re-score
@@ -6809,6 +6888,7 @@ async def hr_exclude_question_from_score(
         list(rec.get("answers") or []),
         model=model,
         force_regenerate=True,
+        position_skills=list(rec.get("skills") or []),
     )
 
     upsert_interview_record_snapshot(AUTH_DB_TARGET, rec)
@@ -9119,9 +9199,14 @@ def hr_schedules(request: Request):
     rows = list_interview_schedules(AUTH_DB_TARGET, str(payload.get("sub", "hr")))
     base = _invite_base_url(request)
     for row in rows:
-        cfg = _extract_invite_config_from_notes(str(row.get("notes", "")))
-        jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
-        job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
+        try:
+            cfg = _extract_invite_config_from_notes(str(row.get("notes", "")))
+            jid = str(cfg.get("job_id") or cfg.get("jobId") or "").strip()
+            job = get_job_template(AUTH_DB_TARGET, jid) if jid else None
+        except Exception:
+            # A schedule whose notes / template cannot be read is listed as-is.
+            logger.exception("hr.schedules.row_enrich_failed", extra={"event": "hr.schedules.row_enrich_failed"})
+            cfg, jid, job = {}, "", None
         job_title = str((job or {}).get("jobTitle") or "").strip()
         if jid:
             row["job_id"] = jid
@@ -9210,7 +9295,8 @@ def _interview_format(cfg: dict, job: dict | None) -> dict:
         "skills_choice": skills_choice,
         "minutes_estimate": minutes_estimate,
         "typed_minutes": typed_minutes,
-        "followups": int(conv.get("max_followups") or 0) if conv.get("followups") and not bank else 0,
+        # Follow-ups run on spoken answers in a question-bank interview too (21 Oct 2026).
+        "followups": int(conv.get("max_followups") or 0) if conv.get("followups") else 0,
         "closing_qa": bool(conv.get("closing_qa")),
         "recruiter_may_join": live_ctl.enabled(),
         "screen_recorded": _screen_recording_on(),

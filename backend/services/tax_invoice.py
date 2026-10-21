@@ -6,6 +6,7 @@ Seller PAN/GSTIN/bank are hardcoded constants (never env-overridden here).
 from __future__ import annotations
 
 import io
+import logging
 import re
 import zipfile
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from typing import Any, Iterable
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("karnex.crm.tax_invoice")
 
 # ---------------------------------------------------------------------------
 # Fixed seller constants (exact)
@@ -199,6 +202,9 @@ def billing_breakdown_for_invoice(db, invoice) -> dict | None:
                 qty_days = round(working_days * share, 2)
             leave_days = 0.0
             part_label = f"Part {invoice.split_no}"
+            # 0142 — a part split BY DATES prints its own days as the period.
+            if getattr(invoice, "split_start", None) and getattr(invoice, "split_end", None):
+                period_start, period_end = invoice.split_start, invoice.split_end
         from services.invoice_format import normalize_invoice_format
         return {
             "part_label": part_label,
@@ -1184,21 +1190,16 @@ def map_crm_invoice_to_tax_invoice(db, invoice, *, share_base_url: str = "", ein
     if delivery_branch is None:
         delivery_branch = billing_branch
 
-    def _addr(branch: CustomerBranch | None, *, delivery: bool) -> str:
-        if branch is None:
-            return ""
-        parts: list[str] = []
-        if delivery and branch.delivery_address:
-            parts.append(branch.delivery_address.strip())
-        else:
-            if branch.billing_address:
-                parts.append(branch.billing_address.strip())
-            if branch.address_line_2:
-                parts.append(branch.address_line_2.strip())
-        city_line = ", ".join(p for p in [branch.city, branch.state, branch.pincode] if p)
-        if city_line:
-            parts.append(city_line)
-        return ", ".join(parts)
+    # 0143 — print the buyer / shipping details the invoice was ISSUED with;
+    # a later change to the customer's address never moves an issued invoice.
+    from services import invoice_parties as _ip
+    _snap = _ip.snapshot_of(invoice)
+    if _snap is not None:
+        _snap_customer, billing_branch, delivery_branch = _ip.as_namespaces(_snap)
+        customer = _snap_customer or customer
+
+    def _addr(branch, *, delivery: bool) -> str:
+        return _ip.print_address(branch, delivery=delivery)
 
     gstn = (billing_branch.gstin if billing_branch else "") or ""
     scode, _src = resolve_buyer_state_code(
@@ -1381,16 +1382,19 @@ def render_invoice_html(inv: Invoice, totals: Totals | None = None) -> str:
     if inv.is_einvoice:
         # e-Invoice band (8 Oct 2026): IRN · Ack No. · Ack Date across the top
         # with the QR beside them — the QR opens the public e-invoice page.
-        rows = "".join(
-            f"<tr><td class='k'>{_esc(k)}</td><td class='sep'>:</td><td class='v'>{_esc(v)}</td></tr>"
-            for k, v in einvoice_rows(inv))
+        # Compact (21 Oct 2026): IRN on its own line, Ack No. and Ack Date side
+        # by side — the three-row band pushed a multi-line invoice to page 2.
+        cells = dict(einvoice_rows(inv))
+        rows = (f"<tr><td class='k'>IRN</td><td class='sep'>:</td><td class='v' colspan='4'>{_esc(cells.get('IRN'))}</td></tr>"
+                f"<tr><td class='k'>Ack No.</td><td class='sep'>:</td><td class='v'>{_esc(cells.get('Ack No.'))}</td>"
+                f"<td class='k ack-date'>Ack Date</td><td class='sep'>:</td><td class='v'>{_esc(cells.get('Ack Date'))}</td></tr>")
         band_qr = ""
         try:
             from services.invoice_share import qr_svg_data_url
             src = qr_svg_data_url(inv.share_url or "", size_px=200) if inv.share_url else None
             if src:
                 band_qr = (f"<div class='einv-qr'><img src='{src}' alt='Scan to view this e-invoice' "
-                           "width='84' height='84'/><div class='qr-cap'>Scan to view<br/>this e-invoice</div></div>")
+                           "width='64' height='64'/><div class='qr-cap'>Scan to view</div></div>")
         except Exception:
             band_qr = ""
         einv_html = (f"<div class='einv'><div class='einv-main'><div class='einv-tag'>e-Invoice</div>"
@@ -1498,7 +1502,7 @@ table.services th {{ font-size: {"7pt" if ncols > 6 else "8pt"}; line-height: 1.
 .grand {{
   background: var(--navy); color: #fff; font-weight: 700;
 }}
-.grand .val {{ color: #fff; }}
+.grand .val, .grand .lab {{ color: #fff; }}
 .words {{
   border: 1px solid var(--border); padding: 6px 8px; font-size: 8.5pt;
   background: var(--light);
@@ -1520,16 +1524,17 @@ table.services th {{ font-size: {"7pt" if ncols > 6 else "8pt"}; line-height: 1.
 .qr img {{ width: 68px; height: 68px; display: block; margin: 0 auto; }}
 .qr-cap {{ font-size: 6.5pt; color: var(--muted, #64748B); line-height: 1.2; margin-top: 2px; }}
 .einv {{ display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  margin: 6px 0 2px; padding: 6px 10px; border: 1px solid #1D4ED8; border-radius: 6px; background: #EFF6FF; }}
+  margin: 0; padding: 4px 10px; border: 1px solid #1D4ED8; border-radius: 6px; background: #EFF6FF; }}
 .einv-main {{ min-width: 0; flex: 1; }}
-.einv-tag {{ display: inline-block; background: #1D4ED8; color: #fff; font-weight: 700; font-size: 7.5pt;
-  letter-spacing: .08em; text-transform: uppercase; padding: 1px 8px; border-radius: 999px; margin-bottom: 3px; }}
-.einv-table {{ border-collapse: collapse; font-size: 8.5pt; }}
-.einv-table td {{ padding: 1px 4px 1px 0; vertical-align: top; }}
+.einv-tag {{ display: inline-block; background: #1D4ED8; color: #fff; font-weight: 700; font-size: 7pt;
+  letter-spacing: .08em; text-transform: uppercase; padding: 0 8px; border-radius: 999px; margin-bottom: 2px; }}
+.einv-table {{ border-collapse: collapse; font-size: 8pt; }}
+.einv-table td {{ padding: 0 4px 0 0; vertical-align: top; }}
 .einv-table td.k {{ font-weight: 700; white-space: nowrap; color: #1E3A8A; }}
-.einv-table td.v {{ word-break: break-all; font-family: "SFMono-Regular", Consolas, monospace; font-size: 8pt; }}
-.einv-qr {{ text-align: center; width: 92px; flex-shrink: 0; }}
-.einv-qr img {{ width: 84px; height: 84px; display: block; margin: 0 auto; }}
+.einv-table td.k.ack-date {{ padding-left: 18px; }}
+.einv-table td.v {{ word-break: break-all; font-family: "SFMono-Regular", Consolas, monospace; font-size: 7.5pt; }}
+.einv-qr {{ text-align: center; width: 70px; flex-shrink: 0; }}
+.einv-qr img {{ width: 64px; height: 64px; display: block; margin: 0 auto; }}
 .contact {{
   margin-top: auto; background: var(--navy); color: #fff;
   text-align: center; padding: 5px 8px; font-size: 8pt; letter-spacing: 0.02em;
@@ -1682,9 +1687,50 @@ def _weasyprint_available() -> bool:
         return False
 
 
+#: One-page fit (21 Oct 2026, reported: the e-invoice printed on two pages).
+#: An invoice is ONE sheet. When the layout spills, the same HTML is rendered
+#: again with each tier added in turn — tighter spacing first, then smaller
+#: type — and the first tier that fits on one A4 page wins. Every tier keeps
+#: every printed value; only whitespace and type size change.
+_FIT_TIERS = (
+    # 1: drop the full-page height (the footer no longer pins to the bottom),
+    #    empty filler rows and fixed minimum card heights.
+    """.page { min-height: 0 !important; padding: 7mm 8mm 5mm !important; gap: 4px !important; }
+    .contact { margin-top: 6px !important; }
+    .card-b { min-height: 0 !important; }
+    table.services tr.spacer { display: none; }""",
+    # 2: smaller type and logo / seal / QR.
+    """html, body { font-size: 8.5pt !important; }
+    .card-b, .gst-box table, .words, table.services td, .meta-table { font-size: 7.8pt !important; }
+    .footer2 > div, .icon-line, .seller-meta { font-size: 7.5pt !important; }
+    .tax-title { font-size: 21px !important; margin-bottom: 4px !important; }
+    .logo { height: 28px !important; } .seal { height: 30px !important; }
+    .qr img, .einv-qr img { width: 54px !important; height: 54px !important; }
+    .gst-box td { padding: 2px 8px !important; } .card-b, .words, .footer2 > div { padding: 4px 8px !important; }""",
+    # 3: last resort for very long invoices.
+    """html, body { font-size: 7.8pt !important; }
+    .card-b, .gst-box table, .words, table.services td, table.services th, .meta-table,
+    .footer2 > div, .icon-line { font-size: 7pt !important; line-height: 1.25 !important; }
+    .page { padding: 5mm 7mm 4mm !important; gap: 3px !important; }
+    .header-left, .header-right { padding: 5px 8px !important; }""",
+)
+
+
+def _with_fit_css(html: str, tiers: int) -> str:
+    css = "\n".join(_FIT_TIERS[:tiers])
+    return html.replace("</head>", f"<style>/* one-page fit */\n{css}\n</style>\n</head>", 1)
+
+
 def _pdf_via_weasyprint(html: str) -> bytes:
     from weasyprint import HTML
-    return HTML(string=html, base_url=str(STATIC_DIR)).write_pdf()
+    doc = HTML(string=html, base_url=str(STATIC_DIR)).render()
+    tiers = 0
+    while len(doc.pages) > 1 and tiers < len(_FIT_TIERS):
+        tiers += 1
+        doc = HTML(string=_with_fit_css(html, tiers), base_url=str(STATIC_DIR)).render()
+    if len(doc.pages) > 1:
+        logger.warning("tax invoice still %s pages after the one-page fit", len(doc.pages))
+    return doc.write_pdf()
 
 
 def _pdf_via_reportlab(inv: Invoice, totals: Totals) -> bytes:

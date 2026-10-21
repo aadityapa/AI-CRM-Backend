@@ -157,6 +157,10 @@ def get_current_user(request: Request, db: Session = Depends(get_crm_db)) -> Cur
         full_name=row["full_name"] or "", email=row["email"] or "", roles=roles,
         held_roles=held, must_change_password=must_change,
     )
+    # Who is changing things in this request — the customer Activity Log
+    # listener reads it off the session (services/customer_activity.py).
+    db.info["actor_id"] = user.id
+    db.info["actor_name"] = user.full_name or username
     # Outgoing mail triggered by this request is sent as this person
     # (services/actor_context.py).
     try:
@@ -458,6 +462,57 @@ def screener_or(gate):
             if screens_as_rmg(db, user):
                 return user
             raise
+
+    return dep
+
+
+def subtab_choice_for(db: Session, user: CurrentUser, tab: str, sub: str) -> str:
+    """"show" | "hide" | "default" — what this login's template / custom role
+    says about one sub-tab (22 Oct 2026; rule in `access_registry.subtab_choice`).
+    Admin/CEO → "show"; an unrestricted login → "default" (roles decide).
+    Never raises: a lookup failure answers "default"."""
+    if user.is_admin:
+        return "show"
+    try:
+        from services.access_registry import subtab_choice
+        from services.access_templates import effective_access
+        acc = effective_access(db, user.id, set(user.roles))
+    except Exception:  # noqa: BLE001
+        return "default"
+    if acc.get("full"):
+        return "show"
+    if acc.get("visible_tabs") is None:
+        return "default"
+    return subtab_choice((acc.get("fields") or {}).get(tab), sub)
+
+
+def subtab_gate(tab: str, subs, base):
+    """A route that belongs to sub-tab(s) `subs` of `tab` (22 Oct 2026).
+
+    `base` is the route's ordinary gate (`gated_read(...)`, `role_required(...)`
+    …). The template's sub-tab choice wins over it: any of `subs` explicitly
+    shown → allowed (a template may open Revenue for a login whose role alone
+    would not), all of them hidden → 403; otherwise the base gate decides,
+    exactly as before.
+    """
+    import inspect
+
+    from services.access_registry import SUB_TABS
+
+    names = (subs,) if isinstance(subs, str) else tuple(subs)
+    wants_db = "db" in inspect.signature(base).parameters
+    labels = ", ".join(SUB_TABS.get(tab, {}).get(n, n) for n in names)
+
+    def dep(user: CurrentUser = Depends(get_current_user),
+            db: Session = Depends(get_crm_db)) -> CurrentUser:
+        choices = [subtab_choice_for(db, user, tab, n) for n in names]
+        if "show" in choices:
+            return user
+        if choices and all(c == "hide" for c in choices):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Your access does not include {labels} — ask Admin/CEO to enable it")
+        return base(user, db) if wants_db else base(user)
 
     return dep
 

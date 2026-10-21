@@ -275,9 +275,11 @@ FIELDS_BY_TAB: dict[str, dict[str, str]] = {
         "attendance_rule": "Attendance Rule", "separation": "Separation",
         "cv": "CV",
     },
+    # The three report names that used to sit here as FIELDS are sub-tabs now
+    # (`tab:*`, see SUB_TABS — 22 Oct 2026); `_strip_removed_keys` drops the old
+    # keys from a saved template on its next save.
     "reports": {
-        "opportunities": "Opportunity Report", "profiles": "Profile Report",
-        "productivity": "Recruiter Productivity", "export": "CSV Export",
+        "export": "CSV Export",
     },
     "users": {
         "roles": "Roles", "tab_access": "Tab Access", "access_template": "Access Template",
@@ -318,6 +320,99 @@ FIELDS_BY_TAB["opportunities"].update({
     "tab:details": "Sub-tab: Details", "tab:applicants": "Sub-tab: Applicants",
     "tab:skill-eval": "Sub-tab: Skill Evaluation", "tab:activity": "Sub-tab: Activity Log",
 })
+
+
+# ------------------------------------------------------------------ sub-tabs
+# 22 Oct 2026 (user report: "in Access Template a lot of tabs and sub-tabs are
+# missing — I need to give access to each sub-tab, e.g. Finance only Financial
+# Reports + Revenue under Reports"). Every page section a template can switch
+# off or on is listed here; each one becomes a `tab:<key>` entry of its tab's
+# field map, stored in `field_access` like the detail-page sub-tabs of 25 Aug.
+#
+# Semantics (`subtab_choice`, PURE, mirrored by F-V2 `useAccess.subTabChoice`):
+#   * none of a tab's sub-tabs set to view/edit → the ROLE decides as before,
+#     and only an explicit "hidden" removes one (templates saved before today
+#     keep exactly what they had);
+#   * any sub-tab of the tab set to "view" → the template decides that tab's
+#     sub-tabs ALONE: "view" shows it (even when the role alone would not —
+#     e.g. Revenue for a non-Finance login), anything else hides it.
+# Status chips (Active / Inactive, Pending / Approved …) are list filters, not
+# sub-tabs, and are not listed.
+SUB_TABS: dict[str, dict[str, str]] = {
+    "reports": {
+        "opportunities": "Opportunities", "profiles": "Candidate Profiles",
+        "productivity": "Recruiter Productivity", "financial": "Financial Reports",
+        "revenue": "Revenue",
+    },
+    "finance-reports": {"profit": "Profit", "receivables": "Who owes us", "ledger": "Customer ledger"},
+    "customers": {
+        "branches": "Branches", "billing": "Default Billing Policy", "contacts": "Contacts",
+        "documents": "Documents", "holidays": "Holidays", "opportunities": "Opportunities",
+        "pos": "Purchase Orders", "invoices": "Invoices", "projects": "Projects",
+        "project-employees": "Project Employees", "receipts": "Received Amount",
+        "activity": "Activity Log",
+    },
+    "branch-policy": {
+        "policy": "Policy & Billing", "opportunities": "Opportunities", "projects": "Projects",
+        "timesheets": "Timesheets", "invoices": "Invoices", "receipts": "Received Amount",
+        "pos": "Purchase Orders", "employees": "Employees Working", "ctc-slab": "CTC Slab",
+    },
+    "opportunities": {
+        "details": "Details", "applied": "Applied Candidates (RMG / GM)",
+        "applicants": "Applicants", "suggested": "Suggested Candidates",
+        "skill-eval": "Skill Evaluation", "activity": "Activity Log",
+        "projects": "Projects", "pes": "Project Employees",
+    },
+    "requirements": {
+        "details": "Details", "postings": "Job Postings", "resumes": "Applied Candidates",
+        "slots": "Interview Slots", "applicants": "Applicants",
+        "suggested": "Suggested Candidates", "activity": "Activity Log",
+    },
+    "profiles": {
+        "overview": "Overview", "interviews": "Interviews", "skills": "Skill Evaluation",
+        "activity": "Activity Log", "ai": "AI Interview",
+    },
+    "candidates": {
+        "personal": "Personal Info", "education": "Education", "experience": "Experience",
+        "skills": "Skills", "profiles": "Linked Opportunities", "resumes": "Resumes",
+        "matching": "Matching positions", "outreach": "Outreach", "emails": "Emails",
+    },
+    "projects": {
+        "overview": "Overview", "team": "Team", "timesheets": "Timesheet",
+        "finance": "PO & Invoices", "comm": "Communication Matrix",
+    },
+    "project-employees": {
+        "general": "General", "leave": "Leave", "holidays": "Holidays",
+        "timesheets": "Timesheet", "invoice": "Invoice",
+    },
+    "timesheets": {
+        "due": "Timesheet Due", "submission": "Submit for Approval",
+        "approvals": "Timesheet Approvals", "all": "All Timesheets",
+    },
+    "invoices": {
+        "Proforma": "Proforma", "Awaiting_Customer": "Awaiting customer",
+        "Customer_Approved": "Customer approved", "EInvoice": "E-invoice",
+        "Unpaid": "Unpaid", "Partially_Paid": "Partially Paid", "Paid": "Paid",
+    },
+    "employees": {"profile": "Profile", "employee_history": "History", "history": "Project History"},
+    "talent-pool": {"search": "Search the pool", "position": "Match a position", "retention": "Retention"},
+}
+for _tab, _subs in SUB_TABS.items():
+    _fields = FIELDS_BY_TAB.setdefault(_tab, {})
+    for _k, _label in _subs.items():
+        _fields[f"tab:{_k}"] = f"Sub-tab: {_label}"
+
+SUBTAB_SHOWN = ("view", "edit")
+
+
+def subtab_choice(tab_fields: dict | None, sub: str) -> str:
+    """"show" | "hide" | "default" for ONE sub-tab, given the tab's field map
+    (`effective_access["fields"][tab]`). PURE — see the SUB_TABS comment."""
+    entries = {k: v for k, v in (tab_fields or {}).items() if str(k).startswith("tab:")}
+    mode = entries.get(f"tab:{sub}")
+    if any(v in SUBTAB_SHOWN for v in entries.values()):
+        return "show" if mode in SUBTAB_SHOWN else "hide"
+    return "hide" if mode == "hidden" else "default"
 
 
 # ------------------------------------------------------------------ departments
@@ -402,7 +497,11 @@ def registry() -> dict:
             {"key": k, "label": v,
              "group": "Interview Platform" if is_iv_tab(k) else "CRM",
              "default_roles": list(IV_TAB_DEFAULT_ROLES.get(k, ())),
-             "fields": [{"key": fk, "label": fl} for fk, fl in FIELDS_BY_TAB.get(k, {}).items()]}
+             "fields": [{"key": fk, "label": fl} for fk, fl in FIELDS_BY_TAB.get(k, {}).items()
+                        if not fk.startswith("tab:")],
+             # Sub-tabs as their own list (22 Oct 2026) — the editor shows them
+             # as ticks; stored as `tab:<key>` in field_access.
+             "subtabs": [{"key": f"tab:{sk}", "label": sl} for sk, sl in SUB_TABS.get(k, {}).items()]}
             for k, v in TABS.items()
         ],
     }

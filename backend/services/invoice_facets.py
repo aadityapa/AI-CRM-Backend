@@ -85,7 +85,12 @@ def invoice_facets(db: Session, invoices) -> dict[int, dict]:
         emp = " ".join(p for p in ((t[4], t[5]) if t else ()) if p) or None
         bid = branch_of.get(i.id)
         period = None
-        if t and t[6] and t[7]:
+        s_start, s_end = getattr(i, "split_start", None), getattr(i, "split_end", None)
+        if t and isinstance(s_start, date) and isinstance(s_end, date):
+            # 0142 — a part split BY DATES names its own days.
+            from services.billing_tracker import period_label
+            period = period_label(t[1], t[2], s_start, s_end)
+        elif t and t[6] and t[7]:
             from services.billing_tracker import period_label
             period = period_label(t[1], t[2], t[6], t[7])
         out[i.id] = {"branch_id": bid, "branch_name": names.get(bid) if bid else None,

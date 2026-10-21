@@ -150,6 +150,10 @@ class Invoice(Base):
     #: The share of the sheet's billed quantity this part carries (hours / days,
     #: or the fraction of a month on a Monthly rate). NULL on a whole-sheet invoice.
     split_qty = sa.Column(sa.Numeric(12, 4), nullable=True)
+    #: 0142 — the days this part bills when the sheet was split BY DATES
+    #: (1–29 Mar on PO A, 30–31 Mar on PO B). NULL on an amount / hours split.
+    split_start = sa.Column(sa.Date, nullable=True)
+    split_end = sa.Column(sa.Date, nullable=True)
     invoice_date = sa.Column(sa.Date, nullable=False)
     due_date = sa.Column(sa.Date, nullable=True)
     sub_total = sa.Column(sa.Numeric(14, 2), nullable=False)
@@ -196,6 +200,14 @@ class Invoice(Base):
     #: beside the cash — balance = grand_total − paid − tds_deducted — and is
     #: followed as "pending from client" on the TdsRecord until Form 16A is in.
     tds_deducted = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    #: Buyer / shipping details as they were when the invoice was issued (0143):
+    #: a later change to the customer's address never moves an issued invoice.
+    #: See services/invoice_parties.py. NULL = read the branch live.
+    party_snapshot = sa.Column(JSONB, nullable=True)
+    #: Who generated the original (tax) invoice and when (0144) — stamped by
+    #: services.finance.consume_po_for_invoice. NULL on a Proforma.
+    issued_by = sa.Column(sa.Integer, nullable=True)
+    issued_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
 
     @property
     def is_proforma(self) -> bool:
@@ -245,6 +257,9 @@ class InvoicePayment(Base):
     #: payments recorded directly on the invoice.
     receipt_id = sa.Column(sa.Integer, sa.ForeignKey("customer_receipts.id", ondelete="SET NULL"),
                            nullable=True, index=True)
+    #: Who recorded it (0144). From a receipt = the receipt's author.
+    created_by = sa.Column(sa.Integer, nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=True, server_default=sa.func.now())
 
     invoice = relationship("Invoice", back_populates="payments")
     receipt = relationship("CustomerReceipt", back_populates="payments")

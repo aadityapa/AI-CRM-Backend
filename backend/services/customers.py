@@ -11,6 +11,7 @@ from models import (
     CustomerBillingPolicy,
     CustomerBranch,
     CustomerDocument,
+    CustomerStatus,
     DocumentType,
 )
 from services.invoice_format import normalize_invoice_format
@@ -281,6 +282,18 @@ def serialize_documents(db: Session, docs: list) -> list[dict]:
         }
         for d in docs
     ]
+
+
+def active_customer_ids(db: Session) -> set[int]:
+    """Ids of ACTIVE customers (22 Oct 2026, user rule: every customer dropdown lists
+    the Customers tab's active customers only). Never raises — on any failure it
+    returns an empty set and callers fall back to their unfiltered list."""
+    try:
+        with db.begin_nested():
+            return {int(r[0]) for r in db.execute(
+                select(Customer.id).where(Customer.status == CustomerStatus.ACTIVE)).all()}
+    except Exception:  # noqa: BLE001 — a filter list is never worth a 500
+        return set()
 
 
 def customer_ids_with_po(db: Session, customer_ids) -> set[int]:

@@ -145,11 +145,42 @@ def _day_number(v) -> int | None:
     return n if 1 <= n <= 31 else None
 
 
-def _date_columns(row, year: int | None, month: int | None) -> list[tuple[int, date]]:
+def _window_run(nums: list[tuple[int, int]], window: tuple[date, date]) -> list[tuple[int, date]]:
+    """The longest run of bare day numbers that walks the WINDOW day by day —
+    so "21 22 … 28 1 2 … 20" reads as 21 Feb – 20 Mar, across the month end.
+    A run starts at the first window date carrying its number. PURE."""
+    from datetime import timedelta
+    w_start, w_end = window
+    best: list[tuple[int, date]] = []
+    run: list[tuple[int, date]] = []
+    for ci, n in nums:
+        nxt = run[-1][1] + timedelta(days=1) if run else None
+        if nxt is not None and nxt <= w_end and nxt.day == n:
+            run = run + [(ci, nxt)]
+        else:
+            first = None
+            d = w_start
+            while d <= w_end:
+                if d.day == n:
+                    first = d
+                    break
+                d += timedelta(days=1)
+            run = [(ci, first)] if first else []
+        if len(run) > len(best):
+            best = run
+    return best
+
+
+def _date_columns(row, year: int | None, month: int | None,
+                  window: tuple[date, date] | None = None) -> list[tuple[int, date]]:
     """(column, date) for a row that is a matrix date row, else []."""
     full = [(ci, d) for ci, v in enumerate(row) if (d := parse_date(v, year)) is not None]
     if len(full) >= MIN_MATRIX_DAYS:
         return full
+    if window is not None:
+        nums = [(ci, n) for ci, v in enumerate(row) if (n := _day_number(v)) is not None]
+        best = _window_run(nums, window)
+        return best if len(best) >= MIN_MATRIX_DAYS else []
     if not (year and month):
         return []
     # Bare day numbers 1 2 3 … : believed only as a strictly consecutive run,
@@ -199,18 +230,18 @@ def _codes_for_row(row, cols: list[tuple[int, date]]) -> tuple[int, list[DayMark
 
 
 def find_matrix(grid: list[list], year: int | None = None,
-                month: int | None = None) -> list[DayMark]:
+                month: int | None = None, window: tuple[date, date] | None = None) -> list[DayMark]:
     """Every matrix block in the grid: a date row + the best code row under it."""
     marks: list[DayMark] = []
     i = 0
     while i < len(grid):
-        cols = _date_columns(grid[i], year, month)
+        cols = _date_columns(grid[i], year, month, window)
         if not cols:
             i += 1
             continue
         best_score, best_marks, best_at = 0, [], i
         for j in range(i + 1, min(len(grid), i + 1 + MAX_ROWS_BELOW_DATES)):
-            if _date_columns(grid[j], year, month):
+            if _date_columns(grid[j], year, month, window):
                 break                     # the next block starts here
             score, row_marks = _codes_for_row(grid[j], cols)
             if score > best_score:
@@ -224,10 +255,11 @@ def find_matrix(grid: list[list], year: int | None = None,
 
 
 def find_token_stream(grid: list[list], year: int | None = None,
-                      month: int | None = None) -> list[DayMark]:
+                      month: int | None = None, window: tuple[date, date] | None = None) -> list[DayMark]:
     """A matrix whose layout was lost: every cell of the grid as one flat token
     stream (pypdf writes a PDF table one cell per line). A run of ≥5 dates,
     then — skipping weekday names and labels — the same number of codes."""
+    from datetime import timedelta
     tokens = [c for row in grid for c in row if c is not None and str(c).strip()]
     marks: list[DayMark] = []
     i = 0
@@ -236,7 +268,15 @@ def find_token_stream(grid: list[list], year: int | None = None,
         j = i
         while j < len(tokens):
             d = parse_date(tokens[j], year)
-            if d is None and year and month and (n := _day_number(tokens[j])) is not None \
+            n = _day_number(tokens[j]) if d is None else None
+            if d is None and window is not None and n is not None:
+                if days:
+                    nxt = days[-1] + timedelta(days=1)
+                    d = nxt if nxt <= window[1] and nxt.day == n else None
+                else:
+                    first = _window_run([(0, n)], window)
+                    d = first[0][1] if first else None
+            elif d is None and year and month and n is not None \
                     and (not days or n == days[-1].day + 1):
                 try:
                     d = date(year, month, n)
@@ -354,18 +394,24 @@ def pdf_grids(content: bytes) -> list[list[list]]:
 
 
 def read_day_marks(grids: list[list[list]], year: int | None = None,
-                   month: int | None = None, *, allow_day_list: bool = True) -> list[DayMark]:
-    """Matrix blocks first (every grid), else a day list. First mark per date wins."""
+                   month: int | None = None, *, allow_day_list: bool = True,
+                   window: tuple[date, date] | None = None) -> list[DayMark]:
+    """Matrix blocks first (every grid), else a day list. First mark per date wins.
+
+    ``window`` (20 Oct 2026): the sheet's own period when filling ONE sheet —
+    bare day numbers then walk that period, so a 21st–20th customer's
+    "21 … 28 1 … 20" lands on 21 Feb – 20 Mar instead of being cut at the
+    month end."""
     if not (year and month):
         hdr = header_period(grids)
         if hdr:
             year, month = hdr
     marks: list[DayMark] = []
     for g in grids:
-        marks.extend(find_matrix(g, year, month))
+        marks.extend(find_matrix(g, year, month, window))
     if not marks:
         for g in grids:
-            marks.extend(find_token_stream(g, year, month))
+            marks.extend(find_token_stream(g, year, month, window))
     if not marks and allow_day_list:
         for g in grids:
             marks.extend(find_day_list(g, year))

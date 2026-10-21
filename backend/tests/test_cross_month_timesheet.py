@@ -94,8 +94,9 @@ def test_monthly_cycle_factor_is_one_month_plus_extra_days():
     # Up to one month = one monthly rate.
     assert billing_cycle_factor(date(2026, 2, 20), date(2026, 3, 19)) == Decimal(1)
     assert billing_cycle_factor(date(2026, 3, 21), date(2026, 4, 20)) == Decimal(1)
-    # Shorter than a cycle (still crossing a month) = that share of itself = 1.
-    assert billing_cycle_factor(date(2026, 2, 25), date(2026, 3, 10)) == Decimal(1)
+    # Shorter than a cycle (20 Oct 2026) = its share of the cycle: 25 Feb – 10 Mar is
+    # 14 days of the 25 Feb – 24 Mar cycle (28 days) → half a month, not a whole one.
+    assert billing_cycle_factor(date(2026, 2, 25), date(2026, 3, 10)) == Decimal(14) / Decimal(28)
     # 21 Apr – 30 May: cycle 21 Apr – 20 May is 30 days, 10 extra → 40/30.
     f = billing_cycle_factor(date(2026, 4, 21), date(2026, 5, 30))
     assert f == Decimal(40) / Decimal(30)

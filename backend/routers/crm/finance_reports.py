@@ -33,9 +33,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, gated_read, get_crm_db
+from crm_deps import CurrentUser, gated_read, get_crm_db, subtab_gate
 from models import (
-    CreditNote, Customer, Invoice, InvoicePayment, Project, TdsRecord,
+    CreditNote, Customer, Invoice, InvoicePayment, Project, PurchaseOrder, TdsRecord,
 )
 from models.finance import InvoiceKind
 from schemas.common import envelope
@@ -43,6 +43,11 @@ from schemas.common import envelope
 router = APIRouter(prefix="/api/finance/reports", tags=["CRM: Finance Reports"])
 
 INV_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
+#: Sub-tabs (22 Oct 2026): the page's own tab first, then Reports ▸ Financial
+#: Reports (where the page is embedded), then the invoices grant as before.
+_FIN_REPORTS = subtab_gate("reports", "financial", INV_READ)
+LEDGER_READ = subtab_gate("finance-reports", "ledger", _FIN_REPORTS)
+RECEIVABLES_READ = subtab_gate("finance-reports", "receivables", _FIN_REPORTS)
 NOT_PROFORMA = Invoice.kind != InvoiceKind.PROFORMA.value
 #: Payment terms assumed when an invoice has no due date (revenue_report's rule).
 DEFAULT_TERMS_DAYS = 30
@@ -70,11 +75,16 @@ def _num(v) -> float:
     return float(v or 0)
 
 
-def _customer_invoices(db: Session, customer_id: int) -> list[tuple[Invoice, Project]]:
+def _customer_invoices(db: Session, customer_id: int) -> list[tuple[Invoice, Project | None]]:
+    """The customer's issued invoices — through the project's customer OR the PO's
+    (22 Oct 2026: an invoice raised on a PO with no project, or on a project of
+    another customer record, used to be missing from the ledger)."""
+    from sqlalchemy import or_
+    po_ids = select(PurchaseOrder.id).where(PurchaseOrder.customer_id == customer_id)
     return db.execute(
         select(Invoice, Project)
-        .join(Project, Project.id == Invoice.project_id)
-        .where(Project.customer_id == customer_id, NOT_PROFORMA)
+        .outerjoin(Project, Project.id == Invoice.project_id)
+        .where(or_(Project.customer_id == customer_id, Invoice.po_id.in_(po_ids)), NOT_PROFORMA)
         .order_by(Invoice.invoice_date, Invoice.id)
     ).all()
 
@@ -85,7 +95,7 @@ def customer_ledger(
     date_from: date | None = None,
     date_to: date | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(INV_READ),
+    user: CurrentUser = Depends(LEDGER_READ),
 ):
     customer = db.get(Customer, customer_id)
     if customer is None:
@@ -111,8 +121,9 @@ def customer_ledger(
         entries.append({
             "date": inv.invoice_date, "rank": 0, "type": "Invoice",
             "ref": inv.invoice_number,
-            "note": prj.name,
+            "note": prj.name if prj is not None else "",
             "debit": Decimal(inv.grand_total or 0), "credit": ZERO,
+            "invoice_id": inv.id, "invoice_number": inv.invoice_number,
         })
     for p in payments:
         inv = inv_by_id.get(p.invoice_id)
@@ -121,6 +132,8 @@ def customer_ledger(
             "ref": p.reference_number or (inv.invoice_number if inv else ""),
             "note": f"{p.payment_mode or 'Payment'} against {inv.invoice_number if inv else '—'}",
             "debit": ZERO, "credit": Decimal(p.amount or 0),
+            "invoice_id": p.invoice_id, "invoice_number": inv.invoice_number if inv else None,
+            "receipt_id": getattr(p, "receipt_id", None),
         })
     for t in tds_rows:
         inv = inv_by_id.get(t.invoice_id)
@@ -133,6 +146,7 @@ def customer_ledger(
             "ref": inv.invoice_number if inv else "",
             "note": "TDS deducted at source",
             "debit": ZERO, "credit": amt,
+            "invoice_id": t.invoice_id, "invoice_number": inv.invoice_number if inv else None,
         })
     for cn in credit_notes:
         inv = inv_by_id.get(cn.invoice_id)
@@ -142,6 +156,8 @@ def customer_ledger(
             "note": f"{cn.credit_type} against {inv.invoice_number if inv else '—'}"
                     + (f" · {cn.status}" if getattr(cn, "status", None) else ""),
             "debit": ZERO, "credit": Decimal(cn.total_amount or 0),
+            "invoice_id": cn.invoice_id, "invoice_number": inv.invoice_number if inv else None,
+            "credit_note_id": cn.id,
         })
 
     entries = [e for e in entries if e["date"] is not None]
@@ -167,6 +183,12 @@ def customer_ledger(
             "debit": _num(e["debit"]) or None,
             "credit": _num(e["credit"]) or None,
             "balance": _num(running),
+            # Links (22 Oct 2026): every line opens its invoice; a payment that
+            # came through a received amount names it too.
+            "invoice_id": e.get("invoice_id"),
+            "invoice_number": e.get("invoice_number"),
+            "receipt_id": e.get("receipt_id"),
+            "credit_note_id": e.get("credit_note_id"),
         })
 
     totals = {
@@ -189,7 +211,7 @@ def customer_ledger(
 def receivables(
     as_of: date | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(INV_READ),
+    user: CurrentUser = Depends(RECEIVABLES_READ),
 ):
     as_of = as_of or date.today()
 

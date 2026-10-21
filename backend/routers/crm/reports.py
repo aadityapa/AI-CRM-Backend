@@ -8,7 +8,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, gated_read, get_crm_db, role_required
+from crm_deps import CurrentUser, gated_read, get_crm_db, role_required, subtab_gate
 from models import AppSetting
 from schemas.common import envelope
 from services import reports as svc
@@ -38,6 +38,14 @@ FINANCE_VIEW = role_required(*FINANCE_VIEW_ROLES)
 #: Changing what the CEO is measured against (targets) — Finance + Admin / CEO.
 FINANCE_EDIT = role_required("Finance")
 
+#: Sub-tabs (22 Oct 2026): a template may switch each report on or off for its
+#: logins (`crm_deps.subtab_gate`). Revenue is also what Financial Reports ▸
+#: Profit reads, so either sub-tab opens it. Untemplated logins: unchanged.
+REVENUE_READ = subtab_gate("reports", ("revenue", "financial"), FINANCE_VIEW)
+OPP_REPORT_READ = subtab_gate("reports", "opportunities", REPORTS_READ)
+PROFILE_REPORT_READ = subtab_gate("reports", "profiles", REPORTS_READ)
+PRODUCTIVITY_READ = subtab_gate("reports", "productivity", REPORTS_READ)
+
 
 def _respond(rows: list[dict], format: str | None, filename: str):
     if (format or "").strip().lower() == "csv":
@@ -59,7 +67,7 @@ def opportunities_report(
     date_to: date | None = Query(None, alias="to", description="Created on or before (YYYY-MM-DD)"),
     format: str | None = Query(None, description="csv for file download"),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(REPORTS_READ),
+    user: CurrentUser = Depends(OPP_REPORT_READ),
 ):
     _window(date_from, date_to)
     rows = svc.opportunities_report(db, team=team, status=status, customer_id=customer_id,
@@ -79,7 +87,7 @@ def candidate_profiles_report(
     date_to: date | None = Query(None, alias="to", description="Applied on or before (YYYY-MM-DD)"),
     format: str | None = Query(None, description="csv for file download"),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(REPORTS_READ),
+    user: CurrentUser = Depends(PROFILE_REPORT_READ),
 ):
     _window(date_from, date_to)
     rows = svc.candidate_profiles_report(db, team=team, status=status, customer_id=customer_id,
@@ -99,7 +107,7 @@ def recruiter_productivity_report(
     date_to: date | None = Query(None, alias="to", description="Range end (YYYY-MM-DD)"),
     format: str | None = Query(None, description="csv for file download"),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(REPORTS_READ),
+    user: CurrentUser = Depends(PRODUCTIVITY_READ),
 ):
     _window(date_from, date_to)
     rows, meta = svc.recruiter_productivity_report(db, date_from=date_from, date_to=date_to)
@@ -120,7 +128,7 @@ def revenue(
     db: Session = Depends(get_crm_db),
     # CEO view (18 Sep 2026); since 19 Oct 2026 Finance + the Sales family read it
     # too (FINANCE_VIEW, by role — templates cannot widen it).
-    user: CurrentUser = Depends(FINANCE_VIEW),
+    user: CurrentUser = Depends(REVENUE_READ),
 ):
     """`month` is the ANCHOR at every zoom: `?month=2026-09&period=quarter` is
     the quarter containing September 2026, so existing `?month=` links (the
@@ -141,7 +149,7 @@ def revenue_placements(
     customer_id: int | None = Query(None, ge=1),
     project_id: int | None = Query(None, ge=1),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(FINANCE_VIEW),   # same readers as the page
+    user: CurrentUser = Depends(REVENUE_READ),   # same readers as the page
 ):
     """Customer placements split internal (redeployed) vs external (new hire).
 
@@ -235,7 +243,7 @@ def revenue_export(
     customer_id: int | None = Query(None, ge=1),
     project_id: int | None = Query(None, ge=1),
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(FINANCE_VIEW),   # whoever reads the page may take its workbook
+    user: CurrentUser = Depends(REVENUE_READ),   # whoever reads the page may take its workbook
 ):
     """Period-close workbook: every section of the report, one sheet each.
 

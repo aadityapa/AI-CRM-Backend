@@ -185,6 +185,66 @@ def plan_splits(splits: list[dict], *, remaining: Decimal, remaining_qty: Decima
     return parts
 
 
+def _fmt_d(d) -> str:
+    return d.strftime("%d-%b-%Y")
+
+
+def plan_date_splits(splits: list[dict], *, days: list[tuple], window: tuple,
+                     total: Decimal, taken: list[tuple] | None = None) -> list[dict]:
+    """PURE — split a sheet BY DATES (0142): 1–29 Mar on PO A, 30–31 Mar on PO B.
+
+    `days` = [(date, weight)] for every day of the sheet — the billable hours
+    on an Hourly rate, else the billable days (so a Monthly rate is shared out
+    by the same billed days its invoice already counts, and an unworked weekend
+    the customer does not pay for moves no money). `total` = the whole sheet's
+    sub-total (the figure frozen at approval). `taken` = date ranges already
+    raised on live parts.
+
+    Each part's amount = total × (weight in its dates ÷ weight of the whole
+    sheet). The caller passes the parts to `plan_splits` as amounts, so the part
+    that finishes the sheet still takes the exact remainder.
+    Returns [{po_id, start, end, amount, weight, days}] sorted by start date.
+    Raises ValueError with the sentence the GM sees."""
+    if not splits:
+        raise ValueError("Add at least one PO to the split")
+    w_start, w_end = window
+    weights = {d: Decimal(str(w or 0)) for d, w in days}
+    whole = sum(weights.values(), Decimal("0"))
+    calendar = whole <= 0          # nothing billable recorded — share by calendar days
+    if calendar:
+        weights = {d: Decimal("1") for d in weights}
+        whole = Decimal(len(weights)) or Decimal("1")
+    parts: list[dict] = []
+    for s in splits:
+        start, end = s.get("start_date"), s.get("end_date")
+        if start is None or end is None:
+            raise ValueError("Each PO needs the dates it covers — a From and a To date")
+        if end < start:
+            raise ValueError(f"{_fmt_d(end)} is before {_fmt_d(start)} — fix the dates")
+        if start < w_start or end > w_end:
+            raise ValueError(f"The dates must lie inside this timesheet's period "
+                             f"{_fmt_d(w_start)} to {_fmt_d(w_end)}")
+        parts.append({"po_id": int(s["po_id"]), "start": start, "end": end})
+    parts.sort(key=lambda p: p["start"])
+    ranges = [(p["start"], p["end"]) for p in parts] + list(taken or [])
+    ranges.sort()
+    for (a1, b1), (a2, b2) in zip(ranges, ranges[1:]):
+        if a2 <= b1:
+            raise ValueError(f"Two parts both bill {_fmt_d(a2)} — a day can be on one invoice only")
+    seen: set[int] = set()
+    for p in parts:
+        if p["po_id"] in seen:
+            raise ValueError("The same PO is listed twice — give it one date range")
+        seen.add(p["po_id"])
+        w = sum((v for d, v in weights.items() if p["start"] <= d <= p["end"]), Decimal("0"))
+        if w <= 0:
+            raise ValueError(f"Nothing billable between {_fmt_d(p['start'])} and {_fmt_d(p['end'])}")
+        p["weight"] = w
+        p["days"] = sum(1 for d in weights if p["start"] <= d <= p["end"])
+        p["amount"] = (total * w / whole).quantize(_C, rounding=ROUND_HALF_UP)
+    return parts
+
+
 def returned_proformas(db: Session, ts: Timesheet) -> list[Invoice]:
     """Every RETURNED Proforma on the sheet (0141: a split sheet can have one per
     part). Raising the sheet again replaces them, reusing their PI numbers."""
@@ -303,6 +363,13 @@ def convert_to_tax_invoice(db: Session, invoice: Invoice, actor, *,
         days=invoice_credit_days(db, invoice.project_id, po)[0])
     if round_off is not None:
         apply_round_off(invoice, round_off)
+    # 0143 — the TAX invoice is issued now: it carries the customer's address
+    # of today (a Proforma raised before a move must not print the old one),
+    # unless Finance already corrected the Proforma's address by hand.
+    from services.invoice_parties import freeze as freeze_parties, snapshot_of
+    _snap = snapshot_of(invoice)
+    if not (_snap and _snap.get("corrected")):
+        freeze_parties(db, invoice, source="converted", force=True)
     db.flush()
     consume_po_for_invoice(db, invoice, po, getattr(actor, "id", None))
     _notify_generated(db, invoice, actor)

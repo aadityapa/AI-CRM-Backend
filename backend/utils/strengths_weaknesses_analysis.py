@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, List
 
-SW_ANALYSIS_VERSION = 2
+SW_ANALYSIS_VERSION = 3  # 3 (21 Oct 2026): overall lists grounded on the POSITION's skills
 
 _SKIP_ANSWER_TOKENS = frozenset({"skip", "skipped", "[skipped]"})
 _PLACEHOLDER_BULLETS = frozenset({"-", "—", "n/a", "na", "none", ""})
@@ -418,6 +418,99 @@ def _generate_overall_sw_openai(
         return [], []
 
 
+def _skill_names(position_skills: Any) -> list[dict]:
+    """The position's skills as [{skill_name, is_mandatory}] whatever shape
+    they arrive in (template strings, CRM dicts)."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for s in position_skills or []:
+        if isinstance(s, dict):
+            name = _safe_str(s.get("skill_name") or s.get("skill") or s.get("name"))
+            mand = bool(s.get("is_mandatory") or s.get("mandatory"))
+        else:
+            name, mand = _safe_str(s), False
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append({"skill_name": name, "is_mandatory": mand})
+    return out
+
+
+def position_grounded_lists(report: dict, questions: List[str], answers: List[str],
+                            position_skills: Any) -> dict | None:
+    """21 Oct 2026 (user report: "Strength Summary shows wrong skills"). The
+    overall strengths / improvement areas are rebuilt from the POSITION's skills
+    and what the answers actually showed (`ai_interview_summary.evidence_report`):
+
+    * strength  = a position skill answered well (status shown / mixed / thin
+      with a good score), with the answer's own point as the example;
+    * improvement area = a position skill answered weakly, or never tested.
+
+    Skills the AI named on its own that the position does not ask for are left
+    out. None when the position's skills are unknown (the old lists stay). PURE."""
+    skills = _skill_names(position_skills)
+    if not skills:
+        return None
+    from services.ai_interview_summary import evidence_report
+
+    ev = evidence_report({"report": report, "questions": questions, "answers": answers}, skills)
+    if not ev.get("available"):
+        return None
+    by_num = {q["number"]: q for q in ev.get("questions") or []}
+    position_keys = {s["skill_name"].lower() for s in skills}
+    strengths: list[str] = []
+    gaps: list[str] = []
+    rows: list[dict] = []
+    for sk in ev.get("skills") or []:
+        if sk["skill"].lower() not in position_keys:
+            continue                                   # the AI's own extra skill
+        nums = sk.get("questions") or []
+        avg = sk.get("avg_score_percent")
+        tag = " (must-have)" if sk.get("mandatory") else ""
+        example = ""
+        for n in nums:
+            q = by_num.get(n) or {}
+            pts = q.get("got_right") or []
+            if pts:
+                example = pts[0]
+                break
+        missed = ""
+        for n in nums:
+            q = by_num.get(n) or {}
+            pts = q.get("missed") or []
+            if pts:
+                missed = pts[0]
+                break
+        where = f"Q{', Q'.join(str(n) for n in nums)}" if nums else ""
+        status = sk["status"]
+        if status in ("shown", "mixed") or (status == "thin" and avg is not None and avg >= 60):
+            line = f"{sk['skill']}{tag} — {sk['status_label'].lower()} in {where}"
+            if avg is not None:
+                line += f" (avg {round(avg)}%)"
+            if example:
+                line += f": {example}"
+            strengths.append(line[:280])
+        if status in ("weak", "not_tested") or (status in ("thin", "mixed") and (avg or 0) < 60):
+            if status == "not_tested":
+                line = f"{sk['skill']}{tag} — not tested in this interview; probe it in the next round"
+            else:
+                line = f"{sk['skill']}{tag} — {sk['status_label'].lower()} in {where}"
+                if avg is not None:
+                    line += f" (avg {round(avg)}%)"
+                if missed:
+                    line += f": {missed}"
+            gaps.append(line[:280])
+        rows.append({"skill": sk["skill"], "mandatory": bool(sk.get("mandatory")), "status": status,
+                     "status_label": sk["status_label"], "avg_score_percent": avg, "questions": nums,
+                     "ai_estimate_percent": sk.get("ai_estimate_percent"),
+                     "estimate_overstated": bool(sk.get("estimate_overstated"))})
+    # Must-haves first in both lists.
+    mand = {s["skill_name"].lower() for s in skills if s["is_mandatory"]}
+    strengths.sort(key=lambda t: 0 if any(t.lower().startswith(m) for m in mand) else 1)
+    gaps.sort(key=lambda t: 0 if any(t.lower().startswith(m) for m in mand) else 1)
+    return {"strengths": strengths[:8], "gaps": gaps[:8], "skills": rows,
+            "caveats": list(ev.get("caveats") or [])}
+
+
 def attach_strengths_weaknesses_analysis(
     report: dict,
     questions: List[str],
@@ -425,6 +518,7 @@ def attach_strengths_weaknesses_analysis(
     *,
     model: str = "gpt-5.5",
     force_regenerate: bool = False,
+    position_skills: Any = None,
 ) -> dict:
     """
     Ensure ``report['strengths_weaknesses_analysis']`` exists and is marked complete.
@@ -487,6 +581,24 @@ def attach_strengths_weaknesses_analysis(
     except Exception:
         ist = datetime.now(timezone.utc).isoformat()
 
+    # Grounded on the position's skill set (21 Oct 2026): the AI's own lists
+    # are kept as notes, the summary a reader sees names the position's skills.
+    grounded = None
+    try:
+        grounded = position_grounded_lists(out, questions, answers, position_skills)
+    except Exception:  # noqa: BLE001 — the analysis must never fail on this
+        grounded = None
+    if grounded:
+        analysis["ai_notes_strengths"] = overall_s[:8]
+        analysis["ai_notes_weaknesses"] = overall_w[:8]
+        analysis["position_skills"] = grounded["skills"]
+        analysis["position_caveats"] = grounded["caveats"]
+        if grounded["strengths"]:
+            overall_s = grounded["strengths"]
+        else:
+            overall_s = ["No position skill was clearly shown in this interview"]
+        if grounded["gaps"]:
+            overall_w = grounded["gaps"]
     analysis["questions"] = items
     analysis["overall_strengths"] = overall_s[:8]
     analysis["overall_weaknesses"] = overall_w[:8]

@@ -17,6 +17,7 @@ from crm_deps import CurrentUser, PageParams, any_crm_role, gated_create, get_cr
 from routers.crm.candidates import _reject_impossible_ctc
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Customer,
+    CustomerStatus,
     InterviewEvent, OfferHistory, OfferStatus, Opportunity, PipelineStatus, Requirement,
     Resume,
 )
@@ -243,6 +244,16 @@ def _id_csv(raw, field: str) -> list[int]:
         raise HTTPException(status_code=400, detail=f"{field} must be an id or a comma-separated list of ids")
 
 
+def _not_hidden_clause():
+    """Profiles the directory lists: not hidden — EXCEPT a joiner (21 Oct 2026,
+    user report "two joined, the Joined chip shows one"). Closing a deal as Won
+    hides its candidate profiles (`opportunities._set_profiles_hidden`), and the
+    person who joined was hidden with them; a joining is a fact, so it always
+    stays on the directory."""
+    return sa.or_(CandidateProfile.is_hidden.is_(False),
+                  CandidateProfile.pipeline_status == PipelineStatus.JOINED)
+
+
 def _apply_bucket(stmt, bucket: str | None):
     """`?bucket=` on the directory + its export: `active` (in pipeline),
     `joined` and `rejected` (closed) leave out what is in Archive; `archive`
@@ -411,7 +422,7 @@ def list_profiles(pp: PageParams = Depends(page_params),
     if not include_hidden:
         # is_hidden is NOT NULL with a false default, so this never drops rows
         # that predate the column.
-        stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
+        stmt = stmt.where(_not_hidden_clause())
     stmt = _narrow_to_stages(db, stmt, user)
     # The stage strip counts every stage, Closed included, whatever the bucket.
     pre_bucket = stmt
@@ -502,7 +513,8 @@ def profile_customer_options(db: Session = Depends(get_crm_db),
     """Customers that have at least one profile — the directory's Customer filter."""
     rows = db.execute(
         select(Customer.id, Customer.name)
-        .where(Customer.id.in_(
+        .where(Customer.status == CustomerStatus.ACTIVE,          # 22 Oct 2026: active only
+               Customer.id.in_(
             select(Opportunity.customer_id).join(
                 CandidateProfile, CandidateProfile.opportunity_id == Opportunity.id)))
         .order_by(Customer.name)
@@ -633,7 +645,7 @@ def export_profiles(format: str = "csv",
     if customer_id is not None:
         stmt = stmt.where(CandidateProfile.opportunity_id.in_(
             select(Opportunity.id).where(Opportunity.customer_id == customer_id)))
-    stmt = stmt.where(CandidateProfile.is_hidden.is_(False))
+    stmt = stmt.where(_not_hidden_clause())
     stmt = _narrow_to_stages(db, stmt, user)
     stmt = _apply_bucket(stmt, bucket)
     visible = visible_statuses_for(user)

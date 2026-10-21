@@ -56,6 +56,10 @@ class InvoiceSplitIn(BaseModel):
     po_id: int
     quantity: float | None = Field(default=None, gt=0)
     amount: float | None = Field(default=None, gt=0)
+    #: 0142 — split BY DATES: the days this PO pays for (both inclusive). When
+    #: given, the server works out the amount from the billable days / hours.
+    start_date: date | None = None
+    end_date: date | None = None
 
 
 GenerateInvoiceIn.model_rebuild()

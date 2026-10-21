@@ -280,7 +280,13 @@ def _custom_role_grants(db: Session, user_id: int):
             if rank.get(mode, -1) > rank.get(tabs.get(tab, ""), -1):
                 tabs[tab] = mode
         for tab, fmap in _normalize_field_modes(role.field_access or {}).items():
-            fields.setdefault(tab, {}).update(fmap)
+            merged = fields.setdefault(tab, {})
+            for key, mode in fmap.items():
+                # A sub-tab one role SHOWS stays shown when another hides it
+                # (22 Oct 2026) — several roles add up, they never subtract.
+                if str(key).startswith("tab:") and merged.get(key) in ("view", "edit"):
+                    continue
+                merged[key] = mode
         own = template_actions(getattr(role, "action_access", None))
         for key in (own if own is not None else default_actions_for_role(role.name)):
             if key not in actions:
