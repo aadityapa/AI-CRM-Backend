@@ -314,6 +314,21 @@ def _narrow_to_stages(db: Session, stmt, user: CurrentUser):
     return stmt if clause is None else stmt.where(clause)
 
 
+def _readable_profile(db: Session, profile_id: int, user: CurrentUser):
+    """get_profile_or_404 + the Hiring Manager scope (404 outside their positions)."""
+    from services import hiring_managers
+    profile = get_profile_or_404(db, profile_id)
+    hiring_managers.ensure_profile(db, user, profile)
+    return profile
+
+
+def _narrow_to_hm(db: Session, stmt, user: CurrentUser):
+    """A Hiring Manager lists only the candidates of the positions they are on
+    (22 Oct 2026, services/hiring_managers)."""
+    from services import hiring_managers
+    return stmt.where(hiring_managers.profile_clause(db, user)) if hiring_managers.hm_scoped(user, db) else stmt
+
+
 @router.get("")
 def list_profiles(pp: PageParams = Depends(page_params),
                   pipeline_status: str | None = None,
@@ -424,6 +439,7 @@ def list_profiles(pp: PageParams = Depends(page_params),
         # that predate the column.
         stmt = stmt.where(_not_hidden_clause())
     stmt = _narrow_to_stages(db, stmt, user)
+    stmt = _narrow_to_hm(db, stmt, user)
     # The stage strip counts every stage, Closed included, whatever the bucket.
     pre_bucket = stmt
     stmt = _apply_bucket(stmt, bucket)
@@ -647,6 +663,7 @@ def export_profiles(format: str = "csv",
             select(Opportunity.id).where(Opportunity.customer_id == customer_id)))
     stmt = stmt.where(_not_hidden_clause())
     stmt = _narrow_to_stages(db, stmt, user)
+    stmt = _narrow_to_hm(db, stmt, user)
     stmt = _apply_bucket(stmt, bucket)
     visible = visible_statuses_for(user)
     if visible is not None:
@@ -875,7 +892,7 @@ def create_profile_core(db: Session, payload: ProfileCreate, user: CurrentUser,
 def get_profile(profile_id: int,
                 db: Session = Depends(get_crm_db),
                 user: CurrentUser = Depends(any_crm_role)):
-    profile = get_profile_or_404(db, profile_id)
+    profile = _readable_profile(db, profile_id, user)
     # Pre-fill commercials from Candidate (TA) + opportunity CTC slab (Sales) when
     # still empty, so RMG sees them without re-keying. Only touches NULL fields.
     changed = backfill_profile_commercials(db, profile)
@@ -908,6 +925,9 @@ def get_profile(profile_id: int,
     data["internal_employee"] = internal
     data["fast_track_block"] = fast_track_block(profile, internal)
     data["direct_to_sales_block"] = direct_to_sales_block(profile)
+    # The Hiring Manager's two gates (22 Oct 2026) — None when the deal has no HM.
+    from services import hiring_managers
+    data["hiring_manager"] = hiring_managers.payload(db, profile)
     # HR's offered CTC (0116) — present for HR / Admin / CEO ONLY; every other
     # login never sees the key, so the tab cannot render for them.
     if hr_offer.may_see(user):
@@ -1172,7 +1192,7 @@ def skip_ai_l1(
 
 class AiL1DecisionIn(BaseModel):
     """RMG / GM's call on a FINISHED (or parked) AI L1 (7 Oct 2026, user ask)."""
-    decision: str = Field(pattern="^(proceed|hold|release)$")
+    decision: str = Field(pattern="^(proceed|hold|release|reject)$")
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -1209,10 +1229,14 @@ def ai_l1_decision(
     * ``hold`` — parks the candidate (``hr_decision = on_hold``); the row reads
       "On Hold" until released or decided.
     * ``release`` — clears the hold; the AI's verdict stands again.
+    * ``reject`` (23 Oct 2026, user ask) — ``hr_decision = rejected`` and the
+      candidacy CLOSES as RMG Rejected, so TA's row offers Archive / Re-apply
+      instead of Reschedule. A reason (≥ 5) is required.
 
     The manual-L1 and Direct-to-Sales alternatives keep their own routes
-    (``skip-ai-l1``, ``direct-to-sales``); a rejection goes through ``rmg-screening``.
+    (``skip-ai-l1``, ``direct-to-sales``).
     """
+    from services.admin_corrections import close_on_ai_rejection
     from services.candidate_profiles import hand_off_to_rmg_review
 
     profile = get_profile_or_404(db, profile_id)
@@ -1253,6 +1277,30 @@ def ai_l1_decision(
                         message="Proceeding — the candidate is with RMG for review: request the L2 "
                                 "or submit to Sales from the row")
 
+    if payload.decision == "reject":
+        if stage not in (PipelineStatus.SOURCING.value, PipelineStatus.TECHNICAL_SCREENING.value,
+                         PipelineStatus.RMG_REVIEW.value):
+            raise HTTPException(status_code=409,
+                                detail=f"The candidate is already at {stage.replace('_', ' ')}.")
+        if ai_said == "Pending":
+            raise HTTPException(status_code=409,
+                                detail="The AI L1 has not finished yet — wait for the result.")
+        if len(note) < 5:
+            raise HTTPException(status_code=400,
+                                detail="Say why the candidate is rejected (at least 5 characters).")
+        if link.hr_decision != "rejected":
+            link.hr_decision = "rejected"
+            link.hr_decision_by = who[:255]
+            link.hr_decision_at = datetime.now(timezone.utc)
+            log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                         "AI_INTERVIEW_DECISION",
+                         f"Interview marked Rejected by {who} — AI verdict was {ai_said}{score} — {note}")
+        close_on_ai_rejection(db, profile, user, note)
+        db.commit()
+        db.refresh(profile)
+        return envelope(data=profile_to_dict(profile),
+                        message="Rejected — the candidacy is closed; TA can archive the row")
+
     wanted = "on_hold" if payload.decision == "hold" else None
     if link.hr_decision != wanted:
         link.hr_decision = wanted
@@ -1269,6 +1317,43 @@ def ai_l1_decision(
     return envelope(data=profile_to_dict(profile),
                     message=("Candidate put on hold — decide later from this row"
                              if wanted else "Hold released — the AI verdict stands"))
+
+
+class AdminCorrectionIn(BaseModel):
+    """Admin / CEO undoing a wrong call (23 Oct 2026, user ask)."""
+    target_status: str | None = Field(default=None, max_length=40)
+    #: "" / "none" = not sent; else Pending / Shortlisted / Rejected; null = leave it.
+    screening: str | None = Field(default=None, max_length=20)
+    clear_ai_decision: bool = False
+    restore: bool = False
+    note: str = Field(min_length=1, max_length=1000)
+
+
+@router.get("/{profile_id}/admin-correction")
+def admin_correction_options(profile_id: int, db: Session = Depends(get_crm_db),
+                             user: CurrentUser = Depends(role_required())):
+    """Where the candidacy is and the last moves — for the correction dialog."""
+    from services.admin_corrections import correction_options
+    return envelope(data=correction_options(db, get_profile_or_404(db, profile_id)))
+
+
+@router.post("/{profile_id}/admin-correction")
+def admin_correction(profile_id: int, payload: AdminCorrectionIn,
+                     db: Session = Depends(get_crm_db),
+                     user: CurrentUser = Depends(role_required())):
+    """Admin / CEO only (`role_required()`, never template-widenable): put a
+    candidacy on any stage, reset the RMG screening, clear an AI L1 decision or
+    restore an archived row — with a reason (≥ 10), logged as ADMIN_CORRECTION.
+    A wrong round verdict is corrected on the round itself (Admin may edit every
+    round); changing a "No Hire" reopens the candidacy by itself."""
+    from services.admin_corrections import admin_correct
+    profile = get_profile_or_404(db, profile_id)
+    done = admin_correct(db, profile, user, target_status=payload.target_status or None,
+                         screening=payload.screening, clear_ai_decision=payload.clear_ai_decision,
+                         restore=payload.restore, note=payload.note)
+    db.commit()
+    db.refresh(profile)
+    return envelope(data=profile_to_dict(profile), message="Corrected — " + "; ".join(done))
 
 
 @router.post("/{profile_id}/rmg-screening")
@@ -2179,7 +2264,7 @@ def _require_offer_authority(user: CurrentUser) -> None:
 def activity_log(profile_id: int,
                  db: Session = Depends(get_crm_db),
                  user: CurrentUser = Depends(any_crm_role)):
-    get_profile_or_404(db, profile_id)
+    _readable_profile(db, profile_id, user)
     rows = db.execute(
         sa.text(
             "SELECT l.id, l.user_id, r.username, l.action_type, l.comment, l.timestamp "
@@ -2380,6 +2465,40 @@ def submit_for_approval(profile_id: int, payload: SubmitForApprovalIn,
     db.refresh(profile)
     return envelope(data=profile_to_dict(profile),
                     message="Sent to Sales Head for approval — they have been notified")
+
+
+class HmDecisionIn(BaseModel):
+    decision: str = Field(pattern="^(approve|reject)$")
+    note: str | None = Field(default=None, max_length=2000)
+
+
+def _hm_decide(db: Session, profile_id: int, kind: str, payload: HmDecisionIn, user: CurrentUser):
+    from services import hiring_managers
+    profile = _readable_profile(db, profile_id, user)
+    message = hiring_managers.decide(db, profile, kind, payload.decision, payload.note, user)
+    db.commit()
+    db.refresh(profile)
+    data = profile_to_dict(profile)
+    data["hiring_manager"] = hiring_managers.payload(db, profile)
+    return envelope(data=data, message=message)
+
+
+@router.post("/{profile_id}/hm-review")
+def hm_review(profile_id: int, payload: HmDecisionIn,
+              db: Session = Depends(get_crm_db),
+              user: CurrentUser = Depends(gated_write_action("profile.hm_review", "profiles"))):
+    """The Hiring Manager reviews a candidate RMG handed to Sales (22 Oct 2026):
+    approve → Sales may submit to the customer; reject → closed."""
+    return _hm_decide(db, profile_id, "review", payload, user)
+
+
+@router.post("/{profile_id}/hm-signoff")
+def hm_signoff(profile_id: int, payload: HmDecisionIn,
+               db: Session = Depends(get_crm_db),
+               user: CurrentUser = Depends(gated_write_action("profile.hm_signoff", "profiles"))):
+    """The Hiring Manager signs off the final selection + terms before the
+    Sales Head approves them; reject → closed."""
+    return _hm_decide(db, profile_id, "signoff", payload, user)
 
 
 @router.post("/{profile_id}/sales-head-decision")
@@ -2852,7 +2971,7 @@ def download_offer_letter(profile_id: int, offer_id: int, fmt: str,
 def offer_history(profile_id: int,
                   db: Session = Depends(get_crm_db),
                   user: CurrentUser = Depends(any_crm_role)):
-    profile = get_profile_or_404(db, profile_id)
+    profile = _readable_profile(db, profile_id, user)
     return envelope(data=[offer_to_dict(o) for o in profile.offers])
 
 
@@ -2903,7 +3022,7 @@ def interview_round_options(profile_id: int,
     Served from the router rather than the Employees tab so the picker does not
     depend on that tab's access template.
     """
-    get_profile_or_404(db, profile_id)
+    _readable_profile(db, profile_id, user)
     # Pass the user so the round list is narrowed to what they may actually
     # save — offering a choice the save would reject is a trap, not a form.
     data = interview_round_options_data(db, user)
@@ -2917,7 +3036,7 @@ def interview_round_options(profile_id: int,
 def list_interview_rounds(profile_id: int,
                           db: Session = Depends(get_crm_db),
                           user: CurrentUser = Depends(any_crm_role)):
-    profile = get_profile_or_404(db, profile_id)
+    profile = _readable_profile(db, profile_id, user)
     return envelope(data=interview_events_for_profile(db, profile.id))
 
 

@@ -46,7 +46,8 @@ Rules that are easy to get wrong:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 
 import sqlalchemy as sa
@@ -92,7 +93,14 @@ SCREENING_REVIEW = "review"
 
 
 def screening_tab_for(screening: str | None, stage: str | None) -> str:
-    """Which tab a row belongs to (PURE; the counts and the filter agree)."""
+    """Which tab a row belongs to (PURE; the counts and the filter agree).
+
+    27 Oct 2026 (filter audit): the STAGE decides first — a candidate at RMG
+    Review is "In review" whatever the screening column says (a manual-L1 /
+    AI-pass hand-off can reach review with screening still Pending or blank;
+    it used to sit under Pending and be offered Shortlist again)."""
+    if stage == REVIEW_STAGE:
+        return SCREENING_REVIEW
     if screening == SCREENING_PENDING:
         return "pending"
     if screening == SCREENING_REJECTED:
@@ -118,8 +126,8 @@ EXP_FITS = ("in", "out", "unknown")
 #: manual L1 verdict.
 BUDGET_FITS = ("over", "within", "unknown")
 PRIORITIES = ("High", "Medium", "Low")
-NOTICE_BUCKETS = ("15", "30", "60", "90", "unknown")
-AI_RESULTS = ("passed", "failed", "pending", "none")
+NOTICE_BUCKETS = ("serving", "15", "30", "60", "90", "unknown")
+AI_RESULTS = ("passed", "failed", "on_hold", "not_attempted", "pending", "none")
 L1_RESULTS = ("hire", "no_hire", "awaiting", "none")
 #: Rows read when a derived filter is on (a to-do list, not a report).
 MAX_DERIVED_ROWS = 2000
@@ -147,6 +155,9 @@ class DeskFilters:
     #: `?task=` (28 Sep 2026): the rows of one RMG / GM task category
     #: (`services/rmg_tasks.task_profile_ids`) — an empty tuple matches nothing.
     profile_ids: tuple[int, ...] | None = None
+    #: A Hiring Manager's own positions (23 Oct 2026): the deals they are on —
+    #: an HM-scoped login never sees another position's candidates here.
+    opportunity_ids: tuple[int, ...] | None = None
     #: Whose move it is (next_step.owner) · the interview route · experience vs
     #: the position's band · the candidate's city · only rows with a result to review.
     next_owner: str | None = None
@@ -207,21 +218,34 @@ def ats_band(score) -> str:
     return "low"
 
 
+def _serving_notice(t: str) -> bool:
+    """A candidate already serving notice / resigned / with a last working day."""
+    import re
+    return bool(re.search(r"\bserving\b|\blwd\b|last working|resigned|\bon notice\b", t)
+                or re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}", t))
+
+
 def notice_days(text) -> int | None:
     """A free-text notice period in days ("Immediate" → 0, "30 days", "2 months",
-    "3 weeks", "45"). None when nothing can be read. PURE."""
+    "3 weeks", "45"). None when nothing can be read. PURE.
+
+    27 Oct 2026 (filter audit): "No notice" / "Nil" → 0; a range ("30-60 days",
+    "1 to 2 months") reads its LONGER end — the honest worst case for joining;
+    a date or "serving" is NOT a day count (see `notice_bucket`)."""
     if text is None:
         return None
     t = str(text).strip().lower()
     if not t:
         return None
-    if "immediate" in t or t in ("0", "nil", "none", "serving notice"):
+    if ("immediate" in t or t in ("0", "nil", "none", "na", "n/a")
+            or re.search(r"\bno\s+notice\b|\bzero\b", t)):
         return 0
-    import re
-    m = re.search(r"(\d+(?:\.\d+)?)", t)
-    if not m:
+    if _serving_notice(t):
         return None
-    n = float(m.group(1))
+    nums = re.findall(r"(\d+(?:\.\d+)?)", t)
+    if not nums:
+        return None
+    n = max(float(x) for x in nums[:2])
     if "month" in t:
         n *= 30
     elif "week" in t:
@@ -230,7 +254,11 @@ def notice_days(text) -> int | None:
 
 
 def notice_bucket(text) -> str:
-    """"15" (≤ 15 days / immediate) · "30" · "60" · "90" (more than 60) · "unknown". PURE."""
+    """"serving" (already serving notice / a last working day given) · "15"
+    (≤ 15 days / immediate) · "30" (16–30) · "60" (31–60) · "90" (more than 60)
+    · "unknown". PURE."""
+    if text is not None and _serving_notice(str(text).strip().lower()):
+        return "serving"
     days = notice_days(text)
     if days is None:
         return "unknown"
@@ -238,12 +266,21 @@ def notice_bucket(text) -> str:
 
 
 def ai_result_bucket(ai: dict | None) -> str:
-    """The AI L1 as a filter value: passed · failed · pending (link, not done) · none. PURE."""
+    """The AI L1 as a filter value: passed · failed · on_hold (a recruiter put it
+    on hold) · not_attempted (finished with no scored answer — TA reschedules,
+    it is NOT a fail) · pending (link, not done) · none. PURE.
+
+    27 Oct 2026 (filter audit): "On Hold" and "Not attempted" used to fall into
+    pending / failed and were mixed with real results."""
     if not ai:
         return "none"
     eff = (ai.get("ai_effective_result") or "").strip()
     if eff in ("Passed", "Selected"):
         return "passed"
+    if ai.get("ai_not_attempted"):
+        return "not_attempted"
+    if eff in ("On Hold", "On_Hold", "Hold") or (ai.get("ai_hr_decision") or "") == "on_hold":
+        return "on_hold"
     if eff in ("Failed", "Rejected"):
         return "failed"
     return "pending"
@@ -365,31 +402,39 @@ def _base(filters: DeskFilters, *, with_screening: bool = True):
             CandidateProfile.pipeline_status == PS(REVIEW_STAGE)),
     ]
     if with_screening:
-        wanted = SCREENING_FILTERS[filters.screening]
-        if wanted is not None:
-            where.append(CandidateProfile.rmg_screening_status == wanted)
+        # 27 Oct 2026 (filter audit) — the SQL twin of `screening_tab_for`: the
+        # STAGE decides first, so every row sits in exactly one tab.
         if filters.screening == SCREENING_REVIEW:
             where.append(CandidateProfile.pipeline_status == PS(REVIEW_STAGE))
-        elif filters.screening == "shortlisted":
+        elif filters.screening != "all":
+            where.append(CandidateProfile.rmg_screening_status == SCREENING_FILTERS[filters.screening])
             where.append(CandidateProfile.pipeline_status != PS(REVIEW_STAGE))
     if filters.location:
         where.append(Candidate.city.ilike(f"%{filters.location.strip()}%"))
     exp = Candidate.experience_years
-    in_band = sa.and_(exp.isnot(None),
+    # 27 Oct 2026 (filter audit): a position with NO band (both bounds blank)
+    # cannot say in / out — those rows are "unknown", never "in band".
+    has_band = or_(Requirement.experience_min.isnot(None), Requirement.experience_max.isnot(None))
+    in_band = sa.and_(exp.isnot(None), has_band,
                       or_(Requirement.experience_min.is_(None), exp >= Requirement.experience_min),
                       or_(Requirement.experience_max.is_(None), exp <= Requirement.experience_max))
     if filters.exp_fit == "in":
         where.append(in_band)
     elif filters.exp_fit == "out":
-        where.append(sa.and_(exp.isnot(None), ~in_band))
+        where.append(sa.and_(exp.isnot(None), has_band, ~in_band))
     elif filters.exp_fit == "unknown":
-        where.append(exp.is_(None))
+        where.append(or_(exp.is_(None), ~has_band))
     if filters.exp_min is not None:
         where.append(exp >= filters.exp_min)
     if filters.exp_max is not None:
         where.append(exp <= filters.exp_max)
-    expected = func.coalesce(CandidateProfile.expected_ctc, Candidate.expected_ctc)
-    cap = Requirement.budget_ctc_max
+    # 27 Oct 2026 (filter audit): some records hold CTC in LAKHS (12.5) and
+    # others in rupees (1250000) — compare both in rupees, or a lakh figure
+    # always read "within budget".
+    def _rupees(col):
+        return sa.case((sa.and_(col.isnot(None), col > 0, col < 1000), col * 100000), else_=col)
+    expected = _rupees(func.coalesce(CandidateProfile.expected_ctc, Candidate.expected_ctc))
+    cap = _rupees(Requirement.budget_ctc_max)
     if filters.budget == "over":
         where.append(sa.and_(expected.isnot(None), cap.isnot(None), cap > 0, expected > cap))
     elif filters.budget == "within":
@@ -401,6 +446,8 @@ def _base(filters: DeskFilters, *, with_screening: bool = True):
         where.append(Requirement.priority == Priority(filters.priority))
     if filters.profile_ids is not None:
         where.append(CandidateProfile.id.in_(list(filters.profile_ids) or [-1]))
+    if filters.opportunity_ids is not None:
+        where.append(CandidateProfile.opportunity_id.in_(list(filters.opportunity_ids) or [-1]))
     if filters.customer_id is not None:
         where.append(Opportunity.customer_id == filters.customer_id)
     if filters.opportunity_id is not None:
@@ -548,11 +595,20 @@ def desk_queue(db: Session, filters: DeskFilters, *, page: int = 1,
         ).scalars().all()
 
     rows = _serialize(db, ids, today)
+    count_filters, pos_filters = filters, filters
+    if filters.derived:
+        # 27 Oct 2026 (filter audit): with a derived filter on, the tab counts and
+        # the position headers counted EVERY row the SQL let through — "Pending 40"
+        # over a list of 3. Count exactly what the derived filter keeps.
+        j_all, w_all = _base(filters, with_screening=False)
+        ids_all = db.execute(j_all.where(*w_all).limit(MAX_DERIVED_ROWS)).scalars().all()
+        count_filters = replace(filters, profile_ids=tuple(_derived_keep(db, filters, list(ids_all))))
+        pos_filters = replace(filters, profile_ids=tuple(kept))
     meta = {
         "page": page, "limit": limit, "total": total,
         "pages": max(1, -(-total // limit)),
-        "counts": _screening_counts(db, filters),
-        "positions": _positions(db, filters),
+        "counts": _screening_counts(db, count_filters),
+        "positions": _positions(db, pos_filters),
         "options": _options(db),
         "ats_thresholds": {"high": ATS_HIGH, "medium": ATS_MEDIUM},
         "max_score_batch": MAX_SCORE_BATCH,
@@ -711,7 +767,10 @@ def interview_route(*, screening: str | None, stage: str | None, ai: dict | None
     ai_taken = bool(ai) or bool(rounds.get("ai_l1_requested"))
     manual_requested = bool(rounds.get("l1_manual_requested"))
     manual_scheduled = bool(rounds.get("l1_manual_scheduled"))
-    chosen = "ai" if ai_taken else "manual" if (manual_requested or manual_scheduled) else None
+    # 27 Oct 2026 (filter audit): a manual L1 asked for / booked wins over an
+    # earlier AI link — that is the "Manual L1 instead" path after an AI L1 that
+    # failed / was not attempted / was put on hold; the row used to stay "AI".
+    chosen = "manual" if (manual_requested or manual_scheduled) else "ai" if ai_taken else None
     return {
         "chosen": chosen,
         "open": (screening == "Shortlisted" and stage in ROUTE_STAGES and chosen is None),
@@ -778,9 +837,11 @@ def next_step(*, screening: str | None, stage: str | None, ai: dict | None,
     def step(key, label, owner="you", tone="warn"):
         return {"key": key, "label": label, "owner": owner, "tone": tone}
 
-    if screening == SCREENING_REJECTED:
+    # 27 Oct 2026 (filter audit): the stage decides first — a candidate already at
+    # RMG Review is never "to screen" again, whatever the screening column says.
+    if screening == SCREENING_REJECTED and stage != REVIEW_STAGE:
         return step("rejected", "Rejected at screening", "done", "bad")
-    if screening != SCREENING_SHORTLISTED:
+    if screening != SCREENING_SHORTLISTED and stage != REVIEW_STAGE:
         return step("screen", "Read the resume, then shortlist or reject")
     # manual ladder, whichever stage it runs in
     if l["l1_scheduled"] and not l["l1_result"]:
@@ -799,7 +860,13 @@ def next_step(*, screening: str | None, stage: str | None, ai: dict | None,
         if not ai:
             return step("ai_book", "AI L1 chosen — TA is scheduling it", "TA", "none")
         result = ai.get("ai_effective_result")
-        if result in (None, "Pending"):
+        bucket = ai_result_bucket(ai)
+        if bucket == "not_attempted":
+            # Not a fail: the candidate never answered — TA sends a fresh link.
+            return step("ai_not_attempted", "AI L1 not attempted — TA is rescheduling it", "TA", "warn")
+        if bucket == "on_hold":
+            return step("ai_on_hold", "AI L1 on hold — decide: proceed, manual L1 or reject", "you", "warn")
+        if result in (None, "Pending", "Pending Review"):
             return step("ai_wait", "AI L1 scheduled — waiting for the candidate to take it", "candidate", "none")
         if result in ("Failed", "Rejected"):
             return step("ai_failed", "AI L1 not cleared — reject, or override the verdict on the profile", "you", "bad")

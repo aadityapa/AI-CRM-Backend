@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, gated_read, gated_write_action, get_crm_db, screener_or
+from crm_deps import CurrentUser, action_only, gated_read, gated_write_action, get_crm_db, screener_or
 from models import (
     Customer, Opportunity, Requirement, RequirementActivityLog, RequirementPositionRequest,
     RequirementStatus,
@@ -59,8 +59,11 @@ router = APIRouter(prefix="/api/requirements", tags=["CRM: Requirement positions
 #: A screener (RMG by role, GM by approval) reads positions even when the
 #: custom role / template never granted the `requirements` tab (1 Oct 2026).
 POS_READ = screener_or(gated_read("requirements", "TA", "RMG", "Sales", "Sales_Head"))
-#: Who may ASK for a change — Sales owns the customer conversation.
-POS_REQUEST = gated_write_action("requirement.positions.request", "requirements", "Sales", "Sales_Head")
+#: Who may change / ask to change the headcount (23 Oct 2026): the APPROVAL
+#: `requirement.positions.request` alone — RMG / GM / Sales / Sales Head by
+#: default, Admin-editable. It used to be a MANAGE button implied by
+#: Requirements: Edit, so every TA (who needs that grant) saw "Change positions".
+POS_REQUEST = action_only("requirement.positions.request")
 #: Who may APPROVE — RMG only by default; Admin/CEO always (user decision,
 #: 21 Sep 2026). Editable in Users ▸ Action permissions without a deploy.
 POS_APPROVE = gated_write_action("requirement.positions.approve", "requirements", "RMG")
@@ -133,6 +136,12 @@ def _visible_requirement(db: Session, requirement_id: int, user: CurrentUser) ->
         raise HTTPException(status_code=404,
                             detail="Positions are not set up for this opportunity yet — it has no "
                                    "approved hiring requirement.")
+    from services.hiring_managers import hm_scoped, is_assigned
+    if hm_scoped(user, db):
+        # A Hiring Manager reads (and may ask to change) only their positions.
+        if is_assigned(db, user, req.id):
+            return req
+        raise HTTPException(status_code=404, detail="Opportunity not found")
     if user.is_admin or user.has_any("Sales", "Sales_Head", "RMG"):
         return req
     if "TA" in user.roles and req.status in TA_VISIBLE_STATUSES:
@@ -146,6 +155,15 @@ def _visible_requirement(db: Session, requirement_id: int, user: CurrentUser) ->
     if screens_as_rmg(db, user) or sees_all_requirements(db, user):
         return req
     raise HTTPException(status_code=403, detail="Your role cannot view positions for this opportunity")
+
+
+def _passes(gate, user: CurrentUser, db: Session) -> bool:
+    """Would `gate` admit this user? (the panel shows a button exactly then)."""
+    try:
+        gate(user, db)
+        return True
+    except HTTPException:
+        return False
 
 
 def _pending(db: Session, requirement_id: int) -> RequirementPositionRequest | None:
@@ -354,7 +372,7 @@ def list_position_requests(requirement_id: int, db: Session = Depends(get_crm_db
         **positions_summary(req.no_of_positions, joined),
         "pending_id": pending.id if pending else None,
         "pending": serialize_request(pending) if pending else None,
-        "can_request": bool(user.is_admin or user.has_any("Sales", "Sales_Head")),
+        "can_request": _passes(POS_REQUEST, user, db),
         "can_approve": bool(can_approve and pending is not None
                             and (pending.requested_by != user.id or user.is_admin)),
         "is_requester": bool(pending and pending.requested_by == user.id),
@@ -396,20 +414,21 @@ def request_position_change(requirement_id: int, body: PositionRequestIn,
     label, customer = _context(db, req)
     where = f" ({customer})" if customer else ""
 
-    if user.is_admin:
-        # Admin/CEO are the escalation path: applied at once, still recorded.
+    if user.is_admin or _can_approve(user, db):
+        # Admin/CEO are the escalation path, and RMG / GM ARE the approvers
+        # (23 Oct 2026: the change is theirs now) — applied at once, still recorded.
         pr.status = "Approved"
         pr.decided_by = user.id
         pr.decided_by_name = who
         pr.decided_at = datetime.now(timezone.utc)
-        pr.decision_note = "Applied directly by Admin/CEO"
+        pr.decision_note = "Applied directly by " + ("Admin/CEO" if user.is_admin else "the approver")
         _apply(db, req, pr, user, joined)
         db.commit()
         db.refresh(req)
         _notify(db, req, pr, user,
                 event="requirement.positions_approved",
                 title=f"Positions changed: {label}",
-                message=f"{who} (Admin/CEO) set {label}{where} to {pr.to_positions} position(s) "
+                message=f"{who} set {label}{where} to {pr.to_positions} position(s) "
                         f"(was {pr.from_positions}). Reason: {reason}. "
                         f"{max(0, pr.to_positions - joined)} still open for sourcing.",
                 roles=("RMG", "TA", "Sales_Head"))

@@ -181,6 +181,11 @@ def schedule_project_close(db: Session, project: Project, *, end_date: date, rea
             pe.exit_date = end_date
     # Full reassignment — SQLAlchemy does not track in-place JSON edits.
     project.closure_capped_exits = capped
+    # 23 Oct 2026 (user report: a May sheet on a project closed 30 Apr): sheets
+    # nobody touched for months after the last working day go.
+    from services.billing_rules import drop_sheets_after_end
+    db.flush()
+    drop_sheets_after_end(db, project)
 
     released: list[Released] = []
     if end_date < today:

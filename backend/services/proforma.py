@@ -128,6 +128,55 @@ def replaceable_proforma(db: Session, ts: Timesheet) -> Invoice | None:
 QTY_UNITS = ("Hourly", "Daily")
 _C = Decimal("0.01")
 _Q4 = Decimal("0.0001")
+_HALF = Decimal("0.5")
+
+
+def round_per_day(*, unit: str | None, rate, amount, per_day, step=Decimal("1")) -> dict | None:
+    """PURE. The per-day round off on a Proforma (24 Oct 2026, Finance ask).
+
+    A Monthly (or Yearly, already ÷12) rate over a PART month bills
+    rate ÷ days × days: ₹1,20,000 over 31 days is ₹3,870.9677 a day, and the
+    printed per-day figure never multiplied back to the amount. Rounded, the
+    invoice bills `days × per-day` with the per-day figure rounded to the rupee
+    (half up) and prints exactly those two numbers.
+
+    A FULL month (amount = the monthly rate) is never touched — it bills the
+    rate exactly, with no ₹1 drift. Nor is a cycle longer than a month
+    (amount > rate) or an Hourly / Daily rate (already priced per unit).
+    Returns {per_day, days, amount, before} or None when nothing changes.
+
+    `step` (24 Oct 2026, later): Decimal("1") = the GM's "round to the rupee"
+    toggle; Decimal("0.01") = the DEFAULT for every part month — the per-day
+    figure the invoice prints (to the paisa) × the billed days, so
+    "30 days × ₹8,387.10 = ₹2,51,613.00" reads true. With the paisa step the
+    billed days must be whole or half days; anything else is left alone.
+    """
+    if (unit or "Monthly") not in ("Monthly", "Yearly"):
+        return None
+    try:
+        r, a, p = Decimal(str(rate or 0)), Decimal(str(amount or 0)), Decimal(str(per_day or 0))
+    except Exception:  # noqa: BLE001
+        return None
+    if r <= 0 or a <= 0 or p <= 0 or a >= r:
+        return None
+    days = a / p
+    # Days come in halves (half days); a tiny gap is the per-day figure's own
+    # rounding, not a real fraction — snap to the half day.
+    snapped = (days / _HALF).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * _HALF
+    step = Decimal(str(step))
+    if abs(days - snapped) < Decimal("0.05"):
+        days = snapped
+    elif step < Decimal("1"):
+        return None             # not a whole / half day count — the default never guesses
+    else:
+        days = days.quantize(_C, rounding=ROUND_HALF_UP)
+    if days <= 0:
+        return None
+    rounded = p.quantize(step, rounding=ROUND_HALF_UP)
+    new_amount = (days * rounded).quantize(_C, rounding=ROUND_HALF_UP)
+    if new_amount > r:
+        new_amount = r          # rounding can never bill more than the whole month
+    return {"per_day": rounded, "days": days, "amount": new_amount, "before": a.quantize(_C)}
 
 
 def plan_splits(splits: list[dict], *, remaining: Decimal, remaining_qty: Decimal | None,
@@ -275,15 +324,52 @@ def notify_proforma_ready(db: Session, invoice: Invoice, ts: Timesheet, actor) -
 
 
 def _notify_returned(db: Session, invoice: Invoice, actor, reason: str) -> None:
-    notify_role(
-        db, ROLE_GM,
-        f"Proforma {invoice.invoice_number} returned by Finance",
-        f"Finance sent proforma {invoice.invoice_number} back: {reason}",
-        f"/invoices/{invoice.id}", exclude_user_id=getattr(actor, "id", None),
+    """26 Oct 2026: not only the GM — the Sales Manager / Sales Head, RMG, the
+    people who may raise Proformas (a template-granted GM) and whoever filled
+    the sheet hear which month came back and why; the Dashboard's Returned
+    Proformas board keeps it in view until it is raised again."""
+    ts = db.get(Timesheet, invoice.timesheet_id) if invoice.timesheet_id else None
+    rows = [("Proforma", invoice.invoice_number), ("Reason", reason)]
+    month = ""
+    extra: set[int] = set()
+    if ts is not None:
+        from models import Employee
+        from services.billing_tracker import month_key, month_label
+        month =month_label(month_key(ts.year, ts.month)) or ""
+        emp = db.get(Employee, ts.employee_id) if ts.employee_id else None
+        name = " ".join(x for x in (getattr(emp, "first_name", None), getattr(emp, "last_name", None)) if x)
+        rows = [("Proforma", invoice.invoice_number), ("Month", month or "—"),
+                ("Employee", name or "—"), ("Reason", reason)]
+        submitter = None
+        try:
+            from models import TimesheetActivityLog
+            submitter = db.execute(
+                select(TimesheetActivityLog.user_id)
+                .where(TimesheetActivityLog.timesheet_id == ts.id,
+                       TimesheetActivityLog.action_type.in_(("TS_SUBMITTED", "TS_CREATED")))
+                .order_by(TimesheetActivityLog.id.desc()).limit(1)).scalar()
+        except Exception:  # noqa: BLE001 — a notice never undoes the return
+            submitter = None
+        if submitter:
+            extra.add(int(submitter))
+    try:
+        from services.action_permissions import user_ids_who_may
+        extra |= set(user_ids_who_may(db, "timesheet.generate_invoice"))
+    except Exception:  # noqa: BLE001
+        pass
+    extra.discard(getattr(actor, "id", None))
+    what = f" for {month}" if month else ""
+    notify_roles(
+        db, [ROLE_GM, ROLE_SALES_MANAGER, "Sales_Head", "RMG"],
+        f"Proforma {invoice.invoice_number}{what} returned by Finance",
+        f"Finance sent proforma {invoice.invoice_number}{what} back: {reason}. "
+        "Check the timesheet — reopen it to correct and submit again, or the GM reissues it.",
+        f"/timesheets/{ts.id}" if ts is not None else f"/invoices/{invoice.id}",
+        exclude_user_id=getattr(actor, "id", None),
         event=EVENT_PROFORMA_RETURNED, actor=actor,
         dedupe_prefix=f"{EVENT_PROFORMA_RETURNED}:{invoice.id}:{invoice.returned_at.isoformat() if invoice.returned_at else ''}",
         related_type="invoice", related_id=invoice.id,
-        rows=[("Proforma", invoice.invoice_number), ("Reason", reason)],
+        rows=rows, user_ids=extra or None,
     )
 
 

@@ -75,6 +75,17 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
         candidate_stages = None if stages is None else [s for s in ALL_STAGES if s in stages]
     except Exception:
         candidate_stages = None
+    def _hm_scoped(db, user) -> bool:
+        try:
+            from services.hiring_managers import hm_scoped
+            return hm_scoped(user, db)
+        except Exception:  # noqa: BLE001 — a pre-0145 DB
+            return False
+
+    def _is_hm(user) -> bool:
+        from services.hiring_managers import is_hiring_manager
+        return is_hiring_manager(user)
+
     return envelope(data={
         "id": user.id,
         "username": user.username,
@@ -87,6 +98,12 @@ def me(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_
         "display_roles": sorted(user.held_roles or user.roles),
         # A manager rung (Sales Manager) works the whole team's deals.
         "sees_team": _sees_team(user),
+        # A Hiring Manager who sees ONLY their positions (22 Oct 2026) — the UI
+        # gives them the HM dashboard and hides company-wide widgets.
+        "hiring_manager_scoped": _hm_scoped(db, user),
+        # Holds the Hiring Manager role at all (23 Oct 2026) — the Dashboard
+        # shows the HM panel to every such login, scoped or not.
+        "is_hiring_manager": _is_hm(user),
         "is_superadmin": user.is_admin,   # Admin or CEO
         "is_ceo": user.is_ceo,
         # None => full role-based access; list => only these tab keys are visible.

@@ -205,14 +205,36 @@ def billing_breakdown_for_invoice(db, invoice) -> dict | None:
             # 0142 — a part split BY DATES prints its own days as the period.
             if getattr(invoice, "split_start", None) and getattr(invoice, "split_end", None):
                 period_start, period_end = invoice.split_start, invoice.split_end
+        # 0148 — per-day round off: the document billed days × the rounded
+        # per-day figure; print exactly those, so Qty × Rate/Day = Amount.
+        pdr = getattr(invoice, "per_day_rate", None)
+        pdd = getattr(invoice, "per_day_days", None)
+        billed_days = None
+        if pdr is not None and pdd is not None and getattr(invoice, "split_no", None) is None:
+            per_day = float(pdr)
+            billed_days = float(pdd)
+            amount = float(getattr(invoice, "sub_total", 0) or 0)
+        elif unit in ("Monthly", "Yearly") and getattr(invoice, "split_no", None) is None:
+            billed_days = line.get("billed_days")
+            if billed_days is None and per_day and 0 < amount < cost:
+                # An invoice raised before 24 Oct: read the days off the amount.
+                raw = amount / per_day
+                half = round(raw * 2) / 2
+                billed_days = half if abs(raw - half) < 0.05 else None
         from services.invoice_format import normalize_invoice_format
+        fmt = normalize_invoice_format(getattr(invoice, "invoice_format", None))
+        if billed_days is not None:
+            # Qty = the days billed; with the Leave column printed the row reads
+            # "31 days − 1 leave", without it "30 days" — Qty × Rate/Day = Amount
+            # either way (24 Oct 2026: a hidden Leave column printed Qty 31).
+            qty_days = float(billed_days) + (leave_days if fmt.get("leave") else 0.0)
         return {
             "part_label": part_label,
             "billing_unit": unit,
             "columns": cols,
             # The customer's column choice frozen on this document — the
             # on-screen sheet reads it from here, the printers from Invoice.
-            "invoice_format": normalize_invoice_format(getattr(invoice, "invoice_format", None)),
+            "invoice_format": fmt,
             "monthly_cost": cost,
             "qty": qty_days,
             "leave_days": leave_days,

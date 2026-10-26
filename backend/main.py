@@ -119,6 +119,8 @@ from auth_db import (
     get_live_columns,
     set_live_control,
     set_live_reply,
+    get_device_check_log,
+    set_device_check_log,
     increment_schedule_login_attempts,
     init_auth_db,
     list_recoverable_interview_progress,
@@ -1966,7 +1968,7 @@ def _actor_label(request: Request) -> str | None:
 
 
 def _push_decision_to_crm(*, decision, actor, interview_record_id=None,
-                          invite_token=None, candidate_email=None) -> None:
+                          invite_token=None, candidate_email=None) -> dict | None:
     """Mirror a recruiter's interview decision into the CRM. Never raises.
 
     The report page and the CRM sit in two different databases. Without this the
@@ -1974,6 +1976,7 @@ def _push_decision_to_crm(*, decision, actor, interview_record_id=None,
     interview marked Selected could still show "Failed · 57.2%" on the profile.
     Best-effort by design: the report page must keep working if the CRM is down.
     """
+    outcome: dict = {}
     try:
         from services.ai_interview_bridge import sync_hr_decision
         sync_hr_decision(
@@ -1982,9 +1985,11 @@ def _push_decision_to_crm(*, decision, actor, interview_record_id=None,
             invite_token=invite_token,
             interview_record_id=interview_record_id,
             candidate_email=candidate_email,
+            outcome=outcome,
         )
     except Exception as exc:
         logging.getLogger(__name__).warning("CRM decision mirror failed: %s", exc)
+    return outcome or None
 
 
 def _enforce_crm_roles(request: Request, *allowed: str, tab: str | None = None, mode: str = "view") -> None:
@@ -6947,6 +6952,21 @@ def hr_put_candidate_hr_decision(request: Request, candidate_id: str, payload: d
             return JSONResponse({"error": "decision must be shortlist, reject, on_hold, or null."}, status_code=400)
 
     records = _candidate_history_for_id(cid)
+    # 23 Oct 2026: the report page may have been opened with the RESUME's email
+    # while interview_records is keyed by the SCHEDULED one (the GET self-heals
+    # through the record id). Without the same heal here every click answered
+    # 404 "Candidate not found." — RMG / GM reported the buttons "do nothing".
+    iid = str(payload.get("interview_id") or "").strip()
+    if not records and iid:
+        try:
+            rec_payload = get_interview_record_payload(AUTH_DB_TARGET, iid)
+            healed = _candidate_dashboard_key_from_record(rec_payload) if rec_payload else None
+            if healed and healed != cid:
+                records = _candidate_history_for_id(healed)
+                if records:
+                    cid = healed
+        except Exception:
+            pass
     if not records:
         return JSONResponse({"error": "Candidate not found."}, status_code=404)
     try:
@@ -6958,18 +6978,18 @@ def hr_put_candidate_hr_decision(request: Request, candidate_id: str, payload: d
     except Exception as exc:
         logging.getLogger(__name__).warning("sync interview hr status from hr_decision failed: %s", exc)
     # And into the CRM, so Candidate Profiles > AI Interview reflects it at once.
-    # `cid` is the lower-cased email for dashboard-keyed candidates, which is
-    # what the CRM link lookup falls back to.
-    newest = records[0] if records else {}
-    _push_decision_to_crm(
+    # The interview the reviewer is LOOKING AT wins; else the newest one.
+    target = next((r for r in records if iid and str(r.get("id") or "") == iid), None) \
+        or (records[0] if records else {})
+    crm = _push_decision_to_crm(
         decision=normalized,
         actor=request,
-        interview_record_id=newest.get("id"),
-        invite_token=newest.get("invite_token"),
+        interview_record_id=target.get("id"),
+        invite_token=target.get("invite_token"),
         candidate_email=cid,
     )
     invalidate_hr_dashboard_cache()
-    return {"status": "ok", "candidate_id": cid, "hr_decision": normalized}
+    return {"status": "ok", "candidate_id": cid, "hr_decision": normalized, "crm": crm}
 
 
 @app.delete("/hr/candidates/{candidate_id}")
@@ -9380,6 +9400,50 @@ def candidate_invite_lookup(token: str, request: Request):
     return {"status": "ok", "schedule": safe_schedule, "access": access, "prewarm": prewarm}
 
 
+@app.post("/candidate/invite/{token}/device-check")
+@_rl.limit("30/minute")
+async def candidate_invite_device_check(token: str, request: Request):
+    """24 Oct 2026: what the Device Check saw when the candidate pressed Share
+    screen (services/device_check.py). Runs BEFORE sign-in, so the invite token
+    is the only credential — the same one the public lookup takes. Stored on the
+    schedule row and shown on the Integrity timeline; it never blocks or changes
+    the interview, and a closed interview is left alone."""
+    from services import device_check as dc
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    record = get_schedule_by_token(AUTH_DB_TARGET, token)
+    if not record:
+        return JSONResponse({"error": "Invalid or expired interview link."}, status_code=404)
+    status = str(record.get("session_status") or "pending").strip().lower()
+    if status in ("completed", "terminated"):
+        return {"status": "ignored"}
+    from services.ist import now_ist
+    event = dc.clean_event(
+        body if isinstance(body, dict) else {},
+        user_agent=request.headers.get("user-agent", ""),
+        ip=request.client.host if request.client else "",
+        at=now_ist().isoformat(timespec="seconds"),
+    )
+    if not event:
+        return JSONResponse({"error": "Unknown check."}, status_code=400)
+    try:
+        set_device_check_log(AUTH_DB_TARGET, token, dc.append(get_device_check_log(AUTH_DB_TARGET, token), event))
+        invalidate_integrity_logs_cache()
+    except Exception:
+        logger.warning("interview.device_check.store_failed", exc_info=True)
+    if not event["ok"]:
+        logger.warning(
+            "interview.device_check.screen_share_failed",
+            extra={"event": "interview.device_check.screen_share_failed",
+                   "invite_token": _invite_token_tag(token), "reason": event["reason"],
+                   "surface": event["surface"], "attempt": event["attempt"],
+                   "user_agent": event["user_agent"]},
+        )
+    return {"status": "ok"}
+
+
 @app.post("/candidate/invite/{token}/verify")
 def candidate_invite_verify(token: str, request: Request, email: str = Form(""), access_key: str = Form("")):
     """Verify candidate email + access key before allowing interview entry."""
@@ -10264,6 +10328,13 @@ def interview_integrity_detail(request: Request, invite_token: str):
     # A recruiter's live actions (11 Oct 2026) sit on the same timeline,
     # informational — they never change the score.
     live_events = _live_timeline_events(token)
+    # What the Device Check reported before sign-in (24 Oct 2026) — e.g. why
+    # the screen share failed. Informational, never a strike.
+    try:
+        from services.device_check import timeline_events as _device_events
+        live_events = live_events + _device_events(get_device_check_log(AUTH_DB_TARGET, token))
+    except Exception:
+        pass
     summary_events = sorted(list(summary["events"]) + live_events,
                             key=lambda ev: str(ev.get("timestamp") or ev.get("at_ist") or ""))
     timeline = []

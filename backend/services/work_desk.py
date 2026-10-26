@@ -132,13 +132,37 @@ TABS = {
     "fin_proformas": ("Proformas to convert",
                       "Proformas the GM raised — review, then generate the original tax invoice or return it."),
     "fin_invoices": ("Tax invoices issued",
-                     "Original invoices generated in the last 30 days, with how much has been received."),
-    "fin_customer_approved": ("Customer approved invoices",
-                              "Invoices the customer accepted (confirmed by the Sales Manager / Sales Head) — "
-                              "add the e-invoice IRN and Acknowledgement No."),
+                     "Every original invoice from the data start month, with its payment status."),
+    "fin_awaiting_customer": ("Awaiting customer approval",
+                              "Original invoices with Sales for the customer's approval — the Invoices ▸ "
+                              "Awaiting customer list, item for item."),
+    "fin_customer_approved": ("Pending e-invoices",
+                              "The customer accepted these invoices — add the e-invoice IRN and "
+                              "Acknowledgement No. so payments can be recorded."),
+    "fin_payment_pending": ("Unpaid — record payment",
+                            "E-invoices with nothing received yet — record the payment or the TDS when it "
+                            "arrives; overdue first."),
+    "fin_partially_paid": ("Partially paid — balance due",
+                           "Part received (cash or TDS), the balance still due from the customer — map the "
+                           "customer's next payment advice to it; overdue first."),
+    "fin_tds_pending": ("TDS pending from client",
+                        "TDS the customer withheld and has not paid over yet — mark it received with the "
+                        "Form 16A."),
+    "fin_receipts": ("Receipts to map",
+                     "Money received that is still on account or has no branch — map it to invoices and "
+                     "name the branch."),
     "inv_confirm": ("Confirm with customer",
                     "Original invoices Finance generated — send them to the customer and confirm their "
                     "approval so Finance can add the IRN."),
+    # The Hiring Manager (22 Oct 2026): their three decisions + their positions.
+    "hm_jd": ("JD & skills to confirm",
+              "Positions RMG approved — confirm the JD & skills so TA can start sourcing, or send them back."),
+    "hm_review": ("Candidates to review",
+                  "Candidates RMG handed to Sales — approve before the profile goes to the customer, or reject."),
+    "hm_signoff": ("Selections to sign off",
+                   "The customer selected these candidates and Sales submitted the terms — sign off before "
+                   "the Sales Head approves."),
+    "hm_positions": ("My positions", "The positions you are Hiring Manager for — open, filled and their status."),
     "upcoming": ("Upcoming", "Interviews, joinings, roll-offs and due dates in the next 7 days."),
     "queues": ("My queues", "Approvals and hand-offs waiting on you, by count."),
 }
@@ -167,6 +191,9 @@ def tab_link(key: str, *, screener: bool = False) -> str:
 #: as "waiting on you".
 TAB_STAGE = {"fin_timesheets": ("Coming up", True), "fin_proformas": ("Your move", False),
              "fin_invoices": ("Done", True), "fin_customer_approved": ("Your move", False),
+             "fin_awaiting_customer": ("With Sales", True), "fin_payment_pending": ("Your move", False),
+             "fin_partially_paid": ("Follow up", False),
+             "fin_tds_pending": ("Follow up", False), "fin_receipts": ("Your move", False),
              "inv_confirm": ("Your move", False),
              "sales_submit": ("Your move", False), "sales_response": ("With the customer", False),
              "sales_decide": ("Your move", False), "sales_terms": ("Your move", False),
@@ -186,7 +213,9 @@ TAB_STAGE = {"fin_timesheets": ("Coming up", True), "fin_proformas": ("Your move
              "hr_bench": ("To place", True), "hr_celebrations": ("Coming up", True),
              "hr_onboarding": ("Your move", False), "hr_joining": ("Coming up", True),
              "hr_joined": ("Done", True), "hr_exits": ("Coming up", True),
-             "panel_feedback": ("Your move", False), "panel_upcoming": ("Coming up", True)}
+             "panel_feedback": ("Your move", False), "panel_upcoming": ("Coming up", True),
+             "hm_jd": ("Your approval", False), "hm_review": ("Your approval", False),
+             "hm_signoff": ("Your approval", False), "hm_positions": ("Yours", True)}
 
 
 #: Tabs whose tile opens a page of its own rather than My Tasks.
@@ -438,6 +467,54 @@ def _panel_tabs(db: Session, user) -> list[dict]:
     return out
 
 
+def _hm_tabs(db: Session, user) -> list[dict]:
+    """The Hiring Manager's day (22 Oct 2026, services/hiring_managers): the
+    JD & skills to confirm, candidates to review before the customer, selections
+    to sign off before the Sales Head — on the positions they are on only —
+    then the positions themselves. Empty for a login on no position."""
+    from models import RequirementStatus
+    from services import hiring_managers as hm
+    from services.requirements import positions_by_opportunity, requirement_label
+
+    req_ids = hm.requirement_ids_for(db, user.id)
+    if not req_ids:
+        # The tiles still show (reading "All clear"): an HM on no position yet
+        # must not get an empty Dashboard (23 Oct 2026).
+        return [_tab(k, []) for k in ("hm_jd", "hm_review", "hm_signoff", "hm_positions")]
+    reqs = db.execute(select(Requirement, Opportunity)
+                      .join(Opportunity, Opportunity.id == Requirement.opportunity_id)
+                      .where(Requirement.id.in_(req_ids))).all()
+    opp_ids = [o.id for _, o in reqs]
+    jd = [_item(f"hmjd:{r.id}", f"{requirement_label(r)} — {r.title}",
+                "RMG approved — confirm the JD & skills", chip="JD & skills", tone="warn",
+                when=r.engineering_reviewed_at.isoformat() if r.engineering_reviewed_at else None, path=f"opportunities/{o.id}",
+                action="Review JD & skills")
+          for r, o in reqs if r.status == RequirementStatus.PENDING_HM_REVIEW]
+    out = [_tab("hm_jd", jd)]
+    for key, col, stage, action in (
+            ("hm_review", CandidateProfile.hm_review_status, PS.SALES_SCREENING.value, "Review candidate"),
+            ("hm_signoff", CandidateProfile.hm_final_status, PS.CUSTOMER_APPROVAL.value, "Sign off")):
+        items = []
+        for p, cand, opp, _rid in _profiles(db, [stage], owner_id=None,
+                                             where=(col == hm.PENDING,
+                                                    CandidateProfile.opportunity_id.in_(opp_ids))):
+            name = " ".join(x for x in (cand.first_name, cand.last_name) if x) or f"Candidate #{cand.id}"
+            items.append(_item(f"{key}:{p.id}", name, f"{opp.opp_id} — {opp.title}",
+                               chip="Waiting for you", tone="warn", when=p.updated_at.isoformat() if p.updated_at else None,
+                               path=f"profiles/{p.id}", action=action, profile_id=p.id))
+        out.append(_tab(key, items))
+    heads = positions_by_opportunity(db, opp_ids)
+    pos = []
+    for r, o in reqs:
+        h = heads.get(o.id, {})
+        pos.append(_item(f"hmpos:{r.id}", f"{requirement_label(r)} — {r.title}",
+                         f"{h.get('positions_open', 0)} open of {h.get('positions_total', r.no_of_positions)}",
+                         chip=h.get("requirement_display_status") or getattr(r.status, "value", r.status),
+                         tone="info", path=f"opportunities/{o.id}", action="Open"))
+    out.append(_tab("hm_positions", pos))
+    return out
+
+
 def _upcoming_tab(db: Session, user) -> dict:
     from services.dashboard_desk import upcoming
 
@@ -519,6 +596,8 @@ TERMS_SENT_BACK = "Sent back — revise and resubmit"
 TERMS_TO_SUBMIT = "Ready to submit"
 TERMS_WAITING = "With Sales Head — waiting for approval"
 TERMS_SECTIONS = (TERMS_SENT_BACK, TERMS_TO_SUBMIT, TERMS_WAITING)
+#: Derived statuses that park a candidacy — not Sales' move (27 Oct 2026).
+_PARKED_STATUSES = frozenset({"deal_customer_hold", "deal_sales_hold", "candidate_hold", "hm_review"})
 
 
 def _sales_tabs(db: Session, user, *, is_admin: bool) -> list[dict]:
@@ -581,32 +660,47 @@ def _sales_tabs(db: Session, user, *, is_admin: bool) -> list[dict]:
 
         age = f"{days} day{'s' if days != 1 else ''}"
         waiting_tone = "bad" if days > 2 * CUSTOMER_WAIT_DAYS else "warn" if days > CUSTOMER_WAIT_DAYS else "info"
-        if stage == PS.SALES_SCREENING.value:
+        parked = st.get("key") in _PARKED_STATUSES
+        if parked and stage in (PS.SALES_SCREENING.value, PS.CUSTOMER_SCREENING.value):
+            # 27 Oct 2026: a candidate on a held deal, on hold by request, or with
+            # the Hiring Manager is NOT Sales' move — the move would be refused.
+            # It stays in its tab under its real status (no move buttons, not
+            # counted), so the Status filter never groups it with ready ones.
+            tab = "sales_submit" if stage == PS.SALES_SCREENING.value else "sales_response"
+            item(tab, st.get("label") or "On hold", "warn", "Open", moves=False)
+            tabs[tab][-1].update(status=st.get("label") or "On hold", parked=True)
+        elif stage == PS.SALES_SCREENING.value:
             item("sales_submit", f"Cleared by RMG · {age}", waiting_tone, "Submit to customer")
+            tabs["sales_submit"][-1]["status"] = "Ready to submit"
         elif stage == PS.CUSTOMER_SCREENING.value:
             item("sales_response", f"With the customer · {age}", waiting_tone, "Record the response")
+            tabs["sales_response"][-1]["status"] = "Waiting for the customer"
         elif st.get("key") in _SALES_DECIDE:
             failed = st["key"].endswith("_failed")
             item("sales_decide", st.get("label"), "bad" if failed else "ok", "Decide the next step")
+            tabs["sales_decide"][-1]["status"] = st.get("label")
         elif stage == PS.SHORTLISTED.value:
             back = st.get("key") == "terms_sent_back"
             item("sales_terms", "Sent back by Sales Head" if back else f"Customer shortlisted · {age}",
                  "warn" if back else "ok", "Resubmit terms" if back else "Submit terms", moves=False)
             tabs["sales_terms"][-1]["section"] = TERMS_SENT_BACK if back else TERMS_TO_SUBMIT
+            tabs["sales_terms"][-1]["status"] = TERMS_SENT_BACK if back else TERMS_TO_SUBMIT
         elif stage == PS.CUSTOMER_APPROVAL.value:
             item("sales_approval", f"Waiting {age}",
                  "bad" if days > 2 * CUSTOMER_WAIT_DAYS else "warn" if days > 1 else "info",
                  "Review terms" if approver else "Open", moves=False)
+            tabs["sales_approval"][-1]["status"] = "Waiting for approval"
             # …and the same candidacy on the submitter's side, as "sent, waiting"
             # (29 Sep 2026: everything Sales sends Sales Head lives in ONE tab).
             tabs["sales_terms"].append(dict(tabs["sales_approval"][-1], key=f"sales_terms_wait:{p.id}",
                                             chip=f"With Sales Head · {age}", tone="info", action="Open",
-                                            section=TERMS_WAITING))
+                                            section=TERMS_WAITING, status=TERMS_WAITING))
         elif p.budget_status == BUDGET_OUT and may_reply:
             item("sales_budget", "Out of budget", "bad", "Reply to HR", moves=False)
             tabs["sales_budget"][-1]["hr_note"] = p.budget_note
     terms = sorted(tabs["sales_terms"], key=lambda it: TERMS_SECTIONS.index(it.get("section", TERMS_TO_SUBMIT)))
-    out = [_tab(k, tabs[k]) for k in ("sales_submit", "sales_response", "sales_decide")]
+    out = [_tab(k, tabs[k], count=sum(1 for it in tabs[k] if not it.get("parked")))
+           for k in ("sales_submit", "sales_response", "sales_decide")]
     # The count is what Sales still has to SEND — waiting items are information.
     # A real Sales Head APPROVES terms (their own tab below); "Submit to Sales
     # Head" is for Sales / Sales Manager only (29 Sep 2026, user ask).
@@ -696,13 +790,16 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
             it.pop("_order", None)
         return items
 
-    # 1 — timesheets not yet approved.
+    from services.billing_rules import invoice_window_clause, work_month_clause
+
+    # 1 — timesheets not yet approved (from the data start month, 23 Oct 2026).
     this_month = today.year * 12 + today.month
     ts_rows = db.execute(
         select(Timesheet, Employee).outerjoin(Employee, Employee.id == Timesheet.employee_id)
         .where(Timesheet.project_id.in_(pids or [-1]),
                Timesheet.status.in_([TimesheetStatus.DRAFT, TimesheetStatus.SUBMITTED, TimesheetStatus.REJECTED]),
-               Timesheet.year * 12 + Timesheet.month <= this_month)
+               Timesheet.year * 12 + Timesheet.month <= this_month,
+               work_month_clause(Timesheet.year, Timesheet.month))
         .order_by(Timesheet.year, Timesheet.month)).all()
     ts_items, ts_move = [], 0
     for ts, emp in ts_rows:
@@ -728,11 +825,10 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
         ts_items.append(it)
 
     # 2 — approved sheets waiting for an issued invoice.
-    since = datetime.now(timezone.utc) - timedelta(days=FIN_TIMESHEET_DAYS)
     approved = db.execute(
         select(Timesheet, Employee).outerjoin(Employee, Employee.id == Timesheet.employee_id)
         .where(Timesheet.project_id.in_(inv_pids or [-1]), Timesheet.status == TimesheetStatus.APPROVED,
-               func.coalesce(Timesheet.approved_at, Timesheet.updated_at) >= since)).all()
+               work_month_clause(Timesheet.year, Timesheet.month))).all()
     sdocs = _sheet_docs(db, [ts.id for ts, _ in approved])
     pend_items = []
     for ts, emp in approved:
@@ -758,10 +854,17 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
     # for every invoice on the page; a manual invoice names nobody.
     # 8 Oct 2026: EVERY tax invoice of the scope (was the last 90 days) — the
     # tab filters by customer / employee / month instead of hiding older ones.
-    invoices = db.execute(select(Invoice).where(
-        Invoice.project_id.in_(inv_pids or [-1]),
+    inv_q = select(Invoice).where(
+        invoice_window_clause(),
         or_((Invoice.kind == proforma) & Invoice.returned_at.is_(None), Invoice.kind == tax))
-        .order_by(Invoice.invoice_date.desc(), Invoice.id.desc())).scalars().all()
+    if not invoices_everyone:
+        inv_q = inv_q.where(Invoice.project_id.in_(inv_pids or [-1]))
+    # 27 Oct 2026: the whole of Sales sees EVERY invoice — a manual invoice with
+    # no project used to be missing here while "Confirm with customer" listed it.
+    invoices = db.execute(inv_q.order_by(Invoice.invoice_date.desc(), Invoice.id.desc())).scalars().all()
+    inv_nm = _invoice_names(db, invoices)
+    inv_state = invoice_states(db, invoices, today)
+    from services.billing_rules import COLLECTABLE_STAGES
     emp_of_sheet: dict[int, str] = {}
     sheet_ids = [inv.timesheet_id for inv in invoices if inv.timesheet_id]
     if sheet_ids:
@@ -776,7 +879,9 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
 
     pi_items, iv_items, due_items = [], [], []
     for inv in invoices:
-        pname, cname = where_of(inv.project_id, inv_projects)
+        # ONE customer per invoice (`billing_rules.invoice_customer_id`).
+        pname, cname = inv_nm.get(inv.id, (None, None))
+        pname, cname = pname or "No project", cname or "No customer"
         who = emp_of_sheet.get(inv.timesheet_id or 0)
         subtitle = f"{pname}{' · ' + who if who else ''}"
         if inv.kind == proforma:
@@ -785,25 +890,34 @@ def _sales_billing_tabs(db: Session, user, *, everyone: bool, invoices_everyone:
                        subtitle, chip=f"With Finance · {age} d" if age else "With Finance",
                        tone="warn" if age > PROFORMA_WAIT_DAYS else "info", when=_when(inv.invoice_date),
                        path=f"invoices/{inv.id}", action="Open Proforma")
-            it.update(section=cname, _order=-age, **facets_of(inv, cname, pname))
+            it.update(section=cname, _order=-age, status="With Finance", stage="proforma",
+                      **facets_of(inv, cname, pname))
             pi_items.append(it)
             continue
-        status = str(getattr(inv.payment_status, "value", inv.payment_status) or "Unpaid")
-        paid = status == PaymentStatus.PAID.value
-        overdue = (not paid) and inv.due_date is not None and inv.due_date < today
+        # 27 Oct 2026: the invoice's STAGE (the Invoices tabs) refined by its
+        # status — never `payment_status`, which read "Unpaid" for an invoice
+        # still waiting for the customer or its IRN.
+        stage, status, late = inv_state[inv.id]
+        fields = _invoice_status_fields(stage, status, late)
         it = _item(f"siv:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}", subtitle,
-                   chip=("Overdue" if overdue else status.replace("_", " ")),
-                   tone="bad" if overdue else "ok" if paid else "info",
+                   chip=fields["chip"], tone=fields["tone"],
                    when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Open invoice")
-        it.update(section=cname, **facets_of(inv, cname, pname))
+        it.update(section=cname, status=fields["status"], stage=stage, status_key=status,
+                  **facets_of(inv, cname, pname))
         iv_items.append(it)
-        if overdue and inv.project_id in projects:
-            late = (today - inv.due_date).days
-            it = _item(f"sdue:{inv.id}", f"{inv.invoice_number} · {rupees(inv.balance_amount or inv.grand_total)} due",
+        # Payments to chase: money ours to collect (Unpaid / Partially paid —
+        # payment is refused before approval + IRN), past the EFFECTIVE due date
+        # (own, else invoice date + 30), in this user's own scope.
+        if (stage in COLLECTABLE_STAGES and status == "overdue" and float(inv.balance_amount or 0) > 0
+                and (everyone or inv.project_id in projects)):
+            from services.billing_rules import effective_due
+            it = _item(f"sdue:{inv.id}", f"{inv.invoice_number} · {rupees(inv.balance_amount)} due",
                        subtitle, chip=f"{late} day{'s' if late != 1 else ''} overdue",
-                       tone="bad" if late > 30 else "warn", when=inv.due_date.isoformat(),
+                       tone="bad" if late > 30 else "warn",
+                       when=_when(effective_due(inv.due_date, inv.invoice_date)),
                        path=f"invoices/{inv.id}", action="Open invoice")
-            it.update(section=cname, _order=-late, **facets_of(inv, cname, pname))
+            it.update(section=cname, _order=-late, status=fields["status"], stage=stage,
+                      **facets_of(inv, cname, pname))
             due_items.append(it)
 
     return [_tab("sales_timesheets", clean(by_section(ts_items)), count=ts_move),
@@ -1005,11 +1119,15 @@ def _team_tabs(db: Session) -> list[dict]:
                Opportunity.created_by)
         .outerjoin(Customer, Customer.id == Project.customer_id)
         .outerjoin(Opportunity, Opportunity.id == Project.opportunity_id)).all()}
+    from services.billing_rules import work_month_clause
+
     ts_raw = []
     for ts, emp in db.execute(
             select(Timesheet, Employee).outerjoin(Employee, Employee.id == Timesheet.employee_id)
             .where(Timesheet.status.in_([TimesheetStatus.DRAFT, TimesheetStatus.REJECTED]),
-                   Timesheet.year * 12 + Timesheet.month < this_month)
+                   Timesheet.year * 12 + Timesheet.month < this_month,
+                   # 27 Oct 2026: from the data start month, like Sales' own tab.
+                   work_month_clause(Timesheet.year, Timesheet.month))
             .order_by(Timesheet.year, Timesheet.month)).all():
         pname, cname, owner = proj.get(ts.project_id, ("Project", "No customer", None))
         month_end = date(ts.year + (ts.month // 12), ts.month % 12 + 1, 1) - timedelta(days=1)
@@ -1020,20 +1138,25 @@ def _team_tabs(db: Session) -> list[dict]:
                    chip=("Sent back · " if rejected else "Not submitted · ") + f"{late} d late",
                    tone="bad" if late > SHEET_LATE_DAYS else "warn", when=_when(ts.updated_at),
                    path=f"timesheets/{ts.id}", action="Open timesheet")
-        it.update(**_facets(cname, pname, ts.year, ts.month))
+        it.update(status="Sent back" if rejected else "Not submitted",
+                  **_facets(cname, pname, ts.year, ts.month, employee=_employee_name(emp)))
         ts_raw.append((owner, -late, it))
+    # 3 — overdue collections: `collectable_overdue` (27 Oct 2026) — Unpaid /
+    # Partially paid, past the effective due date, inside the data window.
+    from services.billing_rules import days_late as _late, effective_due
     due_raw = []
-    for inv in db.execute(select(Invoice).where(
-            Invoice.kind == InvoiceKind.TAX.value,
-            Invoice.payment_status.in_((PaymentStatus.UNPAID, PaymentStatus.PARTIALLY_PAID)),
-            Invoice.due_date.is_not(None), Invoice.due_date < today)).scalars():
-        pname, cname, owner = proj.get(inv.project_id, ("Project", "No customer", None))
-        late = (today - inv.due_date).days
-        it = _item(f"tdue:{inv.id}", f"{inv.invoice_number} · {rupees(inv.balance_amount or inv.grand_total)} due",
+    due_invs = collectable_overdue(db)
+    due_nm = _invoice_names(db, due_invs)
+    for inv in due_invs:
+        pname, _pc, owner = proj.get(inv.project_id, ("Project", "No customer", None))
+        cname = due_nm.get(inv.id, (None, None))[1] or "No customer"
+        late = _late(inv.due_date, inv.invoice_date, today)
+        it = _item(f"tdue:{inv.id}", f"{inv.invoice_number} · {rupees(inv.balance_amount)} due",
                    f"{cname} · {pname}", chip=f"{late} day{'s' if late != 1 else ''} overdue",
-                   tone="bad" if late > 30 else "warn", when=inv.due_date.isoformat(),
+                   tone="bad" if late > 30 else "warn",
+                   when=_when(effective_due(inv.due_date, inv.invoice_date)),
                    path=f"invoices/{inv.id}", action="Open invoice")
-        it.update(**_facets(cname, pname, day=inv.invoice_date))
+        it.update(status=_collect_stage(inv), **_facets(cname, pname, day=inv.invoice_date, amount=inv.balance_amount))
         due_raw.append((owner, -late, it))
 
     names = _deal_owner_names(db, {o for o, *_ in stuck_raw + ts_raw + due_raw if o})
@@ -1142,23 +1265,26 @@ def _head_tabs(db: Session, user) -> list[dict]:
     out.append(_tab("head_lost", lost))
 
     # 4 — top overdue collections, biggest balance first.
+    # 27 Oct 2026: `collectable_overdue` (the ONE collections rule), biggest
+    # balance first, and the WHOLE list — My Tasks filters it; the tile's hint
+    # names the top ones. It was cut to 10 on the server.
+    from services.billing_rules import days_late as _late, effective_due
     due = []
-    for inv, pname, cname in db.execute(
-            select(Invoice, Project.name, func.coalesce(Customer.name, "No customer"))
-            .outerjoin(Project, Project.id == Invoice.project_id)
-            .outerjoin(Customer, Customer.id == Project.customer_id)
-            .where(Invoice.kind == InvoiceKind.TAX.value,
-                   Invoice.payment_status.in_((PaymentStatus.UNPAID, PaymentStatus.PARTIALLY_PAID)),
-                   Invoice.due_date.is_not(None), Invoice.due_date < today)
-            .order_by(func.coalesce(Invoice.balance_amount, Invoice.grand_total).desc())).all():
-        late = (today - inv.due_date).days
-        it = _item(f"hdue:{inv.id}", f"{cname} · {rupees(inv.balance_amount or inv.grand_total)}",
+    due_invs = sorted(collectable_overdue(db), key=lambda i: -float(i.balance_amount or 0))
+    due_nm = _invoice_names(db, due_invs)
+    for inv in due_invs:
+        pname, cname = due_nm.get(inv.id, (None, None))
+        cname = cname or "No customer"
+        late = _late(inv.due_date, inv.invoice_date, today)
+        it = _item(f"hdue:{inv.id}", f"{cname} · {rupees(inv.balance_amount)}",
                    f"{inv.invoice_number} · {pname or ''}", chip=f"{late} day{'s' if late != 1 else ''} overdue",
-                   tone="bad" if late > 30 else "warn", when=inv.due_date.isoformat(),
+                   tone="bad" if late > 30 else "warn",
+                   when=_when(effective_due(inv.due_date, inv.invoice_date)),
                    path=f"invoices/{inv.id}", action="Open invoice")
-        it.update(**_facets(cname, pname, day=inv.invoice_date))
+        it.update(status=_collect_stage(inv), top=len(due) < HEAD_TOP_COLLECTIONS,
+                  **_facets(cname, pname, day=inv.invoice_date, amount=inv.balance_amount))
         due.append(it)
-    out.append(_tab("head_collections", due[:HEAD_TOP_COLLECTIONS], count=len(due)))
+    out.append(_tab("head_collections", due))
 
     # 5 — PO renewals across the company.
     out.append(_tab("head_po_renewals", _renewal_items(db, customers=None, rolloff_days=0, prefix="hpo")))
@@ -1510,10 +1636,13 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
             select(Timesheet.id, Employee).join(Employee, Employee.id == Timesheet.employee_id)
             .where(Timesheet.id.in_(sheet_ids))).all()}
 
+    from services.billing_rules import work_month_clause as _wmc
+
     # 0 — submitted sheets: the approver's move (oldest first — they have waited longest).
+    # 27 Oct 2026: from the data start work month, like every other billing list.
     submitted = db.execute(
         select(Timesheet, Employee).outerjoin(Employee, Employee.id == Timesheet.employee_id)
-        .where(Timesheet.status == TimesheetStatus.SUBMITTED)
+        .where(Timesheet.status == TimesheetStatus.SUBMITTED, _wmc(Timesheet.year, Timesheet.month))
         .order_by(func.coalesce(Timesheet.submitted_at, Timesheet.updated_at).asc())).all()
     nm = names({ts.project_id for ts, _ in submitted})
     sub_items = []
@@ -1525,12 +1654,16 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
             "Review & approve", ts.submitted_at or ts.updated_at))
 
     # 1 — approved sheets with no issued tax invoice (the GM's Proforma is next).
-    since = datetime.now(timezone.utc) - timedelta(days=FIN_TIMESHEET_DAYS)
+    # 23 Oct 2026: windowed by the WORK month (Settings ▸ Billing ▸ Data starts
+    # from), the same rule as the billing tracker and the lists — not by "approved
+    # in the last 180 days", which made the tile and the list disagree.
+    from services.billing_rules import invoice_window_clause, work_month_clause
+
     sheets = db.execute(
         select(Timesheet, Employee)
         .outerjoin(Employee, Employee.id == Timesheet.employee_id)
         .where(Timesheet.status == TimesheetStatus.APPROVED,
-               func.coalesce(Timesheet.approved_at, Timesheet.updated_at) >= since)
+               work_month_clause(Timesheet.year, Timesheet.month))
         .order_by(func.coalesce(Timesheet.approved_at, Timesheet.updated_at).desc())
     ).all()
     sdocs = _sheet_docs(db, [ts.id for ts, _ in sheets])
@@ -1547,14 +1680,15 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
         ts_items.append(sheet_item("ts", ts, emp, nm, chip, tone, action, ts.approved_at or ts.updated_at))
 
     # 2 — Proformas raised and not returned: Finance's move.
-    pis = db.execute(select(Invoice).where(Invoice.kind == proforma, Invoice.returned_at.is_(None))
+    pis = db.execute(select(Invoice).where(Invoice.kind == proforma, Invoice.returned_at.is_(None),
+                                           invoice_window_clause())
                      .order_by(Invoice.id)).scalars().all()
-    nm = names({i.project_id for i in pis})
+    nm = _invoice_names(db, pis)
     emp_of = employees_of(pis)
     pi_chip, pi_action = words["proforma"]
     pi_items = []
     for inv in pis:
-        pname, cname = nm.get(inv.project_id, ("Project", None))
+        pname, cname = nm.get(inv.id, ("Project", None))
         who = emp_of.get(inv.timesheet_id or 0)
         age = _age_days(inv.invoice_date, today) or 0
         tone = "bad" if age > 2 * PROFORMA_WAIT_DAYS else "warn" if age > PROFORMA_WAIT_DAYS else "info"
@@ -1569,56 +1703,309 @@ def billing_chain(db: Session, *, audience: str = "finance") -> dict[str, list[d
     # report: "Tax invoices issued is not showing all invoices" — the old
     # 30-day window hid the older ones; the tab's customer / employee / month
     # filters narrow it instead.
-    issued = db.execute(select(Invoice).where(Invoice.kind == tax)
+    issued = db.execute(select(Invoice).where(Invoice.kind == tax, invoice_window_clause())
                         .order_by(Invoice.invoice_date.desc(), Invoice.id.desc())).scalars().all()
-    nm = names({i.project_id for i in issued})
+    nm = _invoice_names(db, issued)
     emp_of = employees_of(issued)
+    # 27 Oct 2026: the chip is the invoice's STAGE (the Invoices tabs) refined by
+    # its status — it printed `payment_status`, so awaiting customer, pending
+    # e-invoice and unpaid all read "Unpaid" and filtered as one.
+    states = invoice_states(db, issued, today)
     iv_items = []
     for inv in issued:
-        pname, cname = nm.get(inv.project_id, ("Project", None))
+        pname, cname = nm.get(inv.id, ("Project", None))
         who = emp_of.get(inv.timesheet_id or 0)
-        status = getattr(inv.payment_status, "value", inv.payment_status) or "Unpaid"
-        paid = str(status).lower() == "paid"
         from_pi = f"from {inv.proforma_number}" if inv.proforma_number else None
+        fields = _invoice_status_fields(*states[inv.id])
         iv_items.append(_item(
             f"iv:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
             " · ".join(x for x in (cname, pname, who, from_pi) if x),
-            chip=str(status).replace("_", " "), tone="ok" if paid else "info",
+            chip=fields["chip"], tone=fields["tone"],
             when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Open invoice")
-            | {"section": cname or "No customer"}
+            | {"section": cname or "No customer", "status": fields["status"], "stage": fields["stage"],
+               "status_key": fields["status_key"]}
             | _facets(cname, pname, day=inv.invoice_date, employee=who, amount=inv.grand_total))
 
     return {"submitted": sub_items, "awaiting": ts_items, "proformas": pi_items, "issued": iv_items}
 
 
 def _finance_tabs(db: Session) -> list[dict]:
-    """Finance's desk (29 Sep 2026, user ask): the timesheet → Proforma →
-    tax-invoice chain as three tabs (`billing_chain`, Finance's words), then
-    the customer-approved invoices waiting for the IRN (5 Oct 2026)."""
-    chain = billing_chain(db, audience="finance")
-    return [_tab("fin_timesheets", chain["awaiting"]), _tab("fin_proformas", chain["proformas"]),
-            _tab("fin_invoices", chain["issued"]), _customer_approved_tab(db)]
+    """Finance's desk, in the order the money moves (29 Sep 2026; 23 Oct 2026
+    user ask: "Pending e-invoices, Pending record payment and whatever else
+    Finance needs daily"): approved sheets → Proformas to convert → awaiting
+    the customer → e-invoices to add → payments to record → TDS to collect →
+    receipts to map → every tax invoice issued. Each tab is built in its own
+    savepoint, so one failing never blanks the others."""
+    import logging
+
+    def safe(fn):
+        try:
+            with db.begin_nested():
+                return fn()
+        except Exception:
+            logging.getLogger("karnex.crm.work_desk").warning("finance tab failed", exc_info=True)
+            return None
+
+    chain = safe(lambda: billing_chain(db, audience="finance")) or {}
+    tabs = [
+        _tab("fin_timesheets", chain["awaiting"]) if "awaiting" in chain else None,
+        _tab("fin_proformas", chain["proformas"]) if "proformas" in chain else None,
+        safe(lambda: _awaiting_customer_tab(db, "fin_awaiting_customer")),
+        safe(lambda: _customer_approved_tab(db)),
+        safe(lambda: _payment_pending_tab(db)),
+        safe(lambda: _partially_paid_tab(db)),
+        safe(lambda: _tds_pending_tab(db)),
+        safe(lambda: _receipts_to_map_tab(db)),
+        _tab("fin_invoices", chain["issued"]) if "issued" in chain else None,
+    ]
+    return [t for t in tabs if t is not None]
 
 
-#: "Customer approved invoices" keeps an invoice whose IRN is in for this long.
+#: "Pending e-invoices" keeps an invoice whose IRN is in for this long (done section).
 FIN_IRN_DONE_DAYS = 30
-#: "Confirm with customer" looks back this far (invoice date).
-CONFIRM_LOOKBACK_DAYS = 90
 #: An invoice waiting longer than this for the customer's approval turns amber, twice as long red.
 CONFIRM_WAIT_DAYS = 7
+#: Credit terms when an invoice has no due date — the Revenue report's rule.
+DEFAULT_TERMS_DAYS = 30
+
+
+def _awaiting_customer_tab(db: Session, key: str) -> dict:
+    """Tax invoices still waiting for the customer's approval — `inv_confirm`
+    for the Sales Manager / Sales Head (their move) and `fin_awaiting_customer`
+    for Finance (information). 23 Oct 2026, user report: the Invoices list read
+    101 while the Sales Manager's tile read 25 — the tile had its own 90-day
+    window. Both now use `billing_rules.awaiting_customer_clause()`."""
+    from datetime import date
+
+    from models import Invoice
+    from services.billing_rules import awaiting_customer_clause
+
+    today = date.today()
+    rows = db.execute(select(Invoice).where(awaiting_customer_clause())
+                      .order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).scalars().all()
+    nm = _invoice_names(db, rows)
+    confirm = key == "inv_confirm"
+    items = []
+    for inv in rows:
+        pname, cname = nm.get(inv.id, (None, None))
+        age = _age_days(inv.invoice_date, today) or 0
+        items.append(_item(
+            f"confirm:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
+            " · ".join(x for x in (cname, pname) if x),
+            chip=f"Issued {age} d ago" if age else "Issued today",
+            tone="bad" if age > 2 * CONFIRM_WAIT_DAYS else "warn" if age > CONFIRM_WAIT_DAYS else "info",
+            when=_when(inv.invoice_date), path=f"invoices/{inv.id}",
+            action="Confirm customer approval" if confirm else "Open invoice")
+            | {"section": cname or "No customer", "status": "Awaiting customer", "stage": "awaiting_customer"}
+            | _facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
+    return _tab(key, items)
+
+
+def _effective_due(inv):
+    from datetime import timedelta
+
+    return inv.due_date or (inv.invoice_date + timedelta(days=DEFAULT_TERMS_DAYS))
+
+
+def _payment_pending_tab(db: Session) -> dict:
+    """UNPAID tax invoices (24 Oct 2026: the `unpaid` stage — IRN in, nothing
+    received yet). Finance records the payment / TDS here. Overdue first."""
+    return _open_balance_tab(db, "unpaid", "fin_payment_pending", "pay", "Record payment")
+
+
+def _partially_paid_tab(db: Session) -> dict:
+    """PARTIALLY PAID tax invoices — part received (cash or TDS), the balance
+    still due from the customer (24 Oct 2026, user ask). Mapping the customer's
+    next payment advice to the balance clears it."""
+    return _open_balance_tab(db, "partially_paid", "fin_partially_paid", "bal", "Collect balance")
+
+
+def _open_balance_tab(db: Session, stage: str, key: str, prefix: str, action: str) -> dict:
+    """One Finance tile over one invoice stage (`billing_rules.invoice_stage_case`
+    — the Invoices tabs use the same rule), overdue first by days late."""
+    from datetime import date
+
+    from models import Invoice
+    from services.billing_rules import invoice_stage_case, invoice_window_clause
+
+    today = date.today()
+    rows = db.execute(select(Invoice).where(
+        invoice_stage_case() == stage, Invoice.balance_amount > 0,
+        invoice_window_clause())).scalars().all()
+    rows.sort(key=lambda i: (_effective_due(i), i.id))
+    nm = _invoice_names(db, rows)
+    items = []
+    for inv in rows:
+        pname, cname = nm.get(inv.id, (None, None))
+        late = (today - _effective_due(inv)).days
+        chip = f"{late} d late" if late > 0 else ("Due today" if late == 0 else f"Due in {-late} d")
+        tone = "bad" if late > 30 else "warn" if late > 0 else "info"
+        received = float(inv.paid_amount or 0) + float(getattr(inv, "tds_deducted", 0) or 0)
+        sub = [cname, pname, f"total {rupees(inv.grand_total)}"]
+        if received > 0:
+            sub.append(f"received {rupees(received)}")
+        items.append(_item(
+            f"{prefix}:{inv.id}", f"{inv.invoice_number} · {rupees(inv.balance_amount)} due",
+            " · ".join(x for x in sub if x),
+            chip=chip, tone=tone, when=_when(_effective_due(inv)), path=f"invoices/{inv.id}",
+            action=action)
+            | {"section": "Overdue" if late > 0 else "Not yet due",
+               "status": "Overdue" if late > 0 else "Not yet due", "stage": stage}
+            | _facets(cname, pname, day=inv.invoice_date, amount=inv.balance_amount))
+    return _tab(key, items)
+
+
+def _tds_pending_tab(db: Session) -> dict:
+    """TDS the customer withheld and has not yet paid over (Form 16A pending)."""
+    from datetime import date
+
+    from models import Invoice
+    from models.finance import TdsRecord, TdsStatus
+    from services.billing_rules import invoice_window_clause
+
+    today = date.today()
+    rows = db.execute(select(TdsRecord, Invoice).join(Invoice, Invoice.id == TdsRecord.invoice_id).where(
+        TdsRecord.tds_status.in_([TdsStatus.PENDING, TdsStatus.PARTIALLY_PAID]),
+        invoice_window_clause()).order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).all()
+    nm = _invoice_names(db, [inv for _, inv in rows])
+    items = []
+    for rec, inv in rows:
+        pname, cname = nm.get(inv.id, (None, None))
+        since = rec.created_at.date() if getattr(rec, "created_at", None) else inv.invoice_date
+        days = (today - since).days
+        owed = rec.tds_balance if rec.tds_balance is not None else rec.tds_amount
+        items.append(_item(
+            f"tds:{rec.id}", f"{inv.invoice_number} · TDS {rupees(owed)}",
+            " · ".join(x for x in (cname, pname, rec.section) if x),
+            chip=f"Pending {days} d" if days else "Pending", tone="bad" if days > 90 else "warn" if days > 30 else "info",
+            when=_when(since), path=f"invoices/{inv.id}", action="Mark received")
+            | {"section": cname or "No customer"} | _facets(cname, pname, day=inv.invoice_date, amount=owed))
+    return _tab("fin_tds_pending", items)
+
+
+def _receipts_to_map_tab(db: Session) -> dict:
+    """Money received but not fully placed: amount still on account (map it to
+    invoices) or no branch named (say which branch paid). 23 Oct 2026."""
+    from sqlalchemy import or_
+
+    from models import Customer
+    from models.finance import CustomerReceipt
+
+    rows = db.execute(select(CustomerReceipt, Customer.name)
+                      .outerjoin(Customer, Customer.id == CustomerReceipt.customer_id)
+                      .where(or_(CustomerReceipt.unallocated_amount > 0, CustomerReceipt.branch_id.is_(None)))
+                      .order_by(CustomerReceipt.received_date.asc(), CustomerReceipt.id.asc())).all()
+    items = []
+    for rc, cname in rows:
+        on_account = float(rc.unallocated_amount or 0) > 0
+        no_branch = rc.branch_id is None
+        bits = []
+        if on_account:
+            bits.append(f"{rupees(rc.unallocated_amount)} on account")
+        if no_branch:
+            bits.append("no branch")
+        items.append(_item(
+            f"rcpt:{rc.id}", f"{rupees(rc.amount)} received · {rc.received_date.strftime('%d %b %Y')}",
+            " · ".join(x for x in (cname, rc.reference_number, rc.payment_mode) if x),
+            chip=" · ".join(bits), tone="warn",
+            when=_when(rc.received_date), path=f"received-amounts?receipt={rc.id}",
+            action="Map invoices" if on_account else "Set branch")
+            | {"section": "Not mapped to invoices" if on_account else "Branch missing"}
+            | _facets(cname, None, day=rc.received_date, amount=rc.amount))
+    return _tab("fin_receipts", items)
 
 
 def _invoice_names(db: Session, invoices) -> dict[int, tuple[str | None, str | None]]:
-    """project id → (project name, customer name) — ONE query."""
-    from models import Customer, Project
+    """INVOICE id → (project name, customer name) — three small queries.
 
-    ids = {i.project_id for i in invoices if i.project_id}
-    if not ids:
-        return {}
-    return {pid: (pn, cn) for pid, pn, cn in db.execute(
-        select(Project.id, Project.name, Customer.name)
-        .outerjoin(Customer, Customer.id == Project.customer_id)
-        .where(Project.id.in_(ids))).all()}
+    27 Oct 2026: the customer is `billing_rules.invoice_customer_id` (the PO's,
+    else the project's) — the Invoices list's and the Billing Tracker's rule —
+    so an invoice carries the same customer on every screen and in every
+    customer filter. It used to be keyed by project, i.e. the project's customer."""
+    from models import Customer, Project
+    from models.finance import PurchaseOrder
+    from services.billing_rules import invoice_customer_id
+
+    invoices = list(invoices)
+    pids = {i.project_id for i in invoices if i.project_id}
+    po_ids = {i.po_id for i in invoices if getattr(i, "po_id", None)}
+    proj = {pid: (pn, cid) for pid, pn, cid in db.execute(
+        select(Project.id, Project.name, Project.customer_id).where(Project.id.in_(pids))).all()} if pids else {}
+    po_cust = dict(db.execute(select(PurchaseOrder.id, PurchaseOrder.customer_id)
+                              .where(PurchaseOrder.id.in_(po_ids))).all()) if po_ids else {}
+    out: dict[int, tuple] = {}
+    cids: set[int] = set()
+    for inv in invoices:
+        pname, pcid = proj.get(inv.project_id, (None, None))
+        cid = invoice_customer_id(pcid, po_cust.get(getattr(inv, "po_id", None)))
+        out[inv.id] = (pname, cid)
+        if cid:
+            cids.add(cid)
+    names = dict(db.execute(select(Customer.id, Customer.name).where(Customer.id.in_(cids))).all()) if cids else {}
+    return {iid: (pname, names.get(cid)) for iid, (pname, cid) in out.items()}
+
+
+def invoice_states(db: Session, invoices, today=None) -> dict[int, tuple[str, str, int]]:
+    """invoice id → (stage, status, days late) — `billing_rules`' ONE stage and
+    status rule (the Invoices tabs and Status filter), with TDS pending read in
+    one query. 27 Oct 2026: every desk chip on an invoice comes from here."""
+    from datetime import date
+
+    from models.finance import TdsRecord, TdsStatus
+    from services import billing_rules
+
+    today = today or date.today()
+    invoices = list(invoices)
+    ids = [i.id for i in invoices]
+    tds_open = set(db.execute(select(TdsRecord.invoice_id).where(
+        TdsRecord.invoice_id.in_(ids), TdsRecord.tds_status != TdsStatus.PAID)).scalars()) if ids else set()
+    out = {}
+    for inv in invoices:
+        stage = billing_rules.stage_of_invoice(inv)
+        status = billing_rules.invoice_status(stage=stage, returned=bool(inv.returned_at),
+                                              tds_pending=inv.id in tds_open, due=inv.due_date,
+                                              invoice_date=inv.invoice_date, today=today)
+        out[inv.id] = (stage, status, billing_rules.days_late(inv.due_date, inv.invoice_date, today))
+    return out
+
+
+def _collect_stage(inv) -> str:
+    """The stage words of an invoice on a collections list (every one there is
+    overdue): "Partially paid" once any cash or TDS is in, else "Unpaid" — the
+    Invoices tabs' words, so the Status filter splits them the same way."""
+    money_in = float(getattr(inv, "paid_amount", 0) or 0) + float(getattr(inv, "tds_deducted", 0) or 0)
+    return "Partially paid" if money_in > 0 else "Unpaid"
+
+
+def _invoice_status_fields(stage: str, status: str, days: int) -> dict:
+    """The chip, tone and FILTER status of an issued invoice item: the stage
+    words (Awaiting customer · Pending e-invoice · Unpaid · Partially paid ·
+    Paid) — the Invoices tabs' — refined by overdue / due soon."""
+    from services import billing_rules
+
+    chip = billing_rules.invoice_chip(stage, status, days if status == "overdue" else 0)
+    tone = ("ok" if stage == "paid" and status == "paid" else "warn" if stage == "paid"
+            else "bad" if status == "overdue" else "warn" if status == "due_soon" else "info")
+    return {"chip": chip, "tone": tone, "status": billing_rules.STAGE_LABELS.get(stage, stage),
+            "stage": stage, "status_key": status}
+
+
+def collectable_overdue(db: Session, *, project_ids=None):
+    """Tax invoices whose money is ours to chase and late: stage Unpaid /
+    Partially paid (payments are refused before the customer's approval and the
+    IRN), a balance left, past the EFFECTIVE due date (own, else invoice date +
+    30), inside the data window. 27 Oct 2026: the ONE rule of every
+    "collections" tab (Sales, Sales Manager team, Sales Head)."""
+    from models import Invoice
+    from services.billing_rules import (
+        COLLECTABLE_STAGES, invoice_stage_case, invoice_window_clause, overdue_clause)
+
+    q = select(Invoice).where(invoice_stage_case().in_(COLLECTABLE_STAGES),
+                              func.coalesce(Invoice.balance_amount, 0) > 0,
+                              overdue_clause(), invoice_window_clause())
+    if project_ids is not None:
+        q = q.where(Invoice.project_id.in_(list(project_ids) or [-1]))
+    return db.execute(q).scalars().all()
 
 
 def _customer_approved_tab(db: Session) -> dict:
@@ -1629,20 +2016,26 @@ def _customer_approved_tab(db: Session) -> dict:
 
     from models import Invoice
     from models.finance import InvoiceKind
+    from services.billing_rules import invoice_window_clause
+
+    from services.billing_rules import invoice_stage_case
 
     since = datetime.now(timezone.utc) - timedelta(days=FIN_IRN_DONE_DAYS)
+    # 27 Oct 2026: the `pending_einvoice` STAGE — the Invoices "Pending e-invoice"
+    # tab, item for item. An approved invoice without an IRN that already has
+    # money on it is in Partially paid / Paid (its own tile), never here as well.
     pending = db.execute(select(Invoice).where(
-        Invoice.kind == InvoiceKind.TAX.value, Invoice.customer_approved_at.isnot(None),
-        Invoice.irn_number.is_(None)).order_by(Invoice.customer_approved_at.asc())).scalars().all()
+        invoice_stage_case() == "pending_einvoice", invoice_window_clause())
+        .order_by(Invoice.customer_approved_at.asc())).scalars().all()
     done = db.execute(select(Invoice).where(
         Invoice.kind == InvoiceKind.TAX.value, Invoice.customer_approved_at.isnot(None),
-        Invoice.irn_number.isnot(None), Invoice.irn_recorded_at >= since)
+        Invoice.irn_number.isnot(None), Invoice.irn_recorded_at >= since, invoice_window_clause())
         .order_by(Invoice.irn_recorded_at.desc())).scalars().all()
     nm = _invoice_names(db, [*pending, *done])
     now = datetime.now(timezone.utc)
     items = []
     for inv in pending:
-        pname, cname = nm.get(inv.project_id, (None, None))
+        pname, cname = nm.get(inv.id, (None, None))
         at = inv.customer_approved_at
         if at is not None and at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
@@ -1654,7 +2047,7 @@ def _customer_approved_tab(db: Session) -> dict:
             path=f"invoices/{inv.id}", action="Add IRN & Ack No.")
             | {"section": "IRN to add"} | _facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
     for inv in done:
-        pname, cname = nm.get(inv.project_id, (None, None))
+        pname, cname = nm.get(inv.id, (None, None))
         items.append(_item(
             f"irn:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
             " · ".join(x for x in (cname, pname, f"Ack {inv.ack_number}" if inv.ack_number else None) if x),
@@ -1665,31 +2058,10 @@ def _customer_approved_tab(db: Session) -> dict:
 
 
 def _customer_confirm_tab(db: Session) -> dict:
-    """Sales Manager / Sales Head (5 Oct 2026): original invoices of the last
-    `CONFIRM_LOOKBACK_DAYS` whose customer approval is not confirmed yet."""
-    from datetime import date, timedelta
-
-    from models import Invoice
-    from models.finance import InvoiceKind
-
-    today = date.today()
-    rows = db.execute(select(Invoice).where(
-        Invoice.kind == InvoiceKind.TAX.value, Invoice.customer_approved_at.is_(None),
-        Invoice.invoice_date >= today - timedelta(days=CONFIRM_LOOKBACK_DAYS))
-        .order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).scalars().all()
-    nm = _invoice_names(db, rows)
-    items = []
-    for inv in rows:
-        pname, cname = nm.get(inv.project_id, (None, None))
-        age = _age_days(inv.invoice_date, today) or 0
-        items.append(_item(
-            f"confirm:{inv.id}", f"{inv.invoice_number} · {rupees(inv.grand_total)}",
-            " · ".join(x for x in (cname, pname) if x),
-            chip=f"Issued {age} d ago" if age else "Issued today",
-            tone="bad" if age > 2 * CONFIRM_WAIT_DAYS else "warn" if age > CONFIRM_WAIT_DAYS else "info",
-            when=_when(inv.invoice_date), path=f"invoices/{inv.id}", action="Confirm customer approval")
-            | {"section": cname or "No customer"} | _facets(cname, pname, day=inv.invoice_date, amount=inv.grand_total))
-    return _tab("inv_confirm", items)
+    """Sales Manager / Sales Head (5 Oct 2026): every original invoice whose
+    customer approval is not confirmed yet — the Invoices ▸ Awaiting customer
+    list, item for item (23 Oct 2026: no own window any more)."""
+    return _awaiting_customer_tab(db, "inv_confirm")
 
 
 # ---------------------------------------------------------- Admin / CEO desk
@@ -1800,11 +2172,23 @@ def desk(db: Session, user, *, max_items: int = MAX_ITEMS) -> dict:
         ("upcoming", (lambda: _upcoming_tab(db, user)) if not no_generic else None),
         ("queues", (lambda: _queues_tab(db, user)) if not no_generic else None),
     ]
+    from services import hiring_managers
     from services.panel_interviews import is_panel_only
-    if is_panel_only(user):
+    if hiring_managers.is_hiring_manager(user):
+        builders.insert(1, ("hiring_manager", lambda: _hm_tabs(db, user)))
+    if hiring_managers.hm_scoped(user, db):
+        # A Hiring Manager's day is their positions' decisions and their own
+        # interviews (22 Oct 2026) — no company-wide Upcoming / queues.
+        builders = [("hiring_manager", lambda: _hm_tabs(db, user)),
+                    ("panel", lambda: _panel_tabs(db, user))]
+    elif is_panel_only(user):
         # A login holding only custom roles (the Interviewer logins, 7 Oct
-        # 2026): their day is their own rounds — nothing else is theirs.
-        builders = [("panel", lambda: _panel_tabs(db, user))]
+        # 2026): their day is their own rounds — nothing else is theirs. A
+        # Hiring Manager among them keeps the HM tabs (23 Oct 2026: they were
+        # dropped here, and the HM's Dashboard read "nothing to show").
+        builders = ([("hiring_manager", lambda: _hm_tabs(db, user))]
+                    if hiring_managers.is_hiring_manager(user) else [])
+        builders += [("panel", lambda: _panel_tabs(db, user))]
     else:
         # Anyone linked to an Employees row and named as a panel member gets
         # their own rounds beside their role's tabs.

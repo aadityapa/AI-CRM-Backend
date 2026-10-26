@@ -782,8 +782,12 @@ def _screeners(db: Session) -> set[int]:
 
 def sync_hr_decision(*, decision: str | None, decided_by: str | None = None,
                      invite_token: str | None = None, interview_record_id: str | None = None,
-                     candidate_email: str | None = None) -> bool:
+                     candidate_email: str | None = None, outcome: dict | None = None) -> bool:
     """Push a recruiter's Shortlist / On Hold / Reject decision into the CRM.
+
+    `outcome` (23 Oct 2026): when a dict is passed it is filled with what the
+    decision did to the candidacy (`describe_decision_outcome`) so the report
+    page can say it — "closed, TA can now Archive", "moved to RMG Review" …
 
     The report page stores this in the legacy auth DB. The CRM lives in a
     different database and only ever knew the AI's score-threshold verdict, so a
@@ -816,10 +820,15 @@ def sync_hr_decision(*, decision: str | None, decided_by: str | None = None,
         try:
             link = _find_link(db, invite_token, interview_record_id, candidate_email)
             if link is None:
+                if outcome is not None:
+                    outcome.update(describe_decision_outcome(normalized, None, None, None))
                 return False
 
             previous = link.hr_decision
+            before = _profile_status(db, link.profile_id)
             if previous == normalized:
+                if outcome is not None:
+                    outcome.update(describe_decision_outcome(normalized, link.profile_id, before, before))
                 return True  # idempotent: repeated clicks must not spam the log
 
             link.hr_decision = normalized
@@ -841,13 +850,82 @@ def sync_hr_decision(*, decision: str | None, decided_by: str | None = None,
                     db, CandidateProfileActivityLog, "profile_id", link.profile_id,
                     link.scheduled_by or None, "AI_INTERVIEW_DECISION", message,
                 )
+                # The decision moves the candidacy (23 Oct 2026): Rejected
+                # closes it (TA then archives the row), Selected hands it to RMG
+                # Review (L2 / Submit to Sales). Savepointed, never raises.
+                from services.admin_corrections import apply_ai_decision_to_pipeline
+                apply_ai_decision_to_pipeline(db, link.profile_id, normalized, link.hr_decision_by)
             db.commit()
+            if outcome is not None:
+                outcome.update(describe_decision_outcome(
+                    normalized, link.profile_id, before, _profile_status(db, link.profile_id)))
             return True
         finally:
             db.close()
     except Exception as exc:  # pragma: no cover — must never break the report page
         logger.error("CRM HR-decision sync failed: %s", exc)
         return False
+
+
+def _profile_status(db: Session, profile_id: int | None) -> str | None:
+    if not profile_id:
+        return None
+    try:
+        profile = db.get(CandidateProfile, profile_id)
+    except Exception:  # pragma: no cover
+        return None
+    if profile is None:
+        return None
+    st = profile.pipeline_status
+    return getattr(st, "value", st)
+
+
+def describe_decision_outcome(decision: str | None, profile_id: int | None,
+                              before: str | None, after: str | None) -> dict:
+    """What a report-page decision did to the candidacy, in plain words. PURE.
+
+    `decision` is the CRM value (selected · rejected · on_hold · None)."""
+    from services.candidate_profiles import REJECTED_BUCKET
+    from services.candidate_status import stage_label
+
+    out = {"linked": bool(profile_id), "profile_id": profile_id, "decision": decision,
+           "status_before": before, "status_after": after, "moved": bool(before and after and before != after),
+           "closed": bool(after in REJECTED_BUCKET) if after else False}
+    now = stage_label(after) if after else ""
+    if not profile_id:
+        out["message"] = ("Saved on this report. The interview is not linked to a candidate in an "
+                          "opportunity, so no candidacy moved.")
+        out["next"] = []
+    elif decision == "rejected":
+        if out["moved"] and out["closed"]:
+            out["message"] = (f"The candidacy is closed as {now}. The TAs were told, and the Applied "
+                              "Candidates row now offers TA Archive and Re-apply.")
+            out["next"] = ["TA: Archive the row (or Re-apply if the candidate should be considered again)",
+                           "Admin: Admin correction can reopen it if this was a mistake"]
+        elif out["closed"]:
+            out["message"] = f"The candidacy was already closed ({now}). The row offers Archive and Re-apply."
+            out["next"] = ["TA: Archive the row"]
+        else:
+            out["message"] = (f"Recorded on the AI interview. The candidate is already at {now}, past the "
+                              "AI L1 stage, so the candidacy did not move.")
+            out["next"] = ["Close it from the candidate's profile if they should leave the process"]
+    elif decision == "selected":
+        if out["moved"]:
+            out["message"] = (f"Moved to {now}. RMG / GM now ask for the L2 or Submit to Sales from "
+                              "Applied Candidates or the Screening Desk.")
+            out["next"] = ["RMG / GM: Request L2 or Submit to Sales"]
+        else:
+            out["message"] = f"Recorded on the AI interview. The candidate stays at {now}."
+            out["next"] = []
+    elif decision == "on_hold":
+        out["message"] = (f"On hold — nothing moves; the candidate stays at {now}. RMG / GM can Proceed, "
+                          "Release the hold or Reject from Applied Candidates.")
+        out["next"] = ["RMG / GM: Proceed to review, Release hold or Reject later"]
+    else:
+        out["message"] = (f"Decision cleared — the AI verdict stands and the candidate stays at {now}. "
+                          "A closed candidacy is reopened with Re-apply or an Admin correction.")
+        out["next"] = []
+    return out
 
 
 def _find_link(db: Session, invite_token: str | None, interview_record_id: str | None,

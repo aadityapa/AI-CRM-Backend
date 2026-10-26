@@ -55,7 +55,7 @@ SOURCING_STATUSES = (
 #: approval; TA must not see those just because they now read On_Hold.
 _PRE_SOURCING_HELD_FROM = (
     "Draft", "Pending_Sales_Head_Approval", "Sales_Head_Rejected",
-    "Pending_Engineering_Review", "Engineering_Rejected",
+    "Pending_Engineering_Review", "Engineering_Rejected", "Pending_HM_Review",
 )
 
 
@@ -95,6 +95,7 @@ def sourcing_opportunity_clause():
 AWAITING_APPROVAL_STATUSES = (
     RequirementStatus.PENDING_SALES_HEAD_APPROVAL,
     RequirementStatus.PENDING_ENGINEERING_REVIEW,
+    RequirementStatus.PENDING_HM_REVIEW,     # the Hiring Manager confirms the JD (0145)
 )
 
 
@@ -195,7 +196,11 @@ def sees_all_requirements(db: Session | None, user: CurrentUser) -> bool:
     scoping below is a business rule for those two roles only, so a user
     admitted by a grant who holds neither is treated like RMG. Reported: the
     GM's Opportunities tab answered 403 "Your role cannot view requirements".
-    `db=None` keeps the pure role rule for callers without a session."""
+    `db=None` keeps the pure role rule for callers without a session.
+    A Hiring Manager (22 Oct 2026) never sees all — only their positions."""
+    from services.hiring_managers import hm_scoped
+    if hm_scoped(user, db):
+        return False
     if user.has_any(*SEE_ALL_ROLES):
         return True
     # A manager rung (Sales Manager) sees the whole team's deals (29 Sep 2026).
@@ -229,6 +234,9 @@ def apply_visibility(stmt: Select, user: CurrentUser,
     """
     if sees_all_requirements(db, user):
         return stmt
+    from services.hiring_managers import hm_scoped, requirement_clause
+    if db is not None and hm_scoped(user, db):
+        return stmt.where(requirement_clause(db, user))   # only the positions they are on
     conditions = []
     if "Sales" in user.roles:
         conditions.append(Requirement.created_by == user.id)
@@ -252,6 +260,11 @@ def ensure_visible(user: CurrentUser, req: Requirement, *, db: Session | None = 
     writes keep their own gates (creator-only edit, approvals)."""
     if sees_all_requirements(db, user):
         return
+    from services.hiring_managers import hm_scoped, is_assigned
+    if db is not None and hm_scoped(user, db):
+        if is_assigned(db, user, req.id):
+            return
+        raise HTTPException(status_code=404, detail="Requirement not found")
     if not user.has_any(*SCOPED_ROLES):
         raise HTTPException(status_code=403, detail="Your role cannot view requirements")
     if "Sales" in user.roles:
@@ -332,6 +345,24 @@ STAGE_OVERRIDES_REQUIREMENT_BADGE = frozenset({
     "Closed_Won", "Closed_Lost", "Closed_Partial", "Rejected", "Archived",
 })
 
+
+
+def announce_open_for_sourcing(db: Session, req: Requirement, actor) -> None:
+    """Tell TA a position is open for sourcing (and the raiser, when it is not
+    the actor) — after RMG approval, or after the Hiring Manager confirms the JD
+    when the position has one (22 Oct 2026). The assigned TAs hear "assigned
+    to you" as well (`requirement_assignments.tell_team`)."""
+    from services.notify import notify_role, notify_user
+    from services.requirement_assignments import tell_team
+    notify_role(db, "TA", "New requirement open for sourcing",
+                f"Requirement {requirement_label(req)} '{req.title}' is open for sourcing.",
+                f"/requirements/{req.id}", exclude_user_id=actor.id,
+                event="requirement.engineering_approved", actor=actor)
+    if req.created_by != actor.id:
+        notify_user(db, req.created_by,
+                    f"Requirement {requirement_label(req)} open for sourcing",
+                    "Approved and open for sourcing.", f"/requirements/{req.id}", actor=actor)
+    tell_team(db, req, actor)
 
 def display_status_for(req_status: str | None, opp_stage: str | None) -> str:
     """The ONE status string every role shows for a piece of work.
@@ -542,6 +573,8 @@ def positions_by_opportunity(db: Session, opportunity_ids) -> dict[int, dict]:
         return {}
     from services.requirement_assignments import assignments_by_requirement
     assigned = assignments_by_requirement(db, [r[0] for r in reqs])
+    from services.hiring_managers import hms_by_requirement
+    hms = hms_by_requirement(db, [r[0] for r in reqs])
     loc_ids = {r[11] for r in reqs if r[11]}
     loc_names = {
         lid: ", ".join(p for p in (city, state) if p) or None
@@ -576,6 +609,7 @@ def positions_by_opportunity(db: Session, opportunity_ids) -> dict[int, dict]:
             # requirement page.
             "requirement_priority": _val(priority),
             "assigned_tas": assigned.get(int(req_id), []),
+            "hiring_managers": hms.get(int(req_id), []),
             # The position row's facts (1 Oct 2026): the Opportunities list
             # prints the same row as TA's list for every role — band, budget,
             # work mode · location, target date and the ONE status wording

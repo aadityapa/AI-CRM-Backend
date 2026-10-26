@@ -466,6 +466,48 @@ def screener_or(gate):
     return dep
 
 
+def action_only(action: str):
+    """The decision for `action` ALONE — `action_permissions.user_may` (23 Oct
+    2026). For buttons whose RECORD is reached through another gate (the
+    position page reads through `POS_READ`), so no tab grant is consulted here:
+    a TA whose template grants Requirements: Edit no longer gets "Change TAs"
+    from that grant. Admin/CEO always pass; everyone else is decided by their
+    template's / custom role's Approvals & buttons list, else the action's role
+    list (Access Control ▸ Users ▸ Action permissions)."""
+    def dep(user: CurrentUser = Depends(get_current_user),
+            db: Session = Depends(get_crm_db)) -> CurrentUser:
+        if user.roles & {"Admin", "CEO"}:
+            return user
+        from services.action_permissions import ACTIONS, user_may
+        if user.roles and user_may(db, user, action):
+            return user
+        label = ACTIONS[action].label if action in ACTIONS else action
+        raise HTTPException(status_code=403, detail=f"You are not allowed to: {label}")
+
+    return dep
+
+
+def hm_or(gate):
+    """Admit a Hiring Manager of the position in the path when `gate` refuses
+    with a 403 (22 Oct 2026, migration 0145): they set priority / hold on THEIR
+    positions without gaining the requirements Edit grant. The route must carry
+    a `requirement_id` path parameter. Everyone else is judged by `gate`."""
+    def dep(requirement_id: int,
+            user: CurrentUser = Depends(get_current_user),
+            db: Session = Depends(get_crm_db)) -> CurrentUser:
+        try:
+            return gate(user, db)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            from services.hiring_managers import is_assigned, is_hiring_manager
+            if is_hiring_manager(user) and is_assigned(db, user, requirement_id):
+                return user
+            raise
+
+    return dep
+
+
 def subtab_choice_for(db: Session, user: CurrentUser, tab: str, sub: str) -> str:
     """"show" | "hide" | "default" — what this login's template / custom role
     says about one sub-tab (22 Oct 2026; rule in `access_registry.subtab_choice`).

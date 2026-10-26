@@ -37,7 +37,9 @@ def test_a_picked_list_decides_alone():
 
 
 def test_registry_lists_every_reports_sub_tab_and_keeps_them_out_of_fields():
-    assert set(SUB_TABS["reports"]) == {"opportunities", "profiles", "productivity", "financial", "revenue"}
+    # invoice_summary added 23 Oct 2026 (Sales' customer + month invoice summary).
+    assert set(SUB_TABS["reports"]) == {"opportunities", "profiles", "productivity", "financial", "revenue",
+                                        "invoice_summary"}
     assert "tab:revenue" in FIELDS_BY_TAB["reports"]
     reports = next(t for t in registry()["tabs"] if t["key"] == "reports")
     assert {s["key"] for s in reports["subtabs"]} >= {"tab:financial", "tab:revenue"}

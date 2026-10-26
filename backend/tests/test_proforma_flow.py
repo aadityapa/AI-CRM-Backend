@@ -247,7 +247,9 @@ def test_return_needs_a_reason_notifies_the_gm_and_blocks_conversion(world):
     assert r.status_code == 200, r.text
     body = r.json()["data"]
     assert body["kind"] == "Proforma" and body["returned_at"] and "Leave days" in body["returned_reason"]
-    assert sent[-1]["role"] == "GM" and sent[-1]["event"] == "invoice.proforma_returned"
+    # 26 Oct 2026: the GM, the Sales Manager / Sales Head and RMG all hear it.
+    told = {x["role"] for x in sent if x["event"] == "invoice.proforma_returned"}
+    assert {"GM", "Sales Manager", "Sales_Head", "RMG"} <= told
     r = client.post(f"/api/invoices/{inv.id}/convert", json={})
     assert r.status_code == 400 and "returned" in r.json()["detail"]
 
@@ -308,7 +310,7 @@ def test_roles_and_events_are_wired_for_the_new_flow():
     by_event = {e["event"]: e for e in EVENTS}
     assert by_event["timesheet.submitted"]["default_roles"] == ["GM", "CEO"]
     assert by_event["invoice.proforma_ready"]["default_roles"] == ["Finance"]
-    assert by_event["invoice.proforma_returned"]["default_roles"] == ["GM"]
+    assert by_event["invoice.proforma_returned"]["default_roles"] == ["GM", "Sales Manager", "Sales_Head", "RMG"]
     assert by_event["invoice.generated"]["default_roles"] == ["Sales Manager", "Sales_Head"]
     assert by_event["invoice.customer_approved"]["default_roles"] == ["Finance"]
 

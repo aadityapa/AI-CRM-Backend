@@ -117,6 +117,10 @@ class EngineeringApproveIn(BaseModel):
     # TAs to source the position (1 Oct 2026): assigned in the same click as the
     # approval. None = leave the team untouched; a list REPLACES it.
     ta_user_ids: list[int] | None = None
+    # Hiring Managers of the position (22 Oct 2026). None = leave them; a list
+    # REPLACES them. With at least one HM the position waits for the HM to
+    # confirm the JD & skills (Pending_HM_Review) before TA sources.
+    hm_user_ids: list[int] | None = None
 
     _ats = field_validator("ats_weights")(_validate_ats_weights)
 

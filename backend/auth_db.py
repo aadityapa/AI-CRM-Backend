@@ -391,6 +391,9 @@ def _ensure_schedule_security_columns_postgres(conn) -> None:
         # per writer, so staff and candidate never overwrite each other.
         "live_control": "TEXT",
         "live_reply": "TEXT",
+        # What the Device Check reported before sign-in (24 Oct 2026,
+        # services/device_check.py) — a short JSON list.
+        "device_check_log": "TEXT",
     }
     with conn.cursor() as cur:
         cur.execute(
@@ -425,6 +428,7 @@ def _ensure_schedule_security_columns_sqlite(conn: sqlite3.Connection) -> None:
         "recording_status": "TEXT NOT NULL DEFAULT ''",
         "live_control": "TEXT",
         "live_reply": "TEXT",
+        "device_check_log": "TEXT",
     }
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(interview_schedule)")
@@ -2638,6 +2642,39 @@ def set_live_control(db_target: DbTarget, invite_token: str, control: dict) -> N
 
 def set_live_reply(db_target: DbTarget, invite_token: str, reply: dict) -> None:
     update_schedule_field(db_target, invite_token, live_reply=_json_dumps_db(reply, {}))
+
+
+def get_device_check_log(db_target: DbTarget, invite_token: str) -> list:
+    """The Device Check results of one interview (24 Oct 2026) — [] when none,
+    when the interview does not exist, or before the column is added."""
+    token = (invite_token or "").strip()
+    if not token:
+        return []
+    try:
+        if _is_postgres(db_target):
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT device_check_log FROM interview_schedule WHERE invite_token = %s",
+                        (token,),
+                    )
+                    row = cur.fetchone()
+        else:
+            with _connect_sqlite(Path(db_target)) as conn:
+                row = conn.execute(
+                    "SELECT device_check_log FROM interview_schedule WHERE invite_token = ?",
+                    (token,),
+                ).fetchone()
+    except Exception:
+        return []
+    if not row:
+        return []
+    value = _json_loads_db(row[0], [])
+    return value if isinstance(value, list) else []
+
+
+def set_device_check_log(db_target: DbTarget, invite_token: str, log: list) -> None:
+    update_schedule_field(db_target, invite_token, device_check_log=_json_dumps_db(log, []))
 
 
 def _json_dumps_db(value: Any, fallback: Any) -> str:

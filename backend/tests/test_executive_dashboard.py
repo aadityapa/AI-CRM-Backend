@@ -244,6 +244,18 @@ def test_finance_tab_is_the_revenue_report_plus_a_month_by_month_cut(book):
     assert {"ageing", "cashflow", "targets", "collections", "alerts", "by_type"} <= set(r)
 
 
+def test_finance_tab_narrows_to_one_customer_24_oct(book):
+    """24 Oct 2026 — the Finance tab takes the Revenue report's customer / project
+    filters, so every tile, dial and month narrows to one account."""
+    from models import Customer
+    harman = book.query(Customer).filter_by(name="HARMAN").one()
+    r = ed.executive_dashboard(book, "finance", "2026-09", "fy", today=TODAY, customer_id=harman.id)["data"]
+    rep = revenue_report(book, "2026-09", TODAY, "fy", customer_id=harman.id)
+    assert r["headline"] == rep["headline"] and r["headline"]["billed"] == 360_000   # INV-3 (APTIV) is out
+    assert sum(m["billed"] for m in r["monthly"]) == 360_000
+    assert r["filters"]["customer_id"] == harman.id and r["filters"]["options"]["customers"]
+
+
 def test_fy_zoom_counts_only_the_months_that_have_happened(book):
     """At the FY zoom the period ends next March; months after today are NOT elapsed."""
     t = revenue_report(book, "2026-09", TODAY, "fy")["targets"]

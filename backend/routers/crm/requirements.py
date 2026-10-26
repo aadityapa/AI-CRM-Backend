@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from crm_deps import (
     CurrentUser, PageParams, gated_create, get_crm_db, get_current_user, page_params,
-    role_required, gated_read, gated_write, gated_write_action, screener_or)
+    role_required, gated_read, gated_write, gated_write_action, hm_or, screener_or)
 from models import (
     Opportunity, PipelineStage, Priority, Requirement, RequirementActivityLog,
     RequirementAttachment,
@@ -105,6 +105,8 @@ def _one(db: Session, req: Requirement) -> dict:
     _attach_names(db, data, req)
     from services.requirement_assignments import assignments_by_requirement
     data["assigned_tas"] = assignments_by_requirement(db, [req.id]).get(req.id, [])
+    from services.hiring_managers import hms_by_requirement
+    data["hiring_managers"] = hms_by_requirement(db, [req.id]).get(req.id, [])
     return enrich_requirement_jd(db, data, req)
 
 
@@ -295,10 +297,13 @@ def list_requirements(
     }
     from services.requirement_assignments import assignments_by_requirement
     assigned = assignments_by_requirement(db, [r.id for r in items])
+    from services.hiring_managers import hms_by_requirement
+    hms = hms_by_requirement(db, [r.id for r in items])
     for row in rows:
         row["customer_name"] = cust_names.get(row.get("customer_id"))
         row["location_name"] = loc_names.get(row.get("location_id"))
         row["assigned_tas"] = assigned.get(row["id"], [])
+        row["hiring_managers"] = hms.get(row["id"], [])
     return envelope(rows, meta=meta)
 
 
@@ -504,34 +509,33 @@ def engineering_approve(
     # ATS component weights — RMG may tune them at review (None = leave unchanged).
     if payload is not None and payload.ats_weights is not None:
         req.ats_weights = payload.ats_weights or None
-    req.status = RequirementStatus.OPEN_FOR_SOURCING
     req.engineering_reviewed_by = user.id
     req.engineering_reviewed_at = _now()
     comment = (payload.comment if payload else None) or None
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, user.id,
                  "ENGINEERING_APPROVED", comment or "Approved by Engineering (RMG)")
-    notify_role(db, "TA",
-                "New requirement open for sourcing",
-                f"Requirement {requirement_label(req)} '{req.title}' is open for sourcing.",
-                f"/requirements/{req.id}", exclude_user_id=user.id,
-                event="requirement.engineering_approved", actor=user)
-    if req.created_by != user.id:
-        notify_user(db, req.created_by,
-                    f"Requirement {requirement_label(req)} approved by Engineering",
-                    "Now open for sourcing.", f"/requirements/{req.id}",
-                    actor=user)
-    # The sourcing team is picked in the same dialog (1 Oct 2026, user ask):
-    # the assigned TAs hear "assigned to you" on top of the role-wide notice.
-    assigned = None
-    if payload is not None and payload.ta_user_ids is not None:
-        from services.requirement_assignments import set_assignments
-        try:
-            assigned = set_assignments(db, req, payload.ta_user_ids, None, user)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+    # Hiring Managers (22 Oct 2026) and the sourcing team are picked in the same
+    # dialog (1 Oct 2026). With an HM on the position it waits for the HM to
+    # confirm the JD & skills — TA hears once it opens (`hiring_managers.approve_jd`).
+    from services import hiring_managers
+    try:
+        if payload is not None and payload.hm_user_ids is not None:
+            hiring_managers.set_hiring_managers(db, req, payload.hm_user_ids, None, user)
+        waits_for_hm = hiring_managers.to_hm_review(db, req, user)
+        assigned = None
+        if payload is not None and payload.ta_user_ids is not None:
+            from services.requirement_assignments import set_assignments
+            assigned = set_assignments(db, req, payload.ta_user_ids, None, user, notify=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not waits_for_hm:
+        req.status = RequirementStatus.OPEN_FOR_SOURCING
+        from services.requirements import announce_open_for_sourcing
+        announce_open_for_sourcing(db, req, user)
     db.commit()
     _rescore_after_jd_change(db, req, user.id)
-    message = "Approved; open for sourcing"
+    message = ("Approved — waiting for the Hiring Manager to confirm the JD & skills"
+               if waits_for_hm else "Approved; open for sourcing")
     if assigned and assigned["added"]:
         message += f" — {len(assigned['added'])} TA(s) assigned"
     return envelope(_one(db, req), message=message)
@@ -559,6 +563,37 @@ def engineering_reject(
                 reason, f"/requirements/{req.id}", actor=user)
     db.commit()
     return envelope(_one(db, req), message="Requirement rejected by Engineering")
+
+
+@router.post("/{requirement_id}/hm-approve")
+def hm_approve_jd(
+    requirement_id: int,
+    payload: CommentIn | None = None,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write_action("requirement.hm_approve", "requirements")),
+):
+    """The Hiring Manager confirms the JD & skills (22 Oct 2026) → open for
+    sourcing; TA and the RMG who approved it are told."""
+    from services import hiring_managers
+    req = get_requirement_or_404(db, requirement_id)
+    hiring_managers.approve_jd(db, req, payload.comment if payload else None, user)
+    db.commit()
+    return envelope(_one(db, req), message="JD & skills confirmed — open for sourcing, TA notified")
+
+
+@router.post("/{requirement_id}/hm-request-changes")
+def hm_request_jd_changes(
+    requirement_id: int,
+    payload: RejectIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(gated_write_action("requirement.hm_approve", "requirements")),
+):
+    """The Hiring Manager sends the JD & skills back to RMG review with what to change."""
+    from services import hiring_managers
+    req = get_requirement_or_404(db, requirement_id)
+    hiring_managers.request_jd_changes(db, req, payload.reason, user)
+    db.commit()
+    return envelope(_one(db, req), message="Sent back to RMG with your changes")
 
 
 @router.post("/{requirement_id}/close")
@@ -598,7 +633,7 @@ def hold_requirement(
     requirement_id: int,
     payload: RejectIn,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "RMG", "Sales_Head")),
+    user: CurrentUser = Depends(hm_or(gated_write("requirements", "RMG", "Sales_Head"))),
 ):
     """RMG pauses sourcing (25 Aug 2026). New uploads, slot invites and AI-L1
     scheduling all refuse while held; candidates already mid-pipeline are left
@@ -638,7 +673,7 @@ def resume_requirement(
     requirement_id: int,
     payload: CommentIn | None = None,
     db: Session = Depends(get_crm_db),
-    user: CurrentUser = Depends(gated_write("requirements", "RMG", "Sales_Head")),
+    user: CurrentUser = Depends(hm_or(gated_write("requirements", "RMG", "Sales_Head"))),
 ):
     """Resume a held requirement — back to exactly the status it held from."""
     req = get_requirement_or_404(db, requirement_id)
@@ -677,7 +712,7 @@ def set_requirement_priority(
     db: Session = Depends(get_crm_db),
     # Deliberately NOT the full edit form: RMG sets urgency without gaining
     # access to budget fields.
-    user: CurrentUser = Depends(screener_or(gated_write("requirements", "RMG", "Sales_Head"))),
+    user: CurrentUser = Depends(hm_or(screener_or(gated_write("requirements", "RMG", "Sales_Head")))),
 ):
     req = get_requirement_or_404(db, requirement_id)
     previous = getattr(req.priority, "value", req.priority)

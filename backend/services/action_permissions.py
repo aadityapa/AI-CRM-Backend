@@ -115,6 +115,21 @@ ACTIONS: dict[str, Action] = {
         "Resolve HR budget flags",
         "Answer HR's budget flag on a candidate after talking to the customer.",
         ("Sales", "Sales_Head"), APPROVAL, "Sales & hiring"),
+    # The Hiring Manager (22 Oct 2026, 0145): a custom role. Each decision is
+    # also limited, in services/hiring_managers, to the positions they are on.
+    "requirement.hm_approve": Action(
+        "Hiring Manager: confirm the JD & skills",
+        "Approve the JD & skills RMG approved (opens the position for sourcing) or send them "
+        "back to RMG with what to change — only on positions the person is Hiring Manager for.",
+        ("Hiring Manager",), APPROVAL, "Hiring Manager"),
+    "profile.hm_review": Action(
+        "Hiring Manager: review candidates",
+        "Approve or reject a candidate RMG handed to Sales, before the profile goes to the customer.",
+        ("Hiring Manager",), APPROVAL, "Hiring Manager"),
+    "profile.hm_signoff": Action(
+        "Hiring Manager: sign off the selection",
+        "Sign off (or reject) the customer's selection and the terms before the Sales Head approves them.",
+        ("Hiring Manager",), APPROVAL, "Hiring Manager"),
     "leave.approve": Action(
         "Approve leave applications",
         "Approve a pending leave application.",
@@ -155,11 +170,20 @@ ACTIONS: dict[str, Action] = {
         "Close projects",
         "Set a project's last working day; the team moves to the bench after it.",
         ("Sales_Head", "RMG", "HR"), MANAGE, "Buttons", "projects"),
+    # 23 Oct 2026 (user rule): "Change positions" is no longer a plain button
+    # implied by Requirements: Edit — a TA held that grant and saw it. It is an
+    # Approvals-list entry now: RMG / GM (and Sales, who own the customer
+    # conversation) by default; Admin ticks it per template / role.
     "requirement.positions.request": Action(
-        "Request a position (headcount) change",
-        "Ask to increase or reduce the number of positions on a requirement. "
-        "The request goes to RMG for approval.",
-        ("Sales", "Sales_Head"), MANAGE, "Buttons", "requirements"),
+        "Change positions (headcount)",
+        "Ask to increase or reduce the number of positions on an opportunity. "
+        "RMG / GM's own changes apply at once; anyone else's go to RMG for approval.",
+        ("RMG", "GM", "Sales", "Sales_Head"), APPROVAL, "Sales & hiring", "requirements"),
+    "requirement.team.assign": Action(
+        "Assign the sourcing team & Hiring Manager",
+        "Change which TAs source a position (Change TAs) and assign its Hiring "
+        "Manager (RMG / GM).",
+        ("RMG", "GM"), APPROVAL, "Sales & hiring", "requirements"),
 }
 
 #: The approval buttons, in editor order.

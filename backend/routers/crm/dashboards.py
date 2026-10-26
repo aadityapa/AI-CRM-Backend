@@ -1,6 +1,8 @@
 """Role-specific CRM dashboards (read-only aggregates)."""
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -10,6 +12,16 @@ from schemas.common import envelope
 from services import dashboards as svc
 
 router = APIRouter(prefix="/api/dashboard", tags=["CRM: Dashboards"])
+
+
+@router.get("/hiring-manager")
+def hiring_manager_dashboard(db: Session = Depends(get_crm_db), user: CurrentUser = Depends(any_crm_role)):
+    """The Hiring Manager's own Dashboard (23 Oct 2026): the positions this login
+    is on — decisions waiting, position cards with their candidates per phase,
+    their interviews and the latest moves. Scoped by the assignment table, so
+    any login gets only ITS positions (an empty shape when it is on none)."""
+    from services.hiring_managers import dashboard
+    return envelope(dashboard(db, user))
 
 
 @router.get("/executive")
@@ -130,6 +142,16 @@ def work_desk(
     return envelope(desk(db, user, max_items=FULL_MAX_ITEMS if full else MAX_ITEMS))
 
 
+def billing_reader(user: CurrentUser = Depends(any_crm_role)) -> CurrentUser:
+    """The billing tracker's readers (26 Oct 2026): Finance · Sales Head · the
+    Sales Manager (a custom role — `sees_team`) · Admin / CEO. By role only."""
+    from services.role_implications import sees_team
+
+    if user.is_admin or user.has_any("Finance", "Sales_Head") or sees_team(user.roles):
+        return user
+    raise HTTPException(status_code=403, detail="The billing tracker is for Finance and the Sales Manager / Sales Head")
+
+
 @router.get("/billing")
 def billing_tracker(
     customer_id: int | None = None,
@@ -138,19 +160,68 @@ def billing_tracker(
     search: str | None = None,
     page: int = 1,
     limit: int = 25,
+    # 24 Oct 2026 — Finance's filters (services/billing_tracker.apply_filters).
+    branch_id: int | None = Query(None, description="0 = no branch on record"),
+    project_id: int | None = None,
+    employee_id: int | None = None,
+    po_id: int | None = Query(None, description="0 = no PO"),
+    owner_id: int | None = Query(None, description="the Sales person who raised the deal"),
+    late: str | None = Query(None, description="not_due | late_1_30 | late_31_60 | late_61_90 | late_90_plus | late"),
+    date_field: str = Query("invoice", description="invoice | due — what date_from / date_to read"),
+    date_from: date | None = None,
+    date_to: date | None = None,
+    amount_min: float | None = Query(None, ge=0),
+    waiting_min: int | None = Query(None, ge=0, le=3650),
+    flags: str | None = Query(None, description="CSV of split, tds_pending, no_branch, overdue"),
+    format: str | None = Query(None, description="csv = every filtered row as a download"),
     db: Session = Depends(get_crm_db),
-    # Finance by role, Admin / CEO always (role_required adds them). Not
-    # template-widenable: it prints every customer's billing.
-    user: CurrentUser = Depends(role_required("Finance")),
+    # Finance, the Sales Manager and the Sales Head by role (26 Oct 2026), Admin
+    # / CEO always. Not template-widenable: it prints every customer's billing.
+    user: CurrentUser = Depends(billing_reader),
 ):
     """Every approved timesheet and every invoice, one row per piece of billed
     work, filtered by customer / month / stage on the server — the Dashboard's
-    billing tracker for Finance, Admin and CEO (`services/billing_tracker`)."""
-    from services.billing_tracker import TrackerFilters, billing_tracker as build
+    billing tracker for Finance, the Sales Manager / Sales Head, Admin and CEO
+    (`services/billing_tracker`). `stage=invoiced` = every generated tax invoice."""
+    from fastapi.responses import Response
 
+    from services.billing_tracker import TrackerFilters, billing_tracker as build, parse_flags, to_csv
+
+    export = (format or "").lower() == "csv"
     try:
-        out = build(db, TrackerFilters(customer_id=customer_id, month=month, stage=stage,
-                                       search=search, page=page, limit=limit))
+        out = build(db, TrackerFilters(
+            customer_id=customer_id, month=month, stage=stage, search=search, page=page, limit=limit,
+            branch_id=branch_id, project_id=project_id, employee_id=employee_id, po_id=po_id,
+            owner_id=owner_id, late=late or None, date_field=date_field, date_from=date_from,
+            date_to=date_to, amount_min=amount_min, waiting_min=waiting_min, flags=parse_flags(flags)),
+            export=export)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if export:
+        name = f"billing-{stage or 'all'}{'-' + month if month else ''}.csv"
+        return Response(content=to_csv(out["rows"]), media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    return envelope(data=out["rows"], meta=out["meta"])
+
+
+@router.get("/returned-proformas")
+def returned_proformas_board(
+    customer_id: int | None = None,
+    month: str | None = Query(None, description="YYYY-MM — the month the work was done"),
+    search: str | None = None,
+    step: str | None = Query(None, description="to_correct | correcting | resubmitted | reissue | manual"),
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(any_crm_role),
+):
+    """Every Proforma Finance returned and not yet raised again — which month,
+    why, who returned it, and whose move it is now (26 Oct 2026). Sales family,
+    RMG / GM, Finance, Admin / CEO (`services/returned_proformas.may_see`)."""
+    from services.returned_proformas import board, may_see
+
+    if not may_see(db, user):
+        raise HTTPException(status_code=403, detail="Returned Proformas are for Sales, RMG / GM and Finance")
+    try:
+        out = board(db, user, customer_id=customer_id, month=month, search=search, step=step)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return envelope(data=out["rows"], meta=out["meta"])
@@ -221,6 +292,8 @@ def ceo_dashboard(
     tab: str = Query("finance", description="finance | customer | sales | people"),
     month: str | None = Query(None, description="YYYY-MM anchor; blank = current month"),
     period: str | None = Query(None, description="month | quarter | fy (default fy)"),
+    customer_id: int | None = Query(None, description="Finance tab only — narrow to one customer"),
+    project_id: int | None = Query(None, description="Finance tab only — narrow to one project"),
     db: Session = Depends(get_crm_db),
     # The Finance tab (19 Oct 2026): Finance + the Sales family read it too
     # (reports.FINANCE_VIEW_ROLES, by role). Customer · Sales · People stay
@@ -237,7 +310,8 @@ def ceo_dashboard(
     if tab != "finance" and not user.is_admin:
         raise HTTPException(status_code=403, detail="Only the CEO / Admin can open this tab")
     try:
-        return envelope(executive_dashboard(db, tab, month, period))
+        return envelope(executive_dashboard(db, tab, month, period,
+                                            customer_id=customer_id, project_id=project_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

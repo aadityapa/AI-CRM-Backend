@@ -157,9 +157,13 @@ def test_filters_narrow_rows_but_never_the_choices(db):
     assert {r["employee"] for r in may["rows"]} == {"Aakash Malwade", "Bina Rao"}
     # A chosen month does not shrink the month dropdown.
     assert {m["key"] for m in may["meta"]["options"]["months"]} >= {"2025-06", "2026-05", "2026-07"}
-    # The manual invoice on a Harman project PRINTS Harman (the project's customer).
+    # 27 Oct 2026 (filter audit): ONE customer per invoice — the PO's, else the
+    # project's (the Invoices list / desk rule). The manual invoice on a Harman
+    # project drawn on Uno Minda's PO belongs to Uno Minda, in ONE customer only.
     harman = billing_tracker(db, TrackerFilters(customer_id=other.id))
-    assert {r["invoice_number"] for r in harman["rows"]} == {"INV-2026-001", "INV-2026-002"}
+    assert {r["invoice_number"] for r in harman["rows"]} == {"INV-2026-001"}
+    unos = billing_tracker(db, TrackerFilters(customer_id=uno.id))
+    assert "INV-2026-002" in {r["invoice_number"] for r in unos["rows"]}
     # Stage filter narrows the rows, not the counts.
     irn = billing_tracker(db, TrackerFilters(stage="irn_pending"))
     assert [r["invoice_number"] for r in irn["rows"]] == ["INV-2026-001"]
@@ -193,9 +197,144 @@ def test_invoice_list_customer_filter_finds_an_invoice_by_its_po(db):
     assert "INV-2026-002" in {x["invoice_number"] for x in r.json()["data"]}
 
 
-def test_the_route_is_finance_admin_ceo_only():
+def test_the_route_is_finance_sales_manager_head_admin_only():
+    """26 Oct 2026: Finance, the Sales Manager and the Sales Head (by role) +
+    Admin / CEO. Plain Sales, RMG, TA, HR are refused; no template widens it."""
     import inspect
 
+    from fastapi import HTTPException
+
+    import crm_deps
     import routers.crm.dashboards as dash
-    src = inspect.getsource(dash.billing_tracker)
-    assert 'role_required("Finance")' in src
+    assert "Depends(billing_reader)" in inspect.getsource(dash.billing_tracker)
+
+    def u(*roles):
+        return crm_deps.CurrentUser(id=1, username="x", roles=set(roles))
+
+    for ok in (u("Finance"), u("Sales_Head"), u("Sales", "Sales Manager"), u("Admin"), u("CEO")):
+        assert dash.billing_reader(ok) is ok
+    for no in (u("Sales"), u("RMG"), u("TA"), u("HR"), u("GM")):
+        with pytest.raises(HTTPException):
+            dash.billing_reader(no)
+
+
+def test_every_generated_invoice_and_the_csv(db):
+    """26 Oct 2026 — `stage=invoiced` is every issued tax invoice, newest first;
+    the CSV holds every filtered row (not one page)."""
+    from services.billing_tracker import CSV_COLUMNS, to_csv
+
+    _seed(db)
+    out = billing_tracker(db, TrackerFilters(stage="invoiced", limit=1))
+    assert out["meta"]["counts"]["invoiced"] == 2
+    assert out["meta"]["total"] == 2 and len(out["rows"]) == 1        # paged …
+    full = billing_tracker(db, TrackerFilters(stage="invoiced", limit=1), export=True)
+    assert [r["invoice_number"] for r in full["rows"]] == ["INV-2026-002", "INV-2026-001"]  # … export is not
+    csv = to_csv(full["rows"] + [{"customer": "=HYPERLINK(1)"}])
+    lines = csv.strip().splitlines()
+    assert lines[0].split(",")[0] == CSV_COLUMNS[0][1] and len(lines) == 4
+    assert "'=HYPERLINK" in csv                                            # formula neutralised
+
+
+def test_returned_proformas_board_and_reopen(db, monkeypatch):
+    """26 Oct 2026 — a Proforma Finance returned shows on the board with its
+    month, reason and whose move it is; Sales reopens the sheet to correct it."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import crm_deps
+    import routers.crm.dashboards as dash
+    import routers.crm.timesheets as tsr
+    from models import Invoice, Timesheet, TimesheetStatus
+    from services.returned_proformas import board, next_step
+
+    # PURE whose-move rule.
+    t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    assert next_step("Approved", t0, t0 + timedelta(days=1)) == "to_correct"
+    assert next_step("Approved", t0 + timedelta(days=2), t0) == "reissue"
+    assert next_step("Rejected", None, t0) == "correcting"
+    assert next_step("Submitted", None, t0) == "resubmitted"
+    assert next_step(None, None, t0) == "manual"
+
+    _seed(db)
+    pi = db.query(Invoice).filter_by(invoice_number="PI-2026-005").one()
+    pi.returned_at = datetime.now(timezone.utc)
+    pi.returned_reason = "Leave on 12 May is missing"
+    db.commit()
+
+    sales = crm_deps.CurrentUser(id=1, username="sanjana", roles={"Sales"})
+    out = board(db, sales)
+    assert out["meta"]["counts"]["to_correct"] == 1 and out["meta"]["can_reopen"]
+    row = out["rows"][0]
+    assert (row["month_label"], row["returned_reason"], row["step"]) == ("May 2026", "Leave on 12 May is missing", "to_correct")
+    assert board(db, sales, month="2026-06")["rows"] == []
+
+    app = FastAPI()
+    app.include_router(dash.router)
+    app.include_router(tsr.router)
+    app.dependency_overrides[crm_deps.get_crm_db] = lambda: db
+    app.dependency_overrides[crm_deps.get_current_user] = lambda: sales
+    c = TestClient(app)
+    r = c.get("/api/dashboard/returned-proformas")
+    assert r.status_code == 200 and r.json()["data"][0]["proforma_number"] == "PI-2026-005"
+    monkeypatch.setattr(tsr, "_require_owner_or", lambda *a, **k: None)   # template check not under test
+    r = c.post(f"/api/timesheets/{row['timesheet_id']}/reopen-for-correction", json={"note": "fixing leave"})
+    assert r.status_code == 200, r.text
+    ts = db.get(Timesheet, row["timesheet_id"])
+    assert ts.status == TimesheetStatus.REJECTED and "Leave on 12 May" in ts.rejection_reason
+    assert board(db, sales)["rows"][0]["step"] == "correcting"
+    # Twice → refused (no longer approved).
+    assert c.post(f"/api/timesheets/{row['timesheet_id']}/reopen-for-correction", json={}).status_code == 409
+    # Someone with no reason to see it is refused.
+    app.dependency_overrides[crm_deps.get_current_user] = lambda: crm_deps.CurrentUser(id=9, username="ta", roles={"TA"})
+    assert c.get("/api/dashboard/returned-proformas").status_code == 403
+
+
+def test_finance_filters_24_oct(db):
+    """24 Oct 2026 — branch · project · employee · PO · days late · date range ·
+    amount · waiting · quick switches, all narrowing the counts too."""
+    from models import CustomerBranch, Invoice, Project, TdsRecord
+    from services.billing_tracker import days_late, late_bucket, parse_flags
+
+    uno, other = _seed(db)
+    br = CustomerBranch(customer_id=other.id, branch_name="Pune")
+    db.add(br)
+    db.flush()
+    p_other = db.query(Project).filter_by(customer_id=other.id).one()
+    p_other.branch_id = br.id
+    inv1 = db.query(Invoice).filter_by(invoice_number="INV-2026-001").one()
+    inv1.due_date = date.today() - timedelta(days=45)
+    inv1.balance_amount = 118
+    db.add(TdsRecord(invoice_id=inv1.id, tds_amount=10, tds_balance=10, tds_paid=0))
+    db.commit()
+
+    # PURE pieces.
+    assert late_bucket(0) == "not_due" and late_bucket(45) == "late_31_60" and late_bucket(200) == "late_90_plus"
+    assert days_late(None, date.today() - timedelta(days=40), date.today()) == 10
+    assert parse_flags("split, tds_pending") == ("split", "tds_pending")
+    with pytest.raises(ValueError):
+        parse_flags("nope")
+
+    base = billing_tracker(db, TrackerFilters(limit=100))
+    row = next(r for r in base["rows"] if r["invoice_number"] == "INV-2026-001")
+    assert (row["branch"], row["days_late"], row["late_bucket"], row["tds_pending"]) == ("Pune", 45, "late_31_60", 10.0)
+    opts = base["meta"]["options"]
+    assert {b["name"] for b in opts["branches"]} == {"Pune"}
+    assert {p["name"] for p in opts["pos"]} == {"4300472106"}
+
+    def nums(**kw):
+        out = billing_tracker(db, TrackerFilters(limit=100, **kw))
+        return sorted(r["invoice_number"] or f"ts{r['timesheet_id']}" for r in out["rows"]), out["meta"]["counts"]["all"]
+
+    assert nums(branch_id=br.id)[0] == ["INV-2026-001", "INV-2026-002"]      # the Harman project's branch
+    assert len(nums(branch_id=0)[0]) == 2                                      # Uno Minda rows have none
+    assert nums(late="late_31_60") == (["INV-2026-001"], 1)                    # counts narrow too
+    assert "INV-2026-001" in nums(late="late")[0]
+    assert nums(flags=("tds_pending",))[0] == ["INV-2026-001"]
+    assert nums(po_id=0)[0] != nums()[0]
+    assert "INV-2026-002" in nums(date_from=date(2026, 7, 1), date_to=date(2026, 7, 31))[0]
+    assert nums(amount_min=200)[0] == ["PI-2026-005"]
+    assert nums(waiting_min=300)[0] == [f"ts{next(r['timesheet_id'] for r in base['rows'] if r['month'] == '2025-06')}"]
+    with pytest.raises(ValueError):
+        billing_tracker(db, TrackerFilters(late="soon"))
+    with pytest.raises(ValueError):
+        billing_tracker(db, TrackerFilters(date_from=date(2026, 7, 2), date_to=date(2026, 7, 1)))

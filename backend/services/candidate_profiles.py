@@ -453,7 +453,13 @@ def _notify_stage_owner(db: Session, profile: CandidateProfile, previous: str,
     Best-effort: a notification failure must never roll back a legitimate status
     change. The candidate has moved either way, and losing the transition would
     be far worse than losing the alert.
+
+    Every arrival passes here (perform_transition, `_auto_move`,
+    `record_stage_arrival`), so it is also where a Hiring Manager's gate opens
+    (22 Oct 2026, services/hiring_managers.on_stage_arrival — never raises).
     """
+    from services.hiring_managers import on_stage_arrival
+    on_stage_arrival(db, profile, new_status, user)
     role = _ARRIVAL_NOTIFY_ROLE.get(new_status)
     if not role:
         return
@@ -508,6 +514,12 @@ def _candidate_display_name(db: Session, profile: CandidateProfile) -> str:
 
 def _check_entry_requirement(db: Session, profile: CandidateProfile, new_status: str) -> None:
     """Block entry to a stage whose precondition is unmet, with the reason."""
+    # A Hiring Manager decision still owed (22 Oct 2026): the review before the
+    # customer, the sign-off before HR. 409 — the move is right, just not yet.
+    from services.hiring_managers import entry_block
+    waiting = entry_block(db, profile, new_status)
+    if waiting:
+        raise HTTPException(status_code=409, detail=waiting)
     reason = ENTRY_REQUIREMENTS.get(new_status)
     if not reason:
         return
@@ -871,8 +883,14 @@ def apply_round_verdict(db: Session, profile: CandidateProfile, event, user: Cur
     "No Hire" closes the candidacy at that round, anything else advances the
     customer ladder. Returns the status the profile moved to, else None.
     Caller commits. A round without a result is not a verdict: nothing moves."""
+    from services.admin_corrections import reopen_on_corrected_verdict
     from services.rmg_tasks import record_round_result
     record_round_result(db, profile, event, user, previous_result)
+    # A "No Hire" changed to anything else reopens the candidacy it closed
+    # (23 Oct 2026: Admin correcting an RMG / GM mistake from any feedback form).
+    reopened = reopen_on_corrected_verdict(db, profile, event, user, previous_result)
+    if reopened:
+        return reopened
     if not (event.result or "").strip():
         return None
     if event.kind == "HR_Interview":

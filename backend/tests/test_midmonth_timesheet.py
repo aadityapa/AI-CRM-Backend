@@ -154,18 +154,17 @@ def test_monthly_invoice_prorates_for_midmonth_joiner(db):
     line = preview["line_items"][0]
     # Present 19 of 28 days → bill 19/28 of the monthly rate, and SAY so:
     # qty shows the fraction, rate stays the full monthly figure.
-    # Since 0074 the amount is REDEFINED as qty(4dp) x rate so the stored
-    # line, the PDF and the GST base reconcile exactly; the price of that is
-    # a drift from the "true" fraction of at most rate x 0.00005 (₹15 here).
+    # 24 Oct 2026: a part month bills billed days × the per-day figure the
+    # invoice prints (to the paisa) — the old 4-dp qty × rate drifted up to
+    # rate × 0.00005 (₹15 here, ₹10.90 on the reported March invoice).
     true_amount = float(Decimal(300000) * Decimal(19) / Decimal(28))  # 203571.43
     qty = float((Decimal(str(19 / 28))).quantize(Decimal("0.0001")))  # 0.6786
     assert line["total_billed_qty"] == pytest.approx(qty, abs=0.00005)
-    assert line["amount"] == pytest.approx(qty * 300000, abs=0.01)    # 203580.00
-    assert abs(line["amount"] - true_amount) <= 300000 * 0.00005
     assert line["rate_per_unit"] == 300000.0
-    # The invariant the popup and Tax Invoice rely on: Qty x Rate == Amount.
-    assert line["total_billed_qty"] * line["rate_per_unit"] == pytest.approx(
-        line["amount"], abs=0.01)
+    # The invariant the popup and Tax Invoice rely on: Days × Rate/Day == Amount.
+    assert line["billed_days"] == line["working_days_in_period"]
+    assert line["billed_days"] * line["per_day_charge"] == pytest.approx(line["amount"], abs=0.01)
+    assert abs(line["amount"] - true_amount) <= line["billed_days"] * 0.005
 
 
 def test_full_month_employee_still_bills_full_month(db):

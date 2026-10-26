@@ -35,6 +35,11 @@ SALES_FROM = "sales_screening"
 SALES_FAMILY_STAGES: list[str] = ALL_STAGES[ALL_STAGES.index(SALES_FROM):]
 #: Built-in roles whose default is the Sales view.
 SALES_FAMILY: frozenset[str] = frozenset({"Sales", "Sales_Head"})
+#: The Hiring Manager's default (22 Oct 2026): from the technical interview on —
+#: they interview, review before the customer and sign off the selection; the
+#: CV-screening queue is RMG's. Admin changes it on Access Control ▸ Roles.
+HM_FROM = "technical_interview"
+HM_STAGES: list[str] = ALL_STAGES[ALL_STAGES.index(HM_FROM):]
 #: Always see everything — not offered on the Roles page.
 UNRESTRICTED: frozenset[str] = frozenset({"Admin", "CEO"})
 
@@ -44,6 +49,7 @@ PRESETS: list[dict] = [
     {"key": "sales", "label": "From Sales Screening", "stages": SALES_FAMILY_STAGES},
     {"key": "recruitment", "label": "Up to Technical Interview + Closed",
      "stages": ["sourcing", "technical_screening", "technical_interview", "closed"]},
+    {"key": "hiring_manager", "label": "From Technical Interview", "stages": HM_STAGES},
     {"key": "hr", "label": "From Customer Shortlisted",
      "stages": ALL_STAGES[ALL_STAGES.index("selection"):]},
 ]
@@ -74,6 +80,9 @@ def default_stages(name: str) -> list[str]:
         return list(ALL_STAGES)
     if name in SALES_FAMILY or approval_default_roles({name}) & SALES_FAMILY:
         return list(SALES_FAMILY_STAGES)
+    from services.hiring_managers import is_hm_role_name
+    if is_hm_role_name(name):
+        return list(HM_STAGES)
     return list(ALL_STAGES)
 
 

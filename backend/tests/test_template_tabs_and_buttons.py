@@ -238,7 +238,12 @@ def test_the_0124_snapshots_match_the_registry():
     mod = _migration()
     assert mod._IV_TAB_ROLES == reg.IV_TAB_DEFAULT_ROLES
     assert mod._IV_ROLE_ALIASES == reg.IV_ROLE_ALIASES
-    assert mod._BUTTON_TABS == {k: ap.ACTIONS[k].tab for k in ap.MANAGE_ACTIONS}
+    # 0146 turned "Change positions" into an approval; the frozen 0124 copy
+    # still carries it (it was a button then).
+    later_approvals = {"requirement.positions.request"}
+    assert {k: v for k, v in mod._BUTTON_TABS.items() if k not in later_approvals} == \
+        {k: ap.ACTIONS[k].tab for k in ap.MANAGE_ACTIONS}
+    assert all(ap.is_approval(k) for k in later_approvals)
 
 
 def test_rmg_and_the_gm_open_reports_ats_and_integrity_by_default():

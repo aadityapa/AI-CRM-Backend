@@ -476,5 +476,8 @@ def test_the_0112_merge_raises_grants_and_never_lowers_them():
         == {"customers": {"gst": "edit", "pan": "view"}}
     # The snapshot names exactly the approvals the registry gives Sales / Sales Head.
     from services.action_permissions import ACTIONS, APPROVAL_ACTIONS
+    # `requirement.positions.request` became an approval in 0146, which backfills
+    # the Sales Manager itself (frozen snapshot — never edited).
+    later = {"requirement.positions.request"}
     assert set(mod._SALES_APPROVALS) == {k for k in APPROVAL_ACTIONS
-                                         if {"Sales", "Sales_Head"} & set(ACTIONS[k].roles)}
+                                         if {"Sales", "Sales_Head"} & set(ACTIONS[k].roles)} - later

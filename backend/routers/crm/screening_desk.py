@@ -29,6 +29,14 @@ router = APIRouter(prefix="/api/screening-desk", tags=["CRM: Screening Desk"])
 desk_gate = gated_write_action("profile.rmg_screening", "profiles")
 
 
+def hm_opportunity_scope(db: Session, user) -> tuple[int, ...] | None:
+    """The deals an HM-scoped login is on (23 Oct 2026), else None (no limit)."""
+    from services import hiring_managers
+    if hiring_managers.hm_scoped(user, db):
+        return tuple(hiring_managers.opportunity_ids_for(db, user.id))
+    return None
+
+
 class ScoreIn(BaseModel):
     profile_ids: list[int] = Field(min_length=1, max_length=desk.MAX_SCORE_BATCH)
 
@@ -84,6 +92,7 @@ def screening_queue(
         notice=(notice or "").strip().lower() or None,
         ai_result=(ai_result or "").strip().lower() or None,
         l1_result=(l1_result or "").strip().lower() or None,
+        opportunity_ids=hm_opportunity_scope(db, user),
     )
     rows, meta = desk.desk_queue(db, filters, page=page, limit=limit)
     # Positions waiting for RMG approval — only for a caller who may approve.

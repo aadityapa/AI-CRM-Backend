@@ -980,6 +980,9 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         "grand_total": _num(invoice.grand_total),
         # Rupee round-off inside grand_total (0120); null = not rounded.
         "round_off": _num(invoice.round_off) if invoice.round_off is not None else None,
+        # 0148 — per-day round off: the rounded per-day figure and its days.
+        "per_day_rate": _num(invoice.per_day_rate) if getattr(invoice, "per_day_rate", None) is not None else None,
+        "per_day_days": _num(invoice.per_day_days) if getattr(invoice, "per_day_days", None) is not None else None,
         "buyer_state_code": (invoice.buyer_state_code or None),
         "payment_status": _ev(invoice.payment_status),
         "paid_amount": _num(invoice.paid_amount),

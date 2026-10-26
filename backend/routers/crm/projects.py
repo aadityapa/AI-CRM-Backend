@@ -1303,7 +1303,10 @@ def _due_timesheet_rows(
     project-employee mapping, not from the sheets, so a month that was never
     created still shows — as `status: "Due"` with no id.
     """
+    from services.billing_rules import owed_months
+
     today = _coverage_today()
+    project = db.get(Project, project_id)
     pes = db.execute(
         select(ProjectEmployee).where(ProjectEmployee.project_id == project_id)
     ).scalars().all()
@@ -1313,13 +1316,12 @@ def _due_timesheet_rows(
     for pe in pes:
         if employee_id is not None and pe.employee_id != employee_id:
             continue
-        start = pe.onboarding_date
-        if start is None:
+        if pe.onboarding_date is None:
             continue
-        # Exited employees owe sheets only up to their exit month.
-        end = pe.exit_date if (pe.is_exit and pe.exit_date) else today
-        y, m = start.year, start.month
-        while (y, m) <= (end.year, end.month):
+        # 23 Oct 2026 (user report): owed from the data start month (Settings ▸
+        # Billing) through the EARLIER of the person's exit date and the project's
+        # last working day — a project closed on 30 Apr owes no May sheet.
+        for y, m in owed_months(pe, project, today, start=pe.onboarding_date):
             key = (pe.employee_id, y, m)
             if key not in existing and key not in seen:
                 seen.add(key)
@@ -1337,7 +1339,6 @@ def _due_timesheet_rows(
                     "approved_by": None,
                     "approved_at": None,
                 })
-            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
     return rows
 
 
@@ -1349,12 +1350,17 @@ def project_timesheets(
     status: str | None = None,
     employee_id: int | None = None,
     include_missing: bool = False,
+    all_history: bool = False,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_read("timesheets", "HR", "Finance", "Sales_Head")),
 ):
+    from services.billing_rules import work_month_clause
+
     get_project_or_404(db, project_id)
     stmt = select(Timesheet).where(Timesheet.project_id == project_id).order_by(Timesheet.id.desc())
+    if not all_history:
+        stmt = stmt.where(work_month_clause(Timesheet.year, Timesheet.month))
     if month is not None:
         stmt = stmt.where(Timesheet.month == month)
     if year is not None:

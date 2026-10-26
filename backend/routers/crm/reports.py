@@ -45,6 +45,10 @@ REVENUE_READ = subtab_gate("reports", ("revenue", "financial"), FINANCE_VIEW)
 OPP_REPORT_READ = subtab_gate("reports", "opportunities", REPORTS_READ)
 PROFILE_REPORT_READ = subtab_gate("reports", "profiles", REPORTS_READ)
 PRODUCTIVITY_READ = subtab_gate("reports", "productivity", REPORTS_READ)
+#: The month's invoices per customer, ready to paste into a mail (23 Oct 2026):
+#: Sales · Sales Manager (implied Sales) · Sales Head · Finance + Admin / CEO by
+#: role; a template's "Invoice Summary" tick admits anyone else.
+INVOICE_SUMMARY_READ = subtab_gate("reports", "invoice_summary", FINANCE_VIEW)
 
 
 def _respond(rows: list[dict], format: str | None, filename: str):
@@ -117,6 +121,33 @@ def recruiter_productivity_report(
         return rows_to_csv([{k: v for k, v in r.items() if k not in hidden} for r in rows],
                            "recruiter_productivity_report.csv")
     return envelope(rows, meta=meta)
+
+
+@router.get("/invoice-summary")
+def invoice_summary_report(
+    month: str | None = Query(None, description="YYYY-MM; blank = current month"),
+    basis: str = Query("invoice", description="invoice = dated in the month · work = for the month's work"),
+    customer_id: int | None = Query(None),
+    format: str | None = Query(None, description="csv for file download"),
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(INVOICE_SUMMARY_READ),
+):
+    """The month's tax invoices per customer — Sr · number · date · amount · tax ·
+    total · "Contract Staffing Service <employee> - <Mon YYYY>" — for Sales to send
+    each customer (23 Oct 2026, services/invoice_summary.py)."""
+    from services.invoice_summary import invoice_summary
+    try:
+        data = invoice_summary(db, month=month, basis=(basis or "invoice").strip().lower(),
+                               customer_id=customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if (format or "").strip().lower() == "csv":
+        flat = [{"Customer": g["customer"], "Sr.": r["sr"], "Invoice Number": r["invoice_number"],
+                 "Invoice Date": r["invoice_date"], "Invoice Amount": r["invoice_amount"],
+                 "Tax Amount": r["tax_amount"], "Total Amount": r["total_amount"],
+                 "Description": r["description"]} for g in data["groups"] for r in g["rows"]]
+        return rows_to_csv(flat, f"invoice_summary_{data['month']}.csv")
+    return envelope(data)
 
 
 @router.get("/revenue")

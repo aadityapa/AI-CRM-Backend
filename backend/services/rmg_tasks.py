@@ -74,7 +74,7 @@ CATEGORIES: dict[str, tuple[str, str, str, bool]] = {
     "decide": ("Submit to Sales", "Rounds are judged — submit to Sales, ask for an L2, or reject. "
                "The desk also lists who you handed over lately and where they are now.",
                "send", True),
-    "ai_failed": ("AI L1 not cleared", "Reject, or take a manual L1 when the AI read looks wrong.",
+    "ai_failed": ("AI L1 to decide", "AI L1 not cleared or put on hold — proceed, take a manual L1, or reject.",
                   "alert", True),
     "approvals": ("Positions to approve", "New positions waiting for your JD & skills approval.",
                   "check", False),
@@ -91,7 +91,7 @@ CATEGORIES: dict[str, tuple[str, str, str, bool]] = {
                        "returned — raise or reissue the Proforma.", "receipt", False),
     "proforma_finance": ("Proformas with Finance", "Raised and waiting for Finance to issue the tax invoice.",
                          "hourglass", False),
-    "invoices_issued": ("Tax invoices issued", "Original invoices Finance issued in the last 30 days.",
+    "invoices_issued": ("Tax invoices issued", "Original invoices Finance issued (from the data start month), newest first.",
                         "rupee", False),
 }
 #: Billing categories → (the approval that brings them, the `billing_chain` list).
@@ -108,8 +108,15 @@ INFO_CATEGORIES = frozenset({"proforma_finance", "invoices_issued"})
 _STEP_CATEGORY = {
     "screen": "screening", "route": "route", "decide": "decide", "ai_failed": "ai_failed",
     "l1_book": "booking", "l2_book": "booking", "ai_book": "booking",
+    # 27 Oct 2026 (filter audit): an AI L1 put ON HOLD is the screener's call (it
+    # used to read "cleared"); one NOT ATTEMPTED is TA's to reschedule — never a fail.
+    "ai_on_hold": "ai_failed", "ai_not_attempted": "booking",
 }
-_BOOK_CHIP = {"l1_book": "Technical L1", "l2_book": "Technical L2", "ai_book": "AI L1"}
+_BOOK_CHIP = {"l1_book": "Technical L1", "l2_book": "Technical L2", "ai_book": "AI L1",
+              "ai_not_attempted": "AI L1 · not attempted", "ai_on_hold": "AI L1 · on hold"}
+#: Categories sent in FULL — the Feedback-due panel and the results list group and
+#: count every item; the others print a top-`MAX_ITEMS` list.
+FULL_LIST_CATEGORIES = frozenset({"feedback", "results"})
 
 
 def _item(key, title, subtitle="", *, chip=None, tone="info", when=None, path="", action=None,
@@ -327,7 +334,7 @@ def _candidate_categories(db: Session, now: datetime) -> tuple[dict[str, list[di
         applied = _aware(p.applied_on or p.created_at)
         waited = (now - applied).days if applied else None
         chip = _BOOK_CHIP.get(step["key"]) or (f"{waited} d waiting" if waited is not None else None)
-        tone = "bad" if cat == "ai_failed" or (waited or 0) >= 5 else "warn"
+        tone = ("bad" if step["key"] == "ai_failed" or (waited or 0) >= 5 else "warn")
         out.setdefault(cat, []).append(_item(
             f"{cat}:{p.id}:{step['key']}", _name(cand), _subtitle(opp, req, p.ta_owner_name),
             chip=chip, tone=tone, when=_iso(applied), path=desk_path(cat, p.id),
@@ -480,15 +487,30 @@ def screener_tasks(db: Session, user, *, now: datetime | None = None) -> dict:
                 items = []
         categories.append({
             "key": key, "label": label, "hint": hint, "icon": icon, "on_desk": on_desk,
-            "count": len(items), "items": items[:MAX_ITEMS],
+            "count": len(items),
+            "items": items if key in FULL_LIST_CATEGORIES else items[:MAX_ITEMS],
+            "_all": items,
             "desk_ids": sorted({i["profile_id"] for i in items if i["profile_id"] in desk_ids}),
             "info": key in INFO_CATEGORIES,
             # A permitted billing tab stays on the board at zero: "nothing to approve" is news.
             "always": key in BILLING_CATEGORIES,
         })
-    return {"categories": categories,
-            "total": sum(c["count"] for c in categories if not c["info"]),
-            "as_of": now.isoformat()}
+    # 27 Oct 2026 (filter audit): "N pending" counts each candidate ONCE — a
+    # candidate with a result to review AND a decision to make is one person.
+    seen: set[int] = set()
+    total = 0
+    for c in categories:
+        all_items = c.pop("_all")
+        if c["info"]:
+            continue
+        for it in all_items:
+            pid = it.get("profile_id")
+            if pid is not None:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+            total += 1
+    return {"categories": categories, "total": total, "as_of": now.isoformat()}
 
 
 def _billing(db: Session, user) -> dict[str, list[dict]]:

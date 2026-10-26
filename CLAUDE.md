@@ -43,7 +43,7 @@ resolved by `paths._resolve_frontend_dir()` (`FRONTEND_DIR` env → `<repo>/fron
 **Working tree, 8 Sep 2026:** branch `main`, head **`dd61630`**, ~90 modified + 63 untracked paths,
 none committed. `git status` is dominated by CRLF churn — review with `git diff --ignore-all-space`.
 
-**Migration head is now 0120** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
+**Migration head is now 0148** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
 Deploying REQUIRES `alembic upgrade head` before serving traffic — the ORM maps columns from every
 one of them. Tests: **1034 pass**, 2 stale pins fail (`test_full_pipeline_flow::test_ai_l1_can_only_be_triggered_by_ta`,
 `test_pipeline_tail::test_no_other_stage_has_a_hidden_precondition`) plus the §9 known set.
@@ -3720,6 +3720,324 @@ otherwise `base`. Wired: `reports.OPP_REPORT_READ / PROFILE_REPORT_READ / PRODUC
 (`_custom_role_grants`: a role that shows never loses to one that hides). Other pages' sub-tabs are enforced in the UI
 only (their data routes keep their tab gates). Deploy: restart; rebuild F-V2.
 
+**22 Oct 2026 (night) — the Hiring Manager role, migration 0145, head is now 0145 (`tests/test_hiring_manager.py`
+12; `test_approval_permissions` snapshot + `test_requirement_ta_assignments` re-pinned):** user ask — a new role that
+sees ONLY the opportunities assigned to it. Decisions: a Karnex employee; GM / RMG assign at RMG approval (several per
+position allowed); CTC shown; its stages set on Access Control ▸ Roles. **`services/hiring_managers.py`** is the ONE
+module. A login is **HM-scoped** (`hm_scoped(user, db)`) when it holds the custom role "Hiring Manager" (`HM_ROLE`,
+case-insensitive) and no built-in workflow role and does not screen as RMG — someone also Sales / RMG keeps their own
+view. **Data (0145):** `requirement_status` gains **`Pending_HM_Review`** (autocommit ALTER TYPE);
+`requirement_hiring_managers` (`RequirementHiringManager`, same shape as the TA table — but a VISIBILITY rule, so a
+separate table; in `DATASETS["opportunities"]`); `candidate_profiles.hm_review_*` / `hm_final_*` (status · note · by ·
+at; NULL = no HM on the deal, every existing flow unchanged); the **Hiring Manager** custom role SEEDED (tabs dashboard ·
+opportunities · requirements · profiles view + my-interviews edit; actions = the three approvals + `requirement.positions.
+request`; department engineering; skipped when the name exists). **Team code is shared:** `requirement_assignments.
+replace_members` / `members_by_requirement` (generic over the model) back both `set_assignments` (TA) and
+`hiring_managers.set_hiring_managers`; `release_user` now releases BOTH teams on deactivation; `set_assignments(...,
+notify=False)` + `tell_team` defer the TA notice until a position opens. Routes `GET/PUT /api/requirements/{id}/
+hiring-managers` (same `POS_READ` / `ASSIGN_WRITE` as the TA team; `meta.is_mine`). **Scoping:** `sees_all_requirements`
+→ False, `apply_visibility` / `ensure_visible` → only assigned (404 otherwise), `GET /api/opportunities` +
+`/{id}` + activity-log + suggested-candidates (`ensure_opportunity`), candidate profiles list / export
+(`_narrow_to_hm`) and detail / activity / offers / rounds (`_readable_profile`), positions (`_visible_requirement`).
+`stage_access.default_stages("Hiring Manager")` = **`HM_STAGES`** (Technical Interview → Closed; preset
+"From Technical Interview"). `/api/me.hiring_manager_scoped`. **Responsibilities:** (1) JD — `engineering-approve` takes
+`hm_user_ids`; with an HM on the position it goes to `Pending_HM_Review` (`to_hm_review`, HMs told) instead of opening;
+`POST /api/requirements/{id}/hm-approve` → Open_For_Sourcing + `requirements.announce_open_for_sourcing` (the TA notice,
+extracted from engineering-approve) · `/hm-request-changes {reason ≥ 10}` → back to Pending_Engineering_Review, RMG told;
+APPROVAL `requirement.hm_approve` + "is an HM of this position" (`_require_jd_turn`). (2) Review — arriving at Sales
+Screening on a deal with an HM stamps `hm_review_status = Pending` (`on_stage_arrival`, called from
+`candidate_profiles._notify_stage_owner`, which every arrival passes); `_check_entry_requirement` → **409** on Customer
+Screening while pending (`entry_block`, only while the deal still has an HM); `POST /api/candidate-profiles/{id}/hm-review
+{decision approve|reject, note}` (APPROVAL `profile.hm_review`). (7) Sign-off — the same at Customer Approval
+(`hm_final_status`), blocking HR Screening, i.e. the Sales Head's approve; `POST …/hm-signoff` (`profile.hm_signoff`).
+A reject (note ≥ 5) closes through `_auto_move(... Rejected, allow_exit=True)` + activity `HM_REJECTED` /
+`HM_SIGNOFF_REJECTED`. `candidate_status`: statuses `hm_review` "With Hiring Manager – Review", `hm_signoff` "Pending
+Hiring Manager Sign-off", `hm_rejected` "Rejected by Hiring Manager"; `TA_CLOSE_ACTIONS` → `_CLOSED_BY` (closing phase
+sales_screening / selection); `load_facts` reads the two HM columns in the deal-stage query (no extra query).
+Removing every HM releases pending gates and an HM-pending position (`_release_waiting`). (3) Interviews — My Interviews
+as for any panel member (link the Employees record). (4) Headcount — via the seeded `requirement.positions.request`;
+`meta.can_request` now asks the gate itself (`_passes`). (5) Priority / hold / resume — `crm_deps.hm_or(gate)` admits an
+HM of the path's `requirement_id` on a 403. (6) Notices — events `requirement.hm_assigned · hm_jd_review · hm_jd_decided ·
+profile.hm_review_requested · hm_review_decided · hm_signoff_requested · hm_signoff_decided` in `email_flows.EVENTS`.
+Work desk: `_hm_tabs` → `hm_jd` · `hm_review` · `hm_signoff` · `hm_positions` (info); an HM-scoped login gets those +
+the panel tabs ONLY. Deploy: `python -m alembic upgrade head` (0145), restart; Admin gives people the Hiring Manager
+role (and an Employees record with the login's email for My Interviews).
+
+**23 Oct 2026 — HM dashboard, Sales invoice summary, Admin corrections, the AI L1 decision moves the candidacy (no
+migration; `tests/test_admin_corrections.py` 7, `tests/test_invoice_summary.py` 4, `test_hiring_manager` +2,
+`test_subtab_access` re-pinned):** five screenshot asks.
+(1) **Hiring Manager dashboard** — the HM login read "No dashboard widgets for your roles". ⚠️ `hiring_managers.hm_scoped`
+is now decided by the roles HELD: Hiring Manager (+ the Interviewer companion role) and nothing else — the
+`screens_as_rmg` check is gone (a GM-style approval grant made an HM look like a screener). `hiring_managers.dashboard(db,
+user)` → `assigned` · `tiles` (positions · open_positions · candidates · waiting · interviews_week · feedback_due · joined) ·
+`decisions` (jd / review / signoff, each with the path) · `positions` (label, customer, status, priority, filled, band,
+stage counts, TA team, waiting) · `stages` · `interviews` (`panel_interviews.my_rounds`) · `recent`; batched queries.
+`GET /api/dashboard/hiring-manager` (`any_crm_role`). `/api/me.is_hiring_manager`. The work desk keeps the HM tabs for a
+panel-only login (`is_panel_only` branch) and returns the four HM tabs empty when no position is assigned. The Screening
+Desk is HM-scoped: `screening_desk.DeskFilters.opportunity_ids` (`routers/crm/screening_desk.hm_opportunity_scope`).
+(2) **Invoice Summary** — `services/invoice_summary.invoice_summary(db, month=, basis="invoice"|"work", customer_id=)`:
+one table per customer — Sr · Invoice Number · Invoice Date · Invoice Amount (`sub_total`) · Tax · Total (`grand_total`) ·
+Description "<`invoice.service_description`, default Contract Staffing Service> <employee> - <work month>" (from
+`invoice_facets`); issued Tax invoices only (⚠️ `InvoiceKind` lives in `models.finance`, not `models`); customer = project's
+else PO's. `GET /api/reports/invoice-summary?month=&basis=&customer_id=&format=csv` behind `INVOICE_SUMMARY_READ =
+subtab_gate("reports", "invoice_summary", FINANCE_VIEW)` (Finance · Sales · Sales Head · the Sales Manager; a template tick
+widens). `SUB_TABS["reports"]` += `invoice_summary`.
+(3) **Admin corrections** — `services/admin_corrections.py`. (a) `reopen_on_corrected_verdict`, first in
+`apply_round_verdict` (so EVERY feedback form): a round verdict changed from "No Hire" to anything else, while the profile
+still sits at that round's rejection (`_ROUND_REJECTS_TO`), goes back to the stage the "No Hire" closed it from (read off the
+latest `X -> <target>` STATUS_CHANGE, `parse_change` PURE), logs STATUS_CHANGE + `VERDICT_CORRECTED`, lifts a manual
+Archive. Admin already edits every round, so fixing RMG / GM's wrong L1 / L2 verdict is just Edit on the round.
+(b) `admin_correct` behind `GET/POST /api/candidate-profiles/{id}/admin-correction` (`role_required()` = Admin / CEO, never
+template-widenable): any stage (`target_status`), RMG screening (`screening`: "" = not sent · Pending · Shortlisted ·
+Rejected), `clear_ai_decision`, `restore`; reason ≥ `MIN_REASON`=10; logged as `ADMIN_CORRECTION` (+ STATUS_CHANGE "Admin
+correction — …"); 400 when nothing would change. `correction_options` = current · stages · the last 12 moves (who / when /
+note) · `undo_to` · screening · AI decision · archived.
+(4) **The AI L1 decision moves the candidacy** (screenshot: "Rejected · AI: Failed" at Technical Interview offered TA only
+Reschedule). `close_on_ai_rejection` (Sourcing / Technical_Screening / RMG_Review → **RMG_Rejected**, TAs told via
+`_notify_rejection`) and `forward_on_ai_selection` (pre-review → RMG Review). Three doors: `POST …/ai-l1-decision` gains
+`reject` (reason ≥ 5, sets `hr_decision = rejected`); the report page's Shortlist / Reject (`ai_interview_bridge.
+sync_hr_decision` → `apply_ai_decision_to_pipeline`, savepointed); and a lazy heal for older rows (`heal_ai_rejected`, from
+`services/resumes.enrich_resumes_with_ai`, `routers/crm/resumes._with_profile_ai` and the profile-only rows) — ⚠️ skipped
+when a `REAPPLIED` / `ADMIN_CORRECTION` / `VERDICT_CORRECTED` row is LATER than `hr_decision_at`, so a re-applied candidate
+is never closed again. A closed row is what gives TA Archive / Re-apply.
+(5) Resume download = candidate name, zoom on the notice-period proof — F-V2 only. Suite: 2,230 pass, 3 skipped.
+
+**23 Oct 2026 (later) — report-page decision fixed + explained, team / positions are RMG-GM decisions, active
+customers everywhere, migration 0146, head is now 0146 (`tests/test_team_and_positions_gate.py` 7;
+`test_template_tabs_and_buttons` + `test_custom_roles` snapshot tests re-pinned):** three screenshot reports.
+(1) ⚠️ **The report page's Shortlist / On Hold / Reject "did nothing" for RMG / GM**: the page was opened with the
+RESUME's email as `cid` while `interview_records` is keyed by the SCHEDULED email — the GET self-heals through the record
+id, the PUT `/hr/candidates/{cid}/hr-decision` did not, so every click answered 404 in a 2.4 s toast. The PUT now takes
+`interview_id` (the interview on screen), self-heals the key the same way, mirrors the decision onto THAT interview (was
+the newest), and returns **`crm`** = `ai_interview_bridge.describe_decision_outcome(decision, profile_id, before, after)`
+(PURE: `linked · moved · closed · status_before/after · message · next`) — `sync_hr_decision(..., outcome=dict)` fills
+it, `_push_decision_to_crm` returns it. Words: Reject at Sourcing / Technical Screening / RMG Review → "closed as RMG
+Rejected; TA gets Archive and Re-apply"; past those stages → "recorded, did not move"; Shortlist → "moved to RMG Review —
+Request L2 / Submit to Sales"; On Hold → "nothing moves". (2) **Change positions / Change TAs / Assign Hiring Manager**
+were reachable by any TA whose template grants Requirements: Edit. `crm_deps.action_only(action)` = Admin/CEO, else
+`user_may` ALONE (no tab check — the record is reached through `POS_READ`). New APPROVAL **`requirement.team.assign`**
+(RMG · GM) gates `ASSIGN_WRITE` (TA team + Hiring Manager PUTs and `meta.can_assign`; Sales Head no longer by default);
+**`requirement.positions.request`** is an APPROVAL now (RMG · GM · Sales · Sales Head; was a MANAGE button the 0124
+backfill gave every Requirements-Edit list) behind `POS_REQUEST = action_only(...)`, and a requester who may also
+APPROVE (RMG / GM) has the change applied at once, still recorded. **0146** (frozen `_APPROVAL_DEFAULTS` + `_ALSO`,
+PURE `plan(name, list)`): adds both keys to saved lists tagged / named with a default role (Sales Manager + Hiring
+Manager get the positions key), and STRIPS the positions key from lists tagged TA / HR / Finance, the Interviewer role,
+and untagged templates whose members are only TA / HR / Finance (`untagged_name`). Admin edits all of it in Access
+Control ▸ Approvals & buttons. (3) Customer dropdowns: client-side only (see F-V2). Deploy: `python -m alembic upgrade
+head` (0146), restart, rebuild F-V2. Suite: 2,236 pass, 3 skipped.
+
+**23 Oct 2026 (finance round) — one "awaiting customer" rule, a data start month, no timesheet after the end, the
+Finance desk, receipt branches, migration 0147, head is now 0147 (`tests/test_finance_round_oct23.py` 7,
+`test_work_desk` re-pinned; NEW `tests/conftest.py`):** five screenshot asks.
+- **`services/billing_rules.py`** is the one module.
+  - `data_start()` reads Settings `billing.data_start_month` (env `BILLING_DATA_START_MONTH`, default **2026-03**;
+    `org_settings.validation_error` wants YYYY-MM) — user: "only FY 2026-27 data, March 2026 onwards".
+  - `work_month_clause(year, month)` and `invoice_window_clause()` (the invoice's WORK month = its timesheet's month,
+    else the invoice date — the `invoice_facets` rule) are the SQL.
+  - `awaiting_customer_clause()` = Tax · no customer approval · in the window. It is THE rule for "waiting for the
+    customer": `GET /api/invoices?customer_approved=false` and the Sales Manager's `inv_confirm` tile both use it.
+    The tile used to have its own 90-day window — 25 on the tile against 101 on the list. `CONFIRM_LOOKBACK_DAYS` is
+    gone.
+  - `last_working_day(project, pe)` = the earlier of `pe.exit_date` and `project.end_date`; `month_after_end`,
+    `end_refusal`, `start_refusal`.
+  - `owed_months(pe, project, today, start=)` = the months an assignment owes a sheet: from the data start through the
+    last working day.
+  - `drop_sheets_after_end(db, project, pe=None)` deletes Draft / Rejected sheets with no invoice for months after the
+    end, each in a savepoint.
+- **Where the window applies** (`all_history=true` lifts it on the three lists; each carries `meta.data_start`):
+  `GET /api/invoices`, `GET /api/timesheets`, `GET /api/projects/{id}/timesheets` (the coverage "Due" rows use
+  `owed_months`), `due_report_rows` / `_due_rows`, every work-desk billing query (Finance chain, Sales billing, GM chain
+  — the 180-day "approved recently" window became the work-month window), and the billing tracker + its options.
+  Reports, ledger and receivables keep their own windows. Nothing is deleted for being old.
+- ⚠️ **Tests:** `tests/conftest.py` (the FIRST conftest in this repo) sets `BILLING_DATA_START_MONTH=2000-01` for every
+  test, because most fixtures use 2025 dates. A test of the rule sets its own month with `monkeypatch.setenv`.
+- **No timesheet after the end** (report: project closed 30 Apr 2026, a May sheet existed, and Dec–Feb read "Due — not
+  created").
+  - `POST /api/timesheets` answers 400 before the data start and for a month starting after the last working day.
+  - `schedule_project_close` and `exit_project_employee` (after its own queries — a test mocks their order) call
+    `drop_sheets_after_end`.
+  - **0147** deletes the existing such sheets: Draft / Rejected, no invoice, month > `LEAST(pe.exit_date,
+    p.end_date)`; entries / activity / attachments first, one savepoint per sheet. Submitted / Approved / invoiced
+    sheets are kept.
+- **Finance desk** (`work_desk._finance_tabs`, each tab in its own savepoint, in the money's order):
+  1. `fin_timesheets`
+  2. `fin_proformas`
+  3. `fin_awaiting_customer` (info, same clause)
+  4. `fin_customer_approved` — now labelled **"Pending e-invoices"**
+  5. **`fin_payment_pending`** "Pending record payment" — IRN in, `balance_amount > 0`, not Paid; overdue first by
+     due date, else invoice date + `DEFAULT_TERMS_DAYS`=30; sections Overdue / Not yet due.
+  6. **`fin_tds_pending`** — TdsRecord Pending / Partly paid.
+  7. **`fin_receipts`** "Receipts to map" — unallocated > 0 or no branch; links `received-amounts?receipt=<id>`.
+  8. `fin_invoices` — every Tax invoice in the window.
+- **Receipt branch** (user: "ask which branch paid; give an Edit so we can map it").
+  - `POST /api/customer-receipts` with no branch infers it (`_infer_branch`: the ticked invoices' single branch, else
+    the customer's only branch). Otherwise it answers 400 "Choose the … branch that paid", unless every ticked invoice
+    itself has no branch, or the customer has no branches.
+  - **`POST /api/customer-receipts/assign-branch {receipt_ids, branch_id}`** sets it in bulk and skips (and names) a
+    receipt mapped to another branch's invoices.
+  - `GET /api/customer-receipts/{receipt_id}` is new (declared after the literal GETs). `?branch_id=0` = no branch.
+  - **0147** backfills a blank `customer_receipts.branch_id` from the one branch of its paid invoices (project branch,
+    else PO billing branch), else the customer's only branch.
+
+Deploy: `python -m alembic upgrade head` (0147), restart. Set Settings ▸ Organisation ▸ Billing ▸ "Data starts
+from" if 2026-03 is not right.
+
+**24 Oct 2026 — why a screen share failed reaches the Integrity tab (`tests/test_device_check.py`, 5; no
+migration — one legacy column by startup ALTER):** reported — a candidate could not pass the Device Check's Screen
+share and nobody could see why (the page wrote the reason to the browser console only; the tile also told her to
+"choose this tab", which the 11 Oct entire-screen rule refuses — F-V2 notes). The Device Check runs BEFORE sign-in,
+so **`POST /candidate/invite/{token}/device-check`** (JSON `{check: "screen_share", ok, reason, surface, attempt}`,
+30/min, no bearer — the invite token is the credential, like the public lookup) stores each result on
+`interview_schedule.device_check_log` (TEXT JSON, `_ensure_schedule_security_columns_*`, both dialects;
+`auth_db.get_device_check_log` / `set_device_check_log`); 404 unknown token, 400 unknown check, a completed /
+terminated interview is ignored. `services/device_check.py` (PURE): `clean_event` (known checks only, short
+codes, markup stripped), `append` (newest `MAX_EVENTS`=20), `reason_words` (denied = cancelled or blocked ·
+not_entire_screen · NotReadableError · NotFoundError · …), `timeline_events`, `failure_count`. A failure is also
+logged as `interview.device_check.screen_share_failed` (reason, surface, attempt, user agent).
+`GET /interview/integrity-logs/{token}` merges them into the timeline as `screen_share_failed` /
+`screen_share_ok` — new informational `EVENT_TYPES` (system, penalty 0, never strikes). Deploy: restart.
+
+**24 Oct 2026 — one stage per invoice, the next payment advice on a partly paid invoice, per-day round off,
+migration 0148, head is now 0148 (`tests/test_invoice_stages_and_receipts.py` 4; `test_work_desk` re-pinned):**
+screenshot report — an invoice still waiting for the customer's approval also showed under Finance's **Unpaid** tab (the
+tabs read `payment_status` alone). (1) ⚠️ **`billing_rules.invoice_stage_case()`** (SQL) + PURE twin
+`invoice_stage(...)` / `stage_of_invoice(inv)` are THE stage of an invoice, in this order: `proforma` → `paid`
+(payment_status Paid) → `partially_paid` (any cash or TDS in) → `awaiting_customer` (no customer approval) →
+`pending_einvoice` (no IRN) → `unpaid`. Money in wins over the approval steps, so an invoice paid before the approval
+rule is never in two tabs. `INVOICE_STAGES` / `INVOICE_STAGE_KEYS`. `awaiting_customer_clause` = that stage + the data
+window. `GET /api/invoices` takes `stage` (400 on an unknown key) and `with_stage_counts=true` (→ `meta.stage_counts`,
+ONE grouped query over the same customer / project / PO / branch / employee / month / search filters, applied by
+`_invoice_common_filters` BEFORE the stage); every row carries `stage`. Work desk: `_open_balance_tab` backs
+`fin_payment_pending` ("Unpaid — record payment", stage unpaid) and the new **`fin_partially_paid`** ("Partially paid —
+balance due", subtitle "received ₹x"). Billing tracker: stage `partially_paid` ("Partly paid — balance due", open,
+counts in overdue); `stage_of(..., money_in=)`. (2) **Receipts** (`routers/crm/customer_receipts.py`): ⚠️ the picker,
+create and allocate matched invoices by the PROJECT's customer only, so an invoice whose project sits under another
+customer record but whose PO is this customer's could never take the receipt — `customer_invoice_clause(customer_id)` =
+project's customer OR PO's customer (the ledger / list rule). An invoice with NO branch on record may take any branch's
+receipt (`not in (None, branch_id)` in create / allocate / update). `invoice-options?match_amount=` → each row's
+`likely_match` (|balance − amount| < `MATCH_TOLERANCE` ₹1) — the advice that names no invoice: save on account, Map
+invoices, the matching one is first. A Partially_Paid invoice was always mappable server-side (balance > 0). (3) **Per-day
+round off**: PURE `proforma.round_per_day(*, unit, rate, amount, per_day)` — a PART month on Monthly / Yearly only;
+days = amount ÷ per_day snapped to ½ within 0.05 else 2 dp; per_day rounded half-up to the rupee; amount = days ×
+rounded, capped at the rate; a full month, Hourly / Daily, or nothing to round → None. `GenerateInvoiceIn.round_per_day`
+(single PO, no qty / rate override; the split path never rounds) rewrites the line (qty = days, rate = per day), logs
+`INVOICE_PER_DAY_ROUNDED`; **0148** adds `invoices.per_day_rate` / `per_day_days`, used by
+`billing_breakdown_for_invoice` (the printed Rate Per Day / Qty) and returned by `serialize_invoice`. Deploy:
+`python -m alembic upgrade head` (0148), restart.
+
+**24 Oct 2026 (later) — Finance filters on the Dashboard (`test_billing_tracker` +1, `test_executive_dashboard` +1;
+no migration):** user ask "what more filters for the Finance Dashboard — implement as we need". (1) **Billing Tracker**
+(`services/billing_tracker.py`, `GET /api/dashboard/billing`): every row now carries `branch_id / branch` (project's
+branch, else the PO's billing branch — the `invoice_facets` rule), `po_id / po_number`, `owner_id / owner` (the Sales
+person who raised the deal: project → opportunity `created_by`, names via `revenue_report._user_names`), `days_late` +
+`late_bucket` (PURE `days_late`: due date, else invoice date + `DEFAULT_TERMS_DAYS` 30; only on money stages
+`MONEY_STAGES` with a balance; `LATE_BUCKETS` = the same keys as `finance_reports`), `waiting_days` (PURE `stage_since`:
+approved_at · returned_at · invoice date · issued_at · customer_approved_at · irn_recorded_at — paid has no clock),
+`amount` (grand total, else the rest to bill), `tds_pending` (open `TdsRecord` balance, one query) and `split`. New
+query params: `branch_id` (0 = no branch) · `project_id` · `employee_id` · `po_id` (0 = no PO) · `owner_id` · `late`
+(a bucket key or `late` = any days late) · `date_field` invoice|due + `date_from` / `date_to` · `amount_min` ·
+`waiting_min` · `flags` CSV (`FLAGS` overdue · tds_pending · split · no_branch; `parse_flags` → 400 on an unknown one).
+PURE `apply_filters(rows, f)` runs after customer + search and BEFORE the counts (the stage still narrows rows only);
+the new pickers come from `_row_options(rows)` taken BEFORE those filters, so choosing a project never empties its own
+dropdown: `meta.options` adds `branches`, `no_branch`, `projects` (with `customer_id`), `employees`, `pos`, `owners`,
+`late`, `flags`; `meta.late_total` = balance of the late rows. Bad late key / date field / to < from → 400.
+(2) **Finance tab**: `executive_dashboard(..., customer_id=, project_id=)` → `_finance` passes them to `revenue_report`,
+`_invoices_in_window`, `_payments_in_window` and `_deployed_rows` (the report's own SQL filters, so tab and report
+agree) and returns `filters` (choices = the report's `filters.options`). `GET /api/dashboard/ceo` takes `customer_id` /
+`project_id` (Finance tab only; ignored by the others). Deploy: restart.
+
+**24 Oct 2026 (night) — a part month bills days × per-day; Qty prints the billed days (`test_invoice_stages_and_receipts`
++1, `test_midmonth_timesheet` re-pinned; no migration):** screenshot report — March 2026, ₹2,60,000 a month, 31 days, one
+LOP day: the invoice printed Qty 31 × ₹8,387.10 and an amount of ₹2,51,602. Two faults. (1) ⚠️ The Monthly branch of
+`timesheet_invoice_preview` redefined amount = qty(4 dp) × rate — 30/31 = 0.9677 × 2,60,000 lost ₹10.90 (up to rate ×
+0.00005). A part month now bills **billed days × the per-day figure to the paisa** — `proforma.round_per_day(...,
+step=Decimal("0.01"))` (the 0148 rupee toggle is `step=1`; with the paisa step the days must be whole / half, else None)
+over `per_day = rate × presence / billed_days` (skipped on a mid-month rate change): 30 × ₹8,387.10 = ₹2,51,613.00. The line
+adds **`billed_days`**; when the plan applies the amount is NOT redefined from the 4-dp qty (qty × rate no longer equals
+amount on such lines — `billed_days × per_day_charge` does). `generate-invoice` applies the same paisa plan by default
+(no toggle, no qty / rate override, not a split) and stores `per_day_rate` / `per_day_days` + line qty = days, rate =
+per day — which also corrects a sheet frozen before the fix (251,602 → 251,613). (2) `billing_breakdown_for_invoice`
+printed Qty = days in the month even when the customer's format HIDES the Leave column. Qty is now the billed days
+(stored `per_day_days`, else the line's `billed_days`, else the amount ÷ per-day snapped to a half day), plus the leave days
+only when the Leave column is printed ("31 − 1 leave" vs "30"). Invoices already issued keep their stored amount — correct
+one through an invoice change request. Deploy: restart.
+
+**26 Oct 2026 — the Invoices Status column is a filter (`test_invoice_stages_and_receipts` +1; no migration):**
+`billing_rules.invoice_status_case(today)` (SQL, no date arithmetic in SQL) + PURE twin `invoice_status(...)`:
+`proforma_with_finance` · `proforma_returned` · `overdue` · `due_soon` (≤ `DUE_SOON_DAYS`=7) · `not_due` (due date,
+else invoice date + `DEFAULT_TERMS_DAYS`=30) · `paid_tds_pending` (a TdsRecord not Paid) · `paid`;
+`STATUSES_BY_STAGE` = what each tab can hold. `GET /api/invoices` takes `status` (CSV, 400 on an unknown key),
+`with_status_counts` (→ `meta.status_counts` for the open stage, counted BEFORE the status filter, and
+`meta.filter_options {employees, pos}` of the tab), and common filters `invoice_from/to`, `due_from/to`,
+`amount_min/max` (grand total — they narrow the stage counts too). Rows carry `status_key`, `status_label`,
+`days_late` (TDS pending in one query per page). Deploy: restart, rebuild F-V2.
+
+**26 Oct 2026 — returned Proformas on the Dashboard, reopen a sheet for correction, every generated invoice for the
+Sales Manager / Head (`tests/test_billing_tracker.py` +3 / re-pinned, `test_proforma_flow` re-pinned; no migration):**
+(1) **`services/returned_proformas.py`** — `board(db, user, customer_id=, month=, search=, step=)`: every Proforma with
+`returned_at` set (the generate route DELETES it on reissue, so these are exactly the open returns), inside
+`invoice_window_clause()`, with the work month / period, employee, customer (project's, else PO's), PI no., amount,
+Finance's reason, who returned it + when, and PURE `next_step(ts_status, approved_at, returned_at)` → `to_correct`
+(Approved, untouched since the return) · `correcting` (Draft / Rejected) · `resubmitted` · `reissue` (approved AFTER the
+return) · `manual` (no timesheet). Meta: per-step counts, customer / month options (from the rows), `can_reopen`,
+`can_reissue`. `may_see` = Admin/CEO · Finance · Sales family · RMG · `user_may(timesheet.approve | generate_invoice)` ·
+`screens_as_rmg`. Route **`GET /api/dashboard/returned-proformas`** (403 otherwise). (2) **`POST
+/api/timesheets/{id}/reopen-for-correction {note?}`** — Approved sheet + ≥ 1 returned Proforma + no live invoice
+(409 otherwise); `may_reopen` (Sales family · RMG · `timesheet.reject` · screener · Admin) + `_require_owner_or`; status →
+Rejected with "Reopened for correction — Finance returned PI-…: <reason>", frozen figures dropped, ledger reversed, activity
+`TS_REOPENED`, the submitter told (event **`timesheet.reopened`**). The returned Proforma stays and is replaced (same PI no.)
+when the corrected sheet is raised again. ⚠️ **`reject_timesheet` now blocks only on LIVE invoices** (`live_invoices`) — a
+returned Proforma used to make a sheet unrejectable for everyone but Admin's undo. (3) `proforma._notify_returned` → **GM ·
+Sales Manager · Sales Head · RMG** + `user_ids_who_may("timesheet.generate_invoice")` + the sheet's submitter, names the work
+month and employee, links the TIMESHEET; `invoice.proforma_returned` default roles updated in `email_flows.EVENTS` (a saved
+route still replaces them). (4) **Billing tracker**: `GET /api/dashboard/billing` behind `dashboards.billing_reader` =
+Finance · Sales Head · the Sales Manager (`role_implications.sees_team`) · Admin/CEO, by role (plain Sales / RMG / GM refused —
+pinned). New stage group **`invoiced`** (`INVOICED_STAGES` = every issued Tax invoice incl. paid, newest invoice date first;
+`counts/amounts.invoiced`), and **`format=csv`** → `billing_tracker(..., export=True)` returns every filtered row, PURE
+`to_csv` (`CSV_COLUMNS`, formula-neutralised). Deploy: restart.
+
+**27 Oct 2026 — dashboard filter audit: every record in exactly ONE filter (`tests/test_filter_audit.py` 7;
+`test_billing_tracker` / `test_work_desk` re-pinned; no migration):** user report — "a lot of filters merge with each
+other" on the Finance, Sales Manager and RMG / GM dashboards. Rules now shared:
+- **One customer per invoice** — `billing_rules.invoice_customer_id(project_cid, po_cid)` = the PO's customer, else the
+  project's, and its SQL twin `invoice_customer_clause(cid)`. Used by the Invoices list filter, the Billing Tracker
+  (rows + options), every work-desk invoice item (`work_desk._invoice_names` is keyed by INVOICE id now) and the
+  Returned Proformas board. An invoice on a Harman project drawn on Uno Minda's PO is Uno Minda's — it used to be
+  listed under both. ⚠️ The Revenue report still groups by the project's customer (`revenue_report._invoice_filters`).
+- **One overdue rule** — `effective_due` (own due date, else invoice date + 30), `days_late`, `overdue_clause()`,
+  `due_range_clause()`. The tracker's `overdue` / `late_total` / header pill come from the SAME rows (after the
+  filters, before the stage) and a "due" date range matches the effective due date (invoices with no due date used to
+  vanish from it). Tracker rows carry `effective_due`.
+- **One stage per invoice on every desk** — `work_desk.invoice_states` + `_invoice_status_fields` (chip
+  `billing_rules.invoice_chip`: "Unpaid · 10 d overdue", "Awaiting customer", "Paid · TDS pending"; item `status` =
+  the stage words, `stage`, `status_key`). "Tax invoices issued" printed `payment_status`, so awaiting-customer,
+  pending-e-invoice and unpaid all read "Unpaid". "Pending e-invoices" = `invoice_stage_case() == pending_einvoice`;
+  its IRN-recorded section is windowed. **Collections** (Sales `sales_collections`, `team_collections`, `head_collections`
+  — the latter now the FULL list, `top` on the first 10) = `COLLECTABLE_STAGES` (unpaid · partially_paid) AND overdue
+  (`collectable_overdue`); an invoice still waiting for the customer is not a collection; status = "Unpaid" /
+  "Partially paid" (`_collect_stage`). `team_timesheets` / team / head collections and the GM's submitted sheets
+  follow the data-start window.
+- **Invoices list** `with_status_counts`: `filter_options` (employees / POs) are built WITHOUT the employee / PO
+  filters, so choosing one no longer shrinks its own picker.
+- **Sales desk** — a candidate on a held deal, on hold by request or with the Hiring Manager (`_PARKED_STATUSES`) is
+  listed under its real status with no move buttons and is NOT counted (it read "Cleared by RMG · Submit"); every Sales
+  item carries `status` (Ready to submit · Waiting for the customer · the decide label · terms sections · Waiting for
+  approval).
+- **Returned Proformas** — `next_step(..., has_live_part=)`: a returned PART of a split sheet whose other part is
+  live is "reissue" (GM), never "to_correct" (a sheet with a live invoice cannot be reopened).
+- **CEO / Finance tab with a customer / project scope** — `revenue_report._efficiency` counts the scoped heads;
+  `targets.scoped = True` and every attainment / projection % is None (a company target against one account's
+  billing was meaningless); target alerts drop out with them.
+- **Screening Desk** — the STAGE decides the tab first (`screening_tab_for` + the SQL in `_base`): RMG_Review is
+  "In review" whatever the screening column says, and `next_step` never offers "screen" there. AI buckets add
+  `on_hold` and `not_attempted` (`ai_result_bucket`; steps `ai_on_hold` → category ai_failed, now "AI L1 to decide";
+  `ai_not_attempted` → booking, owner TA). A manual L1 asked / booked wins the route over an older AI link. Notice:
+  bucket `serving` (serving / LWD / a date), "No notice" = 0, a range reads its longer end. Experience with no band
+  on the position = `unknown`; budget compares CTC in rupees (a lakh figure < 1000 × 100000). With a derived filter
+  on, the tab counts and position headers count only what the filter keeps.
+- **`rmg_tasks`** — `total` counts each candidate once; `feedback` and `results` are sent in full
+  (`FULL_LIST_CATEGORIES`); the invoices-issued hint no longer says "last 30 days".
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 
@@ -4109,7 +4427,7 @@ docker compose up -d --build       # monolith + postgres on :2020
 docker compose --profile cache up -d   # + redis (used only by rate limiting)
 
 # Migrations
-cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0144
+cd backend && python -m alembic upgrade head && python -m alembic current   # head = 0148
 
 # Tests — run from backend/, no live DB needed
 cd backend && python -m pytest -q

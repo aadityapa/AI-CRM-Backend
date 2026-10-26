@@ -79,6 +79,42 @@ EVENTS: list[dict] = [
                     "the opportunity, how many positions, the priority and any note. Only the TAs "
                     "named on the assignment receive it.",
      "default_roles": ["TA"]},
+    # The Hiring Manager (22 Oct 2026, services/hiring_managers.py).
+    {"event": "requirement.hm_assigned",
+     "label": "Hiring Manager assigned to a position",
+     "description": "Sent to a Hiring Manager when RMG / GM puts them on a position — they will "
+                    "confirm the JD & skills, review candidates and sign off the selection.",
+     "default_roles": ["Hiring Manager"]},
+    {"event": "requirement.hm_jd_review",
+     "label": "JD & skills waiting for the Hiring Manager",
+     "description": "Sent to the position's Hiring Managers when RMG approves it — the position opens "
+                    "for sourcing once one of them confirms the JD & skills.",
+     "default_roles": ["Hiring Manager"]},
+    {"event": "requirement.hm_jd_decided",
+     "label": "Hiring Manager decided on the JD",
+     "description": "Tells RMG (the reviewer first) that the Hiring Manager confirmed the JD & skills, "
+                    "or sent them back with what to change.",
+     "default_roles": ["RMG"]},
+    {"event": "profile.hm_review_requested",
+     "label": "Candidate waiting for the Hiring Manager's review",
+     "description": "Sent to the position's Hiring Managers when RMG hands a candidate to Sales — the "
+                    "profile goes to the customer once they approve it.",
+     "default_roles": ["Hiring Manager"]},
+    {"event": "profile.hm_review_decided",
+     "label": "Hiring Manager reviewed a candidate",
+     "description": "Tells Sales (and the candidate's TAs) that the Hiring Manager approved the "
+                    "candidate for the customer, or rejected them (RMG is told of a rejection too).",
+     "default_roles": ["Sales"]},
+    {"event": "profile.hm_signoff_requested",
+     "label": "Selection waiting for the Hiring Manager's sign-off",
+     "description": "Sent to the position's Hiring Managers when Sales submits the terms for a "
+                    "selected candidate — the Sales Head approves after their sign-off.",
+     "default_roles": ["Hiring Manager"]},
+    {"event": "profile.hm_signoff_decided",
+     "label": "Hiring Manager signed off a selection",
+     "description": "Tells the Sales Head and Sales that the Hiring Manager signed off (or rejected) "
+                    "the selection.",
+     "default_roles": ["Sales_Head", "Sales"]},
     {"event": "requirement.positions_requested",
      "label": "Position change requested",
      "description": "Sent to RMG (and Sales Head) when Sales asks to increase or reduce the number of "
@@ -132,8 +168,15 @@ EVENTS: list[dict] = [
      "default_roles": ["Finance"]},
     {"event": "invoice.proforma_returned",
      "label": "Proforma invoice returned to the GM",
-     "description": "Sent when Finance sends a Proforma back with a reason, for the GM to fix and reissue.",
-     "default_roles": ["GM"]},
+     "description": "Sent when Finance sends a Proforma back with a reason — the GM, the Sales Manager / "
+                    "Sales Head and RMG (and whoever filled the timesheet) check the timesheet, correct it "
+                    "and resubmit, or the GM reissues it.",
+     "default_roles": ["GM", "Sales Manager", "Sales_Head", "RMG"]},
+    {"event": "timesheet.reopened",
+     "label": "Timesheet reopened for correction",
+     "description": "Sent to whoever filled the timesheet when it is reopened after Finance returned its "
+                    "Proforma — correct it and submit again.",
+     "default_roles": []},
     {"event": "invoice.generated",
      "label": "Original invoice generated",
      "description": "Sent when Finance generates the original (tax) invoice from a Proforma — "

@@ -2564,6 +2564,8 @@ def due_report_rows(db: Session) -> list[dict]:
 
     Includes missing timesheets (Due) and Submitted (not yet Approved).
     """
+    from services.billing_rules import owed_months
+
     today = date.today()
     assignments = db.execute(
         select(ProjectEmployee).where(ProjectEmployee.is_active.is_(True))
@@ -2571,8 +2573,10 @@ def due_report_rows(db: Session) -> list[dict]:
     ).scalars().all()
     rows: list[dict] = []
     for pe in assignments:
-        start = _assignment_start(pe)
-        for year, month in _month_range(start, today):
+        # 23 Oct 2026: from the data start month, never past the project's /
+        # the person's last working day (a closed project owed no May sheet).
+        for year, month in owed_months(pe, db.get(Project, pe.project_id), today,
+                                       start=_assignment_start(pe)):
             ts = db.execute(
                 select(Timesheet).where(
                     Timesheet.project_id == pe.project_id,
@@ -2609,11 +2613,17 @@ def _due_rows(db: Session, month: int, year: int) -> list[dict]:
         select(ProjectEmployee).where(ProjectEmployee.is_active.is_(True))
         .order_by(ProjectEmployee.project_id, ProjectEmployee.employee_id)
     ).scalars().all()
+    from services.billing_rules import month_after_end, month_in_window
+
     rows: list[dict] = []
+    if not month_in_window(year, month):
+        return rows
     for pe in assignments:
         start = _assignment_start(pe)
         period_start, _ = period_bounds(year, month)
         if period_start < date(start.year, start.month, 1):
+            continue
+        if month_after_end(year, month, db.get(Project, pe.project_id), pe):
             continue
         ts = db.execute(
             select(Timesheet).where(
@@ -3034,6 +3044,7 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
     def _entry_in_range(e: TimesheetEntry, start: date, end: date) -> bool:
         return start <= e.entry_date <= end
 
+    billed_days_line: Decimal | None = None   # part-month days billed (Monthly)
     if unit == BillingUnit.HOURLY:
         if rate_changed:
             parts: list[tuple[Decimal, Decimal]] = []
@@ -3155,9 +3166,24 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         # (max rounding cost: rate x 0.00005). 2dp qty was the old precision;
         # 0.96 x 3,00,000 = 2,88,000 vs an amount of 2,86,957 put a phantom
         # thousand rupees between the popup and the invoice.
+        # PART MONTH = billed days × the per-day figure (24 Oct 2026, user
+        # report: March, 31 days, one leave — ₹2,60,000 printed Qty 31 ×
+        # ₹8,387.10 and an amount of ₹2,51,602). The 4-dp qty below rounded
+        # 30/31 to 0.9677 and lost ₹10.90. A part month now bills exactly
+        # "30 days × ₹8,387.10 = ₹2,51,613.00" — the per-day figure the
+        # invoice prints, times the days it bills — so the row reconciles.
+        if rate > ZERO and working_days > ZERO and not rate_changed:
+            from services.proforma import round_per_day
+            per_day_exact = (rate * presence_ratio) / working_days
+            plan = round_per_day(unit="Monthly", rate=rate, amount=amount,
+                                 per_day=per_day_exact, step=TWO_PLACES)
+            if plan is not None:
+                amount = plan["amount"]
+                billed_days_line = plan["days"]
         if rate > ZERO:
             qty = (amount / rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-            amount = (qty * rate).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+            if billed_days_line is None:
+                amount = (qty * rate).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
     # Rate basis for the breakdown popup: WHICH unit the assignment bills in
     # (straight from the Project Employee record) and the derived per-day /
@@ -3193,6 +3219,8 @@ def timesheet_invoice_preview(db: Session, ts: Timesheet,
         # Where the rate and its unit live — the UI links a warning straight there.
         "project_employee_id": assignment.id,
         "working_days_in_period": float(wd_count),
+        # Days a part month bills (Monthly) — amount = billed_days × per_day_charge.
+        "billed_days": float(billed_days_line) if billed_days_line is not None else None,
         "hours_per_full_day": float(hours_per_day),
         "per_day_charge": _money(per_day),
         "per_hour_charge": _money(per_hour),

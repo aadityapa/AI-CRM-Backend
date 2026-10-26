@@ -196,7 +196,9 @@ def test_rmg_approval_assigns_the_team_in_the_same_click(db, monkeypatch):
     assert out["success"] and req.status == RequirementStatus.OPEN_FOR_SOURCING
     assert "1 TA(s) assigned" in out["message"]
     assert [a.user_id for a in db.query(RequirementTaAssignment).all()] == [TA_A]
-    assert told and told[0][0] == TA_A
+    # The assigned TA hears "assigned to you" once the position opens (22 Oct
+    # 2026: `announce_open_for_sourcing` tells the team; the raiser hears too).
+    assert any(uid == TA_A and "assigned to you" in title for uid, title in told)
     # A forged id is refused as a 400 and nothing is approved.
     req2 = Requirement(req_number="REQ-72", opportunity_id=req.opportunity_id, customer_id=req.customer_id,
                        title="Second position", no_of_positions=1,

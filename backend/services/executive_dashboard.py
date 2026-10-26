@@ -254,14 +254,19 @@ def _kind_index(db: Session, employee_ids: set[int]) -> dict[int, tuple[str, str
 # --------------------------------------------------------------------------- finance
 
 
-def _finance(db: Session, period: Period, today: date) -> dict:
+def _finance(db: Session, period: Period, today: date,
+             customer_id: int | None = None, project_id: int | None = None) -> dict:
     """The Revenue report's sections the CEO reads first, plus a month-by-month
     cut INSIDE the period (the report's own trend is 12 months / 8 quarters /
-    5 FYs — at the FY zoom it cannot show how this year unfolded)."""
-    rep = revenue_report(db, period.anchor.key, today, period.kind)
-    invoices = _invoices_in_window(db, period.start, period.end)
-    payments = _payments_in_window(db, period.start, period.end)
-    deployed = _deployed_rows(db)
+    5 FYs — at the FY zoom it cannot show how this year unfolded).
+
+    24 Oct 2026: `customer_id` / `project_id` narrow every figure — the same SQL
+    filters the Revenue report uses, so the tab and the report never disagree."""
+    rep = revenue_report(db, period.anchor.key, today, period.kind,
+                         customer_id=customer_id, project_id=project_id)
+    invoices = _invoices_in_window(db, period.start, period.end, customer_id, project_id)
+    payments = _payments_in_window(db, period.start, period.end, customer_id, project_id)
+    deployed = _deployed_rows(db, customer_id, project_id)
 
     monthly = []
     for m in _months_in(period):
@@ -289,6 +294,7 @@ def _finance(db: Session, period: Period, today: date) -> dict:
         "series": rep["series"],
         "monthly": monthly,
         "by_type": by_type,
+        "filters": rep.get("filters"),
         "top_customers": rep["by_customer"]["rows"][:DONUT_SLICES],
         "concentration": {
             "top1_share_pct": rep["by_customer"]["top1_share_pct"],
@@ -1017,7 +1023,8 @@ _BUILDERS = {"finance": _finance, "customer": _customer, "sales": _sales, "peopl
 
 
 def executive_dashboard(db: Session, tab: str, month_raw: str | None = None,
-                        period_raw: str | None = None, today: date | None = None) -> dict:
+                        period_raw: str | None = None, today: date | None = None,
+                        customer_id: int | None = None, project_id: int | None = None) -> dict:
     """One tab of the CEO dashboard. `tab` ∈ TABS; `month` is the anchor and
     `period` the zoom (default FY). Raises ValueError on a bad tab / period."""
     tab = (tab or "").strip().lower()
@@ -1029,5 +1036,6 @@ def executive_dashboard(db: Session, tab: str, month_raw: str | None = None,
         "as_of": today.isoformat(),
         "tab": tab,
         "period": _period_view(period, today),
-        "data": _BUILDERS[tab](db, period, today),
+        "data": (_finance(db, period, today, customer_id, project_id) if tab == "finance"
+                 else _BUILDERS[tab](db, period, today)),
     }

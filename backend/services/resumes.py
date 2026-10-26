@@ -262,7 +262,14 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
                               "auto-forwarded for RMG review")
                 healed = True
             status_by_profile[p.id] = status
-        if healed:
+        # A REJECTED AI L1 decision closes the candidacy (23 Oct 2026) — older
+        # rows that sat at Technical Interview with "Rejected" are closed here.
+        from services.admin_corrections import heal_ai_rejected
+        closed = heal_ai_rejected(db, {link.profile_id: link for link in latest.values()
+                                       if link.profile_id})
+        for pid in closed:
+            status_by_profile[pid] = PipelineStatus.RMG_REJECTED.value
+        if healed or closed:
             db.commit()
 
     # L2 face-to-face state (28 Aug 2026): drives one-shot button disabling —

@@ -1237,6 +1237,17 @@ def exit_project_employee(db: Session, pe: ProjectEmployee, *, exit_date: date |
         "needs_settlement": True,
     } for r in leave_rows]
     pe.settlement_pending = bool(settlement)
+    # 23 Oct 2026: untouched sheets for months after the exit are removed, so no
+    # list keeps a timesheet for work that never happened.
+    try:
+        from services.billing_rules import drop_sheets_after_end
+
+        project = db.get(Project, pe.project_id)
+        if isinstance(project, Project):
+            db.flush()
+            drop_sheets_after_end(db, project, pe)
+    except Exception:  # noqa: BLE001 — never block an exit on the clean-up
+        pass
     return {
         "exit_date": exit_date.isoformat(),
         "closed_periods": closed,

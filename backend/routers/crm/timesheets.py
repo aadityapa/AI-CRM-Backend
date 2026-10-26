@@ -36,6 +36,7 @@ from services.notify import notify_employee, notify_role, notify_roles, notify_u
 from services.proforma import (
     PROFORMA_PREFIX, customer_invoice_format, invoice_credit_days, notify_proforma_ready,
     plan_date_splits, plan_splits, replaceable_proforma, resolve_invoice_format, returned_proformas,
+    round_per_day,
 )
 from services.invoice_parties import freeze as freeze_parties
 from services.timesheets import (
@@ -190,6 +191,13 @@ def create_timesheet(
     if not assignment:
         raise HTTPException(status_code=400, detail="Employee is not assigned to this project")
     _reject_future_period(body.month, body.year)
+    # 23 Oct 2026 (user reports): no sheet before the data start month, and none
+    # for a month that starts after the project's / the person's last working day.
+    from services import billing_rules
+    refusal = (billing_rules.start_refusal(body.year, body.month)
+               or billing_rules.end_refusal(body.year, body.month, project, assignment))
+    if refusal:
+        raise HTTPException(status_code=400, detail=refusal)
     duplicate = db.execute(
         select(Timesheet).where(
             Timesheet.project_id == body.project_id,
@@ -271,12 +279,18 @@ def list_timesheets(
     month: int | None = None,
     year: int | None = None,
     status: str | None = None,
+    all_history: bool = False,
     params: PageParams = Depends(page_params),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(get_current_user),
     _acc: CurrentUser = Depends(TS_VIEW),
 ):
+    from services import billing_rules
+
     stmt = select(Timesheet).order_by(Timesheet.id.desc())
+    if not all_history:
+        # 23 Oct 2026: from the data start work month (Settings ▸ Billing).
+        stmt = stmt.where(billing_rules.work_month_clause(Timesheet.year, Timesheet.month))
     if not _can_manage_sheets(user):
         emp = employee_for_user(db, user.id)
         if not emp:
@@ -344,6 +358,7 @@ def list_timesheets(
         cid, cname = proj_cust.get(r.get("project_id"), (None, None))
         r["customer_id"] = cid
         r["customer_name"] = cname
+    meta = {**(meta or {}), "data_start": None if all_history else billing_rules.data_start_meta()}
     return envelope(data=rows, meta=meta)
 
 
@@ -1552,7 +1567,9 @@ def reject_timesheet(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     # 0141: a split sheet has several invoices — every one blocks, every one is undone.
-    linked_all = invoices_for(db, ts) if ts.status == TimesheetStatus.APPROVED else []
+    # 26 Oct 2026: a Proforma Finance RETURNED does not block — it waits to be
+    # replaced when the corrected sheet is raised again (same PI number).
+    linked_all = live_invoices(invoices_for(db, ts)) if ts.status == TimesheetStatus.APPROVED else []
     linked = linked_all[0] if linked_all else None
     undo_summary: dict | None = None
     if linked is not None:
@@ -1649,6 +1666,70 @@ def reject_timesheet(
     if undo_summary is not None:
         msg += f" — invoice {undo_summary['invoice_number']} undone"
     return envelope(data=timesheet_out(ts), message=msg)
+
+
+class ReopenForCorrectionIn(_PeriodBase):
+    note: str | None = None
+
+
+@router.post("/{timesheet_id}/reopen-for-correction")
+def reopen_for_correction(
+    timesheet_id: int,
+    body: ReopenForCorrectionIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Finance returned this sheet's Proforma — send the approved sheet back so it
+    can be corrected and submitted again (26 Oct 2026, user ask). Same effect as
+    a rejection (status Rejected, frozen figures dropped, leave / comp-off
+    reversed until the next submit), but open to the people who work the sheet
+    (Sales family, RMG / GM, the approvers) and ONLY while the sheet carries a
+    returned Proforma and no live invoice. The returned Proforma stays and is
+    replaced — same PI number — when the corrected sheet is raised again."""
+    from services.returned_proformas import may_reopen
+
+    ts = get_timesheet_or_404(db, timesheet_id)
+    if not may_reopen(db, user):
+        raise HTTPException(status_code=403, detail="You cannot reopen timesheets for correction")
+    _require_owner_or(db, user, ts, "HR", "RMG", "Sales", "Sales_Head")
+    if ts.status != TimesheetStatus.APPROVED:
+        raise HTTPException(status_code=409, detail="Only an approved timesheet can be reopened for correction")
+    docs = invoices_for(db, ts)
+    returned = returned_proformas(db, ts)
+    if not returned:
+        raise HTTPException(status_code=409,
+                            detail="Finance has not returned a Proforma for this timesheet — ask the GM to reject it instead")
+    if live_invoices(docs):
+        raise HTTPException(status_code=409,
+                            detail="Another invoice from this timesheet is still live — cancel it first (Finance → Invoices)")
+    why = "; ".join(f"{r.proforma_number or r.invoice_number}: {r.returned_reason}" for r in returned
+                    if r.returned_reason) or "Finance returned the Proforma"
+    note = " ".join((body.note or "").split())
+    reason = f"Reopened for correction — Finance returned {why}" + (f". Note: {note}" if note else "")
+    ts.status = TimesheetStatus.REJECTED
+    ts.rejection_reason = reason[:2000]
+    ts.approved_figures = None
+    reverse_timesheet_ledger_effects(db, ts)
+    log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "TS_REOPENED", reason)
+
+    emp, period, rows = _timesheet_context(db, ts)
+    who = employee_display_name(emp) if emp else f"Employee #{ts.employee_id}"
+    by = user.full_name or user.username
+    submitter = _submitter_user_id(db, ts)
+    if submitter and submitter != user.id:
+        notify_user(
+            db, submitter,
+            f"Timesheet reopened for correction — {who}, {period}",
+            f"{by} reopened {who}'s timesheet for {period} after Finance returned the Proforma. "
+            f"Reason: {why}. Correct it and submit again.",
+            f"timesheets/{ts.id}", actor=user, event="timesheet.reopened",
+            rows=rows + [("Reopened by", by), ("Finance said", why)],
+            dedupe_key=f"timesheet.reopened:{ts.id}:{returned[0].returned_at.isoformat() if returned[0].returned_at else ''}",
+        )
+    db.commit()
+    db.refresh(ts)
+    return envelope(data=timesheet_out(ts),
+                    message=f"Timesheet for {period} reopened — correct it and submit again")
 
 
 # ---------------------------------------------------------------- attachment / summary / detail
@@ -2144,6 +2225,39 @@ def generate_invoice_from_timesheet(
                      f"Reviewer set qty={float(qty):g}, rate={float(rate):g}, "
                      f"amount={float(amount):,.2f} before generating the invoice")
 
+    # Per-day round off (24 Oct 2026, 0148): a part month bills days × the
+    # per-day figure rounded to the rupee; a full month is left exact. Not with
+    # a manual qty / rate (that already decides the figure).
+    per_day_round = None
+    if (body is not None and getattr(body, "round_per_day", False) and preview["line_items"]
+            and override_qty is None and override_rate is None):
+        li = preview["line_items"][0]
+        per_day_round = round_per_day(unit=li.get("billing_unit"), rate=li.get("rate_per_unit"),
+                                      amount=li.get("amount"), per_day=li.get("per_day_charge"))
+        if per_day_round is not None:
+            li["total_billed_qty"] = float(per_day_round["days"])
+            li["rate_per_unit"] = float(per_day_round["per_day"])
+            li["amount"] = float(per_day_round["amount"])
+            preview["totals"]["sub_total"] = float(per_day_round["amount"])
+            log_activity(db, TimesheetActivityLog, "timesheet_id", ts.id, user.id, "INVOICE_PER_DAY_ROUNDED",
+                         f"Per-day amount rounded to {float(per_day_round['per_day']):,.0f}: "
+                         f"{float(per_day_round['days']):g} days = {float(per_day_round['amount']):,.2f} "
+                         f"(was {float(per_day_round['before']):,.2f})")
+    elif preview["line_items"] and override_qty is None and override_rate is None:
+        # The default for every part month (24 Oct 2026, later): billed days ×
+        # the per-day figure to the paisa, stored as days / per-day so the
+        # printed row reads "30 × ₹8,387.10 = ₹2,51,613.00". Also corrects a
+        # sheet frozen before the fix (its 4-dp qty lost up to ₹13).
+        li = preview["line_items"][0]
+        per_day_round = round_per_day(unit=li.get("billing_unit"), rate=li.get("rate_per_unit"),
+                                      amount=li.get("amount"), per_day=li.get("per_day_charge"),
+                                      step=Decimal("0.01"))
+        if per_day_round is not None:
+            li["total_billed_qty"] = float(per_day_round["days"])
+            li["rate_per_unit"] = float(per_day_round["per_day"])
+            li["amount"] = float(per_day_round["amount"])
+            preview["totals"]["sub_total"] = float(per_day_round["amount"])
+
     sub_total = Decimal(str(preview["totals"]["sub_total"]))
 
     po_id = body.po_id if body is not None else None
@@ -2258,6 +2372,8 @@ def generate_invoice_from_timesheet(
         balance_amount=grand_total,
         payment_status=PaymentStatus.UNPAID,
         lines=line_rows,
+        per_day_rate=per_day_round["per_day"] if per_day_round else None,
+        per_day_days=per_day_round["days"] if per_day_round else None,
     )
     apply_round_off(invoice, bool(getattr(body, "round_off", False)))
     grand_total = invoice.grand_total

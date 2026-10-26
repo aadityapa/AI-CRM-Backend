@@ -621,10 +621,17 @@ def _pipeline(db: Session, series: list[dict], period: Period,
     }
 
 
-def _efficiency(db: Session, billed: float, months: int) -> dict:
-    deployed = int(db.execute(
-        select(func.count(ProjectEmployee.id))
-        .where(ProjectEmployee.is_active.is_(True), ProjectEmployee.is_exit.is_(False))).scalar() or 0)
+def _efficiency(db: Session, billed: float, months: int,
+                customer_id: int | None = None, project_id: int | None = None) -> dict:
+    """27 Oct 2026: the head count follows the same customer / project scope as
+    the billed figure — a scoped billed ÷ the company's heads was meaningless."""
+    q = (select(func.count(ProjectEmployee.id))
+         .where(ProjectEmployee.is_active.is_(True), ProjectEmployee.is_exit.is_(False)))
+    if project_id:
+        q = q.where(ProjectEmployee.project_id == project_id)
+    elif customer_id:
+        q = q.join(Project, Project.id == ProjectEmployee.project_id).where(Project.customer_id == customer_id)
+    deployed = int(db.execute(q).scalar() or 0)
     return {"deployed_heads": deployed,
             "revenue_per_head": round(billed / deployed, 2) if deployed else None,
             "revenue_per_head_per_month": round(billed / deployed / months, 2) if deployed else None}
@@ -1379,6 +1386,16 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
     ageing = _ageing(open_rows, today)
     pipeline = _pipeline(db, series, period, customer_id, project_id)
     targets = _targets(db, period, invoices, series, today)
+    # 27 Oct 2026 (filter audit): targets are COMPANY figures. With a customer /
+    # project scope the billed side is one account, so "attainment" against the
+    # company target is meaningless — keep the targets (the modal edits them) but
+    # drop every attainment / projection figure and flag the block as scoped.
+    targets["scoped"] = bool(customer_id or project_id)
+    if targets["scoped"]:
+        for k in ("month_attainment_pct", "run_rate_attainment_pct", "fy_attainment_pct",
+                  "fy_projection_pct"):
+            if k in targets:
+                targets[k] = None
     deployed = _deployed_rows(db, customer_id, project_id)
     margin = _margin(period, invoices, deployed)
     by_project = _by_project(period, invoices, deployed)
@@ -1408,7 +1425,7 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
         "by_employee": by_employee,
         "ageing": ageing,
         "pipeline": pipeline,
-        "efficiency": _efficiency(db, headline["billed"], period.months),
+        "efficiency": _efficiency(db, headline["billed"], period.months, customer_id, project_id),
         "leakage": _leakage(db, period, customer_id, project_id),
         "targets": targets,
         "margin": margin,

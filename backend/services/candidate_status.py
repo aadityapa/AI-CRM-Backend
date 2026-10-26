@@ -52,7 +52,15 @@ NEUTRAL, INFO, WARN, OK, BAD = "neutral", "info", "warn", "ok", "bad"
 #: shared with the Pre-Onboarding budget flag since it began as a budget hold);
 #: a TA rejection is a move to Rejected whose activity row says TA made it.
 TA_HOLD = "TA_Hold"
-TA_CLOSE_ACTIONS = {"TA_REJECTED": "ta"}
+TA_CLOSE_ACTIONS = {"TA_REJECTED": "ta",
+                    # The Hiring Manager (22 Oct 2026): at the review before the
+                    # customer, or at the sign-off before the Sales Head.
+                    "HM_REJECTED": "hm", "HM_SIGNOFF_REJECTED": "hm_final"}
+#: Who closed a generic Rejected candidacy → the status key and the phase it closed in.
+_CLOSED_BY = {"ta": ("ta_rejected", "sourcing"), "hm": ("hm_rejected", "sales_screening"),
+              "hm_final": ("hm_rejected", "selection")}
+#: `candidate_profiles.hm_review_status` / `hm_final_status` while a decision is owed.
+HM_PENDING = "Pending"
 
 #: Filter groups, in display order.
 GROUPS: list[tuple[str, str]] = [
@@ -190,6 +198,9 @@ STATUS_DEFS: list[StatusDef] = [
     _d("sales_review", "With Sales – Ready to Submit", INFO, "customer",
        "Internal rounds cleared. Sales reviews and submits the profile to the customer.",
        {PS.SALES_SCREENING.value}),
+    _d("hm_review", "With Hiring Manager – Review", WARN, "customer",
+       "RMG handed the candidate over; the position's Hiring Manager reviews the profile before "
+       "Sales submits it to the customer.", {PS.SALES_SCREENING.value}),
     _d("submitted_to_customer", "Submitted to Customer", INFO, "customer",
        "The profile is with the customer. Sales records whether they shortlist it.",
        {PS.CUSTOMER_SCREENING.value}),
@@ -211,6 +222,9 @@ STATUS_DEFS: list[StatusDef] = [
     _d("sales_head_approval", "Pending Sales Head Approval", WARN, "selection",
        "Sales submitted the terms. Only the Sales Head approves, sends back or rejects.",
        {PS.CUSTOMER_APPROVAL.value}),
+    _d("hm_signoff", "Pending Hiring Manager Sign-off", WARN, "selection",
+       "Sales submitted the terms; the Hiring Manager signs off the selection before the Sales "
+       "Head approves it.", {PS.CUSTOMER_APPROVAL.value}),
     _d("hr_discussion", "HR Discussion", INFO, "selection",
        "Terms approved. HR reviews the candidate's details and requests the HR round.",
        {PS.HR_SCREENING.value}),
@@ -246,6 +260,9 @@ STATUS_DEFS: list[StatusDef] = [
     _d("rejected", "Rejected", BAD, "closed", "Closed as rejected.", {PS.REJECTED.value}),
     _d("ta_rejected", "Rejected by TA", BAD, "closed",
        "TA closed the candidate before screening — the reason is in the history.", {PS.REJECTED.value}),
+    _d("hm_rejected", "Rejected by Hiring Manager", BAD, "closed",
+       "The position's Hiring Manager rejected the candidate — the reason is in the history.",
+       {PS.REJECTED.value}),
 ]
 
 STATUS_BY_KEY: dict[str, StatusDef] = {d.key: d for d in STATUS_DEFS}
@@ -342,6 +359,9 @@ class StatusFacts:
     opportunity_stage: str | None = None
     #: (side, reason) while the candidacy itself is on hold (16 Oct 2026).
     hold: tuple[str, str] | None = None
+    #: The Hiring Manager's review / sign-off columns (22 Oct 2026, 0145).
+    hm_review: str | None = None
+    hm_final: str | None = None
 
 
 @dataclass(frozen=True)
@@ -469,6 +489,10 @@ def _derive(f: StatusFacts) -> CandidateStatus:
                        hint=f"Reason: {reason}" if reason else None)
     if stage == PS.SHORTLISTED.value and f.terms_sent_back:
         return _status("terms_sent_back")
+    if stage == PS.SALES_SCREENING.value and f.hm_review == HM_PENDING:
+        return _status("hm_review")
+    if stage == PS.CUSTOMER_APPROVAL.value and f.hm_final == HM_PENDING:
+        return _status("hm_signoff")
     if stage in _BUDGET_STAGES and f.budget_status in _BUDGET_STATUS_KEY:
         return _status(_BUDGET_STATUS_KEY[f.budget_status])
     if stage in _FIXED:
@@ -490,7 +514,7 @@ def _derive(f: StatusFacts) -> CandidateStatus:
                 return _status(f"{prefix}_failed")
         return _status("customer_rejected")
     if stage == PS.REJECTED.value:
-        return _status("ta_rejected" if f.ta_closed == "ta" else "rejected")
+        return _status(_CLOSED_BY[f.ta_closed][0] if f.ta_closed in _CLOSED_BY else "rejected")
     if stage == PS.CUSTOMER_SCREEN_REJECTED.value:
         return _status("customer_rejected", hint="The customer rejected the profile at CV screening.")
     if stage == PS.SELF_WITHDRAWN.value:
@@ -576,8 +600,8 @@ def stage_for(f: StatusFacts) -> str:
             pipeline_status=f.withdrawn_from, rmg_screening=f.rmg_screening,
             rounds=f.rounds, requested=f.requested, ai_l1=f.ai_l1,
             budget_status=f.budget_status))
-    if stage == PS.REJECTED.value and f.ta_closed:
-        return "sourcing"
+    if stage == PS.REJECTED.value and f.ta_closed in _CLOSED_BY:
+        return _CLOSED_BY[f.ta_closed][1]
     return "closed"
 
 
@@ -607,6 +631,8 @@ _STATUS_ROUND: dict[str, tuple[str | None, str, str | None]] = {
     "budget_concern": (None, "Pre-Onboarding", "Budget concern"),
     "budget_flagged": (None, "Budget", "With Sales"),
     "budget_replied": (None, "Budget", "With HR"),
+    "hm_review": (None, "Hiring Manager review", "Pending"),
+    "hm_signoff": (None, "Hiring Manager sign-off", "Pending"),
     "deal_customer_hold": (None, "Opportunity", "Customer Hold"),
     "deal_sales_hold": (None, "Opportunity", "Sales Hold"),
 }
@@ -678,14 +704,19 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
     sent_back: dict[int, bool] = {}
     deal_stage: dict[int, str] = {}
     holds: dict[int, tuple[str, str] | None] = {}
+    hm: dict[int, tuple[str | None, str | None]] = {}
     for chunk in _chunks(ids):
-        # The deal's stage — a hold parks the candidacy (one query, never per row).
-        for pid, opp_stage in db.execute(
-            select(CandidateProfile.id, Opportunity.pipeline_stage)
+        # The deal's stage — a hold parks the candidacy — and the Hiring
+        # Manager's two gates (one query, never per row; the rows passed in may
+        # carry only a few columns).
+        for pid, opp_stage, hm_review, hm_final in db.execute(
+            select(CandidateProfile.id, Opportunity.pipeline_stage,
+                   CandidateProfile.hm_review_status, CandidateProfile.hm_final_status)
             .join(Opportunity, Opportunity.id == CandidateProfile.opportunity_id)
             .where(CandidateProfile.id.in_(chunk))
         ).all():
             deal_stage[pid] = _value(opp_stage)
+            hm[pid] = (hm_review, hm_final)
         for pid, kind, stage, status, result, when in db.execute(
             select(InterviewEvent.profile_id, InterviewEvent.kind, InterviewEvent.stage,
                    InterviewEvent.status, InterviewEvent.result, InterviewEvent.scheduled_at)
@@ -739,6 +770,8 @@ def load_facts(db, profiles) -> dict[int, StatusFacts]:
             terms_sent_back=sent_back.get(pid, False),
             opportunity_stage=deal_stage.get(pid),
             hold=holds.get(pid),
+            hm_review=hm.get(pid, (None, None))[0],
+            hm_final=hm.get(pid, (None, None))[1],
         )
         for pid in ids
     }
@@ -900,7 +933,7 @@ def _possible_phases(value: str) -> frozenset[str] | None:
     if value == PS.SELF_WITHDRAWN.value:
         return None
     if value == PS.REJECTED.value:
-        return frozenset({"sourcing", "closed"})
+        return frozenset({"closed"} | {phase for _, phase in _CLOSED_BY.values()})
     return frozenset({"closed"})
 
 

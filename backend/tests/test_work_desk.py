@@ -154,8 +154,12 @@ def test_a_screener_gets_the_screening_tabs(db):
 
 
 def test_finance_gets_no_interview_tabs(db):
-    assert list(_tabs(db, FINANCE)) == ["fin_timesheets", "fin_proformas", "fin_invoices",
-                                    "fin_customer_approved", "upcoming", "queues"]
+    # 23 Oct 2026: the money's order — awaiting customer, pending e-invoices,
+    # payments to record, TDS to collect, receipts to map, then everything issued.
+    assert list(_tabs(db, FINANCE)) == ["fin_timesheets", "fin_proformas", "fin_awaiting_customer",
+                                        "fin_customer_approved", "fin_payment_pending", "fin_partially_paid",
+                                        "fin_tds_pending",
+                                        "fin_receipts", "fin_invoices", "upcoming", "queues"]
 
 
 def test_one_broken_tab_never_blanks_the_desk(db, monkeypatch):
@@ -200,11 +204,13 @@ def test_customer_l2_is_to_schedule_at_either_l2_stage():
         assert rounds_to_schedule({"cust_l2_scheduled": True}, stage, False) == []
 
 
-def test_finance_sees_the_timesheet_proforma_invoice_chain(db):
+def test_finance_sees_the_timesheet_proforma_invoice_chain(db, monkeypatch):
     """29 Sep 2026: Finance's desk is the billing chain — approved sheets still
     waiting on the GM (coming up), Proformas to convert (your move), tax
-    invoices issued (done — every one since 8 Oct 2026)."""
+    invoices issued (done — every one since 8 Oct 2026). 23 Oct 2026: the
+    window is the WORK month (data start), not "approved in the last 180 days"."""
     from datetime import date
+    monkeypatch.setenv("BILLING_DATA_START_MONTH", "2026-05")
     from models import Employee, Invoice, Project, Timesheet, TimesheetStatus
 
     cust = Customer(name="HARMAN")
@@ -243,7 +249,7 @@ def test_finance_sees_the_timesheet_proforma_invoice_chain(db):
     chips = {i["path"]: i["chip"] for i in ts_tab["items"]}
     assert chips[f"timesheets/{returned.id}"] == "Returned to GM"
     assert chips[f"timesheets/{bare.id}"] == "Waiting for GM's Proforma"
-    assert ts_tab["info"] is True and ts_tab["stage"] == "Coming up"      # the 200-day-old sheet is not listed
+    assert ts_tab["info"] is True and ts_tab["stage"] == "Coming up"      # April is before the data start
 
     pis = tabs["fin_proformas"]
     assert [i["path"] for i in pis["items"]] == [f"invoices/{pi.id}"]    # the returned one is with the GM
@@ -445,9 +451,15 @@ def test_sales_see_the_billing_chain_by_customer(db):
     draft = sheet(p1, TimesheetStatus.DRAFT)
     sheet(p2, TimesheetStatus.DRAFT)                                   # a colleague's deal
     approved = sheet(p1, TimesheetStatus.APPROVED, month=max(1, m - 1))
+    # Customer-approved + IRN in → stage "unpaid" (the only stages Sales chases;
+    # before the approval it reads "Awaiting customer" — see the check below).
     db.add(Invoice(invoice_number="KR-1", project_id=p1.id, invoice_date=today - timedelta(days=40),
                    due_date=today - timedelta(days=10), sub_total=100000, grand_total=118000,
-                   balance_amount=118000, kind="Tax"))
+                   balance_amount=118000, kind="Tax", customer_approved_at=datetime.now(timezone.utc),
+                   irn_number="a" * 64))
+    db.add(Invoice(invoice_number="KR-2", project_id=p1.id, invoice_date=today - timedelta(days=40),
+                   due_date=today - timedelta(days=10), sub_total=1000, grand_total=1180,
+                   balance_amount=1180, kind="Tax"))
     db.flush()
 
     # A Proforma with Finance on a colleague's deal, from the colleague's sheet.
@@ -467,10 +479,15 @@ def test_sales_see_the_billing_chain_by_customer(db):
     assert [i["path"] for i in tabs["sales_invoices_pending"]["items"]] == [f"timesheets/{approved.id}"]
     assert tabs["sales_invoices_pending"]["items"][0]["employee"] == "Asha Rao"
     assert tabs["sales_proformas"]["items"] == []                       # the colleague's deal
-    [iv] = tabs["sales_invoices"]["items"]
-    assert iv["section"] == "HARMAN" and iv["chip"] == "Overdue" and iv["employee"] is None
+    # 27 Oct 2026 (filter audit): ONE stage per invoice, with the stage's words —
+    # an invoice waiting for the customer is never "Unpaid" / in collections.
+    ivs = {i["title"].split(" · ")[0]: i for i in tabs["sales_invoices"]["items"]}
+    iv, waiting = ivs["KR-1"], ivs["KR-2"]
+    assert iv["section"] == "HARMAN" and iv["employee"] is None
+    assert iv["status"] == "Unpaid" and iv["status_key"] == "overdue" and iv["chip"].startswith("Unpaid")
+    assert waiting["status"] == "Awaiting customer" and waiting["stage"] == "awaiting_customer"
     [due] = tabs["sales_collections"]["items"]
-    assert due["chip"] == "10 days overdue"
+    assert due["chip"] == "10 days overdue" and due["status"] == "Unpaid"
     # The Sales Head (and a Sales Manager) see every customer's invoices.
     head = _tabs(db, SALES_HEAD)
     assert {i["section"] for i in head["sales_timesheets"]["items"]} == {"HARMAN", "VISTEON"}
@@ -565,7 +582,8 @@ def test_each_sales_rung_gets_its_own_tiles(db):
     db.add(Timesheet(project_id=proj.id, employee_id=emp.id, year=y, month=m, status=TimesheetStatus.DRAFT))
     db.add(Invoice(invoice_number="KR-9", project_id=proj.id, invoice_date=today - timedelta(days=40),
                    due_date=today - timedelta(days=10), sub_total=100000, grand_total=118000,
-                   balance_amount=118000, kind="Tax"))
+                   balance_amount=118000, kind="Tax", customer_approved_at=datetime.now(timezone.utc),
+                   irn_number="b" * 64))
     db.flush()
 
     sales = _tabs(db, SALES)

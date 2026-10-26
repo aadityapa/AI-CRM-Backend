@@ -60,6 +60,10 @@ EVENT_TYPES: dict[str, tuple[str, str, int, bool]] = {
     # 7 Oct 2026 — why a recording has no screen half (not shared when the
     # interview started, an unsupported browser, or the server has it off).
     "screen_share_missing": ("Screen not recorded", "system", 0, False),
+    # 24 Oct 2026 — what happened when the candidate pressed Share screen on the
+    # Device Check (services/device_check.py). Informational.
+    "screen_share_failed": ("Screen share failed (device check)", "system", 0, False),
+    "screen_share_ok": ("Screen shared (device check)", "system", 0, False),
     # A recruiter joined the live interview (11 Oct 2026) — informational.
     "recruiter_joined": ("Recruiter opened live controls", "system", 0, False),
     "recruiter_paused": ("Recruiter paused the interview", "system", 0, False),

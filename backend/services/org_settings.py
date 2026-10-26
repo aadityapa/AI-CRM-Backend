@@ -82,6 +82,11 @@ KEYS: dict[str, tuple[str, str]] = {
     "billing.split_po_enabled": ("", "true"),
     "billing.split_po_max_parts": ("", "10"),
     "billing.allow_expired_po": ("", "true"),
+    # The first work month the application works with (23 Oct 2026, user: "we
+    # only need data from FY 2026-27 — March 2026 onwards"). Timesheets due,
+    # billing queues, the billing tracker and the "awaiting" lists start here;
+    # older rows stay in the database and in reports. YYYY-MM.
+    "billing.data_start_month": ("BILLING_DATA_START_MONTH", "2026-03"),
     # AI spend (28 Sep 2026): OpenAI bills in USD; the CEO page prints rupees too.
     "ai.usd_inr_rate": ("USD_INR_RATE", "84"),
     # Seller (company) block on the Tax Invoice. DB row -> INVOICE_* env -> default.
@@ -201,6 +206,9 @@ def validation_error(key: str, value: str) -> str | None:
         return validate_months(value)
     if key in _BOOL_KEYS and value and value.strip().lower() not in _BOOL_WORDS:
         return "Use true or false"
+    if key == "billing.data_start_month" and value:
+        if not re.match(r"^(19|20)\d{2}-(0[1-9]|1[0-2])$", value.strip()):
+            return "Use YYYY-MM, e.g. 2026-03"
     if key == "billing.split_po_max_parts" and value:
         try:
             n = int(value)

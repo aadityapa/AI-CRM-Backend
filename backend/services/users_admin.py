@@ -729,7 +729,8 @@ def open_work(db: Session, user_id: int) -> list[dict]:
     try:
         from models.requirements import RequirementTaAssignment
         live = [RequirementStatus.OPEN_FOR_SOURCING, RequirementStatus.POSTED_ON_PORTALS,
-                RequirementStatus.IN_PROGRESS, RequirementStatus.PENDING_ENGINEERING_REVIEW]
+                RequirementStatus.IN_PROGRESS, RequirementStatus.PENDING_ENGINEERING_REVIEW,
+                RequirementStatus.PENDING_HM_REVIEW]
         _add("positions", "Positions assigned to them",
              "They are taken off these sourcing teams automatically — assign another TA if needed.",
              select(_f.count()).select_from(RequirementTaAssignment)

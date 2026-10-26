@@ -31,6 +31,10 @@ class GenerateInvoiceIn(BaseModel):
     #: Round the grand total to the nearest rupee with a "Round Off" line
     #: (5 Oct 2026). False / omitted = the exact figure.
     round_off: bool = False
+    #: Round the PER-DAY amount to the rupee on a part-month Monthly / Yearly
+    #: rate (24 Oct 2026, `services.proforma.round_per_day`): the invoice bills
+    #: days × rounded per-day. A full month is never changed. One-PO raise only.
+    round_per_day: bool = False
     #: Invoice number typed in the Generate dialog (11 Sep 2026); blank = the
     #: next INV-YYYY-NNN. Must be unique.
     invoice_number: str | None = Field(default=None, max_length=64)

@@ -181,6 +181,10 @@ def list_opportunities(
     if not sees_unapproved_deals(user):
         # RMG / GM / TA …: a deal still with the Sales Head is not theirs to see.
         stmt = stmt.where(approved_deals_clause())
+    from services import hiring_managers
+    if hiring_managers.hm_scoped(user, db):
+        # A Hiring Manager sees only the deals they are on (22 Oct 2026).
+        stmt = stmt.where(hiring_managers.opportunity_clause(db, user, Opportunity.id))
     if sourcing:
         from services.requirements import sourcing_opportunity_clause
         stmt = stmt.where(sourcing_opportunity_clause())
@@ -504,6 +508,8 @@ def suggested_candidates(
     opp = db.get(Opportunity, opportunity_id)
     if opp is None:
         raise HTTPException(status_code=404, detail="Opportunity not found")
+    from services.hiring_managers import ensure_opportunity
+    ensure_opportunity(db, user, opp.id)
     basis = suggestion_basis(db, opp)
     rows = suggest_candidates(db, opp, basis)
     # `meta.basis` tells the page WHAT it scored against (the RMG JD of REQ-x,
@@ -742,6 +748,8 @@ def get_opportunity(
     user: CurrentUser = Depends(read_opportunities),
 ):
     opp = get_opportunity_or_404(db, opportunity_id)
+    from services.hiring_managers import ensure_opportunity
+    ensure_opportunity(db, user, opp.id)
     if opp.approval_status != OpportunityApprovalStatus.APPROVED and not sees_unapproved_deals(user):
         # 404, not 403 — existence of a deal still with the Sales Head never leaks.
         raise HTTPException(status_code=404, detail="Opportunity not found")
@@ -1154,6 +1162,8 @@ def get_activity_log(
     user: CurrentUser = Depends(read_opportunities),
 ):
     get_opportunity_or_404(db, opportunity_id)
+    from services.hiring_managers import ensure_opportunity
+    ensure_opportunity(db, user, opportunity_id)
     return envelope(data=fetch_activity_log(db, opportunity_id), message="Activity log fetched")
 
 

@@ -3,8 +3,8 @@
 
 Read: whoever reads positions (`requirement_positions.POS_READ` — TA, RMG,
 Sales, Sales Head, and a screener whose custom role never granted the
-`requirements` tab). Write: RMG / Sales Head by role, Admin/CEO, and whoever
-screens as RMG (GM). The requirement is scoped the way the OPPORTUNITY page
+`requirements` tab). Write: the APPROVAL `requirement.team.assign` (RMG + GM
+by default, Admin/CEO always, editable in Access Control). The requirement is scoped the way the OPPORTUNITY page
 scopes it (`_visible_requirement`), because that page is where this lives.
 """
 from __future__ import annotations
@@ -13,14 +13,20 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from crm_deps import CurrentUser, gated_write, get_crm_db, screener_or
+from crm_deps import CurrentUser, action_only, get_crm_db
 from schemas.common import envelope
 from services import requirement_assignments as svc
 from routers.crm.requirement_positions import POS_READ, _visible_requirement
 
 router = APIRouter(prefix="/api/requirements", tags=["CRM: Requirement TA assignments"])
 
-ASSIGN_WRITE = screener_or(gated_write("requirements", "RMG", "Sales_Head"))
+#: Who may change the sourcing team and the Hiring Manager (23 Oct 2026, user
+#: rule: "only RMG / GM, and Admin manages it from Access Control"). It used to
+#: be `gated_write("requirements", …)`, so any TA whose template grants
+#: Requirements: Edit — the grant TA needs to work the position — got "Change
+#: TAs" and "Assign Hiring Manager". Now the APPROVAL `requirement.team.assign`
+#: decides alone (defaults RMG + GM; Admin/CEO always).
+ASSIGN_WRITE = action_only("requirement.team.assign")
 
 
 class AssignIn(BaseModel):
@@ -69,3 +75,41 @@ def set_ta_assignments(requirement_id: int, payload: AssignIn,
             bits.append(f"{n_rem} removed")
         msg = " · ".join(bits)
     return envelope(data=result, message=msg)
+
+
+# ---- Hiring Managers (22 Oct 2026) — same gates as the TA team ---------------
+
+@router.get("/{requirement_id}/hiring-managers")
+def list_hiring_managers(requirement_id: int, db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(POS_READ)):
+    from services import hiring_managers as hm
+    req = _visible_requirement(db, requirement_id, user)
+    can = _can_assign(db, user)
+    return envelope(
+        data={"hiring_managers": hm.hms_by_requirement(db, [req.id]).get(req.id, []),
+              "options": hm.hm_options(db) if can else []},
+        # `is_mine`: this login is a Hiring Manager of the position — they set
+        # its priority / hold and decide its JD (the panel shows those controls).
+        meta={"can_assign": can, "status": getattr(req.status, "value", req.status),
+              "is_mine": hm.is_assigned(db, user, req.id)},
+    )
+
+
+@router.put("/{requirement_id}/hiring-managers")
+def set_hiring_managers(requirement_id: int, payload: AssignIn,
+                        db: Session = Depends(get_crm_db),
+                        user: CurrentUser = Depends(ASSIGN_WRITE)):
+    from services import hiring_managers as hm
+    req = _visible_requirement(db, requirement_id, user)
+    try:
+        result = hm.set_hiring_managers(db, req, payload.user_ids, payload.note, user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+    n_add, n_rem = len(result["added"]), len(result["removed"])
+    bits = []
+    if n_add:
+        bits.append(f"{n_add} Hiring Manager{'s' if n_add != 1 else ''} assigned and notified")
+    if n_rem:
+        bits.append(f"{n_rem} removed")
+    return envelope(data=result, message=" · ".join(bits) or "No change to the Hiring Managers")

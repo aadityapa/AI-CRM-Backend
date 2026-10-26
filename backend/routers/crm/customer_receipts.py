@@ -77,6 +77,34 @@ PAYMENT_MODES = ["NEFT", "RTGS", "IMPS", "UPI", "Cheque", "Cash", "Wire", "Other
 TWO = Decimal("0.01")
 
 
+def customer_invoice_clause(customer_id: int):
+    """An invoice is this customer's when its project OR its PO is theirs —
+    the Invoices list / ledger rule (20–22 Oct 2026). 24 Oct 2026, user report:
+    a Partially Paid MAHLE invoice could not take the customer's next payment
+    advice — the picker only looked at the PROJECT's customer, while the list
+    shows the invoice under the PO's customer."""
+    from models import PurchaseOrder
+
+    return or_(
+        Invoice.project_id.in_(select(Project.id).where(Project.customer_id == customer_id)),
+        Invoice.po_id.in_(select(PurchaseOrder.id).where(PurchaseOrder.customer_id == customer_id)),
+    )
+
+
+#: Two amounts "match" when they differ by less than this (round-off on the advice).
+MATCH_TOLERANCE = Decimal("1.00")
+
+
+def likely_match(balance, amount) -> bool:
+    """PURE: does a payment of `amount` look like the balance of this invoice?
+    24 Oct 2026 (user ask): a second payment advice often carries no invoice
+    number — the invoice whose balance is that amount is the likely one."""
+    if amount is None or balance is None:
+        return False
+    b, a = _d(balance), _d(amount)
+    return b > 0 and abs(b - a) < MATCH_TOLERANCE
+
+
 class ReceiptIn(BaseModel):
     customer_id: int
     #: The paying branch (16 Oct 2026). Every ticked invoice must belong to it.
@@ -264,19 +292,25 @@ def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None
 
 @router.get("/invoice-options")
 def invoice_options(customer_id: int, include_paid: bool = False, branch_id: int | None = None,
+                    match_amount: Decimal | None = None,
                     db: Session = Depends(get_crm_db), user: CurrentUser = Depends(RC_READ)):
-    """Invoices of this customer's projects for the picker — open ones by
-    default, with the employee each one bills and its month, oldest first.
-    `branch_id` keeps one branch's invoices (0 = invoices with no branch);
-    `meta.branches` lists the customer's branches with their open count."""
+    """Invoices of this customer (project OR PO) for the picker — open ones by
+    default (Unpaid AND Partially paid — a balance left after an earlier advice
+    takes the next one), with the employee each one bills and its month,
+    oldest first. `branch_id` keeps one branch's invoices (0 = invoices with no
+    branch); `meta.branches` lists the customer's branches with their open count.
+    `match_amount` (24 Oct 2026) flags `likely_match` on invoices whose balance
+    is that amount — the advice that came with no invoice number."""
     if db.get(Customer, customer_id) is None:
         raise HTTPException(status_code=404, detail="Customer not found")
-    stmt = (select(Invoice).join(Project, Project.id == Invoice.project_id)
-            .where(Project.customer_id == customer_id, Invoice.kind != InvoiceKind.PROFORMA.value))
+    stmt = select(Invoice).where(customer_invoice_clause(customer_id),
+                                 Invoice.kind != InvoiceKind.PROFORMA.value)
     if not include_paid:
         stmt = stmt.where(Invoice.balance_amount > 0)
     invoices = db.execute(stmt.order_by(Invoice.invoice_date.asc(), Invoice.id.asc())).scalars().all()
     rows = _invoice_brief(db, invoices)
+    for r in rows:
+        r["likely_match"] = likely_match(r["balance_amount"], match_amount)
     branches = db.execute(select(CustomerBranch.id, CustomerBranch.branch_name)
                           .where(CustomerBranch.customer_id == customer_id)
                           .order_by(CustomerBranch.branch_name)).all()
@@ -313,7 +347,9 @@ def list_receipts(customer_id: int | None = None, project_id: int | None = None,
     if customer_id is not None:
         stmt = stmt.where(CustomerReceipt.customer_id == customer_id)
     if branch_id is not None:
-        stmt = stmt.where(CustomerReceipt.branch_id == branch_id)
+        # 23 Oct 2026: 0 = receipts with no branch named yet.
+        stmt = stmt.where(CustomerReceipt.branch_id.is_(None) if branch_id == 0
+                          else CustomerReceipt.branch_id == branch_id)
     if project_id is not None:
         sub = (select(InvoicePayment.receipt_id).join(Invoice, Invoice.id == InvoicePayment.invoice_id)
                .where(Invoice.project_id == project_id, InvoicePayment.receipt_id.isnot(None)))
@@ -347,6 +383,17 @@ def list_receipts(customer_id: int | None = None, project_id: int | None = None,
                        else select(func.coalesce(func.sum(CustomerReceipt.amount), 0))).scalar()
     meta = {**(meta or {}), "total_received": float(total or 0)}
     return envelope(data=data, message="Customer receipts", meta=meta)
+
+
+@router.get("/{receipt_id}")
+def get_receipt(receipt_id: int, db: Session = Depends(get_crm_db), user: CurrentUser = Depends(RC_READ)):
+    """One receipt — the work desk's "Receipts to map" items open it straight
+    in the workbench (`received-amounts?receipt=<id>`, 23 Oct 2026). Declared
+    after every literal GET of this router."""
+    receipt = db.get(CustomerReceipt, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    return envelope(_receipt_payload(db, receipt))
 
 
 def allocate(amount: Decimal, invoices: list[Invoice]) -> tuple[list[tuple[Invoice, Decimal]], Decimal]:
@@ -396,6 +443,20 @@ def _receipt_payload(db: Session, receipt: CustomerReceipt) -> dict:
     return _serialize(db, receipt, getattr(customer, "name", None), getattr(branch, "branch_name", None))
 
 
+def _infer_branch(db: Session, customer_id: int, invoices) -> CustomerBranch | None:
+    """The branch a receipt with no branch chosen belongs to: the single branch
+    of its invoices, else the customer's only branch, else None."""
+    if invoices:
+        from services.invoice_facets import invoice_facets
+        facets = invoice_facets(db, invoices)
+        ids = {(facets.get(i.id) or {}).get("branch_id") for i in invoices}
+        if len(ids) == 1 and None not in ids:
+            return db.get(CustomerBranch, next(iter(ids)))
+    only = db.execute(select(CustomerBranch).where(CustomerBranch.customer_id == customer_id)
+                      .limit(2)).scalars().all()
+    return only[0] if len(only) == 1 else None
+
+
 @router.post("")
 def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(RC_WRITE)):
@@ -412,8 +473,7 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
     invoices: list[Invoice] = []
     if body.invoice_ids:
         invoices = db.execute(
-            select(Invoice).join(Project, Project.id == Invoice.project_id)
-            .where(Invoice.id.in_(set(body.invoice_ids)), Project.customer_id == body.customer_id)
+            select(Invoice).where(Invoice.id.in_(set(body.invoice_ids)), customer_invoice_clause(body.customer_id))
         ).scalars().all()
         missing = set(body.invoice_ids) - {i.id for i in invoices}
         if missing:
@@ -424,7 +484,7 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
             from services.invoice_facets import invoice_facets
             facets = invoice_facets(db, invoices)
             other = [i.invoice_number or f"#{i.id}" for i in invoices
-                     if (facets.get(i.id) or {}).get("branch_id") != branch.id]
+                     if (facets.get(i.id) or {}).get("branch_id") not in (None, branch.id)]
             if other:
                 raise HTTPException(status_code=400,
                                     detail=f"Not invoices of {branch.branch_name}: {', '.join(other)}")
@@ -435,6 +495,21 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
             raise HTTPException(status_code=409,
                                 detail=f"Not open for payment yet (customer approval / IRN pending): "
                                        f"{', '.join(waiting)}")
+    # 23 Oct 2026 (user ask): every receipt says which branch paid. Not chosen →
+    # the one branch of the ticked invoices, else the customer's only branch,
+    # else ask. A customer with no branches on record is the one exception.
+    if branch is None:
+        branch = _infer_branch(db, body.customer_id, invoices)
+        unbranched_invoices = False
+        if invoices and branch is None:
+            from services.invoice_facets import invoice_facets
+            f = invoice_facets(db, invoices)
+            # Paying invoices that themselves have no branch on record is allowed.
+            unbranched_invoices = all((f.get(i.id) or {}).get("branch_id") is None for i in invoices)
+        if branch is None and not unbranched_invoices and db.execute(select(CustomerBranch.id).where(
+                CustomerBranch.customer_id == body.customer_id).limit(1)).first():
+            raise HTTPException(status_code=400,
+                                detail=f"Choose the {customer.name} branch that paid this amount.")
     # TDS lines must name ticked invoices; one per invoice.
     by_id = {i.id: i for i in invoices}
     tds_items = list(body.tds or [])
@@ -523,6 +598,46 @@ def set_proof(receipt_id: int, body: ProofIn, db: Session = Depends(get_crm_db),
                     message="Proof saved" if receipt.proof_url else "Proof removed")
 
 
+class AssignBranchIn(BaseModel):
+    receipt_ids: list[int] = Field(min_length=1, max_length=500)
+    branch_id: int
+
+
+@router.post("/assign-branch")
+def assign_branch(body: AssignBranchIn, db: Session = Depends(get_crm_db),
+                  user: CurrentUser = Depends(RC_WRITE)):
+    """23 Oct 2026 (user ask): name the branch on several receipts at once —
+    the "<customer> · No branch on record" groups. A receipt already mapped to
+    invoices of another branch is skipped and named, never changed."""
+    from services.invoice_facets import invoice_facets
+
+    branch = db.get(CustomerBranch, body.branch_id)
+    if branch is None:
+        raise HTTPException(status_code=404, detail="Branch not found")
+    receipts = db.execute(select(CustomerReceipt).where(
+        CustomerReceipt.id.in_(set(body.receipt_ids)))).scalars().all()
+    done, skipped = 0, []
+    for rc in receipts:
+        if rc.customer_id != branch.customer_id:
+            skipped.append(f"#{rc.id} (another customer)")
+            continue
+        invs = db.execute(select(Invoice).where(
+            Invoice.id.in_({p.invoice_id for p in rc.payments or []}))).scalars().all()
+        facets = invoice_facets(db, invs) if invs else {}
+        other = [i.invoice_number or f"#{i.id}" for i in invs
+                 if (facets.get(i.id) or {}).get("branch_id") not in (None, branch.id)]
+        if other:
+            skipped.append(f"#{rc.id} (mapped to {', '.join(other)})")
+            continue
+        rc.branch_id = branch.id
+        done += 1
+    db.commit()
+    msg = f"{done} receipt{'s' if done != 1 else ''} set to {branch.branch_name}"
+    if skipped:
+        msg += f" · skipped {len(skipped)}: {'; '.join(skipped[:5])}"
+    return envelope({"updated": done, "skipped": skipped}, message=msg)
+
+
 @router.put("/{receipt_id}")
 def update_receipt(receipt_id: int, body: ReceiptUpdate, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(RC_WRITE)):
@@ -562,7 +677,7 @@ def update_receipt(receipt_id: int, body: ReceiptUpdate, db: Session = Depends(g
                 invs = db.execute(select(Invoice).where(Invoice.id.in_({p.invoice_id for p in payments}))).scalars().all()
                 facets = invoice_facets(db, invs)
                 other = [i.invoice_number or f"#{i.id}" for i in invs
-                         if (facets.get(i.id) or {}).get("branch_id") != branch.id]
+                         if (facets.get(i.id) or {}).get("branch_id") not in (None, branch.id)]
                 if other:
                     raise HTTPException(status_code=400,
                                         detail=f"Mapped invoices of another branch: {', '.join(other)} — unmap them first")
@@ -591,8 +706,7 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail="An invoice is listed twice")
     customer = db.get(Customer, receipt.customer_id)
     invoices = db.execute(
-        select(Invoice).join(Project, Project.id == Invoice.project_id)
-        .where(Invoice.id.in_(set(ids)), Project.customer_id == receipt.customer_id)
+        select(Invoice).where(Invoice.id.in_(set(ids)), customer_invoice_clause(receipt.customer_id))
     ).scalars().all()
     missing = set(ids) - {i.id for i in invoices}
     if missing:
@@ -621,8 +735,10 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
             branch_id = next(iter(inv_branches))
     if branch_id is not None:
         bname = db.get(CustomerBranch, branch_id).branch_name
+        # An invoice with NO branch on record may take any branch's money
+        # (24 Oct 2026 — the assign-branch rule); another branch's may not.
         other = [i.invoice_number or f"#{i.id}" for i in invoices
-                 if (facets.get(i.id) or {}).get("branch_id") != branch_id]
+                 if (facets.get(i.id) or {}).get("branch_id") not in (None, branch_id)]
         if other:
             raise HTTPException(status_code=400, detail=f"Not invoices of {bname}: {', '.join(other)}")
     receipt.branch_id = branch_id

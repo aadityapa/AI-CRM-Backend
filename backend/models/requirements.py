@@ -22,6 +22,9 @@ class RequirementStatus(str, enum.Enum):
     SALES_HEAD_REJECTED = "Sales_Head_Rejected"
     PENDING_ENGINEERING_REVIEW = "Pending_Engineering_Review"
     ENGINEERING_REJECTED = "Engineering_Rejected"
+    #: RMG approved; the assigned Hiring Manager(s) confirm the JD & skills
+    #: before TA sources (22 Oct 2026, migration 0145).
+    PENDING_HM_REVIEW = "Pending_HM_Review"
     OPEN_FOR_SOURCING = "Open_For_Sourcing"
     POSTED_ON_PORTALS = "Posted_On_Portals"
     IN_PROGRESS = "In_Progress"
@@ -166,6 +169,28 @@ class RequirementTaAssignment(Base):
     assigned_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
     note = sa.Column(sa.Text, nullable=True)
     __table_args__ = (sa.UniqueConstraint("requirement_id", "user_id", name="uq_req_ta_assignment"),)
+
+
+class RequirementHiringManager(Base):
+    """A Hiring Manager assigned to a position (22 Oct 2026, migration 0145).
+
+    Same shape as `RequirementTaAssignment` but a separate table on purpose:
+    an HM row IS a visibility rule — a login whose only CRM role is "Hiring
+    Manager" sees exactly the positions it is on (`services.hiring_managers`),
+    while a TA row never narrows anything. Several HMs per position allowed.
+    """
+
+    __tablename__ = "requirement_hiring_managers"
+    id = sa.Column(sa.Integer, primary_key=True)
+    requirement_id = sa.Column(sa.Integer, sa.ForeignKey("requirements.id", ondelete="CASCADE"),
+                               nullable=False, index=True)
+    user_id = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=False, index=True)
+    user_name = sa.Column(sa.String(255), nullable=True)
+    assigned_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    assigned_by_name = sa.Column(sa.String(255), nullable=True)
+    assigned_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    note = sa.Column(sa.Text, nullable=True)
+    __table_args__ = (sa.UniqueConstraint("requirement_id", "user_id", name="uq_req_hiring_manager"),)
 
 
 class RequirementPositionRequest(Base):

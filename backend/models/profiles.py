@@ -147,6 +147,21 @@ class CandidateProfile(Base, TimestampMixin):
     hr_offered_by = sa.Column(sa.Integer, nullable=True)
     hr_offer_note = sa.Column(sa.Text, nullable=True)
 
+    # --- Hiring Manager (0145) ----------------------------------------------
+    #: The HM's review of the candidate at Sales Screening, before the profile
+    #: goes to the customer: NULL = no HM on the position (no gate), "Pending",
+    #: "Approved", "Rejected". Read / written through services/hiring_managers.
+    hm_review_status = sa.Column(sa.String(16), nullable=True, index=True)
+    hm_review_note = sa.Column(sa.Text, nullable=True)
+    hm_review_by = sa.Column(sa.Integer, nullable=True)
+    hm_review_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    #: The HM's final sign-off on the selection + terms, before the Sales Head
+    #: approves them (Customer Approval). Same values.
+    hm_final_status = sa.Column(sa.String(16), nullable=True, index=True)
+    hm_final_note = sa.Column(sa.Text, nullable=True)
+    hm_final_by = sa.Column(sa.Integer, nullable=True)
+    hm_final_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+
     # --- documents ----------------------------------------------------------
     #: The resume attached to THIS application (may differ from the candidate's CV).
     resume_url = sa.Column(sa.String(1024), nullable=True)

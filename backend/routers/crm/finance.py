@@ -760,16 +760,54 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
                   month: str | None = None,
                   einvoice: bool | None = None,
                   irn_from: date | None = None, irn_to: date | None = None,
+                  all_history: bool = False,
+                  stage: str | None = None,
+                  with_stage_counts: bool = False,
+                  status: str | None = None,
+                  with_status_counts: bool = False,
+                  invoice_from: date | None = None, invoice_to: date | None = None,
+                  due_from: date | None = None, due_to: date | None = None,
+                  amount_min: float | None = None, amount_max: float | None = None,
                   pp: PageParams = Depends(page_params),
                   db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_READ)):
     """16 Oct 2026 (user ask): `branch_id` (the project's branch, else the PO's
     billing branch), `employee_id` (the billed timesheet's employee) and
     `month` "YYYY-MM" (the timesheet period, else the invoice date) narrow the
     list; search also matches the employee's name; every row says its branch,
-    month and employee (`services/invoice_facets`)."""
+    month and employee (`services/invoice_facets`).
+
+    23 Oct 2026: the list starts at the data start WORK month (Settings ▸
+    Billing ▸ Data starts from, `billing_rules`); `all_history=true` lifts it.
+    `customer_approved=false` is `billing_rules.awaiting_customer_clause()` —
+    the same rule as the Sales Manager's "Confirm with customer" tile."""
+    from services import billing_rules
     from services.invoice_facets import invoice_facets
 
     stmt = select(Invoice)
+    if not all_history:
+        stmt = stmt.where(billing_rules.invoice_window_clause())
+    stmt = _invoice_common_filters(stmt, project_id=project_id, customer_id=customer_id, po_id=po_id,
+                                   branch_id=branch_id, employee_id=employee_id, month=month,
+                                   search=pp.search, invoice_from=invoice_from, invoice_to=invoice_to,
+                                   due_from=due_from, due_to=due_to,
+                                   amount_min=amount_min, amount_max=amount_max)
+    base = stmt
+    # 26 Oct 2026: the Status column's filter (CSV of `billing_rules.INVOICE_STATUS_KEYS`).
+    status_keys = [x.strip() for x in (status or "").split(",") if x.strip()]
+    bad = [x for x in status_keys if x not in billing_rules.INVOICE_STATUS_KEYS]
+    if bad:
+        raise HTTPException(status_code=400,
+                            detail=f"status must be one of: {', '.join(billing_rules.INVOICE_STATUS_KEYS)}")
+    if stage:
+        # 24 Oct 2026: the Invoices tabs — ONE stage per invoice
+        # (`billing_rules.invoice_stage_case`).
+        if stage not in billing_rules.INVOICE_STAGE_KEYS:
+            raise HTTPException(status_code=400,
+                                detail=f"stage must be one of: {', '.join(billing_rules.INVOICE_STAGE_KEYS)}")
+        stmt = stmt.where(billing_rules.invoice_stage_case() == stage)
+    tab_stmt = stmt                      # the tab before the Status filter — its status counts
+    if status_keys:
+        stmt = stmt.where(billing_rules.invoice_status_case().in_(status_keys))
     if kind:
         # "Proforma" = Finance's review queue; "Tax" = issued invoices. Blank = both.
         stmt = stmt.where(Invoice.kind == _enum_or_400(InvoiceKind, kind, "kind").value)
@@ -794,42 +832,6 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
     if payment_status:
         stmt = stmt.where(
             Invoice.payment_status == _enum_or_400(PaymentStatus, payment_status, "payment_status"))
-    if project_id is not None:
-        stmt = stmt.where(Invoice.project_id == project_id)
-    if customer_id is not None:
-        # Customer hub tab: an invoice belongs to a customer via its project, or
-        # via its PO (20 Oct 2026, user report "invoice not showing": the rows
-        # print the PO's customer, so the filter must find it by the PO too).
-        stmt = stmt.where(sa.or_(
-            Invoice.project_id.in_(select(Project.id).where(Project.customer_id == customer_id)),
-            Invoice.po_id.in_(select(PurchaseOrder.id).where(PurchaseOrder.customer_id == customer_id))))
-    if po_id is not None:
-        stmt = stmt.where(Invoice.po_id == po_id)
-    if branch_id is not None:
-        stmt = stmt.where(sa.or_(
-            Invoice.project_id.in_(select(Project.id).where(Project.branch_id == branch_id)),
-            sa.and_(Invoice.project_id.in_(select(Project.id).where(Project.branch_id.is_(None))),
-                    Invoice.po_id.in_(select(PurchaseOrder.id).where(PurchaseOrder.billing_branch_id == branch_id)))))
-    if employee_id is not None:
-        stmt = stmt.where(Invoice.timesheet_id.in_(
-            select(Timesheet.id).where(Timesheet.employee_id == employee_id)))
-    if month:
-        try:
-            y, m = int(month[:4]), int(month[5:7])
-            first = date(y, m, 1)
-        except (ValueError, IndexError):
-            raise HTTPException(status_code=400, detail="month must be YYYY-MM")
-        nxt = date(y + (m == 12), 1 if m == 12 else m + 1, 1)
-        stmt = stmt.where(sa.or_(
-            Invoice.timesheet_id.in_(select(Timesheet.id).where(Timesheet.year == y, Timesheet.month == m)),
-            sa.and_(Invoice.timesheet_id.is_(None), Invoice.invoice_date >= first, Invoice.invoice_date < nxt)))
-    if pp.search:
-        like = f"%{pp.search}%"
-        stmt = stmt.where(sa.or_(
-            Invoice.invoice_number.ilike(like), Invoice.proforma_number.ilike(like),
-            Invoice.timesheet_id.in_(select(Timesheet.id).join(Employee, Employee.id == Timesheet.employee_id)
-                                     .where(sa.or_(Employee.first_name.ilike(like), Employee.last_name.ilike(like),
-                                                   Employee.employee_code.ilike(like))))))
     if einvoice:
         stmt = stmt.order_by(Invoice.irn_recorded_at.desc().nullslast(), Invoice.id.desc())
     elif customer_approved:
@@ -849,12 +851,19 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
     cust_names = dict(db.execute(select(Customer.id, sa.func.coalesce(Customer.legal_entity_name, Customer.name))
                                  .where(Customer.id.in_(cust_ids))).all()) if cust_ids else {}
     facets = invoice_facets(db, items)
+    # Paid · TDS pending: one query for the page, never a lazy load per row.
+    from models.finance import TdsRecord, TdsStatus
+    page_ids = [inv.id for inv in items]
+    tds_open = set(db.execute(select(TdsRecord.invoice_id).where(
+        TdsRecord.invoice_id.in_(page_ids), TdsRecord.tds_status != TdsStatus.PAID)).scalars()) if page_ids else set()
     for inv, r in zip(items, rows):
         r.update({k: v for k, v in (facets.get(inv.id) or {}).items()})
         cid = (inv.po.customer_id if inv.po is not None and inv.po.customer_id else proj_cust.get(inv.project_id))
         r["customer_id"] = cid
         r["customer_name"] = cust_names.get(cid)
         r["customer_approved_at"] = inv.customer_approved_at.isoformat() if inv.customer_approved_at else None
+        r["stage"] = billing_rules.stage_of_invoice(inv)
+        r.update(_status_of(inv, r["stage"], inv.id in tds_open))
         if see_irn:
             # The IRN itself stays on the invoice page; the list says only whether it is in.
             r["irn_recorded"] = bool(inv.irn_number)
@@ -876,7 +885,134 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
         meta = {**(meta or {}), "branches": [{"id": b_id, "name": b_name} for b_id, b_name in db.execute(
             select(CustomerBranch.id, CustomerBranch.branch_name)
             .where(CustomerBranch.customer_id == customer_id).order_by(CustomerBranch.branch_name)).all()]}
+    meta = {**(meta or {}), "data_start": None if all_history else billing_rules.data_start_meta()}
+    if with_stage_counts:
+        # One grouped query over the same customer / branch / month / search set —
+        # every tab's count, whichever tab is open (24 Oct 2026).
+        stage_col = billing_rules.invoice_stage_case().label("stage")
+        sub = base.with_only_columns(Invoice.id, stage_col).subquery()
+        counts = {k: 0 for k in billing_rules.INVOICE_STAGE_KEYS}
+        for st, n in db.execute(select(sub.c.stage, sa.func.count()).group_by(sub.c.stage)).all():
+            if st in counts:
+                counts[st] = int(n)
+        meta["stage_counts"] = counts
+    if with_status_counts:
+        # The Status filter's choices for the open tab, each with its count, and
+        # the employee / PO pickers over the same set (26 Oct 2026).
+        status_col = billing_rules.invoice_status_case().label("status_key")
+        sub = tab_stmt.with_only_columns(Invoice.id, status_col).subquery()
+        found = {st: int(n) for st, n in db.execute(
+            select(sub.c.status_key, sa.func.count()).group_by(sub.c.status_key)).all()}
+        keys = billing_rules.STATUSES_BY_STAGE.get(stage or "", billing_rules.INVOICE_STATUS_KEYS)
+        labels = dict(billing_rules.INVOICE_STATUSES)
+        meta["status_counts"] = [{"key": k, "label": labels[k], "count": found.get(k, 0)} for k in keys]
+        # 27 Oct 2026: the pickers come from the tab WITHOUT the employee / PO
+        # filters they control — choosing an employee used to empty both lists.
+        opt_stmt = select(Invoice)
+        if not all_history:
+            opt_stmt = opt_stmt.where(billing_rules.invoice_window_clause())
+        opt_stmt = _invoice_common_filters(opt_stmt, project_id=project_id, customer_id=customer_id,
+                                           branch_id=branch_id, month=month, search=pp.search,
+                                           invoice_from=invoice_from, invoice_to=invoice_to,
+                                           due_from=due_from, due_to=due_to,
+                                           amount_min=amount_min, amount_max=amount_max)
+        if stage:
+            opt_stmt = opt_stmt.where(billing_rules.invoice_stage_case() == stage)
+        meta["filter_options"] = _invoice_filter_options(db, opt_stmt)
     return envelope(data=rows, meta=meta)
+
+
+def _status_of(inv, stage: str, tds_pending: bool) -> dict:
+    """The Status column of one row: key, words, days late (PURE over the row)."""
+    from services import billing_rules
+    returned = bool(getattr(inv, "returned_at", None))
+    key = billing_rules.invoice_status(stage=stage, returned=returned, tds_pending=tds_pending,
+                                       due=inv.due_date, invoice_date=inv.invoice_date)
+    days_late = None
+    if key == "overdue":
+        due = inv.due_date or (inv.invoice_date + timedelta(days=billing_rules.DEFAULT_TERMS_DAYS)
+                               if inv.invoice_date else None)
+        days_late = (date.today() - due).days if due else None
+    return {"status_key": key, "status_label": dict(billing_rules.INVOICE_STATUSES)[key],
+            "days_late": days_late}
+
+
+def _invoice_filter_options(db: Session, stmt) -> dict:
+    """Employees and POs that appear in the open tab — the More filters pickers."""
+    ids = stmt.with_only_columns(Invoice.id).subquery()
+    emps = db.execute(
+        select(Employee.id, Employee.first_name, Employee.last_name)
+        .join(Timesheet, Timesheet.employee_id == Employee.id)
+        .join(Invoice, Invoice.timesheet_id == Timesheet.id)
+        .where(Invoice.id.in_(select(ids.c.id))).distinct()).all()
+    pos = db.execute(
+        select(PurchaseOrder.id, PurchaseOrder.po_number)
+        .join(Invoice, Invoice.po_id == PurchaseOrder.id)
+        .where(Invoice.id.in_(select(ids.c.id))).distinct()).all()
+    return {
+        "employees": sorted(({"id": i, "name": " ".join(x for x in (f, l) if x) or f"#{i}"}
+                             for i, f, l in emps), key=lambda e: e["name"].lower()),
+        "pos": sorted(({"id": i, "name": n or f"#{i}"} for i, n in pos), key=lambda p: str(p["name"])),
+    }
+
+
+def _invoice_common_filters(stmt, *, project_id=None, customer_id=None, po_id=None, branch_id=None,
+                            employee_id=None, month=None, search=None, invoice_from=None, invoice_to=None,
+                            due_from=None, due_to=None, amount_min=None, amount_max=None):
+    """The list filters every Invoices tab shares (project · customer · PO ·
+    branch · employee · work month · search). The tab itself (stage, kind,
+    payment status…) is applied on top, so the tab counts use exactly these."""
+    if project_id is not None:
+        stmt = stmt.where(Invoice.project_id == project_id)
+    if customer_id is not None:
+        # The row prints the PO's customer, else the project's (20 Oct 2026 the
+        # filter learnt the PO). 27 Oct 2026: the SAME one rule as the row and the
+        # Billing Tracker (`billing_rules.invoice_customer_clause`), so an invoice
+        # whose project and PO name different customers lists under ONE of them.
+        from services.billing_rules import invoice_customer_clause
+        stmt = stmt.where(invoice_customer_clause(customer_id))
+    if po_id is not None:
+        stmt = stmt.where(Invoice.po_id == po_id)
+    if branch_id is not None:
+        stmt = stmt.where(sa.or_(
+            Invoice.project_id.in_(select(Project.id).where(Project.branch_id == branch_id)),
+            sa.and_(Invoice.project_id.in_(select(Project.id).where(Project.branch_id.is_(None))),
+                    Invoice.po_id.in_(select(PurchaseOrder.id).where(PurchaseOrder.billing_branch_id == branch_id)))))
+    if employee_id is not None:
+        stmt = stmt.where(Invoice.timesheet_id.in_(
+            select(Timesheet.id).where(Timesheet.employee_id == employee_id)))
+    if month:
+        try:
+            y, m = int(month[:4]), int(month[5:7])
+            first = date(y, m, 1)
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+        nxt = date(y + (m == 12), 1 if m == 12 else m + 1, 1)
+        stmt = stmt.where(sa.or_(
+            Invoice.timesheet_id.in_(select(Timesheet.id).where(Timesheet.year == y, Timesheet.month == m)),
+            sa.and_(Invoice.timesheet_id.is_(None), Invoice.invoice_date >= first, Invoice.invoice_date < nxt)))
+    if invoice_from is not None:
+        stmt = stmt.where(Invoice.invoice_date >= invoice_from)
+    if invoice_to is not None:
+        stmt = stmt.where(Invoice.invoice_date <= invoice_to)
+    if due_from is not None or due_to is not None:
+        # 27 Oct 2026: the EFFECTIVE due date (own, else invoice date + 30) —
+        # the rule the Overdue status uses; an invoice with no stored due date
+        # used to drop out of every due-date range.
+        from services.billing_rules import due_range_clause
+        stmt = stmt.where(due_range_clause(due_from, due_to))
+    if amount_min is not None:
+        stmt = stmt.where(Invoice.grand_total >= amount_min)
+    if amount_max is not None:
+        stmt = stmt.where(Invoice.grand_total <= amount_max)
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(sa.or_(
+            Invoice.invoice_number.ilike(like), Invoice.proforma_number.ilike(like),
+            Invoice.timesheet_id.in_(select(Timesheet.id).join(Employee, Employee.id == Timesheet.employee_id)
+                                     .where(sa.or_(Employee.first_name.ilike(like), Employee.last_name.ilike(like),
+                                                   Employee.employee_code.ilike(like))))))
+    return stmt
 
 
 # Literal BEFORE the parametric sibling — otherwise 'next-number' binds as invoice_id.

@@ -162,6 +162,11 @@ class Invoice(Base):
     #: Rupee round-off folded into grand_total (0120). NULL = not rounded;
     #: 0.00 = rounded and already whole. See services.finance.apply_round_off.
     round_off = sa.Column(sa.Numeric(6, 2), nullable=True)
+    #: 0148 — per-day round off (24 Oct 2026): the rounded per-day figure and
+    #: the days it bills (amount = days × per-day). NULL = not rounded.
+    #: See services.proforma.round_per_day.
+    per_day_rate = sa.Column(sa.Numeric(14, 2), nullable=True)
+    per_day_days = sa.Column(sa.Numeric(8, 2), nullable=True)
     # Per-invoice GST buyer state override (2-digit). Resolution:
     # invoice.buyer_state_code → branch.state (2-digit) → GSTIN[:2].
     buyer_state_code = sa.Column(sa.String(2), nullable=True)

@@ -1420,6 +1420,27 @@ def _with_profile_ai(db: Session, data: list[dict]) -> None:
         if (state.get("ai_effective_result") or state.get("ai_interview_result")) in AI_L1_PASS:
             passed.setdefault(pid, []).append(row)
     heal_ai_passed_to_review(db, passed)
+    _heal_ai_rejected_rows(db, data, by_profile)
+
+
+def _heal_ai_rejected_rows(db: Session, data: list[dict], by_profile: dict) -> None:
+    """A REJECTED AI L1 decision closes the candidacy (23 Oct 2026); rows
+    whose decision predates that are closed now and updated on the page."""
+    rejected = [pid for pid, st in (by_profile or {}).items()
+                if (st or {}).get("ai_hr_decision") == "rejected"]
+    if not rejected:
+        return
+    try:
+        from services.admin_corrections import heal_ai_rejected, latest_ai_link
+        closed = heal_ai_rejected(db, {pid: latest_ai_link(db, pid) for pid in rejected})
+        if closed:
+            db.commit()
+            for row in data:
+                if row.get("profile_id") in closed:
+                    row["profile_pipeline_status"] = PipelineStatus.RMG_REJECTED.value
+    except Exception:  # pragma: no cover — the list must still load
+        db.rollback()
+        logger.warning("AI-rejected heal failed", exc_info=True)
 
 
 def heal_ai_passed_to_review(db: Session, rows_by_profile: dict[int, list[dict]]) -> None:
@@ -1561,6 +1582,8 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
     except Exception:
         db.rollback()
         logger.warning("profile-only RMG hand-off heal failed", exc_info=True)
+    # …and a REJECTED AI L1 decision closes it (23 Oct 2026).
+    _heal_ai_rejected_rows(db, [], ai_by_profile)
 
     needle = (search or "").strip().lower()
     want_ta = (applied_by or "").strip()

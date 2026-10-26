@@ -342,7 +342,7 @@ SUB_TABS: dict[str, dict[str, str]] = {
     "reports": {
         "opportunities": "Opportunities", "profiles": "Candidate Profiles",
         "productivity": "Recruiter Productivity", "financial": "Financial Reports",
-        "revenue": "Revenue",
+        "revenue": "Revenue", "invoice_summary": "Invoice Summary",
     },
     "finance-reports": {"profit": "Profit", "receivables": "Who owes us", "ledger": "Customer ledger"},
     "customers": {

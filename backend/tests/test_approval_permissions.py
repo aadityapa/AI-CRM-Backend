@@ -244,7 +244,7 @@ def test_the_migration_snapshots_match_the_registry():
     """Migrations backfill from frozen copies; layered in order (0108, then the
     entries 0111 changed or added) they must describe the registry exactly —
     a new approval without a backfill would never reach a saved Approvals list."""
-    merged = {**_snapshot("0108"), **_snapshot("0111")}
+    merged = {**_snapshot("0108"), **_snapshot("0111"), **_snapshot("0145"), **_snapshot("0146")}
     assert merged == {k: ap.ACTIONS[k].roles for k in ap.APPROVAL_ACTIONS}
 
 

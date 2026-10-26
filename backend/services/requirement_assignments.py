@@ -28,6 +28,8 @@ TA_ASSIGNED_ACTION = "TA_ASSIGNED"
 #: Notification event — listed in `routers/crm/email_flows.EVENTS` so Admin can
 #: re-route or reword it.
 TA_ASSIGNED_EVENT = "requirement.ta_assigned"
+#: The Hiring Manager team's activity row (services/hiring_managers.py).
+HM_ASSIGNED_ACTION = "HM_ASSIGNED"
 MAX_NOTE = 1000
 
 
@@ -71,7 +73,8 @@ def ta_options(db: Session) -> list[dict]:
     return sorted(out, key=lambda r: r["name"].lower())
 
 
-def serialize_assignment(a: RequirementTaAssignment) -> dict:
+def serialize_assignment(a) -> dict:
+    """One team row (TA or Hiring Manager — same shape)."""
     return {
         "id": a.id,
         "user_id": a.user_id,
@@ -83,15 +86,15 @@ def serialize_assignment(a: RequirementTaAssignment) -> dict:
     }
 
 
-def assignments_by_requirement(db: Session, requirement_ids) -> dict[int, list[dict]]:
-    """`{requirement_id: [assignment…]}` for a whole page — ONE query."""
+def members_by_requirement(db: Session, model, requirement_ids) -> dict[int, list[dict]]:
+    """`{requirement_id: [member…]}` of one team table for a whole page — ONE
+    query. Shared by the TA team and the Hiring Managers (22 Oct 2026)."""
     ids = [int(i) for i in set(requirement_ids or ()) if i]
     if not ids:
         return {}
     rows = db.execute(
-        select(RequirementTaAssignment)
-        .where(RequirementTaAssignment.requirement_id.in_(ids))
-        .order_by(RequirementTaAssignment.assigned_at.asc(), RequirementTaAssignment.id.asc())
+        select(model).where(model.requirement_id.in_(ids))
+        .order_by(model.assigned_at.asc(), model.id.asc())
     ).scalars().all()
     # A deactivated login is never shown as part of a team (14 Oct 2026 — Sweety
     # Falke left, was deactivated, and still read as a sourcing TA on her positions).
@@ -104,62 +107,63 @@ def assignments_by_requirement(db: Session, requirement_ids) -> dict[int, list[d
     return out
 
 
-def release_user(db: Session, user_id: int, reason: str | None, actor) -> list[int]:
-    """Take a login off EVERY position's sourcing team (no commit) — run when the
-    account is deactivated, so a person who left never stays on a team.
+def assignments_by_requirement(db: Session, requirement_ids) -> dict[int, list[dict]]:
+    """The TA team of each requirement — ONE query."""
+    return members_by_requirement(db, RequirementTaAssignment, requirement_ids)
 
-    Each position gets a `TA_ASSIGNED` activity row ("removed X — account
-    deactivated: <reason>"). Returns the requirement ids touched. Nobody is
-    notified: the person cannot sign in, and RMG sees the change on the team."""
-    rows = db.execute(
-        select(RequirementTaAssignment).where(RequirementTaAssignment.user_id == int(user_id))
-    ).scalars().all()
-    if not rows:
-        return []
+
+def release_user(db: Session, user_id: int, reason: str | None, actor) -> list[int]:
+    """Take a login off EVERY position's team — sourcing TAs AND Hiring
+    Managers (no commit) — run when the account is deactivated, so a person who
+    left never stays on a team.
+
+    Each position gets an activity row ("removed X — account deactivated:
+    <reason>"). Returns the requirement ids touched. Nobody is notified: the
+    person cannot sign in, and RMG sees the change on the team."""
+    from models import RequirementHiringManager
     actor_id = getattr(actor, "id", None) if not isinstance(actor, int) else actor
     why = (reason or "").strip()
     touched: list[int] = []
-    for a in rows:
-        name = a.user_name or f"User #{a.user_id}"
-        log_activity(db, RequirementActivityLog, "requirement_id", a.requirement_id, actor_id,
-                     TA_ASSIGNED_ACTION,
-                     f"TA removed {name} — account deactivated" + (f": {why}" if why else ""))
-        touched.append(int(a.requirement_id))
-        db.delete(a)
-    db.flush()
+    for model, word, action in ((RequirementTaAssignment, "TA", TA_ASSIGNED_ACTION),
+                                (RequirementHiringManager, "Hiring Manager", HM_ASSIGNED_ACTION)):
+        for a in db.execute(select(model).where(model.user_id == int(user_id))).scalars().all():
+            name = a.user_name or f"User #{a.user_id}"
+            log_activity(db, RequirementActivityLog, "requirement_id", a.requirement_id, actor_id,
+                         action, f"{word} removed {name} — account deactivated"
+                         + (f": {why}" if why else ""))
+            touched.append(int(a.requirement_id))
+            db.delete(a)
+    if touched:
+        db.flush()
     return sorted(set(touched))
 
 
-def assigned_requirement_ids(db: Session, user_id: int) -> list[int]:
-    """Requirements this TA is assigned to (the "Assigned to me" filter)."""
+def assigned_requirement_ids(db: Session, user_id: int, model=None) -> list[int]:
+    """Requirements this login is on (the TA team by default)."""
+    model = model or RequirementTaAssignment
     return [int(r) for r in db.execute(
-        select(RequirementTaAssignment.requirement_id)
-        .where(RequirementTaAssignment.user_id == int(user_id))
+        select(model.requirement_id).where(model.user_id == int(user_id))
     ).scalars().all()]
 
 
-def set_assignments(db: Session, req: Requirement, user_ids: list[int], note: str | None,
-                    actor) -> dict:
-    """Replace the requirement's TA list with `user_ids` (no commit).
+def replace_members(db: Session, req: Requirement, model, allowed: dict[int, str],
+                    user_ids: list[int], note: str | None, actor, *,
+                    word: str, action: str) -> tuple[list[int], list[int]]:
+    """Replace one team table's members of `req` with `user_ids` (no commit).
 
-    Returns `{added, removed, assignments}`. Unknown or non-TA ids are refused
-    (ValueError) — the picker only offers TA logins, so anything else is a
-    stale or forged request. Newly assigned TAs are notified; removed ones are
-    not (nothing is asked of them). The change is logged as `TA_ASSIGNED`.
-    """
+    `allowed` = {id: name} of the logins that may be ADDED. Someone already on
+    the team who has since been deactivated or lost the role is not a new
+    assignment: keeping or removing them is always allowed (14 Oct 2026, user
+    report: a stale member made the dialog unsavable). Unknown new ids →
+    ValueError. Logs one activity row (`action`) when anything changed.
+    Returns (added, removed)."""
     wanted = {int(u) for u in (user_ids or []) if u}
-    allowed = {o["id"]: o["name"] for o in ta_options(db)}
     current = {int(a.user_id): a for a in db.execute(
-        select(RequirementTaAssignment).where(RequirementTaAssignment.requirement_id == req.id)
+        select(model).where(model.requirement_id == req.id)
     ).scalars().all()}
-    # 14 Oct 2026 (user report: "Only active TA logins can be assigned (unknown
-    # id(s): 73)" — the dialog could not be saved at all). Someone already on the
-    # team who has since been deactivated or lost the TA role is not a NEW
-    # assignment: keeping or removing them is always allowed. Only an id being
-    # ADDED must be an active TA login.
     unknown = sorted(wanted - set(allowed) - set(current))
     if unknown:
-        raise ValueError("Only active TA logins can be assigned (unknown id(s): "
+        raise ValueError(f"Only active {word} logins can be assigned (unknown id(s): "
                          + ", ".join(str(u) for u in unknown) + ")")
     note = (note or "").strip()[:MAX_NOTE] or None
     added = sorted(wanted - set(current))
@@ -169,10 +173,9 @@ def set_assignments(db: Session, req: Requirement, user_ids: list[int], note: st
     for uid in removed:
         db.delete(current[uid])
     for uid in added:
-        db.add(RequirementTaAssignment(
-            requirement_id=req.id, user_id=uid, user_name=allowed[uid],
-            assigned_by=actor_id, assigned_by_name=actor_name,
-            assigned_at=datetime.now(timezone.utc), note=note))
+        db.add(model(requirement_id=req.id, user_id=uid, user_name=allowed[uid],
+                     assigned_by=actor_id, assigned_by_name=actor_name,
+                     assigned_at=datetime.now(timezone.utc), note=note))
     if added or removed:
         parts = []
         if added:
@@ -180,16 +183,42 @@ def set_assignments(db: Session, req: Requirement, user_ids: list[int], note: st
         if removed:
             parts.append("removed " + ", ".join(
                 (current[u].user_name or f"User #{u}") for u in removed))
-        comment = "TA " + "; ".join(parts) + (f": {note}" if note else "")
         log_activity(db, RequirementActivityLog, "requirement_id", req.id, actor_id,
-                     TA_ASSIGNED_ACTION, comment)
+                     action, f"{word} " + "; ".join(parts) + (f": {note}" if note else ""))
         db.flush()
-        _tell_added(db, req, added, note, actor)
+    return added, removed
+
+
+def set_assignments(db: Session, req: Requirement, user_ids: list[int], note: str | None,
+                    actor, *, notify: bool = True) -> dict:
+    """Replace the requirement's TA list with `user_ids` (no commit).
+
+    Returns `{added, removed, assignments}`. Unknown or non-TA ids are refused
+    (ValueError) — the picker only offers TA logins, so anything else is a
+    stale or forged request. Newly assigned TAs are notified (unless `notify`
+    is False — a position waiting for its Hiring Manager is not sourceable yet;
+    `tell_team` tells them once it opens); removed ones are not. The change is
+    logged as `TA_ASSIGNED`.
+    """
+    allowed = {o["id"]: o["name"] for o in ta_options(db)}
+    added, removed = replace_members(db, req, RequirementTaAssignment, allowed, user_ids, note,
+                                     actor, word="TA", action=TA_ASSIGNED_ACTION)
+    if notify:
+        _tell_added(db, req, added, (note or "").strip() or None, actor)
     return {
         "added": added,
         "removed": removed,
         "assignments": assignments_by_requirement(db, [req.id]).get(req.id, []),
     }
+
+
+def tell_team(db: Session, req: Requirement, actor) -> None:
+    """Tell the whole current TA team the position is theirs to source — for a
+    team picked while the position still waited for its Hiring Manager."""
+    ids = [int(r) for r in db.execute(
+        select(RequirementTaAssignment.user_id).where(RequirementTaAssignment.requirement_id == req.id)
+    ).scalars().all()]
+    _tell_added(db, req, ids, None, actor)
 
 
 def _tell_added(db: Session, req: Requirement, added: list[int], note: str | None, actor) -> None:
