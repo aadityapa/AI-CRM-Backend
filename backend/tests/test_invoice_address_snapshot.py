@@ -188,3 +188,81 @@ def test_the_customer_activity_log_records_changes_and_the_whole_history(world):
     assert {r["kind"] for r in only_inv["data"]} == {"invoice"}
     with pytest.raises(ValueError):
         customer_activity.activity_feed(world.db, world.cust.id, kinds=["nope"])
+
+
+def test_finance_moves_an_invoice_to_the_right_branch_label_included(world):
+    """26 Oct 2026 (Visteon, KRSW26-27-3-VTK): the PO named the Chennai branch, the
+    employee works in Bangalore. Correcting the address left "Visteon - Chennai"
+    printed under the name — the branch line was not editable. Picking the right
+    branch moves its id, label, address, GSTIN and PAN; a typed label wins; a branch
+    of another customer is refused; leaving the label out keeps it."""
+    from models import Customer, CustomerBranch
+    blr = CustomerBranch(customer_id=world.cust.id, branch_name="Ascendion - Bangalore",
+                         branch_legal_name="Ascendion Digital Solutions Private Limited",
+                         billing_address="Whitefield", city="Bengaluru", state="Karnataka",
+                         pincode="560066", gstin="29AACCM4351R1Z1", pan="AACCM4351R")
+    other = Customer(name="Other", legal_entity_name="Other Pvt Ltd")
+    world.db.add_all([blr, other])
+    world.db.flush()
+    stranger = CustomerBranch(customer_id=other.id, branch_name="Other - Pune", billing_address="Pune")
+    world.db.add(stranger)
+    world.db.commit()
+    inv = _invoice(world, "KRSW-3", date(2026, 10, 1))
+    assert inv.party_snapshot["billing"]["branch_name"] == "Vadodara"
+    actor = SimpleNamespace(id=1, full_name="F")
+    why = "PO was raised on the wrong branch — employee works in Bangalore"
+
+    form = ip.buyer_form(blr, world.cust)
+    form["branch_id"] = blr.id
+    ip.correct(world.db, inv, buyer=form, shipping=None, reason=why, actor=actor)
+    world.db.commit()
+    snap = inv.party_snapshot["billing"]
+    assert (snap["id"], snap["branch_name"], snap["gstin"], snap["state"]) == (
+        blr.id, "Ascendion - Bangalore", "29AACCM4351R1Z1", "Karnataka")
+
+    ip.correct(world.db, inv, buyer={**form, "branch_name": "Bangalore (Whitefield)"}, shipping=None,
+               reason=why, actor=actor)
+    world.db.commit()
+    assert inv.party_snapshot["billing"]["branch_name"] == "Bangalore (Whitefield)"
+
+    plain = {k: v for k, v in form.items() if k not in ("branch_id", "branch_name")}
+    ip.correct(world.db, inv, buyer=plain, shipping=None, reason=why, actor=actor)
+    world.db.commit()
+    assert inv.party_snapshot["billing"]["branch_name"] == "Bangalore (Whitefield)"
+
+    with pytest.raises(Exception, match="does not belong"):
+        ip.correct(world.db, inv, buyer={**form, "branch_id": stranger.id}, shipping=None,
+                   reason=why, actor=actor)
+
+
+def test_finance_moves_the_po_to_the_right_branch_for_new_invoices(world):
+    """26 Oct 2026: correcting issued invoices left the PO on the wrong branch, so
+    the next invoice printed it again. `move_po_to_branch` points the PO (billing,
+    and delivery when it named the old branch) at the new branch; the next frozen
+    invoice takes it; a foreign branch is refused."""
+    from models import Customer, CustomerBranch
+    blr = CustomerBranch(customer_id=world.cust.id, branch_name="Ascendion - Bangalore",
+                         billing_address="Whitefield", city="Bengaluru", state="Karnataka",
+                         gstin="29AACCM4351R1Z1")
+    other = Customer(name="Other", legal_entity_name="Other Pvt Ltd")
+    world.db.add_all([blr, other])
+    world.db.flush()
+    stranger = CustomerBranch(customer_id=other.id, branch_name="Other - Pune", billing_address="Pune")
+    world.db.add(stranger)
+    world.po.delivery_branch_id = world.br.id
+    world.db.commit()
+    inv = _invoice(world, "KRSW-4", date(2026, 10, 1))
+
+    moved = ip.move_po_to_branch(world.db, inv, blr.id)
+    world.db.commit()
+    assert moved["changed"] and moved["from"] == "Vadodara" and moved["to"] == "Ascendion - Bangalore"
+    assert world.po.billing_branch_id == blr.id and world.po.delivery_branch_id == blr.id
+    assert inv.party_snapshot["billing"]["branch_name"] == "Vadodara"     # issued one untouched
+
+    nxt = _invoice(world, "KRSW-5", date(2026, 10, 20))
+    assert nxt.party_snapshot["billing"]["branch_name"] == "Ascendion - Bangalore"
+
+    with pytest.raises(Exception, match="does not belong"):
+        ip.move_po_to_branch(world.db, inv, stranger.id)
+    with pytest.raises(Exception, match="Pick the branch"):
+        ip.move_po_to_branch(world.db, inv, None)

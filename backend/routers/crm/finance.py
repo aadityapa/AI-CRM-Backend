@@ -1161,6 +1161,11 @@ class _PartyIn(_PBase):
     country: str | None = _PField(default=None, max_length=120)
     gstin: str | None = _PField(default=None, max_length=15)
     pan: str | None = _PField(default=None, max_length=10)
+    #: 26 Oct 2026 — pick one of the customer's branches (its id + label move
+    #: onto the invoice) and / or type the branch label printed under the name
+    #: ("Visteon - Bangalore"). None = keep what the invoice prints today.
+    branch_id: int | None = None
+    branch_name: str | None = _PField(default=None, max_length=255)
 
 
 class InvoicePartiesIn(_PBase):
@@ -1171,6 +1176,9 @@ class InvoicePartiesIn(_PBase):
     #: `same_address`) — the earlier invoices of the customer that print the
     #: same address as this one.
     apply_to: list[int] = _PField(default_factory=list, max_length=500)
+    #: 26 Oct 2026: also point the invoice's PO at the buyer's branch
+    #: (`buyer.branch_id`), so NEW invoices on it print the right branch.
+    move_po_to_branch: bool = False
 
 
 def _parties_payload(db: Session, invoice) -> dict:
@@ -1201,6 +1209,12 @@ def _parties_payload(db: Session, invoice) -> dict:
         if snap is not None else False,
         "po": ({"po_number": po.po_number, "billing": ip.po_form(po, "billing"),
                 "delivery": ip.po_form(po, "delivery")} if po is not None else None),
+        # 26 Oct 2026: every branch of the customer, so a PO raised on the wrong
+        # branch can be corrected in one click ("Use the Bangalore branch").
+        "branches": [{"id": br.id, "branch_name": br.branch_name, "is_primary": bool(br.is_primary),
+                      "buyer": ip.buyer_form(br, c), "shipping": ip.shipping_form(br, None)}
+                     for br in ip.customer_branches(db, ip.customer_id_of(db, invoice))],
+        "po_billing_branch": ({"id": po.billing_branch_id} if po is not None and po.billing_branch_id else None),
         "same_address": [{"id": o.id, "invoice_number": o.invoice_number,
                           "invoice_date": o.invoice_date.isoformat() if o.invoice_date else None,
                           "kind": o.kind} for o in same],
@@ -1241,6 +1255,22 @@ def correct_invoice_parties(invoice_id: int, body: InvoicePartiesIn, db: Session
     result = None
     for inv in targets:
         result = ip.correct(db, inv, buyer=buyer, shipping=shipping, reason=body.reason, actor=user)
+    po_note = ""
+    if body.move_po_to_branch:
+        moved = ip.move_po_to_branch(db, invoice, body.buyer.branch_id)
+        if moved["changed"]:
+            po = moved["po"]
+            log_po_activity(db, po.id, user.id, "BILLING_BRANCH_CHANGED",
+                            comment=(f"Billing branch {moved['from'] or '—'} → {moved['to']} "
+                                     f"(corrected from invoice {invoice.invoice_number}): {body.reason.strip()}"),
+                            section="billing")
+            if customer_id:
+                record_customer_event(
+                    db, customer_id, "PO_BRANCH_CHANGED",
+                    f"PO {po.po_number} now bills {moved['to']}: {body.reason.strip()}",
+                    entity="po", entity_id=po.id, subject=po.po_number, user=user,
+                    changes={"Billing branch": [moved["from"], moved["to"]]})
+            po_note = f"; PO {po.po_number} now bills {moved['to']}"
     if customer_id and result is not None:
         numbers = ", ".join(i.invoice_number for i in targets)
         before, after = result["before"], result["after"]
@@ -1257,7 +1287,7 @@ def correct_invoice_parties(invoice_id: int, body: InvoicePartiesIn, db: Session
     db.refresh(invoice)
     n = len(targets)
     return envelope(_parties_payload(db, invoice),
-                    f"Address corrected on {n} invoice{'s' if n > 1 else ''}")
+                    f"Address corrected on {n} invoice{'s' if n > 1 else ''}{po_note}")
 
 
 @router.api_route("/invoices/{invoice_id}", methods=["PUT", "PATCH"])

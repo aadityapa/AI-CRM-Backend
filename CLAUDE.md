@@ -4038,6 +4038,19 @@ other" on the Finance, Sales Manager and RMG / GM dashboards. Rules now shared:
 - **`rmg_tasks`** — `total` counts each candidate once; `feedback` and `results` are sent in full
   (`FULL_LIST_CATEGORIES`); the invoices-issued hint no longer says "last 30 days".
 
+**26 Oct 2026 — correct an invoice's BRANCH, not only its address (`test_invoice_address_snapshot` +1; no
+migration):** reported — Visteon KRSW26-27-3-VTK: the PO was raised on the Chennai branch, the employee works in
+Bangalore; Finance corrected the address but "Visteon - Chennai" stayed printed under the buyer name (the snapshot's
+`branch_name`, which the correction never touched). `services/invoice_parties`: `buyer_form` / `shipping_form` now
+carry `branch_id` + `branch_name`; `branch_from_form` takes a SENT `branch_name` (blank = no branch line), else keeps the
+old one; `correct()` re-bases the snapshot on `buyer.branch_id` / `shipping.branch_id` (`_branch_base` — 400 "That branch
+does not belong to this invoice's customer") so the branch id, label, address, GSTIN and PAN all move together;
+`customer_branches(db, cid)`. `_PartyIn` gains `branch_id` / `branch_name`; `GET …/parties` adds `branches` (every
+branch of the customer, each with its ready buyer / shipping form) and `po_billing_branch`. ⚠️ The invoice correction
+fixes ISSUED invoices only — new invoices on that PO still take the PO's billing branch (`resolve_billing_branch`), so
+change the PO's billing branch on the PO too; an IRN already registered with the wrong address is fixed on the GST portal.
+**Later the same day:** the same dialog can move the PO — `InvoicePartiesIn.move_po_to_branch` → `invoice_parties.move_po_to_branch(db, invoice, branch_id)` sets the PO's billing branch (and its delivery branch when it was blank or the old billing branch), refuses a foreign branch / no PO / no branch (400), logs `BILLING_BRANCH_CHANGED` on the PO and `PO_BRANCH_CHANGED` on the customer's Activity Log. The PO's typed address snapshot is left as it was. `test_invoice_address_snapshot` now 6.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 

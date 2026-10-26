@@ -180,6 +180,9 @@ def buyer_form(branch: Any, customer: Any) -> dict:
     return {"name": name, "line1": g("billing_address"), "line2": g("address_line_2"),
             "city": g("city"), "state": g("state"), "pincode": g("pincode"),
             "country": g("country"), "gstin": g("gstin"), "pan": g("pan"),
+            # 26 Oct 2026: the branch label the sheet prints under the name
+            # ("Visteon - Chennai") and which branch it came from.
+            "branch_id": g("id"), "branch_name": g("branch_name"),
             "print_address": print_address(branch, delivery=False)}
 
 
@@ -192,6 +195,7 @@ def shipping_form(branch: Any, buyer_name: str | None) -> dict:
     return {"name": name or buyer_name, "line1": g("delivery_address") if own else g("billing_address"),
             "line2": None if own else g("address_line_2"),
             "city": g("city"), "state": g("state"), "pincode": g("pincode"), "country": g("country"),
+            "branch_id": g("id"), "branch_name": g("branch_name"),
             "print_address": print_address(branch, delivery=True)}
 
 
@@ -206,15 +210,24 @@ def po_form(po: Any, kind: str) -> dict | None:
 
 
 def branch_from_form(form: dict, base: dict | None, *, delivery: bool) -> dict:
-    """The correction form back into a branch-shaped dict."""
+    """The correction form back into a branch-shaped dict.
+
+    26 Oct 2026 (reported: a PO raised on the wrong branch — the address was
+    corrected but the sheet still printed "Visteon - Chennai"): the branch LABEL
+    is a field of the form now. A form that sends `branch_name` sets it (blank =
+    no label line); one that omits it keeps the base's label."""
     base = dict(base or {})
     name = _clean(form.get("name"))
     line1 = _clean(form.get("line1"), 1000)
     line2 = _clean(form.get("line2"))
     out = {f: base.get(f) for f in BRANCH_FIELDS}
+    if form.get("branch_name") is not None:      # sent — even blank (= no label line)
+        label = _clean(form.get("branch_name"))
+    else:
+        label = base.get("branch_name") or name
     out.update({
         "branch_legal_name": name or base.get("branch_legal_name"),
-        "branch_name": base.get("branch_name") or name,
+        "branch_name": label,
         "billing_address": line1, "address_line_2": line2,
         "delivery_address": (", ".join(p for p in [line1, line2] if p) or None) if delivery else None,
         "city": _clean(form.get("city"), 120), "state": _clean(form.get("state"), 120),
@@ -263,6 +276,30 @@ def same_address_invoices(db: Session, invoice: Any, customer_id: int | None) ->
     return out
 
 
+def customer_branches(db: Session, customer_id: int | None) -> list:
+    """Every branch of the customer — the correction dialog's "Use the <branch>
+    branch" picks (26 Oct 2026)."""
+    from models import CustomerBranch
+    if not customer_id:
+        return []
+    return db.execute(select(CustomerBranch).where(CustomerBranch.customer_id == customer_id)
+                      .order_by(CustomerBranch.is_primary.desc(), CustomerBranch.branch_name)).scalars().all()
+
+
+def _branch_base(db: Session, invoice: Any, branch_id: Any, old: dict) -> dict | None:
+    """The chosen branch as the base of the corrected party — its id and label
+    move with it. It must be one of THIS customer's branches (400 otherwise)."""
+    if not branch_id:
+        return None
+    from fastapi import HTTPException
+    from models import CustomerBranch
+    branch = db.get(CustomerBranch, int(branch_id))
+    cid = ((old.get("customer") or {}).get("id")) or customer_id_of(db, invoice)
+    if branch is None or (cid and branch.customer_id != int(cid)):
+        raise HTTPException(status_code=400, detail="That branch does not belong to this invoice's customer")
+    return _pick(branch, BRANCH_FIELDS)
+
+
 def correct(db: Session, invoice: Any, *, buyer: dict, shipping: dict | None, reason: str,
             actor: Any) -> dict:
     """Finance corrects the address printed on an issued invoice. Returns the
@@ -273,9 +310,11 @@ def correct(db: Session, invoice: Any, *, buyer: dict, shipping: dict | None, re
         raise HTTPException(status_code=400,
                             detail=f"Say why the address changes (at least {MIN_CORRECTION_REASON} characters)")
     old = snapshot_of(invoice) or capture(db, invoice, source="backfill")
-    billing = branch_from_form(buyer or {}, old.get("billing"), delivery=False)
-    delivery = branch_from_form(shipping, old.get("delivery") or old.get("billing"), delivery=True) \
-        if shipping else None
+    billing_base = _branch_base(db, invoice, (buyer or {}).get("branch_id"), old) or old.get("billing")
+    billing = branch_from_form(buyer or {}, billing_base, delivery=False)
+    ship_base = (_branch_base(db, invoice, (shipping or {}).get("branch_id"), old)
+                 or old.get("delivery") or old.get("billing")) if shipping else None
+    delivery = branch_from_form(shipping, ship_base, delivery=True) if shipping else None
     if not (billing.get("branch_legal_name") and (billing.get("billing_address") or billing.get("city"))):
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Give at least the buyer's name and address")
@@ -289,3 +328,31 @@ def correct(db: Session, invoice: Any, *, buyer: dict, shipping: dict | None, re
     before = address_key(old)
     invoice.party_snapshot = new
     return {"before": before, "after": address_key(new)}
+
+def move_po_to_branch(db: Session, invoice: Any, branch_id: int | None) -> dict:
+    """26 Oct 2026 (Visteon): the PO was raised on the wrong branch, so every NEW
+    invoice on it would keep printing that branch even after Finance corrected the
+    issued ones. Point the PO's billing branch at `branch_id` — and its delivery
+    branch too when it named the old billing branch (or nothing). Issued invoices
+    are untouched (they print their snapshot). Caller logs + commits."""
+    from fastapi import HTTPException
+    from models import CustomerBranch, PurchaseOrder
+
+    po = getattr(invoice, "po", None) or (
+        db.get(PurchaseOrder, invoice.po_id) if getattr(invoice, "po_id", None) else None)
+    if po is None:
+        raise HTTPException(status_code=400, detail="This invoice has no purchase order to update")
+    if not branch_id:
+        raise HTTPException(status_code=400, detail="Pick the branch the PO should bill")
+    branch = db.get(CustomerBranch, int(branch_id))
+    if branch is None or branch.customer_id != po.customer_id:
+        raise HTTPException(status_code=400, detail="That branch does not belong to the PO's customer")
+    old_id = po.billing_branch_id
+    old = db.get(CustomerBranch, old_id) if old_id else None
+    delivery_moved = po.delivery_branch_id in (None, old_id) and po.delivery_branch_id != branch.id
+    po.billing_branch_id = branch.id
+    if delivery_moved and po.delivery_branch_id is not None:
+        po.delivery_branch_id = branch.id
+    return {"po": po, "changed": old_id != branch.id,
+            "from": getattr(old, "branch_name", None), "to": branch.branch_name}
+
