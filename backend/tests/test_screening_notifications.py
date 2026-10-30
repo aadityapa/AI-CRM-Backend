@@ -49,7 +49,6 @@ def db(monkeypatch):
     from models.base import users_table_stub
     from models.custom_roles import CustomRole, UserCustomRole
     from models.rbac import RoleName
-    from services import access_templates as tpl_svc
     from services import action_permissions as ap
 
     monkeypatch.setattr(ap, "roles_for_action", lambda action, defaults: list(defaults))
@@ -66,10 +65,12 @@ def db(monkeypatch):
     s.add(gm)
     s.flush()
     s.add(UserCustomRole(user_id=GM, custom_role_id=gm.id))
-    t = tpl_svc.create_template(s, {"name": "Screener", "role": "Sales",
-                                    "tab_access": {"profiles": "edit"},
-                                    "action_access": ["profile.rmg_screening"]})
-    s.add(UserProfile(user_id=TEMPLATED, access_template_id=t["id"]))
+    # Was an Access Template; since 27 Oct 2026 a role carries the grants.
+    screener = CustomRole(name="Screener", is_active=True, tab_access={"profiles": "edit"},
+                          action_access=["profile.rmg_screening"])
+    s.add(screener)
+    s.flush()
+    s.add(UserCustomRole(user_id=TEMPLATED, custom_role_id=screener.id))
     s.commit()
     try:
         yield s

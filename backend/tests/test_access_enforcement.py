@@ -1,7 +1,7 @@
 """Access Templates — Phase 4: server-side write ENFORCEMENT (black-box + E2E).
 
 Guarded demo endpoints use the reusable `crm_deps.require_access(tab, mode, field)`
-dependency (same `effective_access` resolver). We create a Sales template over the
+dependency (same `effective_access` resolver). We set role permissions over the
 real API, assign it to a user, then hit the guarded endpoints AS that user and assert
 allowed on granted tabs/fields and 403 elsewhere. Admin bypasses; a no-template user
 (role defaults) is unaffected.
@@ -51,7 +51,7 @@ from fastapi.testclient import TestClient                              # noqa: E
 from models.base import Base                                           # noqa: E402
 import crm_deps                                                        # noqa: E402
 from crm_deps import require_access, CurrentUser                       # noqa: E402
-import routers.crm.access_templates as at_router                       # noqa: E402
+import routers.crm.custom_roles as roles_router                         # noqa: E402
 import routers.crm.customers as customers_router                       # noqa: E402
 
 
@@ -67,7 +67,7 @@ def env():
     current = {"user": CurrentUser(id=1, username="admin", roles={"Admin"})}
 
     app = FastAPI()
-    app.include_router(at_router.router)
+    app.include_router(roles_router.router)
     app.include_router(customers_router.router)
 
     @app.get("/demo/customers")
@@ -106,15 +106,36 @@ def _be(client, user):
     client._current["user"] = user
 
 
+def _member(client, role_id: int, uid: int) -> None:
+    """Membership straight in the table — the test users have no login row."""
+    from models.custom_roles import UserCustomRole
+    client._session.add(UserCustomRole(user_id=uid, custom_role_id=role_id))
+    client._session.commit()
+
+
+def _hold_builtin(client, uid: int, name: str) -> None:
+    from models.rbac import Role, RoleName, UserRole
+    s = client._session
+    member = next(r for r in RoleName if r.value == name)
+    role = s.query(Role).filter(Role.name == member).first()
+    if role is None:
+        role = Role(name=member)
+        s.add(role)
+        s.flush()
+    s.add(UserRole(user_id=uid, role_id=role.id))
+    s.commit()
+
+
 def test_enforcement_sales_template_user(env):
     c = env
-    # --- as Admin: create a Sales template + assign to user 30 (over the real API) ---
-    tid = c.post("/api/access-templates", json={
-        "name": "Sales",
+    # --- as Admin: set the BUILT-IN Sales role's permissions (over the real API) ---
+    _hold_builtin(c, 30, "Sales")
+    r = c.put("/api/roles/builtin/Sales/permissions", json={
         "tab_access": {"customers": "view", "opportunities": "edit"},
         "field_access": {"customers": {"name": "edit"}},
-    }).json()["data"]["id"]
-    assert c.post("/api/access-templates/assign", json={"user_id": 30, "template_id": tid}).status_code == 200
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["configured"] is True
 
     # --- now act AS the Sales user (id 30) ---
     _be(c, CurrentUser(id=30, username="ravi", roles={"Sales"}))
@@ -144,17 +165,17 @@ def test_enforcement_no_template_role_defaults_unaffected(env):
 
 def test_enforcement_updates_live_when_template_edited(env):
     c = env
-    tid = c.post("/api/access-templates", json={
-        "name": "RMG", "tab_access": {"projects": "view"}}).json()["data"]["id"]
-    c.post("/api/access-templates/assign", json={"user_id": 50, "template_id": tid})
+    rid = c.post("/api/roles", json={
+        "name": "Ops", "tab_access": {"projects": "view"}}).json()["data"]["id"]
+    _member(c, rid, 50)
 
     _be(c, CurrentUser(id=50, username="rmg", roles={"RMG"}))
     # projects is view-only for now — opportunities blocked
     assert c.post("/demo/opportunities").status_code == 403
 
-    # Admin edits the template to grant opportunities edit -> live change, no re-assign
+    # Admin edits the role to grant opportunities edit -> live change, no re-assign
     _be(c, CurrentUser(id=1, username="admin", roles={"Admin"}))
-    c.put(f"/api/access-templates/{tid}", json={"tab_access": {"projects": "view", "opportunities": "edit"}})
+    c.put(f"/api/roles/{rid}", json={"tab_access": {"projects": "view", "opportunities": "edit"}})
 
     _be(c, CurrentUser(id=50, username="rmg", roles={"RMG"}))
     assert c.post("/demo/opportunities").status_code == 200            # now allowed, live
@@ -163,18 +184,18 @@ def test_enforcement_updates_live_when_template_edited(env):
 def test_wired_customers_endpoint_enforcement(env):
     """Real /api/customers routes use gated_read / gated_write."""
     c = env
-    tid = c.post("/api/access-templates", json={
+    rid = c.post("/api/roles", json={
         "name": "Sales RO",
         "tab_access": {"customers": "view"},
     }).json()["data"]["id"]
-    c.post("/api/access-templates/assign", json={"user_id": 60, "template_id": tid})
+    _member(c, rid, 60)
 
     _be(c, CurrentUser(id=60, username="sales", roles={"Sales"}))
     assert c.get("/api/customers").status_code == 200
     assert c.post("/api/customers", json={"name": "Blocked Co"}).status_code == 403
 
     _be(c, CurrentUser(id=1, username="admin", roles={"Admin"}))
-    c.put(f"/api/access-templates/{tid}", json={"tab_access": {"customers": "edit"}})
+    c.put(f"/api/roles/{rid}", json={"tab_access": {"customers": "edit"}})
 
     _be(c, CurrentUser(id=60, username="sales", roles={"Sales"}))
     # Still 403 on create without required schema fields — but not access-denied

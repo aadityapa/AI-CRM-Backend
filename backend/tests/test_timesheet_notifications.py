@@ -30,11 +30,10 @@ GM, TEMPLATED_APPROVER, SUBMITTER, OTHER_SALES = 2, 3, 4, 5
 @pytest.fixture()
 def people(db, monkeypatch):  # noqa: F811
     """GM by custom role · an approver by TEMPLATE · the Sales submitter · another Sales."""
-    from models import Role, UserProfile, UserRole
+    from models import Role, UserRole
     from models.base import users_table_stub
     from models.custom_roles import CustomRole, UserCustomRole
     from models.rbac import RoleName
-    from services import access_templates as tpl_svc
     from services import action_permissions as ap
 
     monkeypatch.setattr(ap, "roles_for_action", lambda action, defaults: list(defaults))
@@ -49,10 +48,12 @@ def people(db, monkeypatch):  # noqa: F811
     db.add(gm)
     db.flush()
     db.add(UserCustomRole(user_id=GM, custom_role_id=gm.id))
-    t = tpl_svc.create_template(db, {"name": "Delivery approver", "role": "Sales",
-                                     "tab_access": {"timesheets": "edit"},
-                                     "action_access": ["timesheet.approve", "timesheet.reject"]})
-    db.add(UserProfile(user_id=TEMPLATED_APPROVER, access_template_id=t["id"]))
+    # Was an Access Template; since 27 Oct 2026 a role carries the grants.
+    approver = CustomRole(name="Delivery approver", is_active=True, tab_access={"timesheets": "edit"},
+                          action_access=["timesheet.approve", "timesheet.reject"])
+    db.add(approver)
+    db.flush()
+    db.add(UserCustomRole(user_id=TEMPLATED_APPROVER, custom_role_id=approver.id))
     db.commit()
 
 

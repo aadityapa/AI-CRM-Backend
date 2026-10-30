@@ -34,6 +34,7 @@ ACTIONS: dict[str, str] = {
     "user.roles": "Roles changed",
     "user.access_source": "Access changed",
     "user.tab_access": "Tab exceptions changed",
+    # Kept so log rows written before the 27 Oct 2026 merge still read well.
     "user.template": "Access template assigned",
     "user.activated": "Activated",
     "user.deactivated": "Deactivated",
@@ -82,20 +83,14 @@ def _name_of(db: Session, user_id: int | None) -> str | None:
 
 def snapshot(db: Session, user_id: int) -> dict:
     """What decides this user's access right now — the History view diffs two of these."""
-    out: dict[str, Any] = {"roles": [], "custom_roles": [], "template": None, "tab_access": None,
-                           "is_active": None}
+    out: dict[str, Any] = {"roles": [], "custom_roles": [], "tab_access": None, "is_active": None}
     try:
         with db.begin_nested():
             from services.custom_roles import custom_roles_by_user
-            from services.users_admin import _roles_map, _tab_access_map, _template_map
+            from services.users_admin import _roles_map, _tab_access_map
             out["roles"] = _roles_map(db, [user_id]).get(user_id, [])
             out["custom_roles"] = sorted(custom_roles_by_user(db, [user_id]).get(user_id, []))
             out["tab_access"] = _tab_access_map(db, [user_id]).get(user_id)
-            tid = _template_map(db, [user_id]).get(user_id)
-            if tid:
-                from models.access_templates import AccessTemplate
-                t = db.get(AccessTemplate, tid)
-                out["template"] = {"id": tid, "name": getattr(t, "name", None)}
             row = db.execute(sa.text("SELECT COALESCE(is_active, TRUE) AS a FROM registration_data WHERE id = :i"),
                              {"i": user_id}).mappings().first()
             out["is_active"] = bool(row["a"]) if row else None

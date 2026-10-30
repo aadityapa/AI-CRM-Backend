@@ -282,7 +282,7 @@ FIELDS_BY_TAB: dict[str, dict[str, str]] = {
         "export": "CSV Export",
     },
     "users": {
-        "roles": "Roles", "tab_access": "Tab Access", "access_template": "Access Template",
+        "roles": "Roles", "tab_access": "Tab Access", "access_template": "Permissions from (role)",
         "activation": "Activation", "portal_access": "Portal Access",
         "email_flows": "Email Flows", "action_permissions": "Action Permissions",
     },

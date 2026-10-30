@@ -159,7 +159,10 @@ def test_finance_gets_no_interview_tabs(db):
     assert list(_tabs(db, FINANCE)) == ["fin_timesheets", "fin_proformas", "fin_awaiting_customer",
                                         "fin_customer_approved", "fin_payment_pending", "fin_partially_paid",
                                         "fin_tds_pending",
-                                        "fin_receipts", "fin_invoices", "upcoming", "queues"]
+                                        "fin_receipts", "fin_invoices",
+                                        # 26 Oct 2026: always there, "None" at zero (info for Finance).
+                                        "returned_pi", "upcoming", "queues"]
+    assert _tabs(db, FINANCE)["returned_pi"]["count"] == 0
 
 
 def test_one_broken_tab_never_blanks_the_desk(db, monkeypatch):
@@ -260,6 +263,14 @@ def test_finance_sees_the_timesheet_proforma_invoice_chain(db, monkeypatch):
     assert [i["title"] for i in done["items"]] == ["KRSW-26-27-10 · ₹1,18,000"]
     assert "from PI-2026-000" in done["items"][0]["subtitle"] and done["stage"] == "Done"
 
+    # 26 Oct 2026: the returned Proforma is a TILE (the Dashboard panel is gone),
+    # opening My Tasks where the board renders; for Finance (they returned it) it is info.
+    ret = tabs["returned_pi"]
+    assert ret["count"] == 1 and ret["link"] == "my-tasks?tab=returned_pi"
+    assert ret["items"][0]["path"] == f"timesheets/{returned.id}"
+    assert "wrong rate" in ret["items"][0]["subtitle"] and ret["items"][0]["tone"] == "bad"
+    assert ret.get("info") is True
+
 
 def test_rupees_uses_indian_grouping():
     assert wd.rupees(123456789.4) == "₹12,34,56,789"
@@ -301,7 +312,7 @@ def test_sales_get_a_tab_per_stage_with_the_moves_they_may_make(db, monkeypatch)
     keys = list(tabs)
     assert keys == ["feedback", "sales_submit", "sales_response", "sales_decide", "sales_terms",
                     "sales_budget", "sales_timesheets", "sales_invoices_pending", "sales_proformas",
-                    "sales_invoices", "sales_collections", "renewals", "joining_soon"]
+                    "sales_invoices", "sales_collections", "renewals", "joining_soon", "returned_pi"]
     # No generic Upcoming / My queues for a Sales login (29 Sep 2026, user ask).
     assert [i["title"] for i in tabs["sales_submit"]["items"]] == ["Cleared"]
     assert "Customer_Screening" in tabs["sales_submit"]["items"][0]["allowed"]

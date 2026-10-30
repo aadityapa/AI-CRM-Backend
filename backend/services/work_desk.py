@@ -2064,6 +2064,58 @@ def _customer_confirm_tab(db: Session) -> dict:
     return _awaiting_customer_tab(db, "inv_confirm")
 
 
+#: The Returned Proformas tile (26 Oct 2026, user ask: "remove the big panel from
+#: the Dashboard, show it like the upper tiles"). The tile opens My Tasks on this
+#: tab, where the board (whose-move chips · customer · month · search · Reopen)
+#: is rendered.
+RETURNED_PI_TAB = "returned_pi"
+_RETURNED_TONE = {"to_correct": "bad", "correcting": "warn", "resubmitted": "info",
+                  "reissue": "warn", "manual": "info"}
+_RETURNED_SHORT = {"to_correct": "Check & correct", "correcting": "Being corrected",
+                   "resubmitted": "GM to approve", "reissue": "GM to raise again", "manual": "No timesheet"}
+
+
+def _returned_pi_tab(db: Session, user) -> dict | None:
+    """Every Proforma Finance returned (`services.returned_proformas.board`, the
+    same rows and rule). None for a login the board refuses. A login that can
+    neither reopen nor raise (Finance — they returned it) reads it as info."""
+    from services import returned_proformas as rp
+
+    if not rp.may_see(db, user):
+        return None
+    data = rp.board(db, user)
+    items = []
+    for r in data["rows"]:
+        who = r.get("employee") or "Manual Proforma"
+        items.append({
+            "key": f"returned:{r['invoice_id']}",
+            "title": f"{who} · {r.get('month_label') or '—'}",
+            "subtitle": " · ".join(x for x in (
+                r.get("proforma_number"), r.get("customer"), f"Finance: {r.get('returned_reason') or 'no reason'}")
+                if x),
+            "chip": f"{_RETURNED_SHORT.get(r['step'], r['step_label'])} · {r['step_who']}",
+            "tone": _RETURNED_TONE.get(r["step"], "info"),
+            "when": r.get("returned_at"),
+            "path": f"timesheets/{r['timesheet_id']}" if r.get("timesheet_id") else f"invoices/{r['invoice_id']}",
+            "action": "Open timesheet" if r.get("timesheet_id") else "Open Proforma",
+            "profile_id": None,
+            "customer": r.get("customer"), "project": r.get("project"), "employee": r.get("employee"),
+            "month": r.get("month"), "amount": r.get("amount"),
+            "status": _RETURNED_SHORT.get(r["step"], r["step_label"]),
+        })
+    # 26 Oct 2026 (later): the tile is ALWAYS there for a login that may see the
+    # board — at zero it reads "All clear" / "None". Hiding it when nothing was
+    # returned looked like a missing feature (user report: "I don't see the tab").
+    meta = data["meta"]
+    tab = {"key": RETURNED_PI_TAB, "label": "Returned Proformas",
+           "hint": "Proformas Finance sent back — which month, why, and whose move it is",
+           "count": len(items), "items": items, "link": f"{TASKS_PAGE}?tab={RETURNED_PI_TAB}",
+           "stage": "Finance sent back"}
+    if not (meta.get("can_reopen") or meta.get("can_reissue")):
+        tab["info"] = True
+    return tab
+
+
 # ---------------------------------------------------------- Admin / CEO desk
 
 
@@ -2167,6 +2219,9 @@ def desk(db: Session, user, *, max_items: int = MAX_ITEMS) -> dict:
         ("ta", (lambda: _ta_tabs(db, user, owner_id)) if ta else None),
         ("screener", (lambda: _screener_tabs(db, user)) if screener else None),
         ("finance", (lambda: _finance_tabs(db)) if finance else None),
+        # 26 Oct 2026: Proformas Finance returned — a tile, not a Dashboard panel
+        # (after Finance's own chain, which reads in the money's order).
+        (RETURNED_PI_TAB, lambda: _returned_pi_tab(db, user)),
         # An HR-only login's day is the HR tabs above; the generic Upcoming /
         # My queues tiles repeated them in a different shape (29 Sep 2026, user ask).
         ("upcoming", (lambda: _upcoming_tab(db, user)) if not no_generic else None),

@@ -158,8 +158,8 @@ def deactivate_user(user_id: int,
 def set_user_access_source(user_id: int, payload: AccessSourceIn,
                            db: Session = Depends(get_crm_db),
                            user: CurrentUser = Depends(admin_only)):
-    """One source of access per user: role default, an Access Template, or a
-    custom role. Picking one clears the others."""
+    """Where a user's permissions come from: ONE custom role, or their built-in
+    roles (Access Templates were merged into Roles, 27 Oct 2026)."""
     before = audit.snapshot(db, user_id)
     out = svc.set_access_source(db, user_id, payload.kind, payload.id)
     audit.record(db, actor=user, action="user.access_source", target_user_id=user_id,

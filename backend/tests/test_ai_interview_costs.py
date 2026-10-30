@@ -343,6 +343,32 @@ def test_each_interview_adds_up_its_own_calls_and_nothing_else(seeded):
     assert rep["options"]["customers"] == [{"id": cust_id, "name": "HARMAN"}]
 
 
+def test_a_bad_row_or_a_failed_breakdown_never_takes_the_page_down(seeded, monkeypatch):
+    """27 Oct 2026 (production "Request failed (500)"): a NaN / Infinity cost and a
+    failing secondary lookup are absorbed — the page renders, JSON-safe."""
+    import json
+    db, crm, _ = seeded
+    _log(db, "IV-A", "evaluate_turn", "gpt-5.5", "2026-09-25", tin=1, cost=float("nan"))
+    _log(db, "IV-A", "evaluate_turn", "gpt-5.5", "2026-09-25", tin=2, cost=float("inf"))
+
+    def boom(*a, **k):
+        raise RuntimeError("model split broke")
+    monkeypatch.setattr(costs, "_per_interview_models", boom)
+    rep = costs.interview_cost_report(db, crm, date_from="2026-09-01", date_to="2026-09-30", today=TODAY)
+    json.dumps(rep, default=str, allow_nan=False)           # would raise on NaN / inf
+    assert rep["summary"]["interviews"] == 2 and rep["by_model"] == []
+
+
+def test_the_route_names_the_reason_when_the_report_fails(monkeypatch):
+    from fastapi import HTTPException
+    from routers.crm import ai_costs
+    monkeypatch.setattr(ai_costs, "interview_cost_report",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("relation missing")))
+    with pytest.raises(HTTPException) as exc:
+        ai_costs._report_or_reason(db=None, date_from=None)
+    assert exc.value.status_code == 500 and "RuntimeError: relation missing" in exc.value.detail
+
+
 @pytest.mark.parametrize("granularity, key, n_buckets", [
     ("day", "2026-09-25", 30), ("week", "2026-W39", 5), ("month", "2026-09", 1),
     ("quarter", "FY2026-Q2", 1), ("fy", "FY2026", 1),

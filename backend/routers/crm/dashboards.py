@@ -316,6 +316,33 @@ def ceo_dashboard(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.get("/ceo/drill/{metric}")
+def ceo_drilldown(
+    metric: str,
+    month: str | None = Query(None, description="YYYY-MM anchor; blank = current month"),
+    period: str | None = Query(None, description="month | quarter | fy (default fy)"),
+    customer_id: int | None = Query(None),
+    project_id: int | None = Query(None),
+    scope: str | None = Query(None, description="the chip the page opens on (e.g. overdue, bench)"),
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(role_required("Finance", "Sales", "Sales_Head")),
+):
+    """The page behind one CEO-dashboard tile (27 Oct 2026) — every invoice behind
+    "Billed", every payment and PO behind "Collected", every account, position
+    and person behind the other tabs. Same gate as `/ceo`: the Finance metrics are
+    open to Finance and the Sales family; Customer · Sales · People stay Admin / CEO."""
+    from services.ceo_drilldown import FINANCE_METRICS, METRICS, drilldown
+
+    key = (metric or "").strip().lower()
+    if key in METRICS and key not in FINANCE_METRICS and not user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the CEO / Admin can open this page")
+    try:
+        return envelope(drilldown(db, key, month, period, customer_id=customer_id,
+                                  project_id=project_id, scope=scope))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.get("/people")
 def people_dashboard(
     month: str | None = Query(None, description="YYYY-MM anchor; blank = current month"),

@@ -225,6 +225,55 @@ def test_a_brand_new_candidate_still_gets_an_employee(db):
     assert out.date_of_joining == date(2026, 9, 21)
 
 
+def test_a_new_joiner_gets_everything_hr_filled(db):
+    """28 Oct 2026, user report: a NEW joiner's Employees record lacked the
+    offer letter reference, customer onboarding date and relocation HR had
+    filled — only the existing-employee path applied the map."""
+    from models import Department, Designation
+    dept = Department(name="Engineering"); desig = Designation(name="Engineer")
+    db.add_all([dept, desig]); db.flush()
+    profile = _joined_profile(
+        db, employee_ref="335", official_email="anusha.p@karnex.in",
+        karnex_onboarding_date=date(2026, 10, 26), customer_onboarding_date=date(2026, 10, 28),
+        offer_letter_reference="HR/KARNEX/OL-060/2026", total_experience_years=1.1,
+        relocation_applicable=False, department_id=dept.id, designation_id=desig.id,
+    )
+    out = ensure_employee_for_joined_profile(db, profile)
+    db.commit(); db.refresh(out)
+    assert out.employee_code == "335" and out.email == "anusha.p@karnex.in"
+    assert out.date_of_joining == date(2026, 10, 26)
+    assert out.customer_onboarding_date == date(2026, 10, 28)
+    assert out.offer_letter_reference == "HR/KARNEX/OL-060/2026"
+    assert float(out.experience_years) == 1.1
+    assert out.relocation_applicable is False
+    assert (out.department_id, out.designation_id) == (dept.id, desig.id)
+    assert out.work_location == "Bangalore"          # the customer's location
+
+
+def test_0150_fills_only_blank_employee_columns(db):
+    """The backfill for joiners created before the fix never overwrites HR."""
+    import importlib.util, pathlib
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    profile = _joined_profile(db, offer_letter_reference="HR/OL/1",
+                              customer_onboarding_date=date(2026, 10, 28),
+                              karnex_onboarding_date=date(2026, 10, 26))
+    emp = Employee(first_name="Ganesh", email="g@karnex.in", candidate_profile_id=profile.id,
+                   profile_type=ProfileType.INTERNAL, date_of_joining=date(2026, 1, 1))
+    db.add(emp); db.commit()
+    path = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions" / \
+        "0150_backfill_joined_employee_fields.py"
+    spec = importlib.util.spec_from_file_location("m0150", path)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    conn = db.connection()
+    with Operations.context(MigrationContext.configure(conn)):
+        mod.upgrade()
+    db.commit(); db.refresh(emp)
+    assert emp.offer_letter_reference == "HR/OL/1"
+    assert emp.customer_onboarding_date == date(2026, 10, 28)
+    assert emp.date_of_joining == date(2026, 1, 1)   # already set — kept
+
+
 def test_an_internal_candidate_found_by_personal_email_is_updated(db):
     """29 Sep 2026: an internal candidate applied with their own address — the
     Employees record keeps it as the personal email, and HR typed no Emp ID.

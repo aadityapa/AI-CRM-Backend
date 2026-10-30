@@ -1,11 +1,12 @@
-"""Default Access-Template grants per CRM role (Phase C, 27 Aug 2026).
+"""Suggested tab permissions per built-in CRM role (Phase C, 27 Aug 2026).
 
 One dict per role, keys from services.access_registry.TABS, values from MODES.
-Seeded as templates named "Default — <Role>" (role-tagged, so users_admin's
-auto-assign picks them up for new users of that role). Admin/CEO need no
-template — they bypass the gate.
+They used to be seeded as "Default — <Role>" Access Templates; since the
+templates were merged into Roles (27 Oct 2026) they are the starting point the
+Roles page offers when an admin sets a built-in role's permissions
+("Start from the suggested permissions"). Admin/CEO need none.
 
-A tab OMITTED here means the role does not see it at all when templated.
+A tab OMITTED here means the role does not see it once configured.
 Pinned by tests/test_role_template_defaults.py so a registry rename can never
 silently orphan a grant.
 """
@@ -61,37 +62,3 @@ ROLE_TEMPLATE_DEFAULTS: dict[str, dict[str, str]] = {
         "branch-policy": "view",
     },
 }
-
-
-def seed_role_templates(db, *, overwrite: bool = False) -> dict:
-    """Create (or with overwrite=True, update) the six role-default templates.
-
-    Never touches a template an admin has customised unless overwrite is
-    explicit. Returns {role: "created" | "updated" | "kept"}.
-    """
-    from models import AccessTemplate
-
-    from sqlalchemy import select
-
-    out: dict[str, str] = {}
-    for role, tabs in ROLE_TEMPLATE_DEFAULTS.items():
-        name = f"Default — {role.replace('_', ' ')}"
-        existing = db.execute(
-            select(AccessTemplate).where(AccessTemplate.name == name)
-        ).scalars().first()
-        if existing is None:
-            t = AccessTemplate(name=name, tab_access=dict(tabs), field_access={},
-                               is_active=True)
-            if hasattr(t, "role"):
-                t.role = role
-            db.add(t)
-            out[role] = "created"
-        elif overwrite:
-            existing.tab_access = dict(tabs)
-            existing.is_active = True
-            if hasattr(existing, "role"):
-                existing.role = role
-            out[role] = "updated"
-        else:
-            out[role] = "kept"
-    return out

@@ -316,7 +316,7 @@ def enforce_roles(request: Request, *allowed: str, allow_admin: bool = True,
             return
         raise HTTPException(
             status_code=403,
-            detail=f"Your access template does not grant the '{tab}' tab"
+            detail=f"Your role does not grant the '{tab}' tab"
                    + ("" if mode == "view" else f" at {mode} level")
                    + " — ask Admin/CEO to enable it",
         )
@@ -392,7 +392,7 @@ def _template_verdict(db: Session, user: CurrentUser, tab: str,
         verb = {"view": "view", "edit": "edit records on", "create": "create records on"}
         raise HTTPException(
             status_code=403,
-            detail=f"Your access template does not let you {verb.get(required_mode, required_mode)} "
+            detail=f"Your role does not let you {verb.get(required_mode, required_mode)} "
                    f"the '{tab}' tab")
     return True
 
@@ -630,7 +630,7 @@ def gated_write_action(action: str, tab: str, *default_roles: str, field: str | 
             raise HTTPException(
                 status_code=403,
                 detail=f"You are not allowed to: {ACTIONS[action].label.lower()} — "
-                       "ask Admin/CEO to enable it in your access template or role",
+                       "ask Admin/CEO to enable it in your role (Access Control ▸ Roles)",
             )
 
         # MANAGE buttons (7 Oct 2026): a template / custom role that has an
@@ -651,7 +651,7 @@ def gated_write_action(action: str, tab: str, *default_roles: str, field: str | 
             raise HTTPException(
                 status_code=403,
                 detail=f"You are not allowed to: {ACTIONS[action].label.lower()} — "
-                       "ask Admin/CEO to enable it in your access template or role",
+                       "ask Admin/CEO to enable it in your role (Access Control ▸ Roles)",
             )
 
         verdict = _template_verdict(db, user, tab, "edit", field=field)
@@ -706,7 +706,7 @@ def require_access(tab: str, *, mode: str = "edit", field: str | None = None):
         elif not mode_satisfies(tab_mode, mode):
             raise HTTPException(
                 status_code=403,
-                detail=f"Your access template does not let you "
+                detail=f"Your role does not let you "
                        f"{'create records on' if mode == 'create' else 'edit'} the '{tab}' tab")
         return user
     return dep

@@ -33,6 +33,14 @@ class Role(Base):
     #: of `services/candidate_status.STAGES` keys; NULL = the role's default
     #: (`services/stage_access.default_stages`). Set from Access Control ▸ Roles.
     stage_access = sa.Column(sa.JSON, nullable=True)
+    #: The built-in role's OWN permissions (27 Oct 2026, migration 0149 — Access
+    #: Templates merged into Roles). Same shapes as `CustomRole`. NULL tab
+    #: access = not configured: the product's role rules decide, exactly as for
+    #: a role with no template before. NULL action access = the action role
+    #: lists decide. Admin / CEO are never configured (they bypass every gate).
+    tab_access = sa.Column(sa.JSON, nullable=True)
+    field_access = sa.Column(sa.JSON, nullable=True)
+    action_access = sa.Column(sa.JSON, nullable=True)
 
 
 class UserRole(Base):

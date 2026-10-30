@@ -1,4 +1,6 @@
-"""Access templates are AUTHORITATIVE for assigned users (Aug 2026 redesign).
+"""Role permissions are AUTHORITATIVE for the people holding them (Aug 2026
+redesign; Access Templates merged into Roles on 27 Oct 2026 — `_assign_template`
+now gives a role carrying the grants).
 
 The old model ran role gates first and let templates only narrow them — which
 meant "give Sales edit on Projects" in a template did nothing. The new model,
@@ -57,7 +59,7 @@ for _m in [
     importlib.import_module(f"models.{_m}")
 
 from models.base import Base  # noqa: E402
-from models import AccessTemplate, UserProfile  # noqa: E402
+from models import UserProfile  # noqa: E402,F401
 import crm_deps  # noqa: E402
 from services.access_registry import FIELDS_BY_TAB, TABS, mode_satisfies  # noqa: E402
 
@@ -141,13 +143,10 @@ def _user(uid: int, *roles: str) -> crm_deps.CurrentUser:
     return crm_deps.CurrentUser(id=uid, username=f"u{uid}", roles=set(roles))
 
 
-def _assign_template(db, uid: int, tab_access: dict, is_active: bool = True) -> None:
-    t = AccessTemplate(name=f"T{uid}", tab_access=tab_access, field_access={},
-                       is_active=is_active)
-    db.add(t)
-    db.flush()
-    db.add(UserProfile(user_id=uid, access_template_id=t.id))
-    db.commit()
+def _assign_template(db, uid: int, tab_access: dict, is_active: bool = True):
+    """Since 27 Oct 2026 a role carries the permissions a template used to."""
+    from tests.role_grants import give_role
+    return give_role(db, uid, tab_access, is_active=is_active)
 
 
 # ------------------------------------------------- untemplated = role defaults
@@ -217,16 +216,10 @@ def test_field_guard_rejects_view_only_fields(db):
     view-only cannot be saved, even when the tab itself allows edit."""
     from fastapi import HTTPException
 
-    from models import AccessTemplate, UserProfile
     from services.access_templates import reject_view_only_fields
+    from tests.role_grants import give_role
 
-    t = AccessTemplate(name="TA", is_active=True,
-                       tab_access={"profiles": "edit"},
-                       field_access={"profiles": {"approved_ctc": "view"}})
-    db.add(t)
-    db.flush()
-    db.add(UserProfile(user_id=1, access_template_id=t.id))
-    db.commit()
+    give_role(db, 1, {"profiles": "edit"}, {"profiles": {"approved_ctc": "view"}})
 
     field_map = {"current_ctc": "current_ctc", "ctc_approval_amount": "approved_ctc",
                  "commercial_approved": "approved_ctc"}
@@ -258,16 +251,10 @@ def test_field_guard_ignores_unrestricted_users(db):
 def test_field_guard_field_grant_can_unlock_beyond_view_tab(db):
     """A field granted edit works even when the tab is only view — the field
     grant wins over the tab mode, both to lock AND to unlock."""
-    from models import AccessTemplate, UserProfile
     from services.access_templates import reject_view_only_fields
+    from tests.role_grants import give_role
 
-    t = AccessTemplate(name="Viewer+", is_active=True,
-                       tab_access={"candidates": "view"},
-                       field_access={"candidates": {"phone": "edit"}})
-    db.add(t)
-    db.flush()
-    db.add(UserProfile(user_id=3, access_template_id=t.id))
-    db.commit()
+    give_role(db, 3, {"candidates": "view"}, {"candidates": {"phone": "edit"}})
 
     reject_view_only_fields(db, 3, {"TA"}, "candidates",
                             {"phone": "+911234567890"}, {"phone": "phone"})
@@ -282,7 +269,7 @@ def test_an_approval_action_needs_the_templates_approvals_not_the_tab_edit(db, m
     from services import action_permissions as ap
 
     monkeypatch.setattr(ap, "roles_for_action", lambda action, defaults: list(defaults))
-    _assign_template(db, 1, {"timesheets": "edit"})
+    role = _assign_template(db, 1, {"timesheets": "edit"})
     app = FastAPI()
 
     @app.post("/approve", dependencies=[Depends(
@@ -296,8 +283,7 @@ def test_an_approval_action_needs_the_templates_approvals_not_the_tab_edit(db, m
     # Tab Edit alone: refused (Approvals never configured → role list = GM).
     assert client.post("/approve").status_code == 403
     # The template ticks the approval → allowed, whatever the role.
-    t = db.get(AccessTemplate, db.query(UserProfile).filter_by(user_id=1).one().access_template_id)
-    t.action_access = ["timesheet.approve"]
+    role.action_access = ["timesheet.approve"]
     db.commit()
     assert client.post("/approve").status_code == 200
 
@@ -311,7 +297,7 @@ def test_saving_a_template_with_removed_tab_keys_succeeds(db):
     (This test originally used "requirements" as the removed key; that tab was
     RE-ADDED to the registry on 25 Aug 2026, so a genuinely unknown key stands
     in for the removed-tab scenario now.)"""
-    from services.access_templates import create_template, update_template
+    from services.custom_roles import create_role as create_template, update_role as update_template
 
     created = create_template(db, {
         "name": "Legacy Sales",
@@ -319,7 +305,7 @@ def test_saving_a_template_with_removed_tab_keys_succeeds(db):
                        "opportunities": "view"},
         "field_access": {"zoho-legacy": {"jd": "edit"},
                          "opportunities": {"skills": "edit"}},
-    })
+    }, None)
     assert "zoho-legacy" not in created["tab_access"]
     assert created["tab_access"]["customers"] == "create"
     assert "zoho-legacy" not in created["field_access"]

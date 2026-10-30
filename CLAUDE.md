@@ -1,5 +1,179 @@
 # CLAUDE.md — Karnex backend (AI-Interview-Model-B-V2)
 
+## 0. Project at a glance — READ FIRST, UPDATE ON EVERY CHANGE
+
+> **Standing rule (user, 29 Oct 2026):** every change or update to either repo must also update this §0. Do this in
+> the same session: move items between *Made* and *Remaining*, add any new decision, bump the "State" line, and keep
+> the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
+> short copy and points here. Keep both in step.
+
+**Last updated:** 29 Oct 2026 (clickable charts). **State:** migration head **0150**. Backend suite ~2,250 pass, 3 skipped; the known
+failure is `test_public_invoice_qr`. Dashboard `tsc` is green. Nothing is committed since `dd61630`, so **commit the
+working tree.**
+
+### What the project is
+
+**Karnex Orbit** is the product. Karnex is the company: a staffing firm placing engineers (automotive, embedded,
+Android) at customers. One application runs the company's whole hiring-to-billing chain:
+
+1. **AI Interview Platform.**
+   - A candidate opens an invite link on a laptop with the camera on and the entire screen shared.
+   - An AI interviewer asks spoken, pseudo-code and coding questions, with follow-ups and live voice.
+   - The interview is proctored (face count, looking away, focus) and recorded (camera + screen).
+   - It is scored per question with the evidence behind each score, and it produces a report.
+   - A recruiter can join live.
+2. **Karnex CRM / ERP.** The deal runs through every role:
+   - Customers → opportunities → positions (requirements) → sourcing.
+   - Sourcing covers the Talent Pool, resumes, ATS and opening emails.
+   - RMG / GM screen on the Screening Desk. Interviews: AI L1, technical L1 / L2, customer rounds and HR.
+   - Sales Head approves the terms; HR handles pre-onboarding; the candidate joins as an employee.
+   - Projects and timesheets → the GM raises a Proforma → Finance issues the tax invoice → the customer approves →
+     IRN / e-invoice → received amounts and TDS → revenue / CEO dashboards.
+
+Roles:
+- Built-in: CEO, Admin, Sales, Sales Head, RMG, TA, HR, Finance.
+- Custom: GM, Sales Manager, Interviewer, Hiring Manager, and any role Admin creates.
+
+### Stack
+
+| Layer | What |
+| --- | --- |
+| Backend | Python, **FastAPI** monolith (`backend/main.py` + `routers/crm/*`), uvicorn (1 worker unless `REDIS_URL`) |
+| CRM data | **PostgreSQL**, SQLAlchemy 2.0, **Alembic** (linear chain, head 0150) |
+| Interview data | `auth_db.py` raw SQL, dual dialect (SQLite dev / Postgres prod), startup `ALTER`s, no Alembic |
+| AI | OpenAI. Text calls: **GPT-6 Astra** (interview) and **GPT-5.5** (everything else); gpt-4o-mini is retired for text. Voice: gpt-4o-mini-tts. Speech-to-text: gpt-transcribe. Live voice: gpt-realtime. All text calls go through `prompt_logger.tracked_chat_completion` and are priced in AI Costs. |
+| Files / media | Local driver or **S3** (boto3) for recordings and uploads; ffmpeg (imageio-ffmpeg) joins camera + screen |
+| Documents | WeasyPrint / reportlab (PDF), python-docx (Word), openpyxl (Excel) |
+| Frontend | React 18 + Vite 5 + TypeScript + Tailwind 3 + recharts (`/admin` dashboard). The candidate runtime is vanilla ES modules (`/`), with MediaPipe Face Landmarker self-hosted. See F-V2 `CLAUDE.md`. |
+| Ops | Windows dev `start_app.bat` (:2020). Production: Linux + nginx + `karnex-rolling-restart` + RDS Postgres. docker-compose exists. No CI. |
+
+### Decisions that hold (newest wins; details in the dated notes)
+
+**Access**
+- **Roles carry permissions.** Access Templates were merged into Roles (0149). A user's access is the sum of the roles
+  they hold; a role alone lets a login into the CRM.
+- Approvals are their own grant (`action_permissions.user_may`). A tab grant never implies an approval.
+- Candidate stages visible per role are set on Access Control ▸ Roles (0133).
+- The Hiring Manager sees only assigned positions.
+- Interviewers see only their own rounds.
+
+**Candidate flow**
+- An upload waits at **Sourcing** until TA presses Technical Screening.
+- RMG / GM choose the AI or manual L1; TA schedules it.
+- The AI verdict is advice: the screener decides, and a reject closes the candidacy.
+- The opening "are you interested?" email is **manual only**. Archive is manual, except that a held deal parks its
+  candidates.
+- Status is **derived** (`services/candidate_status.py`), never stored, and it is the same on every screen.
+
+**AI interviews**
+- A template decides the timing, the mix and the follow-ups; the schedule's copy never overrides it.
+- Count mode has no clock.
+- Laptop / PC only. Camera is mandatory. Entire screen is shared.
+- The 10th look-away warning ends the interview.
+- Conversation features are opt-in per template.
+
+**Billing**
+- PO drawn by the value **before GST**.
+- Money moves only at Proforma → Tax conversion. A Proforma is never counted as revenue.
+- A part month bills days × per-day.
+- Timesheet periods may cross months.
+- A sheet may be split across POs by dates or by amount.
+- Issued invoices keep the address they were raised with (0143); Finance corrects it explicitly.
+- Payments are blocked until the customer approves and the IRN is recorded.
+- TDS settles the invoice and is followed as "pending from client".
+- Data window: work months from `billing.data_start_month` (default 2026-03).
+
+**UI rules**
+- Customer pickers list active customers only. Name lookups use `/api/customers/names`.
+- CEO dashboard charts are grouped bars with filter ticks; nothing is stacked.
+- Every dashboard bar opens the records behind it (29 Oct 2026):
+  - CEO tabs → the drill page for that month, customer or series.
+  - Billing Tracker → its own table, narrowed.
+  - Other roles → their own lists.
+
+**Engineering rules**
+- Envelope responses.
+- `gated_*` dependencies.
+- Savepoint around every best-effort DB block.
+- Literal routes are declared before parametric ones.
+- Never re-import a module-level name inside a function.
+- No bare `%` in raw SQL on psycopg2.
+
+### Made (in production code, uncommitted where noted)
+
+**Interview platform**
+- Invite flow with device binding, scheduling and reminders.
+- Skill bank: spoken, pseudo-code and coding questions in any language.
+- Two-way conversation and live voice.
+- Proctoring, recording and live join.
+- Per-question evidence scoring, re-score, L2 question suggestions.
+- AI Costs.
+
+**CRM**
+- Customers, branches and policies; rate cards and CTC slab.
+- Opportunities, positions, headcount changes.
+- Sourcing: Talent Pool (search, synonyms, saved searches, retention / opt-out), resume library, apply link, ATS v2.
+- Screening Desk.
+- Interview ladder and My Interviews.
+- Sales / Sales Head / HR flows.
+- Hiring Manager.
+- Employees and separation.
+
+**Projects and billing**
+- Projects and closure; leave and comp-off.
+- Timesheets (cross-month, import Excel / PDF).
+- Proforma → Tax, split POs, round off, e-invoice + IRN, customer approval.
+- Received amounts with proof / TDS / later mapping.
+- Address snapshot; customer Activity Log.
+
+**Insight**
+- Revenue report v3, CEO dashboard (5 tabs + drill pages), Billing Tracker, hiring control tower.
+- Clickable charts on every dashboard tab and drill page.
+- Role work desks / My Tasks with filters.
+- Reports: recruiter productivity, invoice summary.
+
+**Platform**
+- Roles & permissions, audit log, forced password change, backup, support tickets.
+- Notifications with editable email flows.
+
+### Remaining / open
+
+1. **Commit both repos.** The work since mid-Aug lives only in the working tree. Add `.gitattributes` to stop the CRLF
+   churn.
+2. **Security, interview side** (§10):
+   - A1–A3: invite login trusts `session_status`; `/verify` re-binds a device; email-only verify.
+   - A5 `/report` ownership.
+   - A9 `/proctor/*` ownership.
+   - A10: auth failures answered as 200.
+   - C3 `/setup` lock.
+3. **Need a decision:**
+   - D: two security-header middlewares.
+   - E: CORS fallback; set `CORS_ALLOW_ORIGINS`.
+   - 8.3: manual invoice `sub_total` override.
+   - 8.9: masters create-but-not-edit.
+   - P2: appraisal-cycle rounding.
+   - F12: the old `crm/taxInvoice/` generator.
+4. **Known gaps:**
+   - Dashboards / revenue treat a part-billed sheet as invoiced.
+   - The revenue report groups by the project's customer, not the PO's.
+   - `/apply` + `/book` are missing from the frontend proxy lists (P0).
+   - P1: the CTC hours cap is client-only.
+   - Optimistic concurrency exists on Opportunity only (8.2).
+   - The IRP signed QR is not stored.
+5. **Hygiene:**
+   - Delete dead code in §6.
+   - Rewrite stale tests.
+   - Add CI (none exists).
+   - Add a route-order test.
+   - Wire the contrast check.
+6. **Not built:**
+   - Answer-timing anomaly in integrity.
+   - Candidate PII encryption at rest.
+   - Data-retention / candidate delete outside the Talent Pool.
+   - Reasoning-tokens column in AI Costs.
+
+---
+
 Working notes for AI assistants. **Rewritten 18 Aug 2026** from a full mechanical scan of
 both repos (endpoint extraction, model/table counts, migration-chain walk, full test run,
 cross-repo parity diff). Numbers below were measured, not remembered.
@@ -43,7 +217,7 @@ resolved by `paths._resolve_frontend_dir()` (`FRONTEND_DIR` env → `<repo>/fron
 **Working tree, 8 Sep 2026:** branch `main`, head **`dd61630`**, ~90 modified + 63 untracked paths,
 none committed. `git status` is dominated by CRLF churn — review with `git diff --ignore-all-space`.
 
-**Migration head is now 0148** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
+**Migration head is now 0150** (was 0097 on 8 Sep; see the dated notes below) (`0080`…`0097` are untracked files under `alembic/versions/`).
 Deploying REQUIRES `alembic upgrade head` before serving traffic — the ORM maps columns from every
 one of them. Tests: **1034 pass**, 2 stale pins fail (`test_full_pipeline_flow::test_ai_l1_can_only_be_triggered_by_ta`,
 `test_pipeline_tail::test_no_other_stage_has_a_hidden_precondition`) plus the §9 known set.
@@ -4050,6 +4224,144 @@ branch of the customer, each with its ready buyer / shipping form) and `po_billi
 fixes ISSUED invoices only — new invoices on that PO still take the PO's billing branch (`resolve_billing_branch`), so
 change the PO's billing branch on the PO too; an IRN already registered with the wrong address is fixed on the GST portal.
 **Later the same day:** the same dialog can move the PO — `InvoicePartiesIn.move_po_to_branch` → `invoice_parties.move_po_to_branch(db, invoice, branch_id)` sets the PO's billing branch (and its delivery branch when it was blank or the old billing branch), refuses a foreign branch / no PO / no branch (400), logs `BILLING_BRANCH_CHANGED` on the PO and `PO_BRANCH_CHANGED` on the customer's Activity Log. The PO's typed address snapshot is left as it was. `test_invoice_address_snapshot` now 6.
+
+**26 Oct 2026 (later) — Returned Proformas as a work-desk tile (`test_work_desk` +1; no migration):** user ask — the
+Dashboard panel became a tile. `work_desk._returned_pi_tab` (`RETURNED_PI_TAB = "returned_pi"`, builder after the
+Finance tabs, for every login `returned_proformas.may_see` admits; ALWAYS present — at zero it reads "All clear" /
+"None", because a hidden tile was reported as "I don't see the tab") reshapes
+`returned_proformas.board` rows into desk items (chip = whose move, tone by step), link `my-tasks?tab=returned_pi`,
+`info` for a login that can neither reopen nor reissue (Finance). Admin / CEO keep `CEO_TABS` only.
+`GET /api/dashboard/returned-proformas` is unchanged — the My Tasks tab renders the board from it.
+
+**26 Oct 2026 (night) — a template tagged with a CUSTOM role (`tests/test_custom_roles.py` +5; no migration):**
+reported after the deploy — Access Templates ▸ "Hiring Manager" ▸ Assign to Raju Gaikwad answered **400**. Raju's only
+role was the custom role Hiring Manager, and `users_admin.ensure_role_for_template` accepted only a BUILT-IN tag as the
+role that keeps a user in the CRM, so it refused; had it gone through, `assign_template` →
+`remove_user_from_all_roles` would have stripped the role that makes him a Hiring Manager (`hm_scoped`). Now:
+`custom_roles.active_role_by_name` resolves the tag (case-insensitive, active only); a tagged custom role is GIVEN to a
+user with no built-in role (`add_user_to_role`, reported as `role_added`) and KEPT by `assign_template`
+(`remove_user_from_all_roles(..., keep=)`), other custom roles still go. A template and the custom role it is tagged
+with may coexist — the template decides the tabs (`effective_access` reads it first). `set_members` no longer clears
+a template tagged with that role; `set_user_roles` (Edit Roles) clears the template only when a NEWLY added role is not
+the template's tag (before, ANY save on a user holding a custom role dropped the template); the Users-tab "Tabs from"
+choice of a role still clears it explicitly (`set_access_source`). Same fix covers GM, Sales Manager and Interviewer
+templates, via both Access Templates ▸ Assign and Users ▸ Tabs from. Suite: 2,248 pass, 3 skipped.
+
+**27 Oct 2026 — AI Costs never 500s blind; a drill-down page behind every CEO tile; Billing Tracker summary
+(`tests/test_ceo_drilldown.py` 9, `test_ai_interview_costs` +2; no migration):** (1) **AI Costs** answered a bare
+"Request failed (500)" on production (could not be reproduced locally). `services/ai_interview_costs`: `_num()` turns
+NULL / NaN / inf costs into 0 (a NaN reached `json.dumps` → 500), the model split and the "other spend" lookups run
+through `_optional` (logged WARNING with traceback + rollback, the page still answers), the CRM context lookup sits in
+a savepoint. `routers/crm/ai_costs._report_or_reason` logs any remaining failure with its traceback and answers
+`500 {"detail": "Could not build the AI cost report (<Type>: <msg>)"}` — the CRM client prints `detail`, so the next
+failure names itself on the page. (2) **`services/ceo_drilldown.py`** — `drilldown(db, metric, month, period,
+customer_id=, project_id=, scope=)` → ONE shape for every page (`kpis` · `charts[{rows, series[{key,label,tone,stack,
+off}], layout, format}]` · `segments` (chips over `tables[0]`, count + amount) · `default_segment(s)` · `tables[{columns
+[{key,label,format,link}], rows, total, truncated}]` (≤ `MAX_TABLE_ROWS`=2000) · `related` · `notes`). `METRICS`:
+Finance (also open to Finance / Sales family — `FINANCE_METRICS`) **billed** (every Tax invoice dated in the period via
+`load_invoices`: `billing_rules.stage_of_invoice`, received = cash + TDS, effective due + days late, PO, work month /
+employee / branch from `invoice_facets`; adds up to the tile — project's customer, `sub_total`, no Proformas) ·
+**collected** (every `InvoicePayment` in the period with invoice, PO, mode, days to pay, on time / late; a second table
+of the POs behind the cash via `_po_rows`; a third of receipts still on account) · **outstanding** / **overdue** (open
+invoices up to the period end, late buckets, when the money should land) · **margin** (from `executive_dashboard._customer`:
+customer / project / person, worst first) · **target** (per month vs `revenue.target.*`) · **dso** (per customer) ·
+**po** (every PO: renew soon ≤ `PO_RENEW_DAYS`=60 or ≥ 90 % used / expired / healthy / used up, customer cover = live
+balance ÷ today's burn). Customer: **customers** (growing / new / steady / shrinking / no billing, ±`CUSTOMER_MOVE_PCT`=10)
+· **deployed**. Sales: **positions** (`scope` brought_in / open / stale / filled) · **onboarded** · **stages**. People:
+**headcount** (`scope` deployed / bench) · **joiners** · **exits** (left + on notice) · **rolloffs**. Every builder REUSES
+the dashboard's loaders (`_customer`, `_sales`, `_people`, `revenue_report`) — no second rule. Route **`GET
+/api/dashboard/ceo/drill/{metric}?month=&period=&customer_id=&project_id=&scope=`** (`routers/crm/dashboards.ceo_drilldown`):
+same gate as `/ceo` (`role_required("Finance","Sales","Sales_Head")`; a non-Finance metric is Admin / CEO only — 403);
+unknown metric / bad period → 400. (3) **Billing Tracker**: `meta.summary` = PURE `billing_tracker.tracker_summary(rows)`
+over the SAME filtered rows the chips count — tiles (to raise · with the customer · payment due · overdue · paid · TDS ·
+average wait), `by_month` (counts per `SUMMARY_GROUPS`), `late` (balance per bucket), top-10 `customers`. Deploy: restart.
+
+**27 Oct 2026 (later) — Access Templates merged into Roles, migration 0149, head is now 0149
+(`tests/test_role_permissions.py` 18 — replaces `test_access_templates.py`; `tests/role_grants.py` helper;
+`test_custom_roles` / `test_access_template_authority` / `test_approval_permissions` / `test_access_enforcement` /
+`test_template_tabs_and_buttons` / `test_my_work` / the two notification suites re-pinned):** user decision "yes do it" —
+two screens edited the same kind of thing. **Every role now holds its own permissions.** (1) `models.rbac.Role` gains
+`tab_access / field_access / action_access` (NULL tab map = not configured: the product's role rules, nothing restricts its
+holders). (2) ⚠️ **`services/access_templates.effective_access` reads ROLES only** — `_held_role_rows` (built-in roles the
+user HOLDS, Admin/CEO excluded, + active custom roles; two savepointed queries) → PURE `merge_role_grants`: tabs/fields add
+up (higher rung wins; a sub-tab one role shows stays shown); buttons = None when no held role carries an explicit list (the
+action role lists decide), else the union of the lists plus, for a custom role with none, its name's defaults; the per-user
+override still wins on top. A stray `user_profiles.access_template_id` is IGNORED. `source` is `role` · `role+override` ·
+`override` · `role_default` (was `template` / `custom_role`); `template_id` stays in the payload, always None. The module
+keeps its name (every gate imports `effective_access` / `reject_view_only_fields` from it); template CRUD + `assign_template`
+are GONE, `_custom_role_grants` is an alias of `role_grants`. (3) `services/custom_roles`: `CONFIGURABLE_BUILTIN` (not
+Admin/CEO), `set_builtin_permissions(db, name, payload|None)` (≥ 1 tab, unknown keys dropped, `action_access` null = follow
+the lists; does not commit), `builtin_permissions_payload` (`configurable · configured · tab/field/action_access ·
+suggested_tab_access` from `role_template_defaults.ROLE_TEMPLATE_DEFAULTS`, now "suggested permissions"), `builtin_members`;
+`list_roles` builtin rows carry them. Template interplay removed from `set_members` / `set_user_roles` /
+`remove_user_from_all_roles` (`_clear_template`, `_template_tag` deleted). Routes (`routers/crm/custom_roles.py`, Admin/CEO):
+`GET /api/roles/registry` (the catalogue + `suggested`), `GET /api/roles/builtin/{name}/members`, `PUT` / `DELETE
+/api/roles/builtin/{name}/permissions` (audited `role.updated`). `routers/crm/access_templates.py` keeps ONLY `GET
+/api/access-templates/registry` (same `registry_payload`) for older dashboards. (4) `users_admin`: `_auto_assign_role_template`,
+`ensure_role_for_template`, `_template_map` and the rows' `access_template_id` are gone; `set_access_source` takes `role`
+(one custom role) or `default` (built-in roles decide) — `template` answers 400 "merged into Roles". `access_audit.snapshot`
+drops the template (old `user.template` / `template.*` log rows keep their labels). Gate messages say "Your role does not
+grant / let you …". `schemas/access_templates.py`, `scripts/seed_role_templates.py` and `seed_role_templates()` deleted;
+`scripts/diagnose_access.py` prints each held role's permissions. (5) **0149** adds the three columns and moves every
+ASSIGNED, ACTIVE template onto a role with a frozen PURE planner (`plan`, `role_name_for`): tagged with a built-in role X →
+X's own permissions (most assignees wins; covers assignees HOLDING X — ⚠️ it then applies to every holder of X, including
+those who had no template); tagged with a custom role R whose every member had it → R's permissions; anything else → a new
+custom role named after the template ("Default — Sales" → "Default - Sales", a clash adds " access") with those assignees as
+members. Inactive / unassigned / tab-less templates are not converted; every `access_template_id` is cleared; the
+`access_templates` table stays as read-only history; the run prints a `[0149]` line per template. Combining roles can only
+WIDEN someone (never narrows) — except holders of X who had no template. Downgrade drops the columns only. Deploy:
+`python -m alembic upgrade head` (0149), restart, rebuild F-V2; read the `[0149]` lines and check Access Control ▸ Roles &
+permissions. Suite: green in eight chunks (the known `test_public_invoice_qr` failure only).
+
+**28 Oct 2026 — a new joiner's Employees record carries everything HR filled, migration 0150, head is now 0150
+(`tests/test_joined_employee_sync.py` +2):** screenshot report — the Employee page lacked the offer letter reference /
+customer onboarding date HR had entered at Pre-Onboarding. ⚠️ `ensure_employee_for_joined_profile` applied
+`_PROFILE_TO_EMPLOYEE` only when an Employees row ALREADY existed; a brand-new joiner got department / designation /
+joining date / CTC and nothing else (experience from the candidate, work location from the candidate's city).
+`candidate_profiles.apply_profile_to_employee(emp, profile)` is now the ONE map both paths call (only fields HR filled;
+the opportunity's Work Location wins). **0150** fills BLANK employee columns of rows linked by `candidate_profile_id`
+from their profile (portable correlated-subquery UPDATEs, `[0150]` lines; never overwrites). `EmployeeUpdate` accepts
+`offer_letter_reference`, `customer_onboarding_date`, `relocation_applicable` (HR corrects them on the Employee page).
+The Department / Designation "Select…" on a Joined profile was the CLIENT: the masters only loaded while the block was
+editable (F-V2 notes). The Employee page no longer shows Current CTC (F-V2); the server still stores it. Deploy:
+`python -m alembic upgrade head` (0150), restart, rebuild F-V2.
+
+**28 Oct 2026 (later) — the Billed page's monthly chart reads like "Who we billed" (`test_ceo_drilldown` +5
+assertions; no migration):** user ask with a screenshot — the stacked-by-stage chart was hard to read. `m_billed`'s first
+chart is now "Billed month by month": grouped columns Billed (excl. GST) · Received · Still due · Overdue per month
+(`ceo_drilldown._month_sums`, by invoice date, the same money basis as "Who we billed"); months that have not started are
+left off, so a running FY is not half empty. Where each invoice stands stays in the "Where the money stands" chart and the
+table's chips. No frontend change. Deploy: restart.
+
+**28 Oct 2026 (later still) — every drill-page tile is clickable (`test_ceo_drilldown` +assertions; no migration):**
+`ceo_drilldown.kpi(..., go=)` — what clicking the tile shows: `segments` (main-table chips, `[]` = all), `where` (keep rows
+whose field is non-zero), `sort` (largest first), or `metric` (+ `scope`) to open another drill page. The Billed page sets
+all six: Billed → all, by sub_total · GST → `tax` (new GST column, `_with_gst_column`) · Received → `received` · Still to
+collect → `balance` · Of which overdue → `overdue_amount` (a public row field now) · Fully paid → the `paid` chip; the test
+pins that each filtered set adds up to its tile. A tile with no `go` shows the whole main table (F-V2). Deploy: restart +
+rebuild F-V2.
+
+**29 Oct 2026 — every dashboard bar opens the data behind it (`test_ceo_drilldown` +1, `test_billing_tracker` +1
+assertions; no migration):** a screenshot report showed that clicking a chart did nothing. The work is mostly in F-V2;
+these are the server pieces.
+- **Month keys on drill charts:** every month-by-month chart row of `services/ceo_drilldown.py` carries `key`
+  (YYYY-MM): margin, target, positions, headcount, deployed, joiners and exits. A bar on a drill page then zooms that
+  page to the month.
+- **Headcount as of the period's end:** ⚠️ `m_headcount` now reads AS OF the period's end (`as_of = min(today,
+  period.end)`).
+  - A past month lists who was on the rolls then.
+  - "Deployed" is decided by the `_deployed_rows` start / exit rule, which the People tab's month-end figures use too.
+  - So a "Jun 26 · Deployed 40" bar opens a page of 40.
+  - The current period still uses `deployment_by_employee` for today.
+  - The title / question names the date ("Deployed on 30 Jun 2026").
+- **Billing Tracker stage groups:** `services/billing_tracker.GROUP_STAGES` (to_raise · with_customer · due) are
+  accepted as `stage` (`STAGE_GROUPS` now includes them). A "How the work moved" bar therefore lists exactly what it
+  counted.
+- **Customer ids on chart rows:** the tracker summary's `customers` rows carry `customer_id`.
+- **Role dashboards:** `services/dashboards.py` adds `requirement_id` to the RMG sourcing-pipeline rows and `id` to
+  Finance's `po_consumption`, so those bars open the position or the PO.
+
+Deploy: restart.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

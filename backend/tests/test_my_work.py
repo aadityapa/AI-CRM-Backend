@@ -114,15 +114,11 @@ def test_zero_counts_are_dropped_and_all_clear_reported(db):
 
 
 def test_template_hides_items_for_hidden_tabs(db):
-    from models import AccessTemplate, UserProfile
+    from tests.role_grants import give_role
 
     _seed_pending_work(db)
-    # RMG user whose template shows only candidates — timesheets tab hidden.
-    t = AccessTemplate(name="Narrow", is_active=True, tab_access={"candidates": "edit"})
-    db.add(t)
-    db.flush()
-    db.add(UserProfile(user_id=1, access_template_id=t.id))
-    db.commit()
+    # RMG user whose role permissions show only candidates — timesheets tab hidden.
+    give_role(db, 1, {"candidates": "edit"}, name="Narrow")
 
     out = my_work(db, _user("RMG"))
     assert not any(i["key"] == "timesheets_to_approve" for i in out["items"]), \

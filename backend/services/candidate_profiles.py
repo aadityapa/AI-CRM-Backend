@@ -1469,6 +1469,34 @@ _PROFILE_TO_EMPLOYEE: tuple[tuple[str, str], ...] = (
 _KEEP_FALSE = frozenset({"relocation_applicable", "total_experience_years"})
 
 
+def apply_profile_to_employee(emp, profile: CandidateProfile) -> list[str]:
+    """Copy what HR entered before Joined onto an Employees row — the ONE rule
+    both the new-employee and the existing-employee paths use (28 Oct 2026,
+    user report: a NEW joiner's Employees record was missing the offer letter
+    reference, customer onboarding date and relocation HR had filled, because
+    only the existing-employee path applied this map). Only fields HR filled
+    are written; the opportunity's Work Location becomes the work location.
+    Returns the employee columns written."""
+    written: list[str] = []
+    for src, dest in _PROFILE_TO_EMPLOYEE:
+        if not hasattr(emp, dest):
+            continue          # column not migrated yet — skip, never crash a join
+        value = getattr(profile, src, None)
+        blank = value is None if src in _KEEP_FALSE else not value
+        if blank:
+            continue
+        setattr(emp, dest, value)
+        written.append(dest)
+    # Where the customer wants them — the opportunity's Work Location, the same
+    # string the profile screen shows read-only. Never overwritten with a blank.
+    if hasattr(emp, "work_location"):
+        site = _opportunity_location(getattr(getattr(profile, "opportunity", None), "details", None))
+        if site:
+            emp.work_location = site[:120]
+            written.append("work_location")
+    return written
+
+
 def _sync_employee_from_joined_profile(db: Session, emp, profile: CandidateProfile,
                                        candidate: Candidate, offer) -> None:
     """Re-hire / internal placement (11 Sep 2026): copy what HR entered before
@@ -1483,27 +1511,13 @@ def _sync_employee_from_joined_profile(db: Session, emp, profile: CandidateProfi
         emp.candidate_profile_id = profile.id
     emp.is_active = True
 
-    for src, dest in _PROFILE_TO_EMPLOYEE:
-        if not hasattr(emp, dest):
-            continue          # column not migrated yet — skip, never crash a join
-        value = getattr(profile, src, None)
-        blank = value is None if src in _KEEP_FALSE else not value
-        if blank:
-            continue
-        setattr(emp, dest, value)
+    apply_profile_to_employee(emp, profile)
 
     # HR's offered CTC (0116) wins over the Sales Head-approved terms.
     from services.hr_offer import employee_ctc
     ctc = employee_ctc(profile, offer)
     if ctc:
         emp.current_ctc = ctc
-
-    # Where the customer wants them — the opportunity's Work Location, the same
-    # string the profile screen shows read-only. Never overwritten with a blank.
-    if hasattr(emp, "work_location"):
-        site = _opportunity_location(getattr(getattr(profile, "opportunity", None), "details", None))
-        if site:
-            emp.work_location = site[:120]
 
     # Emp ID and official email are UNIQUE, so each needs a clash check before
     # it is written — a collision would 500 the whole join.
@@ -1661,6 +1675,10 @@ def ensure_employee_for_joined_profile(db: Session, profile: CandidateProfile,
             personal_email=(candidate.email or None),
             employee_code=(emp_ref[:32] or None),
         )
+        # Everything else HR filled before Joined (offer letter ref, customer
+        # onboarding date, relocation, HR-verified experience, the customer's
+        # work location) — the same map the existing-employee path applies.
+        apply_profile_to_employee(emp, profile)
         db.add(emp)
         db.flush()
         return emp

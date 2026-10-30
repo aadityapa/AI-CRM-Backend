@@ -316,6 +316,7 @@ def rmg_dashboard(db: Session) -> dict:
 
     pipeline = [
         {
+            "requirement_id": req_id,     # 29 Oct 2026 — a bar opens this position
             "req_number": req_number,
             # ONE id rule (18 Aug 2026): the opp_id is what humans see.
             "opp_id": opp_ids_by_req.get(req_id),
@@ -464,16 +465,18 @@ def finance_dashboard(db: Session) -> dict:
             PurchaseOrder.total_value,
             PurchaseOrder.consumed_value,
             PurchaseOrder.balance_value,
+            PurchaseOrder.id,
         )
         .where(PurchaseOrder.status == POStatus.ACTIVE)
         .order_by(PurchaseOrder.total_value.desc())
         .limit(20)
     ).all()
     po_consumption = []
-    for po_number, total_value, consumed_value, balance_value in po_rows:
+    for po_number, total_value, consumed_value, balance_value, po_id in po_rows:
         total = _num(total_value)
         consumed = _num(consumed_value)
         po_consumption.append({
+            "id": po_id,                  # 29 Oct 2026 — a bar opens this PO
             "po_number": po_number,
             "total_value": total,
             "consumed_value": consumed,

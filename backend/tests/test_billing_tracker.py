@@ -174,6 +174,13 @@ def test_filters_narrow_rows_but_never_the_choices(db):
         billing_tracker(db, TrackerFilters(month="May"))
     with pytest.raises(ValueError):
         billing_tracker(db, TrackerFilters(stage="nope"))
+    # 29 Oct 2026 — a "How the work moved" bar is a stage GROUP: the table lists
+    # exactly the rows that bar counted.
+    from services.billing_tracker import GROUP_STAGES
+    for group, stages in GROUP_STAGES.items():
+        got = billing_tracker(db, TrackerFilters(stage=group, limit=100))
+        assert all(r["stage"] in stages for r in got["rows"])
+        assert got["meta"]["total"] == sum(got["meta"]["counts"][st] for st in stages)
 
 
 def test_invoice_list_customer_filter_finds_an_invoice_by_its_po(db):

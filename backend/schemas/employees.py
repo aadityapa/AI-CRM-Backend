@@ -106,6 +106,11 @@ class EmployeeUpdate(BaseModel):
     min_hours_full_day: Decimal | None = Field(default=None, ge=0)
     min_hours_half_day: Decimal | None = Field(default=None, ge=0)
     normal_hours_per_day: Decimal | None = Field(default=None, ge=0)
+    # Copied from the candidate profile at Joined (0105) — editable on the
+    # Employee page since 28 Oct 2026 so HR can correct them there.
+    offer_letter_reference: str | None = Field(default=None, max_length=255)
+    customer_onboarding_date: date | None = None
+    relocation_applicable: bool | None = None
 
 
 class LeaveBalanceUpsertItem(BaseModel):

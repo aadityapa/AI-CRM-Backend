@@ -27,6 +27,7 @@ import csv
 import io
 import json
 import logging
+import math
 from datetime import date, datetime, timedelta
 
 from prompt_logger import _connect, _is_postgres  # the log store's own driver
@@ -156,6 +157,28 @@ def _rows(cur) -> list[dict]:
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _num(v) -> float:
+    """A stored figure as a FINITE float (27 Oct 2026). A REAL column can hold NaN /
+    Infinity, and one such row made the whole page unrenderable (JSON has no NaN)."""
+    try:
+        f = float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
+def _optional(step: str, conn, fn, fallback):
+    """Run a secondary lookup; on failure log it, roll back (a failed statement
+    poisons a Postgres transaction) and carry on without it (27 Oct 2026: the
+    page used to 500 as a whole when any one of its five lookups failed)."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 — one breakdown is never worth the page
+        logger.warning("ai cost report: %s failed", step, exc_info=True)
+        _rollback(conn)
+        return fallback
+
+
 def _per_interview(conn, ph: str, start: date, end: date) -> dict[str, dict]:
     kind = _kind_case("l")
     cur = conn.cursor()
@@ -193,10 +216,10 @@ def _per_interview(conn, ph: str, start: date, end: date) -> dict[str, dict]:
         row["failed_calls"] += int(r["failed"] or 0)
         row["tokens_in"] += int(r["tokens_in"] or 0)
         row["tokens_out"] += int(r["tokens_out"] or 0)
-        row["audio_seconds"] += float(r["audio_seconds"] or 0)
-        cost = float(r["cost_usd"] or 0)
+        row["audio_seconds"] += _num(r["audio_seconds"])
+        cost = _num(r["cost_usd"])
         row["cost_usd"] += cost
-        row["estimated_usd"] += float(r["estimated_usd"] or 0)
+        row["estimated_usd"] += _num(r["estimated_usd"])
         row[f"cost_{r['kind']}_usd"] += cost
         row["first_at"] = min(filter(None, (row["first_at"], r["first_at"])), default=None)
         row["last_at"] = max(filter(None, (row["last_at"], r["last_at"])), default=None)
@@ -226,7 +249,7 @@ def _per_interview_models(conn, ph: str, start: date, end: date) -> dict[str, li
         out.setdefault(str(r["interview_id"]), []).append({
             "model": str(r["model"] or "").strip() or "unknown",
             "calls": int(r["calls"] or 0),
-            "cost_usd": float(r["cost_usd"] or 0),
+            "cost_usd": _num(r["cost_usd"]),
         })
     return out
 
@@ -266,8 +289,8 @@ def _other_spend(conn, ph: str, start: date, end: date) -> dict:
         label = next((lab for prefix, lab in OTHER_FAMILIES if ct.startswith(prefix)), "Other")
         f = families.setdefault(label, {"label": label, "calls": 0, "cost_usd": 0.0})
         f["calls"] += int(r["calls"] or 0)
-        f["cost_usd"] += float(r["cost_usd"] or 0)
-        total += float(r["cost_usd"] or 0)
+        f["cost_usd"] += _num(r["cost_usd"])
+        total += _num(r["cost_usd"])
     return {"cost_usd": round(total, 4),
             "families": sorted((dict(f, cost_usd=round(f["cost_usd"], 4)) for f in families.values()),
                                key=lambda f: -f["cost_usd"])}
@@ -344,7 +367,11 @@ def crm_context_by_token(crm_db, tokens: list[str]) -> dict[str, dict]:
                 .outerjoin(Customer, Customer.id == Opportunity.customer_id)
                 .where(AiInterviewLink.invite_token.in_(chunk))
             )
-            for tok, pid, result, score, ta, oid, opp_id, title, cid, cname in crm_db.execute(stmt).all():
+            # A savepoint (27 Oct 2026): a failure here used to leave the CRM
+            # session poisoned for every later read in the same request.
+            with crm_db.begin_nested():
+                found = crm_db.execute(stmt).all()
+            for tok, pid, result, score, ta, oid, opp_id, title, cid, cname in found:
                 out[str(tok)] = {
                     "profile_id": pid, "ai_result": result,
                     "ai_score": float(score) if score is not None else None,
@@ -353,7 +380,7 @@ def crm_context_by_token(crm_db, tokens: list[str]) -> dict[str, dict]:
                 }
         return out
     except Exception:
-        logger.debug("CRM context lookup failed", exc_info=True)
+        logger.warning("CRM context lookup failed", exc_info=True)
         return {}
 
 
@@ -498,8 +525,10 @@ def interview_cost_report(db_target: str, crm_db=None, *, date_from: str | None 
     conn = _connect(db_target)
     try:
         per = _per_interview(conn, ph, start, end)
-        per_models = _per_interview_models(conn, ph, start, end)
-        other = _other_spend(conn, ph, start, end)
+        per_models = _optional("model split", conn,
+                               lambda: _per_interview_models(conn, ph, start, end), {})
+        other = _optional("other spend", conn, lambda: _other_spend(conn, ph, start, end),
+                          {"cost_usd": 0.0, "families": []})
         progress = _progress_rows(conn, ph, list(per.keys()))
         tokens = [str(p.get("invite_token") or "") for p in progress.values() if p.get("invite_token")]
         schedules = _schedule_rows(conn, ph, tokens)

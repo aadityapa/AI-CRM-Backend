@@ -89,13 +89,27 @@ def _user(uid: int, *roles: str) -> CurrentUser:
 
 
 def _template(db, uid, tabs, actions=None, role=None):
-    payload = {"name": f"T{uid}", "role": role, "tab_access": tabs}
-    if actions is not None:
-        payload["action_access"] = actions
-    t = tpl_svc.create_template(db, payload)
-    db.add(UserProfile(user_id=uid, access_template_id=t["id"]))
+    """A role carrying these permissions (Access Templates merged into Roles,
+    27 Oct 2026). Like a template, the list defaults to the tag's approvals +
+    the buttons its tabs imply."""
+    from tests.role_grants import give_role
+    if actions is None:
+        actions = ap.clean_action_list(ap.default_actions_for_role(role) + ap.implied_buttons(tabs))
+    r = give_role(db, uid, tabs, action_access=actions)
+    return {"id": r.id, "action_access": r.action_access, "tab_access": r.tab_access, "row": r}
+
+
+def _raw_template(db, uid, tabs, actions=None, role=None):
+    """A row in the (now read-only) access_templates table — the old 0124
+    backfill still runs against it."""
+    from models import AccessTemplate
+    t = AccessTemplate(name=f"T{uid}", role=role, tab_access=tabs, field_access={}, is_active=True,
+                       action_access=actions)
+    db.add(t)
+    db.flush()
+    db.add(UserProfile(user_id=uid, access_template_id=t.id))
     db.commit()
-    return t
+    return {"id": t.id}
 
 
 # ------------------------------------------------------- Interview Platform tabs
@@ -106,10 +120,11 @@ def test_interview_platform_tabs_are_in_the_registry_and_survive_a_save(db):
     assert "iv:promptLogs" not in reg.TABS               # Admin-only on the server, never grantable
     groups = {t["key"]: t["group"] for t in reg.registry()["tabs"]}
     assert groups["iv:integrityLogs"] == "Interview Platform" and groups["customers"] == "CRM"
-    t = tpl_svc.create_template(db, {"name": "RMG+", "role": "RMG",
-                                      "tab_access": {"profiles": "edit", "iv:integrityLogs": "view"}})
+    from services import custom_roles as role_svc
+    t = role_svc.create_role(db, {"name": "RMG plus",
+                                  "tab_access": {"profiles": "edit", "iv:integrityLogs": "view"}}, None)
     assert t["tab_access"]["iv:integrityLogs"] == "view"   # not stripped as unknown
-    t = tpl_svc.create_template(db, {"name": "bad", "tab_access": {"iv:questionBank": "view", "iv:ats": "view"}})
+    t = role_svc.create_role(db, {"name": "bad", "tab_access": {"iv:questionBank": "view", "iv:ats": "view"}}, None)
     assert t["tab_access"] == {"iv:ats": "view"}           # an ungrantable key is dropped, never saved
 
 
@@ -211,16 +226,15 @@ def test_a_never_configured_list_keeps_tab_edit_as_the_rule(db):
     t = _template(db, 2, {"invoices": "edit"}, role=None)
     # Untagged: no role defaults, but the buttons the tab grants imply.
     assert t["action_access"] == ["invoice.manage", "invoice.revision.request"]
-    from models import AccessTemplate
-    row = db.get(AccessTemplate, t["id"])
-    row.action_access = None                                # a pre-0108 template
+    t["row"].action_access = None                           # a role whose buttons were never set
     db.commit()
     assert _gate_client(db, _user(2, "TA"), "invoice.manage", "invoices").post("/act").status_code == 200
 
 
-def test_a_new_tagged_template_starts_with_the_roles_buttons(db):
-    t = tpl_svc.create_template(db, {"name": "Fin", "role": "Finance", "tab_access": {"invoices": "edit"}})
-    assert {"invoice.manage", "po.manage", "invoice.convert_proforma"} <= set(t["action_access"])
+def test_a_new_custom_role_starts_with_its_names_buttons(db):
+    from services import custom_roles as role_svc
+    t = role_svc.create_role(db, {"name": "GM", "tab_access": {"timesheets": "edit"}}, None)
+    assert {"timesheet.approve", "timesheet.generate_invoice"} <= set(t["action_access"])
 
 
 # ----------------------------------------------------------------- migration
@@ -262,12 +276,12 @@ def test_the_0124_backfill_adds_only_what_the_old_rules_already_gave(db):
     rmg = Role(name=RoleName.RMG); db.add(rmg); db.flush()
     db.add(UserRole(user_id=2, role_id=rmg.id))
     # Template A: Finance-tagged, invoices at edit, pos at view, list configured.
-    a = _template(db, 1, {"invoices": "edit", "pos": "view", "projects": "create"},
+    a = _raw_template(db, 1, {"invoices": "edit", "pos": "view", "projects": "create"},
                   actions=["invoice.convert_proforma"], role="Finance")
     # Template B: untagged, used by an RMG (user 2), no platform tabs → gets RMG's platform tabs.
-    b = _template(db, 2, {"profiles": "edit"}, actions=[])
+    b = _raw_template(db, 2, {"profiles": "edit"}, actions=[])
     # Template C: already names a platform tab → untouched.
-    c = _template(db, 3, {"iv:ats": "view"}, actions=[], role="TA")
+    c = _raw_template(db, 3, {"iv:ats": "view"}, actions=[], role="TA")
     db.commit()
     mod._backfill_buttons(db.connection(), "access_templates")
     mod._backfill_iv_tabs(db.connection())

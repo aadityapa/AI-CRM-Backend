@@ -1,9 +1,10 @@
 """Custom roles — the service behind Access Control ▸ Roles (23 Sep 2026).
 
 See models/custom_roles.py for what a custom role IS and how it takes effect.
-This module owns naming rules, grant validation (shared with Access Templates
-so both editors accept exactly the same registry), membership, and the
-built-in + custom listing the page renders as one table.
+This module owns naming rules, grant validation, membership, the built-in +
+custom listing the page renders as one table and — since Access Templates were
+merged into Roles (27 Oct 2026, migration 0149) — the BUILT-IN roles' own
+permissions (`set_builtin_permissions`).
 """
 from __future__ import annotations
 
@@ -123,14 +124,15 @@ def list_roles(db: Session) -> dict:
         ).all()
     }
     saved_stages = stage_access._saved_builtin(db)
-    builtin = [
-        {"name": r.value, "label": BUILTIN_LABELS.get(r.value, r.value), "builtin": True,
-         "department": access_registry.department_of_role(r.value),
-         "members_count": builtin_counts.get(r.value, 0),
-         "candidate_stages": stage_access.role_payload(r.value, saved_stages.get(r.value)),
-         "description": "Built-in role — permissions come from the product's role rules and any Access Template."}
-        for r in RoleName
-    ]
+    perms = _builtin_permissions(db)
+    builtin = []
+    for r in RoleName:
+        row = {"name": r.value, "label": BUILTIN_LABELS.get(r.value, r.value), "builtin": True,
+               "department": access_registry.department_of_role(r.value),
+               "members_count": builtin_counts.get(r.value, 0),
+               "candidate_stages": stage_access.role_payload(r.value, saved_stages.get(r.value))}
+        row.update(builtin_permissions_payload(r.value, perms.get(r.value)))
+        builtin.append(row)
     customs = db.execute(select(CustomRole).order_by(CustomRole.name)).scalars().all()
     counts = _member_counts(db, [c.id for c in customs])
     return {"builtin": builtin, "custom": [serialize(c, counts.get(c.id, 0)) for c in customs],
@@ -242,27 +244,48 @@ def set_members(db: Session, role_id: int, user_ids: list[int]) -> list[dict]:
     for uid in wanted:
         if uid not in current:
             db.add(UserCustomRole(user_id=uid, custom_role_id=role.id))
-            # ONE source of access per person (23 Sep 2026): joining a role
-            # drops an explicit Access Template, which would otherwise
-            # silently outrank the role the admin just chose.
-            _clear_template(db, uid)
     db.commit()
     return list_members(db, role.id)
 
 
-def _clear_template(db: Session, user_id: int) -> None:
-    from models.user_profiles import UserProfile
-    profile = db.execute(select(UserProfile).where(UserProfile.user_id == user_id)).scalars().first()
-    if profile is not None and profile.access_template_id is not None:
-        profile.access_template_id = None
-
-
-def remove_user_from_all_roles(db: Session, user_id: int) -> int:
-    """Used when a template is assigned instead — the two are exclusive."""
+def remove_user_from_all_roles(db: Session, user_id: int, keep: set[int] | None = None) -> int:
+    """Drop every custom role of one user except `keep` (the Users-tab
+    "Permissions from" control picks ONE role). Does not commit."""
     rows = db.execute(select(UserCustomRole).where(UserCustomRole.user_id == user_id)).scalars().all()
+    removed = 0
     for row in rows:
+        if keep and row.custom_role_id in keep:
+            continue
         db.delete(row)
-    return len(rows)
+        removed += 1
+    return removed
+
+
+def active_role_by_name(db: Session, name: str | None) -> CustomRole | None:
+    """The ACTIVE custom role called `name` (case-insensitive), else None.
+    Never raises — a pre-0106 database answers None."""
+    clean = " ".join(str(name or "").split()).strip()
+    if not clean:
+        return None
+    try:
+        with db.begin_nested():
+            return db.execute(
+                select(CustomRole).where(func.lower(CustomRole.name) == clean.lower(),
+                                         CustomRole.is_active.is_(True))
+            ).scalars().first()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def add_user_to_role(db: Session, user_id: int, role_id: int) -> bool:
+    """Give ONE user one custom role. True when it was added. Does not commit."""
+    exists = db.execute(select(UserCustomRole.id).where(
+        UserCustomRole.user_id == user_id, UserCustomRole.custom_role_id == role_id)).scalar_one_or_none()
+    if exists is not None:
+        return False
+    db.add(UserCustomRole(user_id=user_id, custom_role_id=role_id))
+    db.flush()
+    return True
 
 
 def user_role_ids(db: Session, user_id: int) -> list[int]:
@@ -292,8 +315,7 @@ def validate_role_ids(db: Session, role_ids) -> list[int]:
 def set_user_roles(db: Session, user_id: int, role_ids: list[int]) -> list[str]:
     """Replace ONE user's custom-role set (the Edit Roles dialog, 23 Sep 2026)
     — the transpose of `set_members`. Unknown or inactive role ids are
-    refused; choosing any role drops an explicit Access Template (one source
-    of access). Does not commit. Returns the resulting role names."""
+    refused. Does not commit. Returns the resulting role names."""
     wanted = validate_role_ids(db, role_ids)
     current = {
         r.custom_role_id: r for r in db.execute(
@@ -306,10 +328,100 @@ def set_user_roles(db: Session, user_id: int, role_ids: list[int]) -> list[str]:
     for rid in wanted:
         if rid not in current:
             db.add(UserCustomRole(user_id=user_id, custom_role_id=rid))
-    if wanted:
-        _clear_template(db, user_id)
     db.flush()
     return custom_roles_by_user(db, [user_id]).get(user_id, [])
+
+
+# ------------------------------------------------- built-in role permissions
+
+#: Built-in roles whose permissions can be set. Admin / CEO bypass every gate.
+CONFIGURABLE_BUILTIN: tuple[str, ...] = tuple(r.value for r in RoleName if r.value not in ("Admin", "CEO"))
+
+
+def _builtin_permissions(db: Session) -> dict[str, tuple]:
+    """{name: (tab_access, field_access, action_access)} — never raises (a
+    pre-0149 database answers {})."""
+    try:
+        with db.begin_nested():
+            rows = db.execute(select(Role.name, Role.tab_access, Role.field_access, Role.action_access)).all()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {(n.value if hasattr(n, "value") else str(n)): (t, f, a) for n, t, f, a in rows}
+
+
+def builtin_permissions_payload(name: str, saved: tuple | None) -> dict:
+    """What the Roles page prints for one built-in role. `configured` False =
+    the product's role rules decide (nothing restricts the people holding it)."""
+    from services.role_template_defaults import ROLE_TEMPLATE_DEFAULTS
+    tabs, fields, actions = saved or (None, None, None)
+    configurable = name in CONFIGURABLE_BUILTIN
+    return {
+        "configurable": configurable,
+        "configured": bool(configurable and tabs),
+        "tab_access": dict(tabs or {}),
+        "field_access": dict(fields or {}),
+        "action_access": template_actions_or_none(actions),
+        # The product's suggested starting point (`role_template_defaults`).
+        "suggested_tab_access": dict(ROLE_TEMPLATE_DEFAULTS.get(name, {})),
+        "description": ("Built-in role — Admin and CEO open everything." if not configurable else
+                        "Built-in role — the permissions below apply to everyone holding it."
+                        if tabs else
+                        "Built-in role — follows the product's role rules until you set its permissions."),
+    }
+
+
+def template_actions_or_none(raw) -> list[str] | None:
+    from services.action_permissions import clean_action_list
+    return None if raw is None else clean_action_list(raw)
+
+
+def _builtin_row(db: Session, name: str) -> Role:
+    if name not in CONFIGURABLE_BUILTIN:
+        raise HTTPException(status_code=400,
+                            detail=("Admin and CEO open everything — their permissions cannot be set"
+                                    if name in ("Admin", "CEO") else f"Unknown built-in role '{name}'"))
+    member = next(r for r in RoleName if r.value == name)
+    row = db.execute(select(Role).where(Role.name == member)).scalars().first()
+    if row is None:
+        row = Role(name=member)
+        db.add(row)
+        db.flush()
+    return row
+
+
+def set_builtin_permissions(db: Session, name: str, payload: dict | None) -> dict:
+    """Set (or with `payload=None` clear) a built-in role's own permissions.
+    Same validation as a custom role: at least one tab. Does not commit."""
+    row = _builtin_row(db, name)
+    if payload is None:
+        row.tab_access, row.field_access, row.action_access = None, None, None
+    else:
+        tabs, fields = _clean_grants(payload.get("tab_access"), payload.get("field_access"))
+        row.tab_access, row.field_access = tabs, fields
+        raw = payload.get("action_access")
+        if raw is not None:
+            from services.action_permissions import clean_action_list
+            row.action_access = clean_action_list(raw)
+        elif "action_access" in payload:
+            row.action_access = None
+    db.flush()
+    return builtin_permissions_payload(name, (row.tab_access, row.field_access, row.action_access))
+
+
+def builtin_members(db: Session, name: str) -> list[dict]:
+    """People holding one built-in role (membership is edited in Users ▸ Edit roles)."""
+    member = next((r for r in RoleName if r.value == name), None)
+    if member is None:
+        raise HTTPException(status_code=404, detail="Role not found")
+    ids = [int(u) for u in db.execute(
+        select(UserRole.user_id).join(Role, Role.id == UserRole.role_id).where(Role.name == member)
+    ).scalars().all()]
+    users = _user_rows(db, ids)
+    out = [{"id": uid, "full_name": u["full_name"] or "", "email": u["email"] or "",
+            "username": u["username"] or "", "is_active": bool(u["is_active"])}
+           for uid, u in ((i, users.get(i)) for i in ids) if u]
+    out.sort(key=lambda r: (r["full_name"] or r["username"]).lower())
+    return out
 
 
 def active_custom_role_names(db: Session) -> list[str]:

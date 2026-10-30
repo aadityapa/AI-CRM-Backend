@@ -170,7 +170,7 @@ def test_an_inactive_role_grants_nothing(db):
 def test_grants_resolve_like_an_authoritative_template(db):
     _gm(db, uid=2)
     acc = effective_access(db, 2, {"GM"})
-    assert acc["source"] == "custom_role"
+    assert acc["source"] == "role"
     assert acc["tabs"] == {"invoices": "edit", "pos": "view", "branch-policy": "view"}
     assert acc["visible_tabs"] == ["branch-policy", "invoices", "pos"]
 
@@ -182,14 +182,15 @@ def test_two_roles_merge_with_the_higher_mode_winning(db):
     assert acc["tabs"] == {"invoices": "create", "tds": "view", "branch-policy": "view"}
 
 
-def test_an_explicit_template_outranks_the_role(db):
+def test_a_template_left_on_a_profile_decides_nothing(db):
+    """27 Oct 2026: Access Templates were merged into Roles (0149 moved every
+    assignment onto a role and cleared the link). A stray link is ignored."""
     _gm(db, uid=2)
     t = AccessTemplate(name="Narrow", tab_access={"dashboard": "view"}, field_access={})
     db.add(t); db.flush()
     db.add(UserProfile(user_id=2, access_template_id=t.id)); db.commit()
     acc = effective_access(db, 2, {"GM"})
-    assert acc["source"] == "template"
-    assert acc["tabs"] == {"dashboard": "view"}
+    assert acc["source"] == "role" and "dashboard" not in acc["tabs"]
 
 
 def _client(db, user):
@@ -290,16 +291,6 @@ def test_router_is_registered_and_backed_up():
 # in the Access Template dropdown, and that template silently outranked the
 # role. A template and a custom role are now EXCLUSIVE.
 
-def test_joining_a_role_drops_an_explicit_template(db):
-    t = AccessTemplate(name="Default — Sales", tab_access={"dashboard": "view"}, field_access={})
-    db.add(t); db.flush()
-    db.add(UserProfile(user_id=2, access_template_id=t.id)); db.commit()
-    _gm(db, uid=2)
-    profile = db.execute(__import__("sqlalchemy").select(UserProfile).where(UserProfile.user_id == 2)).scalars().first()
-    assert profile.access_template_id is None
-    assert effective_access(db, 2, {"GM"})["source"] == "custom_role"
-
-
 def _give_builtin(db, uid: int, name: str = "Sales") -> None:
     from models.rbac import Role, RoleName, UserRole
     role = Role(name=RoleName(name))
@@ -307,45 +298,32 @@ def _give_builtin(db, uid: int, name: str = "Sales") -> None:
     db.add(UserRole(user_id=uid, role_id=role.id)); db.commit()
 
 
-def test_assigning_a_template_drops_custom_roles(db):
-    from services.access_templates import assign_template
-    _give_builtin(db, 2)                       # keeps a role → can still enter the CRM
-    _gm(db, uid=2)
-    t = AccessTemplate(name="Narrow", tab_access={"dashboard": "view"}, field_access={})
-    db.add(t); db.commit()
-    assign_template(db, 2, t.id)
-    assert crm_deps.custom_role_names(db, 2) == set()
-    assert svc.list_members(db, 1) == [] or all(m["id"] != 2 for m in svc.list_members(db, 1))
+def test_a_built_in_roles_permissions_apply_to_every_holder_and_add_up(db):
+    """27 Oct 2026 (Access Templates merged into Roles): a built-in role holds
+    its own permissions; with a custom role on top the two add up."""
+    _give_builtin(db, 2)
+    assert effective_access(db, 2, {"Sales"})["visible_tabs"] is None      # not configured = role rules
+    svc.set_builtin_permissions(db, "Sales", {"tab_access": {"opportunities": "edit", "dashboard": "view"}})
+    db.commit()
+    acc = effective_access(db, 2, {"Sales"})
+    assert acc["source"] == "role" and acc["tabs"] == {"opportunities": "edit", "dashboard": "view"}
+    _gm(db, uid=2, tabs={"opportunities": "create", "invoices": "view"})
+    acc = effective_access(db, 2, {"Sales", "GM"})
+    assert acc["tabs"]["opportunities"] == "create" and acc["tabs"]["invoices"] == "view"
+    svc.set_builtin_permissions(db, "Sales", None)                          # back to the role rules
+    db.commit()
+    assert "dashboard" not in effective_access(db, 2, {"Sales", "GM"})["tabs"]
 
 
-# ------------------------------------ a template never locks a user out (25 Sep)
-# Reported with a screenshot: "No CRM role is assigned" right after a template
-# was assigned. A template decides the TABS; a ROLE is what lets someone into
-# the CRM, and one-source-of-access removed the user's only (custom) role.
-
-def test_a_template_never_removes_a_users_last_role(db, monkeypatch):
-    from services.access_templates import assign_template
-    _users_admin(monkeypatch)
-    _gm(db, uid=2)                             # GM is their ONLY role
-    t = AccessTemplate(name="Narrow", tab_access={"dashboard": "view"}, field_access={})
-    db.add(t); db.commit()
-    with pytest.raises(HTTPException) as exc:
-        assign_template(db, 2, t.id)
-    assert exc.value.status_code == 400 and "no built-in role" in exc.value.detail
-    assert crm_deps.custom_role_names(db, 2) == {"GM"}        # nothing was taken away
-
-
-def test_a_tagged_template_brings_its_built_in_role(db, monkeypatch):
-    """The "Default — Sales" pattern: assigning it to a role-less user makes them Sales."""
-    from services.access_templates import assign_template
-    from services.users_admin import _roles_map
-    _users_admin(monkeypatch)
-    _gm(db, uid=2)
-    t = AccessTemplate(name="Default — Sales", role="Sales", tab_access={"dashboard": "view"}, field_access={})
-    db.add(t); db.commit()
-    out = assign_template(db, 2, t.id)
-    assert out["role_added"] == "Sales"
-    assert _roles_map(db, [2])[2] == ["Sales"]
+def test_admin_and_ceo_permissions_cannot_be_set(db):
+    for name in ("Admin", "CEO", "Nope"):
+        with pytest.raises(HTTPException):
+            svc.set_builtin_permissions(db, name, {"tab_access": {"dashboard": "view"}})
+    with pytest.raises(HTTPException):
+        svc.set_builtin_permissions(db, "Sales", {"tab_access": {}})        # at least one tab
+    listing = {r["name"]: r for r in svc.list_roles(db)["builtin"]}
+    assert listing["Admin"]["configurable"] is False and listing["Sales"]["configurable"] is True
+    assert listing["Sales"]["configured"] is False and listing["Sales"]["suggested_tab_access"]
 
 
 def test_edit_roles_refuses_to_clear_every_role(db, monkeypatch):
@@ -363,19 +341,16 @@ def test_access_source_dropdown_is_exclusive(db, monkeypatch):
     _give_builtin(db, 2)                       # a built-in role survives every switch below
     gm = svc.create_role(db, {"name": "GM", "tab_access": {"invoices": "edit"}}, actor_id=1)
     sm = svc.create_role(db, {"name": "Sales Manager", "tab_access": {"opportunities": "edit"}}, actor_id=1)
-    t = AccessTemplate(name="Narrow", tab_access={"dashboard": "view"}, field_access={})
-    db.add(t); db.commit()
 
     out = users_admin.set_access_source(db, 2, "role", gm["id"])
-    assert out["custom_roles"] == ["GM"] and out["access_template_id"] is None
+    assert out["custom_roles"] == ["GM"]
     out = users_admin.set_access_source(db, 2, "role", sm["id"])
     assert out["custom_roles"] == ["Sales Manager"]            # one role from this control
-    out = users_admin.set_access_source(db, 2, "template", t.id)
-    assert out["custom_roles"] == [] and out["access_template_id"] == t.id
     out = users_admin.set_access_source(db, 2, "default", None)
-    assert out["custom_roles"] == [] and out["access_template_id"] is None
-    with pytest.raises(HTTPException):
-        users_admin.set_access_source(db, 2, "bogus", None)
+    assert out["custom_roles"] == [] and out["roles"] == ["Sales"]
+    for kind in ("template", "bogus"):                          # templates were merged into roles
+        with pytest.raises(HTTPException):
+            users_admin.set_access_source(db, 2, kind, 1)
 
 
 # ------------------------------------------ Edit Roles dialog lists custom roles
@@ -416,27 +391,6 @@ def test_edit_roles_refuses_unknown_and_inactive_custom_roles(db, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         users_admin.replace_roles(db, 2, [], custom_role_ids=[gm["id"]])
     assert "Inactive" in exc.value.detail
-
-
-def test_role_defaults_never_reattach_a_template_over_a_custom_role(db, monkeypatch):
-    """`_auto_assign_role_template` runs on EVERY Edit Roles save and used to
-    hand a Sales Manager the template tagged 'Sales' — which then outranked
-    the custom role. That is exactly how Balasaheb got 'Default — Sales'."""
-    users_admin = _users_admin(monkeypatch)
-    t = AccessTemplate(name="Default — Sales", role="Sales", is_active=True,
-                       tab_access={"dashboard": "view"}, field_access={})
-    db.add(t); db.commit()
-    sm = svc.create_role(db, {"name": "Sales Manager", "tab_access": {"opportunities": "edit"}}, actor_id=1)
-
-    out = users_admin.replace_roles(db, 2, ["Sales"], custom_role_ids=[sm["id"]])
-    assert out["access_template_id"] is None
-    assert effective_access(db, 2, {"Sales", "Sales Manager"})["source"] == "custom_role"
-
-    out = users_admin.replace_roles(db, 2, ["Sales"])                        # a later plain save, too
-    assert out["access_template_id"] is None
-
-    out = users_admin.replace_roles(db, 3, ["Sales"])                        # no custom role → default still applies
-    assert out["access_template_id"] == t.id
 
 
 # --------------------------------------------------------------- Sales Manager = the whole of Sales

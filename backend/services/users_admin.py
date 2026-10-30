@@ -48,91 +48,17 @@ def _role_member(name: str) -> RoleName:
     )
 
 
-def _auto_assign_role_template(db: Session, user_id: int, members: list[RoleName]) -> None:
-    """Give an untemplated user the ACTIVE template tagged with their role.
-
-    Makes AccessTemplate.role mean something: an admin who builds a template
-    "for RMG" gets it applied to new/re-roled RMG users automatically, in role
-    order. Explicit assignment always wins — a user who already has a template
-    (or a per-user tab override) is left completely alone. Best-effort: any
-    failure must never block user creation or a role change.
-    """
-    try:
-        from models.access_templates import AccessTemplate
-
-        profile = db.execute(
-            select(UserProfile).where(UserProfile.user_id == user_id)
-        ).scalars().first()
-        if profile is not None and (profile.access_template_id or profile.tab_access):
-            return  # explicitly configured — never override
-        from services.custom_roles import user_role_ids
-        if user_role_ids(db, user_id):
-            # A custom role IS the explicit configuration (23 Sep 2026): this
-            # is how "Default — Sales" kept re-attaching itself to a Sales
-            # Manager on every Edit Roles save and silently outranking the role.
-            return
-        for member in members:
-            t = db.execute(
-                select(AccessTemplate).where(
-                    AccessTemplate.role == member.value,
-                    AccessTemplate.is_active.is_(True),
-                ).order_by(AccessTemplate.id)
-            ).scalars().first()
-            if t is None:
-                continue
-            if profile is None:
-                db.add(UserProfile(user_id=user_id, access_template_id=t.id))
-            else:
-                profile.access_template_id = t.id
-            return
-    except Exception:  # noqa: BLE001 — auto-default must never break user admin
-        return
-
-
 def _display_name(db: Session, user_id: int) -> str:
     row = _require_user_row(db, user_id)
     return row.get("full_name") or row.get("username") or f"User #{user_id}"
 
 
-#: What a template or custom role CANNOT do on its own (25 Sep 2026, reported
-#: with a "No CRM role is assigned" screen after a template was assigned): open
-#: the CRM. Entry needs a ROLE — built-in, or an active custom role — and the
-#: template then decides the tabs. One-source-of-access removes custom roles
-#: when a template is chosen, so a user whose ONLY role was custom was silently
-#: locked out by the very click meant to give them access.
+#: A ROLE is what lets someone into the CRM — a user left with none is refused
+#: everywhere ("No CRM role is assigned").
 _ENTRY_MESSAGE = (
     "{name} has no built-in role, so {what} would leave them with no role at all and the CRM would "
     "refuse them (\"No CRM role is assigned\"). Give them a built-in role in Edit Roles first{hint}."
 )
-
-
-def ensure_role_for_template(db: Session, user_id: int, template) -> str | None:
-    """Make sure a user keeps a ROLE when `template` becomes their access source.
-
-    A user with any built-in role is fine as-is. One without: if the template is
-    TAGGED with a built-in role (the "Default — Sales" pattern — the admin built
-    it for Sales people), that role is given to them, because that is what the
-    assignment meant; returns the role added. If they hold only CUSTOM roles —
-    which the template is about to remove — and the tag gives no built-in role,
-    the assignment is refused with a message that says exactly what to do (that
-    removal is the lockout this guards). A user with no role at all and an
-    untagged template loses nothing, so it proceeds; the Users row flags them.
-    Does not commit."""
-    if _roles_map(db, [user_id]).get(user_id):
-        return None
-    tag = str(getattr(template, "role", "") or "").strip()
-    member = next((m for m in RoleName if m.value == tag and m.value not in ("Admin", "CEO")), None)
-    if member is None:
-        from services.custom_roles import user_role_ids
-        if not user_role_ids(db, user_id):
-            return None
-        hint = (f", or tag the template \"{template.name}\" with the built-in role it is for"
-                if not tag else f" (the tag \"{tag}\" is not a built-in role)")
-        raise HTTPException(status_code=400, detail=_ENTRY_MESSAGE.format(
-            name=_display_name(db, user_id), what=f"assigning the template \"{template.name}\"", hint=hint))
-    db.add(UserRole(user_id=user_id, role_id=_get_or_create_role(db, member).id))
-    db.flush()
-    return member.value
 
 
 def _refuse_roleless(db: Session, user_id: int, what: str) -> None:
@@ -180,7 +106,7 @@ def _require_user_row(db: Session, user_id: int) -> dict:
 
 
 def _user_out(row: dict, roles: list[str], tab_access: list[str] | None = None,
-              access_template_id: int | None = None, custom_roles: list[str] | None = None) -> dict:
+              custom_roles: list[str] | None = None) -> dict:
     return {
         # Admin/CEO-defined roles (Access Control ▸ Roles), kept apart from the
         # built-in `roles` so the UI can chip them differently.
@@ -194,7 +120,6 @@ def _user_out(row: dict, roles: list[str], tab_access: list[str] | None = None,
         "roles": roles,
         # None => no override (full role-based access); list => allowed tab keys.
         "tab_access": tab_access,
-        "access_template_id": access_template_id,
     }
 
 
@@ -208,18 +133,6 @@ def _decode_tab_access(raw: str | None) -> list[str] | None:
     if isinstance(val, list):
         return [str(x) for x in val]
     return None
-
-
-def _template_map(db: Session, user_ids: list[int]) -> dict[int, int | None]:
-    out: dict[int, int | None] = {}
-    if not user_ids:
-        return out
-    rows = db.execute(
-        select(UserProfile.user_id, UserProfile.access_template_id).where(UserProfile.user_id.in_(user_ids))
-    ).all()
-    for uid, tid in rows:
-        out[uid] = tid
-    return out
 
 
 def _tab_access_map(db: Session, user_ids: list[int]) -> dict[int, list[str] | None]:
@@ -409,14 +322,13 @@ def list_users(db: Session, p: PageParams, *, status: str | None = None,
     ids = [r["id"] for r in rows]
     roles = _roles_map(db, ids)
     tabs = _tab_access_map(db, ids)
-    templates = _template_map(db, ids)
     from services.custom_roles import custom_roles_by_user
     customs = custom_roles_by_user(db, ids)
     last_login, pending = _optional_user_facts(db, ids)
     linked = set(db.execute(select(Employee.user_id).where(Employee.user_id.in_(ids or [-1]))).scalars().all())
     users = []
     for r in rows:
-        out = _user_out(dict(r), roles.get(r["id"], []), tabs.get(r["id"]), templates.get(r["id"]),
+        out = _user_out(dict(r), roles.get(r["id"], []), tabs.get(r["id"]),
                         custom_roles=customs.get(r["id"], []))
         out["last_login"] = last_login.get(r["id"])
         out["must_change_password"] = r["id"] in pending
@@ -456,7 +368,6 @@ def create_user(db: Session, full_name: str, email: str, username: str,
         role = _get_or_create_role(db, member)
         db.add(UserRole(user_id=user_id, role_id=role.id))
     customs = set_user_roles(db, user_id, custom_ids) if custom_ids else []
-    _auto_assign_role_template(db, user_id, members)   # skips users holding a custom role
     db.commit()
     row = _require_user_row(db, user_id)
     return _user_out(row, sorted(m.value for m in members), custom_roles=customs)
@@ -478,21 +389,18 @@ def replace_roles(db: Session, user_id: int, role_names: list[str],
         role = _get_or_create_role(db, member)
         db.add(UserRole(user_id=user_id, role_id=role.id))
     if custom_role_ids is not None:
-        customs = set_user_roles(db, user_id, custom_role_ids)   # validates; clears a template when any chosen
+        customs = set_user_roles(db, user_id, custom_role_ids)   # validates
     else:
         customs = custom_roles_by_user(db, [user_id]).get(user_id, [])
     if not members and not customs:
         # Clearing every role locks the account out of the CRM (no role = 403
-        # everywhere, whatever the template says). Deactivate it instead.
+        # everywhere). Deactivate it instead.
         raise HTTPException(
             status_code=400,
             detail="Keep at least one role — with none the user cannot open the CRM. "
                    "To remove their access, deactivate the account instead.")
-    _auto_assign_role_template(db, user_id, members)             # skips users holding a custom role
     db.commit()
-    return _user_out(row, sorted(m.value for m in members),
-                     access_template_id=_template_map(db, [user_id]).get(user_id),
-                     custom_roles=customs)
+    return _user_out(row, sorted(m.value for m in members), custom_roles=customs)
 
 
 def set_user_active(db: Session, user_id: int, active: bool, actor_id: int | None = None,
@@ -816,41 +724,38 @@ def reset_password(db: Session, user_id: int, new_password: str | None, actor_id
 # ------------------------------------------------------------ access source
 
 def set_access_source(db: Session, user_id: int, kind: str, ref_id: int | None) -> dict:
-    """The Users-tab "Access" dropdown (23 Sep 2026): exactly ONE of
-    role default · an Access Template · a custom role. Picking any one clears
-    the others, so what the admin sees is what decides the user's tabs."""
-    from services.access_templates import assign_template
-    from services.custom_roles import get_or_404 as _role_or_404, list_members, remove_user_from_all_roles, set_members
+    """The Users-tab "Permissions from" dropdown. Since Access Templates were
+    merged into Roles (27 Oct 2026) there are two choices: `role` — ONE custom
+    role (any other custom role is dropped) — or `default` — no custom role,
+    the user's built-in roles decide (their own permissions, else the product
+    rules). Built-in roles stay in Edit Roles."""
+    from services.custom_roles import (get_or_404 as _role_or_404, list_members,
+                                       remove_user_from_all_roles, set_members)
 
     _require_user_row(db, user_id)
     kind = (kind or "default").strip().lower()
     if kind == "template":
-        if ref_id is None:
-            raise HTTPException(status_code=400, detail="template id required")
-        assign_template(db, user_id, int(ref_id))          # also drops custom roles
-    elif kind == "role":
+        raise HTTPException(status_code=400,
+                            detail="Access Templates were merged into Roles — pick a role instead")
+    if kind == "role":
         if ref_id is None:
             raise HTTPException(status_code=400, detail="role id required")
         role = _role_or_404(db, int(ref_id))
         remove_user_from_all_roles(db, user_id)             # one role from this control
         current = [m["id"] for m in list_members(db, role.id)]
-        set_members(db, role.id, current + [user_id])       # also drops the template
+        set_members(db, role.id, current + [user_id])
     elif kind == "default":
         if not _roles_map(db, [user_id]).get(user_id):
-            # "Role default" means "the rules of their built-in role" — a user
+            # "Built-in role" means "the rules of their built-in role" — a user
             # with none would be left with nothing (their custom role removed).
-            _refuse_roleless(db, user_id, "switching to \"Role default\"")
+            _refuse_roleless(db, user_id, "switching to their built-in role")
         remove_user_from_all_roles(db, user_id)
-        assign_template(db, user_id, None)
     else:
-        raise HTTPException(status_code=400, detail="kind must be default, template or role")
+        raise HTTPException(status_code=400, detail="kind must be default or role")
     db.commit()
     from services.custom_roles import custom_roles_by_user
     return {
         "user_id": user_id,
-        "access_template_id": _template_map(db, [user_id]).get(user_id),
         "custom_roles": custom_roles_by_user(db, [user_id]).get(user_id, []),
-        # A template can ADD the built-in role it is tagged with (see
-        # ensure_role_for_template), so the row's role chips are returned too.
         "roles": _roles_map(db, [user_id]).get(user_id, []),
     }

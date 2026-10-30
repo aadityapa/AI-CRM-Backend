@@ -10,6 +10,8 @@ priced and attributed at log time) plus the CRM for customer / TA context.
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -22,6 +24,7 @@ from services.ai_interview_costs import (
 )
 
 router = APIRouter(prefix="/api/ai-costs", tags=["ai-costs"])
+logger = logging.getLogger("karnex.ai_costs")
 
 _ADMIN_ONLY = role_required()   # Admin / CEO — deliberately not template-widenable
 
@@ -31,6 +34,22 @@ def _validated(granularity: str, sort: str) -> None:
         raise HTTPException(status_code=400, detail=f"granularity must be one of {', '.join(GRANULARITIES)}")
     if sort not in ("cost", "date", "date_desc", "candidate", "duration", "tokens"):
         raise HTTPException(status_code=400, detail="Unknown sort")
+
+
+def _report_or_reason(*, db: Session, **kwargs) -> dict:
+    """The report, or a 500 that SAYS why (27 Oct 2026). Production answered a bare
+    "Request failed (500)" — the global handler hides the reason; this one is logged
+    with its traceback AND named on the page, so the next failure is diagnosable."""
+    try:
+        return interview_cost_report(prompt_log_target(), db, **kwargs)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ai cost report failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not build the AI cost report ({type(exc).__name__}: {str(exc)[:300]})",
+        )
 
 
 @router.get("/interviews")
@@ -50,10 +69,10 @@ def list_interview_costs(
     user: CurrentUser = Depends(_ADMIN_ONLY),
 ):
     _validated(granularity, sort)
-    report = interview_cost_report(
-        prompt_log_target(), db, date_from=date_from, date_to=date_to, granularity=granularity,
-        search=search, customer_id=customer_id, ta=ta, status=status, template=template,
-        sort=sort, page=page, limit=min(max(1, limit), 200),
+    report = _report_or_reason(
+        date_from=date_from, date_to=date_to, granularity=granularity, search=search,
+        customer_id=customer_id, ta=ta, status=status, template=template, sort=sort,
+        page=page, limit=min(max(1, limit), 200), db=db,
     )
     interviews = report.pop("interviews")
     meta = report.pop("meta")
@@ -74,10 +93,9 @@ def export_interview_costs(
     user: CurrentUser = Depends(_ADMIN_ONLY),
 ):
     _validated("day", sort)
-    report = interview_cost_report(
-        prompt_log_target(), db, date_from=date_from, date_to=date_to, search=search,
-        customer_id=customer_id, ta=ta, status=status, template=template, sort=sort,
-        page=1, limit=MAX_EXPORT_ROWS,
+    report = _report_or_reason(
+        date_from=date_from, date_to=date_to, search=search, customer_id=customer_id, ta=ta,
+        status=status, template=template, sort=sort, page=1, limit=MAX_EXPORT_ROWS, db=db,
     )
     name = f"ai-interview-costs_{report['period']['date_from']}_{report['period']['date_to']}.csv"
     return Response(

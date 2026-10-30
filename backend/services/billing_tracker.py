@@ -477,6 +477,7 @@ def billing_tracker(db: Session, f: TrackerFilters, *, export: bool = False) -> 
     # ₹ taken from three rows of one stage.
     overdue = sum(1 for r in rows if r["overdue"])
     late_total = round(sum(float(r["balance"] or 0) for r in rows if r["overdue"]), 2)
+    summary = tracker_summary(rows)
 
     if f.stage == "open":
         rows = [r for r in rows if r["stage"] in OPEN_STAGES]
@@ -484,6 +485,8 @@ def billing_tracker(db: Session, f: TrackerFilters, *, export: bool = False) -> 
         rows = [r for r in rows if r["stage"] in INVOICED_STAGES]
         # A register reads newest invoice first.
         rows.sort(key=lambda r: (r["invoice_date"] or "", r["invoice_number"] or ""), reverse=True)
+    elif f.stage in GROUP_STAGES:
+        rows = [r for r in rows if r["stage"] in GROUP_STAGES[f.stage]]
     elif f.stage:
         rows = [r for r in rows if r["stage"] == f.stage]
     if f.stage != "invoiced":
@@ -506,7 +509,94 @@ def billing_tracker(db: Session, f: TrackerFilters, *, export: bool = False) -> 
             "flags": list(FLAGS),
         },
         "late_total": late_total,
+        "summary": summary,
     }}
+
+
+#: Stage groups the Billing Tracker tab charts (27 Oct 2026, CEO dashboard redesign).
+SUMMARY_GROUPS = (
+    ("to_raise", "Proforma to raise / with Finance", ("awaiting_proforma", "returned", "proforma")),
+    ("with_customer", "With the customer (approval · IRN)", ("awaiting_customer", "irn_pending")),
+    ("due", "Payment due", ("unpaid", "partially_paid")),
+    ("paid", "Paid", ("paid",)),
+)
+#: 29 Oct 2026 — a bar of "How the work moved" is a stage GROUP, so the table can be
+#: narrowed to exactly what the bar counted (`?stage=to_raise|with_customer|due`).
+GROUP_STAGES: dict[str, frozenset[str]] = {k: frozenset(sts) for k, _label, sts in SUMMARY_GROUPS if k != "paid"}
+STAGE_GROUPS.update(GROUP_STAGES)
+
+
+def tracker_summary(rows: list[dict]) -> dict:
+    """Tiles + chart data for the Billing Tracker tab, over the SAME filtered rows the
+    table and chips count (every stage, before the stage chip) — PURE.
+
+    `by_month` counts pieces of work per stage group (a sheet still to be invoiced
+    has no amount yet, so counts are the one unit every stage shares); the money
+    charts use what an invoice says — balance for what is owed, total for what is paid."""
+    group_of = {st: key for key, _label, sts in SUMMARY_GROUPS for st in sts}
+    by_month: dict[str, dict] = {}
+    for r in rows:
+        key = r.get("month") or ""
+        slot = by_month.setdefault(key, {"key": key, "label": _short_month(key), **{g: 0 for g, *_ in SUMMARY_GROUPS}})
+        g = group_of.get(r.get("stage"))
+        if g:
+            slot[g] += 1
+    months = [by_month[k] for k in sorted(by_month) if k][-12:]
+
+    def money(r, key):
+        return float(r.get(key) or 0)
+    late = [{"key": k, "label": label,
+             "balance": round(sum(money(r, "balance") for r in rows if r.get("late_bucket") == k), 2),
+             "count": sum(1 for r in rows if r.get("late_bucket") == k)} for k, label, *_ in LATE_BUCKETS]
+    cust: dict[str, dict] = {}
+    for r in rows:
+        name = r.get("customer") or "—"
+        slot = cust.setdefault(name, {"label": name, "customer_id": r.get("customer_id"),
+                                      "due": 0.0, "paid": 0.0, "with_customer": 0.0})
+        g = group_of.get(r.get("stage"))
+        if g == "due":
+            slot["due"] += money(r, "balance")
+        elif g == "paid":
+            slot["paid"] += money(r, "grand_total")
+        elif g == "with_customer":
+            slot["with_customer"] += money(r, "grand_total")
+    customers = sorted(cust.values(), key=lambda c: -(c["due"] + c["with_customer"] + c["paid"]))[:10]
+    for c in customers:
+        for k in ("due", "paid", "with_customer"):
+            c[k] = round(c[k], 2)
+
+    def grp(g):
+        return [r for r in rows if group_of.get(r.get("stage")) == g]
+    to_raise, with_cust, due, paid = grp("to_raise"), grp("with_customer"), grp("due"), grp("paid")
+    waits = [r["waiting_days"] for r in rows if r.get("waiting_days") is not None and r.get("stage") != "paid"]
+    return {
+        "tiles": {
+            "to_raise": len(to_raise),
+            "to_raise_returned": sum(1 for r in to_raise if r.get("stage") == "returned"),
+            "with_customer": len(with_cust),
+            "with_customer_amount": round(sum(money(r, "grand_total") for r in with_cust), 2),
+            "due_amount": round(sum(money(r, "balance") for r in due), 2),
+            "due_count": len(due),
+            "overdue_amount": round(sum(money(r, "balance") for r in rows if r.get("overdue")), 2),
+            "overdue_count": sum(1 for r in rows if r.get("overdue")),
+            "paid_amount": round(sum(money(r, "grand_total") for r in paid), 2),
+            "paid_count": len(paid),
+            "tds_pending": round(sum(money(r, "tds_pending") for r in rows), 2),
+            "avg_wait_days": round(sum(waits) / len(waits), 1) if waits else None,
+        },
+        "groups": [{"key": k, "label": label} for k, label, _ in SUMMARY_GROUPS],
+        "by_month": months,
+        "late": late,
+        "customers": customers,
+    }
+
+
+def _short_month(key: str) -> str:
+    try:
+        y, m = key.split("-")
+        return f"{_MONTHS[int(m) - 1]} {y[2:]}"
+    except (ValueError, IndexError):
+        return key or "—"
 
 
 #: The CSV's columns (26 Oct 2026 — "take it from there whenever they want").

@@ -63,9 +63,8 @@ for _m in [
 
 import crm_deps  # noqa: E402
 from crm_deps import CurrentUser  # noqa: E402
-from models import AccessTemplate, UserProfile  # noqa: E402
+from models import UserProfile  # noqa: E402,F401
 from models.base import Base  # noqa: E402
-from services import access_templates as tpl_svc  # noqa: E402
 from services import action_permissions as ap  # noqa: E402
 from services import custom_roles as role_svc  # noqa: E402
 from services.access_templates import effective_access  # noqa: E402
@@ -103,14 +102,14 @@ def _user(uid: int, *roles: str) -> CurrentUser:
     return CurrentUser(id=uid, username=f"u{uid}", full_name=f"User {uid}", roles=set(roles))
 
 
-def _assign_template(db, uid: int, name: str, role: str | None, tabs: dict, actions=None) -> int:
-    payload = {"name": name, "role": role, "tab_access": tabs}
-    if actions is not None:
-        payload["action_access"] = actions
-    t = tpl_svc.create_template(db, payload)
-    db.add(UserProfile(user_id=uid, access_template_id=t["id"]))
-    db.commit()
-    return t["id"]
+def _assign_template(db, uid: int, name: str, role: str | None, tabs: dict, actions=None):
+    """Since 27 Oct 2026 a role carries what a template did. A template always
+    stored a list (what was ticked, else its role tag's defaults + the buttons
+    its tabs imply) — the role gets the same list."""
+    from tests.role_grants import give_role
+    if actions is None:
+        actions = ap.clean_action_list(ap.default_actions_for_role(role) + ap.implied_buttons(tabs))
+    return give_role(db, uid, tabs, action_access=actions)
 
 
 def _gate_client(db, user: CurrentUser, action: str, tab: str) -> TestClient:
@@ -181,8 +180,8 @@ def test_view_is_enough_tab_access_for_an_approver(db):
 def test_a_template_without_configured_approvals_falls_back_to_role_lists(db):
     """NULL = never configured (an untagged template before 0108): the action's
     role list decides — nobody loses or gains a button by the upgrade alone."""
-    tid = _assign_template(db, 2, "Legacy HR", None, {"leave-applications": "edit"})
-    db.get(AccessTemplate, tid).action_access = None
+    role = _assign_template(db, 2, "Legacy HR", None, {"leave-applications": "edit"})
+    role.action_access = None
     db.commit()
     acc = effective_access(db, 2, {"HR"})
     assert acc["actions"] is None
@@ -204,22 +203,23 @@ def test_manage_actions_keep_the_tab_edit_rule(db):
 # ------------------------------------------------------------- the editor ---
 
 
-def test_a_new_template_starts_from_its_role_tags_default_approvals(db):
-    t = tpl_svc.create_template(db, {"name": "Default — Finance", "role": "Finance",
-                                     "tab_access": {"invoices": "create"}})
-    assert {"invoice.convert_proforma", "credit_note.approve"} == {a for a in t["action_access"] if ap.is_approval(a)}
-    assert "invoice.manage" in t["action_access"]          # 7 Oct 2026: the buttons too
-    sales = tpl_svc.create_template(db, {"name": "Default — Sales", "role": "Sales",
-                                         "tab_access": {"timesheets": "create"}})
-    assert not any(a.startswith("timesheet.") for a in sales["action_access"])
+def test_a_built_in_role_with_permissions_but_no_button_list_follows_the_role_lists(db):
+    """27 Oct 2026: a built-in role's permissions may leave its buttons unset —
+    then the action role lists decide, exactly as for an unconfigured login."""
+    from tests.role_grants import set_builtin
+    set_builtin(db, 5, "Finance", {"invoices": "create"})
+    finance = _user(5, "Finance")
+    acc = effective_access(db, 5, {"Finance"})
+    assert acc["visible_tabs"] is not None and acc["actions"] is None
+    assert ap.user_may(db, finance, "invoice.convert_proforma", acc)
+    set_builtin(db, 6, "Sales", {"timesheets": "create"})
+    assert not ap.user_may(db, _user(6, "Sales"), "timesheet.approve")
 
 
-def test_unknown_action_keys_are_dropped_and_the_role_tag_can_be_cleared(db):
-    t = tpl_svc.create_template(db, {"name": "T", "role": "GM", "tab_access": {"timesheets": "edit"},
-                                     "action_access": ["timesheet.approve", "no.such.action"]})
+def test_unknown_action_keys_are_dropped(db):
+    t = role_svc.create_role(db, {"name": "Approver", "tab_access": {"timesheets": "edit"},
+                                  "action_access": ["timesheet.approve", "no.such.action"]}, actor_id=1)
     assert t["action_access"] == ["timesheet.approve"]
-    out = tpl_svc.update_template(db, t["id"], {"role": None})
-    assert out["role"] is None
 
 
 def test_the_registry_lists_every_approval_with_a_group():

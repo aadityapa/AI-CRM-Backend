@@ -1,8 +1,10 @@
 """Access Control ▸ Roles — Admin/CEO-defined roles (23 Sep 2026).
 
 `/api/roles` lists the eight built-in roles beside the custom ones so the page
-is ONE table; only custom roles can be created, edited, deleted or given
-members here (built-in membership stays `POST /api/users/{id}/roles`).
+is ONE table. Since Access Templates were merged into Roles (27 Oct 2026) a
+built-in role's own permissions are set here too (`/builtin/{name}/permissions`);
+only custom roles are created, renamed, deleted or given members here
+(built-in membership stays `POST /api/users/{id}/roles`).
 Every route is Admin/CEO (`role_required()`), the same bar as Users.
 """
 from __future__ import annotations
@@ -42,6 +44,51 @@ class RoleUpdateIn(BaseModel):
 
 class MembersIn(BaseModel):
     user_ids: list[int] = Field(default_factory=list)
+
+
+class BuiltinPermissionsIn(BaseModel):
+    tab_access: dict[str, str] = Field(default_factory=dict)
+    field_access: dict[str, dict[str, str]] | None = None
+    action_access: list[str] | None = None
+
+
+@router.get("/registry")
+def roles_registry(db: Session = Depends(get_crm_db), user: CurrentUser = Depends(admin_only)):
+    """The permission catalogue (tabs, fields, buttons, suggested defaults)."""
+    from routers.crm.access_templates import registry_payload
+    return envelope(data=registry_payload(db), message="Access registry")
+
+
+@router.get("/builtin/{name}/members")
+def builtin_role_members(name: str, db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(admin_only)):
+    return envelope(data=svc.builtin_members(db, name))
+
+
+@router.put("/builtin/{name}/permissions")
+def set_builtin_permissions(name: str, body: BuiltinPermissionsIn, db: Session = Depends(get_crm_db),
+                            user: CurrentUser = Depends(admin_only)):
+    """A built-in role's own tab / field / button permissions — they apply to
+    everyone holding it (merged with their other roles)."""
+    before = svc.builtin_permissions_payload(name, svc._builtin_permissions(db).get(name))
+    data = svc.set_builtin_permissions(db, name, body.model_dump(exclude_unset=True))
+    db.commit()
+    audit.record(db, actor=user, action="role.updated", subject_type="role", subject_name=name,
+                 before={"tab_access": before.get("tab_access"), "action_access": before.get("action_access")},
+                 after={"tab_access": data.get("tab_access"), "action_access": data.get("action_access")},
+                 summary=f"Permissions of built-in role '{name}' set")
+    return envelope(data=data, message=f"Permissions saved for {svc.BUILTIN_LABELS.get(name, name)}")
+
+
+@router.delete("/builtin/{name}/permissions")
+def clear_builtin_permissions(name: str, db: Session = Depends(get_crm_db),
+                              user: CurrentUser = Depends(admin_only)):
+    """Back to the product's role rules (nothing restricts the people holding it)."""
+    data = svc.set_builtin_permissions(db, name, None)
+    db.commit()
+    audit.record(db, actor=user, action="role.updated", subject_type="role", subject_name=name,
+                 summary=f"Built-in role '{name}' back to the product's role rules")
+    return envelope(data=data, message=f"{svc.BUILTIN_LABELS.get(name, name)} follows the product's role rules")
 
 
 @router.get("")
