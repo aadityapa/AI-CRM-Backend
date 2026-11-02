@@ -21,6 +21,12 @@ GET /api/finance/reports/receivables?as_of=
 
 Proformas are not issued invoices and are left out of both reports.
 
+Branch-wise (2 Nov 2026, Finance ask): both take `branch_id` (0 = no branch on
+record). An invoice's branch is its project's branch, else its PO's billing
+branch (`invoice_facets`); payments / TDS / credit notes follow their invoice and
+money still on account follows its received amount's branch. The ledger also
+lists money received but not yet mapped ("On account") — it is a real credit.
+
 Read access: Finance / Sales / Sales Head (+ Admin, CEO). 19 Oct 2026 — Sales
 reads the Financial Reports tab, Finance works it.
 """
@@ -89,21 +95,88 @@ def _customer_invoices(db: Session, customer_id: int) -> list[tuple[Invoice, Pro
     ).all()
 
 
+NO_BRANCH = 0
+NO_BRANCH_LABEL = "No branch on record"
+
+
+def _invoice_branches(db: Session, invoices) -> dict[int, tuple[int | None, str | None]]:
+    """invoice id → (branch id, branch name): the project's delivery branch, else the
+    PO's billing branch — the `invoice_facets` rule every finance screen uses."""
+    from services.invoice_facets import invoice_facets
+    try:
+        facets = invoice_facets(db, invoices)
+    except Exception:  # noqa: BLE001 — a missing branch label never breaks a ledger
+        facets = {}
+    return {i.id: ((facets.get(i.id) or {}).get("branch_id"), (facets.get(i.id) or {}).get("branch_name"))
+            for i in invoices}
+
+
+def branch_matches(entry_branch: int | None, branch_id: int | None) -> bool:
+    """PURE. `branch_id` None = every branch; 0 = only entries with no branch."""
+    if branch_id is None:
+        return True
+    if branch_id == NO_BRANCH:
+        return entry_branch is None
+    return entry_branch == branch_id
+
+
+def ledger_branch_summary(entries: list[dict], names: dict[int, str]) -> list[dict]:
+    """PURE. One row per branch over `entries` (debit · credit · balance · invoices),
+    the customer's branches first by name, "No branch on record" last."""
+    acc: dict[int, dict] = {}
+    for e in entries:
+        key = e.get("branch_id") or NO_BRANCH
+        row = acc.setdefault(key, {"branch_id": key, "debit": ZERO, "credit": ZERO, "invoices": 0})
+        row["debit"] += e["debit"]
+        row["credit"] += e["credit"]
+        if e["type"] == "Invoice":
+            row["invoices"] += 1
+    for bid in names:
+        acc.setdefault(bid, {"branch_id": bid, "debit": ZERO, "credit": ZERO, "invoices": 0})
+    out = []
+    for bid, row in acc.items():
+        out.append({
+            "branch_id": bid, "branch_name": names.get(bid) or (NO_BRANCH_LABEL if bid == NO_BRANCH else f"Branch #{bid}"),
+            "invoices": row["invoices"], "debit": _num(row["debit"]), "credit": _num(row["credit"]),
+            "balance": _num(row["debit"] - row["credit"]),
+        })
+    out.sort(key=lambda r: (r["branch_id"] == NO_BRANCH, (r["branch_name"] or "").lower()))
+    return out
+
+
 @router.get("/customer-ledger")
 def customer_ledger(
     customer_id: int,
     date_from: date | None = None,
     date_to: date | None = None,
+    branch_id: int | None = None,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(LEDGER_READ),
 ):
+    """2 Nov 2026 — branch-wise: every line names the customer branch it belongs to
+    (an invoice's branch = project branch, else the PO's billing branch; a payment,
+    TDS or credit note follows its invoice; money on account follows its received
+    amount), `branch_id` narrows the whole statement to one branch (opening and
+    closing balances included), and `branches` sums every branch side by side."""
+    from models import CustomerBranch, CustomerReceipt
     customer = db.get(Customer, customer_id)
     if customer is None:
         raise HTTPException(status_code=404, detail="Customer not found")
+    branch_names = dict(db.execute(
+        select(CustomerBranch.id, CustomerBranch.branch_name).where(CustomerBranch.customer_id == customer_id)
+    ).all())
+    if branch_id is not None and branch_id < 0:
+        raise HTTPException(status_code=400, detail="branch_id must be 0 (no branch) or a branch id")
+    if branch_id and branch_id not in branch_names:
+        raise HTTPException(status_code=400, detail="That branch does not belong to this customer")
 
     inv_rows = _customer_invoices(db, customer_id)
     invoice_ids = [inv.id for inv, _ in inv_rows]
     inv_by_id = {inv.id: inv for inv, _ in inv_rows}
+    inv_branch = _invoice_branches(db, [inv for inv, _ in inv_rows])
+    for bid, bname in inv_branch.values():
+        if bid and bid not in branch_names:
+            branch_names[bid] = bname or f"Branch #{bid}"
 
     payments = db.execute(
         select(InvoicePayment).where(InvoicePayment.invoice_id.in_(invoice_ids or [-1]))
@@ -159,9 +232,29 @@ def customer_ledger(
             "invoice_id": cn.invoice_id, "invoice_number": inv.invoice_number if inv else None,
             "credit_note_id": cn.id,
         })
+    for e in entries:
+        e["branch_id"] = (inv_branch.get(e.get("invoice_id")) or (None, None))[0]
+    # Money received but not mapped to any invoice yet is still a credit the customer
+    # has given us — it belongs on the statement, in the month it arrived, under the
+    # branch that paid. Once mapped it becomes Payment lines and leaves this list.
+    for r in db.execute(
+        select(CustomerReceipt).where(CustomerReceipt.customer_id == customer_id,
+                                      CustomerReceipt.unallocated_amount > 0)
+    ).scalars().all():
+        entries.append({
+            "date": r.received_date, "rank": 4, "type": "On account",
+            "ref": r.reference_number or f"Received amount #{r.id}",
+            "note": f"{r.payment_mode or 'Received'} · not mapped to an invoice yet",
+            "debit": ZERO, "credit": Decimal(r.unallocated_amount or 0),
+            "invoice_id": None, "invoice_number": None, "receipt_id": r.id,
+            "branch_id": r.branch_id,
+        })
 
     entries = [e for e in entries if e["date"] is not None]
     entries.sort(key=lambda e: (e["date"], e["rank"]))
+    branches = ledger_branch_summary(
+        [e for e in entries if date_to is None or e["date"] <= date_to], branch_names)
+    entries = [e for e in entries if branch_matches(e.get("branch_id"), branch_id)]
 
     def _split(pred):
         return [e for e in entries if pred(e)]
@@ -189,6 +282,8 @@ def customer_ledger(
             "invoice_number": e.get("invoice_number"),
             "receipt_id": e.get("receipt_id"),
             "credit_note_id": e.get("credit_note_id"),
+            "branch_id": e.get("branch_id"),
+            "branch_name": branch_names.get(e.get("branch_id")) if e.get("branch_id") else None,
         })
 
     totals = {
@@ -198,6 +293,10 @@ def customer_ledger(
     return envelope(data={
         "customer_id": customer_id,
         "customer_name": customer.name,
+        "branch_id": branch_id,
+        "branch_name": (NO_BRANCH_LABEL if branch_id == NO_BRANCH else branch_names.get(branch_id))
+        if branch_id is not None else None,
+        "branches": branches,
         "date_from": date_from.isoformat() if date_from else None,
         "date_to": date_to.isoformat() if date_to else None,
         "opening_balance": _num(opening),
@@ -210,17 +309,26 @@ def customer_ledger(
 @router.get("/receivables")
 def receivables(
     as_of: date | None = None,
+    customer_id: int | None = None,
+    branch_id: int | None = None,
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(RECEIVABLES_READ),
 ):
+    """2 Nov 2026 — branch-wise: `customer_id` / `branch_id` narrow the page, every
+    open invoice names its branch, and each customer carries `branches` (what each
+    branch owes, how much of it is late) for the drill-down."""
     as_of = as_of or date.today()
 
-    inv_rows = db.execute(
-        select(Invoice, Project, Customer)
-        .join(Project, Project.id == Invoice.project_id)
-        .join(Customer, Customer.id == Project.customer_id)
-        .where(Invoice.invoice_date <= as_of, NOT_PROFORMA)
-    ).all()
+    q = (select(Invoice, Project, Customer)
+         .join(Project, Project.id == Invoice.project_id)
+         .join(Customer, Customer.id == Project.customer_id)
+         .where(Invoice.invoice_date <= as_of, NOT_PROFORMA))
+    if customer_id:
+        q = q.where(Customer.id == customer_id)
+    inv_rows = db.execute(q).all()
+    if branch_id is not None:
+        br = _invoice_branches(db, [inv for inv, _p, _c in inv_rows])
+        inv_rows = [r for r in inv_rows if branch_matches((br.get(r[0].id) or (None, None))[0], branch_id)]
     invoice_ids = [inv.id for inv, _, _ in inv_rows]
 
     pay_by_inv: dict[int, Decimal] = {}
@@ -260,7 +368,7 @@ def receivables(
             "customer_id": cust.id, "customer_name": cust.name,
             "invoiced": ZERO, "received": ZERO, "tds": ZERO, "credit_notes": ZERO,
             "outstanding": ZERO, "overdue": ZERO, "invoice_count": 0, "overdue_count": 0,
-            "oldest_days_late": 0, "open_invoices": [],
+            "oldest_days_late": 0, "open_invoices": [], "branches": {},
             **{b: ZERO for b in buckets},
         })
         total = Decimal(inv.grand_total or 0)
@@ -285,10 +393,19 @@ def receivables(
             row["overdue"] += outstanding
             row["oldest_days_late"] = max(row["oldest_days_late"], days_late)
         f = facets.get(inv.id) or {}
+        bkey = f.get("branch_id") or NO_BRANCH
+        b = row["branches"].setdefault(bkey, {
+            "branch_id": bkey, "branch_name": f.get("branch_name") or NO_BRANCH_LABEL,
+            "outstanding": ZERO, "overdue": ZERO, "invoices": 0})
+        b["outstanding"] += outstanding
+        b["invoices"] += 1
+        if days_late > 0:
+            b["overdue"] += outstanding
         row["open_invoices"].append({
             "id": inv.id, "invoice_number": inv.invoice_number,
             "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
             "month_label": f.get("month_label"), "branch_name": f.get("branch_name"),
+            "branch_id": f.get("branch_id"),
             "employee": f.get("employee"), "project": prj.name,
             "due_date": due.isoformat(), "days_late": max(days_late, 0),
             "bucket": key, "outstanding": _num(outstanding),
@@ -301,6 +418,10 @@ def receivables(
         for k in grand:
             grand[k] += row[k]
         row["open_invoices"].sort(key=lambda i: -i["days_late"])
+        row["branches"] = sorted(
+            ({**b, "outstanding": _num(b["outstanding"]), "overdue": _num(b["overdue"])}
+             for b in row["branches"].values()),
+            key=lambda b: -b["outstanding"])
         out.append({
             **{k: (v if not isinstance(v, Decimal) else _num(v)) for k, v in row.items()},
         })

@@ -453,8 +453,9 @@ def billing_tracker(db: Session, f: TrackerFilters, *, export: bool = False) -> 
     # stage narrows the rows only.
     if f.customer_id is not None:
         rows = [r for r in rows if r["customer_id"] == f.customer_id]
-    if f.search and f.search.strip():
-        q = f.search.strip().lower()
+    from services.search_terms import clean_search
+    if clean_search(f.search):
+        q = clean_search(f.search).lower()
         rows = [r for r in rows if q in " ".join(str(r.get(k) or "") for k in (
             "customer", "project", "employee", "employee_code", "invoice_number", "proforma_number",
             "month_label", "period_label", "branch", "po_number", "owner")).lower()]

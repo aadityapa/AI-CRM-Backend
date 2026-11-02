@@ -170,6 +170,18 @@ class PaymentIn(BaseModel):
     notes: str | None = None
     # Optional payment-proof URL (from POST /api/invoices/{id}/payments/upload).
     attachment_url: str | None = Field(default=None, max_length=512)
+    #: 2 Nov 2026 — optional link to Received Amount (services/invoice_payments):
+    #: take the money from a received amount on account …
+    receipt_id: int | None = None
+    #: … or also save this payment as a new received amount mapped to the invoice.
+    add_to_received: bool = False
+
+
+class PaymentReverseIn(BaseModel):
+    """Undo one payment (2 Nov 2026). `remove_receipt` also deletes the received
+    amount it came from when nothing else is left on it."""
+    reason: str = Field(min_length=1, max_length=1000)
+    remove_receipt: bool = False
 
 
 class TdsCreateIn(BaseModel):

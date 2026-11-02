@@ -46,6 +46,7 @@ from schemas.finance import (
     InvoiceCreate,
     InvoiceUpdate,
     PaymentIn,
+    PaymentReverseIn,
     ProjectCreatePOIn,
     PurchaseOrderCreate,
     PurchaseOrderRenewIn,
@@ -784,6 +785,11 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
     from services.invoice_facets import invoice_facets
 
     stmt = select(Invoice)
+    # 2 Nov 2026: a SEARCH looks through every invoice ever raised — an invoice
+    # number typed in must be found even when its work month is before the
+    # data start (Settings ▸ Billing). Browsing a tab keeps the window.
+    if pp.search:
+        all_history = True
     if not all_history:
         stmt = stmt.where(billing_rules.invoice_window_clause())
     stmt = _invoice_common_filters(stmt, project_id=project_id, customer_id=customer_id, po_id=po_id,
@@ -1007,8 +1013,16 @@ def _invoice_common_filters(stmt, *, project_id=None, customer_id=None, po_id=No
         stmt = stmt.where(Invoice.grand_total <= amount_max)
     if search:
         like = f"%{search}%"
+        # 2 Nov 2026: also the PO number, the project and the customer (project's
+        # or PO's) — what Finance has in hand when a payment advice arrives.
+        cust_ids = select(Customer.id).where(sa.or_(Customer.name.ilike(like),
+                                                     Customer.legal_entity_name.ilike(like)))
         stmt = stmt.where(sa.or_(
             Invoice.invoice_number.ilike(like), Invoice.proforma_number.ilike(like),
+            Invoice.po_id.in_(select(PurchaseOrder.id).where(sa.or_(
+                PurchaseOrder.po_number.ilike(like), PurchaseOrder.customer_id.in_(cust_ids)))),
+            Invoice.project_id.in_(select(Project.id).where(sa.or_(
+                Project.name.ilike(like), Project.customer_id.in_(cust_ids)))),
             Invoice.timesheet_id.in_(select(Timesheet.id).join(Employee, Employee.id == Timesheet.employee_id)
                                      .where(sa.or_(Employee.first_name.ilike(like), Employee.last_name.ilike(like),
                                                    Employee.employee_code.ilike(like))))))
@@ -1492,24 +1506,66 @@ def record_payment(invoice_id: int, body: PaymentIn, db: Session = Depends(get_c
     if body.amount <= 0 or body.amount > Decimal(str(invoice.balance_amount)):
         raise HTTPException(status_code=400,
                             detail="Payment amount must be positive and not exceed the balance amount")
-    payment = InvoicePayment(
-        invoice_id=invoice.id,
-        payment_date=body.payment_date,
-        amount=body.amount,
-        payment_mode=body.payment_mode,
-        reference_number=body.reference_number,
-        notes=body.notes,
-        attachment_url=body.attachment_url,
-        created_by=user.id,
-    )
-    db.add(payment)
-    tax.apply_invoice_payment(invoice, body.amount)
+    from services import invoice_payments
+
+    payment = invoice_payments.record_payment(
+        db, invoice, payment_date=body.payment_date, amount=body.amount,
+        payment_mode=body.payment_mode, reference_number=body.reference_number, notes=body.notes,
+        attachment_url=body.attachment_url, receipt_id=body.receipt_id,
+        add_to_received=body.add_to_received, user=user)
     db.commit()
     db.refresh(payment)
+    msg = "Payment recorded"
+    if body.receipt_id is not None:
+        msg += f" from received amount #{body.receipt_id}"
+    elif body.add_to_received and payment.receipt_id:
+        msg += f" and added to Received Amount (#{payment.receipt_id})"
     return envelope(
-        {"payment": serialize_payment(payment), "invoice": serialize_invoice(invoice)},
-        "Payment recorded",
-    )
+        {"payment": serialize_payment(payment), "invoice": serialize_invoice(invoice)}, msg)
+
+
+@router.get("/invoices/{invoice_id}/payment-options")
+def payment_options(invoice_id: int, db: Session = Depends(get_crm_db),
+                    user: CurrentUser = Depends(INV_READ)):
+    """What the Record Payment dialog may link the payment to (2 Nov 2026):
+    the invoice's customer / branch and its received amounts still on account."""
+    from services import invoice_payments
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    cid, _ = invoice_payments.invoice_customer_ids(db, invoice)
+    branch_id, branch_name = invoice_payments.invoice_branch(db, invoice)
+    customer = db.get(Customer, cid) if cid else None
+    return envelope({
+        "customer_id": cid,
+        "customer_name": getattr(customer, "name", None),
+        "branch_id": branch_id,
+        "branch_name": branch_name,
+        "receipts_on_account": invoice_payments.receipts_on_account(db, invoice),
+    })
+
+
+@router.post("/invoices/{invoice_id}/payments/{payment_id}/reverse")
+def reverse_payment(invoice_id: int, payment_id: int, body: PaymentReverseIn,
+                    db: Session = Depends(get_crm_db), user: CurrentUser = Depends(INV_WRITE)):
+    """Undo one payment recorded by mistake (2 Nov 2026, Admin ask). Finance /
+    Admin / CEO; a reason is required and the event is kept on the customer's
+    Activity Log. Money from a received amount goes back on account."""
+    from services import invoice_payments
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    payment = db.get(InvoicePayment, payment_id)
+    if payment is None or payment.invoice_id != invoice.id:
+        raise HTTPException(status_code=404, detail="That payment is not on this invoice")
+    out = invoice_payments.reverse_payment(db, invoice, payment, reason=body.reason,
+                                           remove_receipt=body.remove_receipt, user=user)
+    db.commit()
+    db.refresh(invoice)
+    msg = f"Payment of {out['amount']:,.2f} reversed"
+    if out["receipt_removed"]:
+        msg += f" and received amount #{out['receipt_id']} removed"
+    elif out["back_on_account"]:
+        msg += f" — the money is back on account on received amount #{out['receipt_id']}"
+    return envelope({"invoice": serialize_invoice(invoice), **out}, msg)
 
 
 @router.post("/invoices/{invoice_id}/payments/upload")

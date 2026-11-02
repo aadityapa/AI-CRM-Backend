@@ -46,6 +46,7 @@ from services.project_closure import BENCH, DEPLOYED, deployment_by_employee
 from services.revenue_report import (
     DEFAULT_TERMS_DAYS, SERIES_BY_PERIOD, Month, Period, _deployed_rows, _invoices_in_window,
     _monthly_rate, _overlap_fraction, _payments_in_window, _user_names, revenue_report,
+    scope_projects,
 )
 
 logger = logging.getLogger("karnex.crm.executive_dashboard")
@@ -255,7 +256,8 @@ def _kind_index(db: Session, employee_ids: set[int]) -> dict[int, tuple[str, str
 
 
 def _finance(db: Session, period: Period, today: date,
-             customer_id: int | None = None, project_id: int | None = None) -> dict:
+             customer_id: int | None = None, project_id: int | None = None,
+             branch_id: int | None = None) -> dict:
     """The Revenue report's sections the CEO reads first, plus a month-by-month
     cut INSIDE the period (the report's own trend is 12 months / 8 quarters /
     5 FYs — at the FY zoom it cannot show how this year unfolded).
@@ -263,10 +265,13 @@ def _finance(db: Session, period: Period, today: date,
     24 Oct 2026: `customer_id` / `project_id` narrow every figure — the same SQL
     filters the Revenue report uses, so the tab and the report never disagree."""
     rep = revenue_report(db, period.anchor.key, today, period.kind,
-                         customer_id=customer_id, project_id=project_id)
-    invoices = _invoices_in_window(db, period.start, period.end, customer_id, project_id)
-    payments = _payments_in_window(db, period.start, period.end, customer_id, project_id)
-    deployed = _deployed_rows(db, customer_id, project_id)
+                         customer_id=customer_id, project_id=project_id, branch_id=branch_id)
+    # 2 Nov 2026 — a branch is the tuple of its projects, the report's own rule.
+    scoped = scope_projects(db, customer_id, project_id, branch_id)
+    invoices = _invoices_in_window(db, period.start, period.end, customer_id, scoped)
+    payments = _payments_in_window(db, period.start, period.end, customer_id, scoped,
+                                   branch_id=branch_id if not project_id else None)
+    deployed = _deployed_rows(db, customer_id, scoped)
 
     monthly = []
     for m in _months_in(period):
@@ -1024,7 +1029,8 @@ _BUILDERS = {"finance": _finance, "customer": _customer, "sales": _sales, "peopl
 
 def executive_dashboard(db: Session, tab: str, month_raw: str | None = None,
                         period_raw: str | None = None, today: date | None = None,
-                        customer_id: int | None = None, project_id: int | None = None) -> dict:
+                        customer_id: int | None = None, project_id: int | None = None,
+                        branch_id: int | None = None) -> dict:
     """One tab of the CEO dashboard. `tab` ∈ TABS; `month` is the anchor and
     `period` the zoom (default FY). Raises ValueError on a bad tab / period."""
     tab = (tab or "").strip().lower()
@@ -1036,6 +1042,6 @@ def executive_dashboard(db: Session, tab: str, month_raw: str | None = None,
         "as_of": today.isoformat(),
         "tab": tab,
         "period": _period_view(period, today),
-        "data": (_finance(db, period, today, customer_id, project_id) if tab == "finance"
+        "data": (_finance(db, period, today, customer_id, project_id, branch_id) if tab == "finance"
                  else _BUILDERS[tab](db, period, today)),
     }

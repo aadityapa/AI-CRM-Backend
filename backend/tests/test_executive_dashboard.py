@@ -234,11 +234,13 @@ def test_finance_tab_is_the_revenue_report_plus_a_month_by_month_cut(book):
     assert r["headline"]["billed"] == 460_000 and r["headline"]["collected"] == 288_800
     assert len(r["monthly"]) == 12 and r["monthly"][0]["key"] == "2026-04"
     aug = next(m for m in r["monthly"] if m["key"] == "2026-08")
-    assert aug["billed"] == 360_000 and aug["collected"] == 0
+    # 2 Nov 2026: money is counted in the month of the INVOICE it pays — the Sept
+    # receipts pay the Aug invoices, so they land in Aug, not in Sept.
+    assert aug["billed"] == 360_000 and aug["collected"] == 288_800
     assert aug["cost"] == pytest.approx((1_200_000 + 600_000) / 12, abs=1)
     assert aug["margin"] == pytest.approx(360_000 - 150_000, abs=1)
     sep = next(m for m in r["monthly"] if m["key"] == "2026-09")
-    assert sep["billed"] == 0 and sep["collected"] == 288_800, "a Proforma is not billing"
+    assert sep["billed"] == 0 and sep["collected"] == 0, "a Proforma is not billing; Sept cash paid Aug invoices"
     assert all(m["future"] for m in r["monthly"] if m["key"] >= "2026-10")
     assert r["top_customers"][0]["customer"] == "HARMAN" and r["concentration"]["risk"] is True
     assert {"ageing", "cashflow", "targets", "collections", "alerts", "by_type"} <= set(r)
@@ -406,7 +408,8 @@ def test_customer_tab_unfolds_month_by_month_with_the_top_customers_as_series(bo
     may = next(m for m in r["monthly"] if m["key"] == "2026-05")
     assert may["customers"] == {"APTIV": 100_000} and may["cost"] == pytest.approx(100_000, abs=1)
     sep = next(m for m in r["monthly"] if m["key"] == "2026-09")
-    assert sep["billed"] == 0 and sep["collected"] == 288_800 and sep["customers"] == {}
+    assert sep["billed"] == 0 and sep["collected"] == 0 and sep["customers"] == {}
+    assert aug["collected"] == 288_800, "the Sept cash pays the Aug invoices"
     h = r["customers"][0]
     assert h["monthly_burn"] == 200_000 + 1_000 * 21 * 8, "today's deployed heads at their monthly rate"
     assert h["po_cover_months"] == pytest.approx(2_640_000 / 368_000, abs=0.05)

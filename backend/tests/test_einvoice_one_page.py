@@ -102,8 +102,12 @@ def test_issuing_a_tax_invoice_stamps_who_issued_it():
 def test_payments_record_who_recorded_them():
     fin = (BACKEND / "routers" / "crm" / "finance.py").read_text(encoding="utf-8")
     body = fin.split('@router.post("/invoices/{invoice_id}/record-payment")', 1)[1].split("@router.", 1)[0]
-    assert "created_by=user.id" in body
-    rc = (BACKEND / "routers" / "crm" / "customer_receipts.py").read_text(encoding="utf-8")
+    # 2 Nov 2026: the write moved into services/invoice_payments.record_payment,
+    # which stamps created_by from the user the route passes.
+    assert "invoice_payments.record_payment(" in body and "user=user" in body
+    svc = (BACKEND / "services" / "invoice_payments.py").read_text(encoding="utf-8")
+    assert "created_by=uid" in svc.split("payment = InvoicePayment(", 1)[1].split("db.add(payment)", 1)[0]
+    rc =(BACKEND / "routers" / "crm" / "customer_receipts.py").read_text(encoding="utf-8")
     assert "created_by=user.id" in rc.split("db.add(InvoicePayment(", 1)[1].split("))", 1)[0]
     approval = fin.split("def _with_approval", 1)[1].split("\n\n\n", 1)[0]
     for key in ('"issued"', "recorded_by_name", "created_by_name"):

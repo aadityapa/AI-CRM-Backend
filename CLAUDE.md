@@ -7,8 +7,8 @@
 > the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
 > short copy and points here. Keep both in step.
 
-**Last updated:** 29 Oct 2026 (clickable charts). **State:** migration head **0150**. Backend suite ~2,250 pass, 3 skipped; the known
-failure is `test_public_invoice_qr`. Dashboard `tsc` is green. Nothing is committed since `dd61630`, so **commit the
+**Last updated:** 2 Nov 2026 (an invoice number is found on every list: search cleaning, all tabs, Received Amount; Record Payment redesign; branch-wise finance). **State:**
+migration head **0150**. Backend suite ~2,295 pass, 3 skipped; the known failure is `test_public_invoice_qr`. Dashboard `tsc` is green. Nothing is committed since `dd61630`, so **commit the
 working tree.**
 
 ### What the project is
@@ -80,11 +80,19 @@ Roles:
 - A sheet may be split across POs by dates or by amount.
 - Issued invoices keep the address they were raised with (0143); Finance corrects it explicitly.
 - Payments are blocked until the customer approves and the IRN is recorded.
+- Record Payment may optionally take the money from a Received Amount on account, or add it as a new one; a payment
+  can be reversed with a reason (2 Nov 2026).
+- Dashboards count "collected" in the month of the INVOICE it pays; money still on account counts in the month it
+  arrived (2 Nov 2026).
 - TDS settles the invoice and is followed as "pending from client".
+- Branch scope (2 Nov 2026): an invoice's branch is the project's, else the PO billing branch (ledger, receivables);
+  revenue figures follow the project's branch; money on account follows the receipt's branch.
 - Data window: work months from `billing.data_start_month` (default 2026-03).
 
 **UI rules**
 - Customer pickers list active customers only. Name lookups use `/api/customers/names`.
+- Every list search runs through `services/search_terms.clean_search` (via `page_params`); a search on Invoices
+  ignores the data window; Received Amount finds receipts by the invoices they paid (2 Nov 2026).
 - CEO dashboard charts are grouped bars with filter ticks; nothing is stacked.
 - Every dashboard bar opens the records behind it (29 Oct 2026):
   - CEO tabs → the drill page for that month, customer or series.
@@ -123,7 +131,8 @@ Roles:
 - Projects and closure; leave and comp-off.
 - Timesheets (cross-month, import Excel / PDF).
 - Proforma → Tax, split POs, round off, e-invoice + IRN, customer approval.
-- Received amounts with proof / TDS / later mapping.
+- Received amounts with proof / TDS / later mapping; Record Payment linked to them; payment reversal. Record Payment opens a credit's Map invoices in place (F-V2, 2 Nov 2026).
+- Branch-wise Customer ledger, Who owes us, Revenue report, Profit tab and CEO Finance tab + drill pages (2 Nov 2026).
 - Address snapshot; customer Activity Log.
 
 **Insight**
@@ -4362,6 +4371,83 @@ these are the server pieces.
   Finance's `po_consumption`, so those bars open the position or the PO.
 
 Deploy: restart.
+
+**2 Nov 2026 — Record Payment ⇄ Received Amount, reverse a payment, "collected" in the invoice's month
+(`tests/test_invoice_payments.py` 4; `test_executive_dashboard` + `test_einvoice_one_page` re-pinned; no migration):**
+three Finance / Admin asks.
+- **`services/invoice_payments.py`** is the ONE writer of a direct invoice payment.
+  - `record_payment(db, invoice, …, receipt_id=None, add_to_received=False, user=)`. Both links at once → 400.
+  - With `receipt_id`: the received amount must be the invoice's customer (project's or PO's,
+    `invoice_customer_ids`) and a compatible branch (`invoice_branch`, the `invoice_facets` rule). The amount must be
+    ≤ what is on account. The payment takes the receipt's date / mode / reference / proof, and the receipt's
+    `unallocated_amount` drops.
+  - With `add_to_received`: a `CustomerReceipt` is created (customer · branch · nothing on account) and the payment
+    carries its `receipt_id`.
+  - `receipts_on_account(db, invoice)` lists the choices, newest first.
+  - `reverse_payment(db, invoice, payment, reason ≥ MIN_REVERSE_REASON=10, remove_receipt=False)` reapplies
+    −amount (`tax.apply_invoice_payment`) and deletes the payment. Money from a receipt goes back ON ACCOUNT;
+    `remove_receipt` deletes the receipt too, but 409 while it still pays other invoices or carries TDS. Logged as
+    `PAYMENT_REVERSED` on the customer Activity Log.
+  - Callers commit.
+- **Routes** (`routers/crm/finance.py`):
+  - `PaymentIn` gains `receipt_id` / `add_to_received`. `POST /api/invoices/{id}/record-payment` goes through the
+    service, and the message names the receipt.
+  - `GET /api/invoices/{id}/payment-options` (INV_READ) → customer, branch, `receipts_on_account`.
+  - `POST /api/invoices/{id}/payments/{pid}/reverse` `{reason, remove_receipt}` (INV_WRITE; Admin / CEO implicit)
+    → the refreshed invoice.
+  - Receipt-based payments can still also be unmapped from Received Amount ▸ receipt ▸ Unmap (unchanged).
+- ⚠️ **"Collected" is counted in the INVOICE's month** (user rule — June / July invoices paid in September count in
+  June / July). `revenue_report._payments_in_window` places mapped payments by
+  `coalesce(Invoice.invoice_date, payment_date)` and adds receipts' `unallocated_amount` (money on account, no
+  invoice yet) by `received_date` with `on_account: True`, so cash never vanishes before it is mapped and moves the
+  moment it is. The project filter leaves on-account money out (it names no project). This feeds the Revenue report
+  headline / series / by-customer and the CEO Finance + Customer monthly cuts. `ceo_drilldown.m_collected` follows the
+  same rule (a "Counted in" column; on-account receipts of the period; the monthly chart's series on time · late · on
+  account).
+  - Still by PAYMENT date on purpose: slip days, average days to pay, DSO and the cash-flow forecast — those measure
+    how fast customers pay.
+
+Deploy: restart; rebuild F-V2.
+
+**2 Nov 2026 (later) — branch-wise Customer ledger, Who owes us and Revenue (`tests/test_branch_wise_finance.py`, 5; no
+migration):** Finance ask with a screenshot (VISTEON's ledger) — "branch-wise Customer Ledger, the same for Revenue,
+whatever else should be branch-wise". (1) **Customer ledger** (`routers/crm/finance_reports.py`): `GET
+/api/finance/reports/customer-ledger` takes `branch_id` (0 = no branch on record; a foreign / negative id → 400). An
+invoice's branch is `invoice_facets` (project's branch, else the PO's billing branch — `_invoice_branches`); payments /
+TDS / credit notes follow their invoice. Money still **on account** is now a ledger line (type "On account", credit =
+`unallocated_amount`, `receipt_id`, the receipt's branch), so the ledger closes at what the customer really owes. Every
+entry carries `branch_id` / `branch_name`; the reply adds `branch_id`, `branch_name` and **`branches`** — PURE
+`ledger_branch_summary` over EVERY branch up to the To date (invoices · debit · credit · balance; named branches first,
+"No branch on record" last), computed before the branch filter so the UI's cards stay put. PURE `branch_matches`. (2) **Who
+owes us** (`GET …/receivables`): `customer_id` + `branch_id` filters; every customer row carries `branches` (outstanding ·
+overdue · invoices per branch, largest first) and open invoices their `branch_id`. (3) **Revenue** — `services/
+revenue_report.py`: a branch resolves ONCE into the tuple of its projects (`scope_projects(db, customer_id, project_id,
+branch_id)` → `BranchProjects`, a tuple subclass carrying `branch_id`; `(-1,)` for a branch with no project, since an empty
+tuple would read as "no filter") and every `== project_id` predicate became `project_clause(col, project_id)` /
+`project_in(id, scope)`, so the whole report (headline · series · customers · projects · employees · margin · ageing · cash
+flow · forecast · leakage) narrows with no signature churn. `_payments_in_window(..., branch_id=)`: money on account counts
+for the branch on the receipt (`receipt_branch_scope`). `revenue_report(..., branch_id=)`; `filters` add `branch_id` and
+`options.branches` (`_branch_options`: every customer branch with `customer_id` + `billed`); project options carry
+`branch_id`; targets read `scoped` with a branch too. Same param on `GET /api/reports/revenue` + `/revenue/export.xlsx`,
+`GET /api/dashboard/ceo` (Finance tab — `executive_dashboard._finance(..., branch_id=)`) and `GET
+/api/dashboard/ceo/drill/{metric}` (`ceo_drilldown`: `_invoice_scope`, on-account receipts, margin / deployed via
+`project_in`; `filters.branch_id`). Placements are not branch-scoped. Deploy: restart.
+
+**2 Nov 2026 (latest) — an invoice number is found everywhere (`tests/test_invoice_search_everywhere.py`, 3; no
+migration):** screenshots — KRNX26-27-01-CT open on its invoice page, yet "No invoices yet" on Invoices (searched on the
+**Proforma** tab; the invoice is **Unpaid** — the Unpaid count already said 1) and "No amounts received yet" on Received
+Amount (searched "KRNX26-27-01-CT)" — a bracket copied with it; and nothing had been received against it; and that search
+never read invoice numbers at all). Fixes: (1) **`services/search_terms.clean_search`** (PURE) — spaces collapsed, brackets /
+quotes / sentence punctuation WRAPPED around the term dropped, nothing inside touched; `crm_deps.page_params` runs it, so
+every list's search benefits; the Billing Tracker search too. (2) `GET /api/invoices` with a search **ignores the data
+window** (Settings ▸ Billing "Data starts from" — an old invoice number typed in is still found; browsing keeps the
+window) and the search also matches the **PO number, the project and the customer** (project's or PO's, name or legal
+name). (3) `GET /api/customer-receipts` search also matches the tax / PI number of every invoice a receipt's cash
+(`InvoicePayment.receipt_id`) or TDS (`TdsRecord.receipt_id`) went to, and the customer's legal name; with a search, the
+reply carries **`meta.invoice_hits`** (`invoice_hits`, ≤ `INVOICE_HITS_LIMIT`=5, savepointed, never raises): number,
+customer, grand total, received (cash + TDS), balance, stage + label, the receipts that paid it and its `payment_block`.
+F-V2: the Invoices page jumps to the tab holding the match and names the others; Received Amount shows the invoice and
+where its money stands (see that repo's notes). Deploy: restart; rebuild F-V2.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

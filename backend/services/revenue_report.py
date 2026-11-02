@@ -8,8 +8,11 @@ productive the deployed team is.
 
 Definitions (keep the UI and this file in sync):
 * billed          — sum of `invoices.sub_total` (excl. GST) by invoice_date.
-* collected       — sum of `invoice_payments.amount` by payment_date (cash in),
-                    whichever invoice it settled.
+* collected       — money received, in the month it BELONGS to (2 Nov 2026):
+                    mapped to an invoice → the month of that invoice's date
+                    (the month it was billed), not the day it arrived; still
+                    on account (a received amount not yet mapped) → the month
+                    it arrived. See `_payments_in_window`.
 * outstanding     — open `balance_amount` of every invoice dated on or before
                     the month end (today's balances; historical months are
                     therefore "as of today", not as they stood then).
@@ -76,7 +79,8 @@ from sqlalchemy.orm import Session
 import sqlalchemy as sa
 
 from models import (
-    BillingUnit, Customer, CustomerBranch, Employee, Invoice, InvoicePayment, Opportunity, POStatus,
+    BillingUnit, Customer, CustomerBranch, CustomerReceipt, Employee, Invoice, InvoicePayment,
+    Opportunity, POStatus,
     PaymentStatus, Project, ProjectEmployee, PurchaseOrder, Timesheet, TimesheetStatus,
 )
 from models.base import USERS_TABLE
@@ -319,6 +323,96 @@ def _month_key(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
+
+# --------------------------------------------------------------------------- scope
+#
+# 2 Nov 2026 — branch-wise (Finance ask). A customer BRANCH narrows the report by
+# the projects that deliver at it (`Project.branch_id`, the same rule the "Billing
+# by dimension ▸ branch" split already used). Internally a branch is resolved
+# ONCE into the tuple of its project ids and handed down as `project_id`, so every
+# section that already honours a project filter honours a branch for free.
+# `project_id` is therefore `int | tuple[int, ...] | None` below.
+
+
+class BranchProjects(tuple):
+    """The project ids a branch scope resolved to — a tuple that remembers the branch
+    (`branch_id`) and whether a single project was also chosen (`explicit`), so a
+    reader of money ON ACCOUNT (which names a branch but no project) can still scope
+    it to the branch."""
+
+    branch_id: int | None = None
+    explicit: bool = False
+
+
+def receipt_branch_scope(project_id) -> int | None:
+    """The branch that money on account should be narrowed to, or None when on-account
+    money is out of scope (a single project) / unscoped (no branch). PURE."""
+    if isinstance(project_id, BranchProjects) and not project_id.explicit:
+        return project_id.branch_id
+    return None
+
+
+def project_clause(column, project_id):
+    """`column == id` for one project, `column IN (...)` for a branch's projects."""
+    if isinstance(project_id, (tuple, list, set, frozenset)):
+        ids = list(project_id) or [-1]
+        return column.in_(ids)
+    return column == project_id
+
+
+def project_in(value, project_id) -> bool:
+    """PURE python twin of `project_clause` — None = no project filter."""
+    if not project_id:
+        return True
+    if isinstance(project_id, (tuple, list, set, frozenset)):
+        return value in project_id
+    return value == project_id
+
+
+def scope_projects(db: Session, customer_id: int | None, project_id, branch_id: int | None):
+    """The effective project filter for (customer, project, branch).
+
+    No branch → `project_id` unchanged. A branch → the tuple of its projects (of the
+    customer when one is chosen), intersected with an explicit project; `(-1,)`-style
+    empty tuple when nothing matches, so the page reads zero rather than everything.
+    `branch_id == 0` means projects with no branch on record."""
+    if branch_id is None:
+        return project_id
+    q = select(Project.id)
+    q = q.where(Project.branch_id.is_(None)) if branch_id == 0 else q.where(Project.branch_id == branch_id)
+    if customer_id:
+        q = q.where(Project.customer_id == customer_id)
+    ids = {r[0] for r in db.execute(q).all()}
+    if project_id:
+        wanted = set(project_id) if isinstance(project_id, (tuple, list, set, frozenset)) else {project_id}
+        ids &= wanted
+    # (-1,) — never empty: an empty tuple is falsy and would read as "no filter".
+    out = BranchProjects(sorted(ids) or [-1])
+    out.branch_id = branch_id
+    out.explicit = bool(project_id)
+    return out
+
+
+def _branch_options(db: Session, start: date, end: date) -> list[dict]:
+    """Every customer branch for the Branch picker (`customer_id` lets the UI scope
+    it to the chosen customer), flagged with whether its projects billed in the window."""
+    billed = {
+        r[0] for r in db.execute(
+            select(Project.branch_id).join(Invoice, Invoice.project_id == Project.id)
+            .where(Invoice.invoice_date >= start, Invoice.invoice_date <= end,
+                   Invoice.kind != InvoiceKind.PROFORMA.value, Project.branch_id.isnot(None))
+            .distinct()
+        ).all()
+    }
+    rows = db.execute(select(CustomerBranch.id, CustomerBranch.branch_name,
+                             CustomerBranch.customer_id)).all()
+    return sorted(
+        ({"id": r[0], "name": r[1] or f"Branch #{r[0]}", "customer_id": r[2], "billed": r[0] in billed}
+         for r in rows),
+        key=lambda b: (b["name"] or "").lower(),
+    )
+
+
 # --------------------------------------------------------------------------- data
 #
 # Every query below takes the same optional (customer_id, project_id) filter so
@@ -339,7 +433,7 @@ def _invoice_filters(customer_id: int | None, project_id: int | None) -> list:
     if customer_id:
         out.append(Project.customer_id == customer_id)
     if project_id:
-        out.append(Invoice.project_id == project_id)
+        out.append(project_clause(Invoice.project_id, project_id))
     return out
 
 
@@ -391,17 +485,50 @@ def _invoices_in_window(db: Session, start: date, end: date,
 
 
 def _payments_in_window(db: Session, start: date, end: date,
-                        customer_id: int | None = None, project_id: int | None = None) -> list[dict]:
+                        customer_id: int | None = None, project_id=None,
+                        branch_id: int | None = None) -> list[dict]:
+    """Money received, placed in the month it BELONGS to (2 Nov 2026, user rule).
+
+    * Money mapped to an invoice counts in the month of that INVOICE's date —
+      the month the dashboard counts it as Billed — not the day it arrived
+      (June and July invoices paid in September are June / July collections).
+      Without an invoice date the payment date is used.
+    * Money received but not mapped to any invoice yet (a received amount still
+      on account) counts in the month it arrived; once mapped it moves to the
+      invoice's month. A project filter leaves it out (it names no project).
+
+    Every row: `date` (the month it counts in), `paid_on` (the day the money
+    arrived), `amount`, `customer_id`, `project_id`, `invoice_id`, `receipt_id`,
+    `on_account`."""
+    counted_on = func.coalesce(Invoice.invoice_date, InvoicePayment.payment_date)
     rows = db.execute(
-        select(InvoicePayment.payment_date, InvoicePayment.amount, Project.customer_id,
-               Invoice.project_id)
+        select(counted_on, InvoicePayment.amount, Project.customer_id, Invoice.project_id,
+               InvoicePayment.payment_date, Invoice.id, InvoicePayment.receipt_id)
         .join(Invoice, Invoice.id == InvoicePayment.invoice_id)
         .join(Project, Project.id == Invoice.project_id)
-        .where(InvoicePayment.payment_date >= start, InvoicePayment.payment_date <= end,
+        .where(counted_on >= start, counted_on <= end,
                *_invoice_filters(customer_id, project_id))
     ).all()
-    return [{"date": r[0], "amount": _num(r[1]), "customer_id": r[2], "project_id": r[3]}
-            for r in rows]
+    out = [{"date": r[0], "amount": _num(r[1]), "customer_id": r[2], "project_id": r[3],
+            "paid_on": r[4], "invoice_id": r[5], "receipt_id": r[6], "on_account": False}
+           for r in rows]
+    # A project names no money on account; a BRANCH does (the received amount
+    # carries the branch that paid), so a branch scope keeps it.
+    if project_id and branch_id is None:
+        return out
+    q = (select(CustomerReceipt.received_date, CustomerReceipt.unallocated_amount,
+                CustomerReceipt.customer_id, CustomerReceipt.id)
+         .where(CustomerReceipt.unallocated_amount > 0,
+                CustomerReceipt.received_date >= start, CustomerReceipt.received_date <= end))
+    if customer_id:
+        q = q.where(CustomerReceipt.customer_id == customer_id)
+    if branch_id is not None:
+        q = q.where(CustomerReceipt.branch_id.is_(None) if branch_id == 0
+                    else CustomerReceipt.branch_id == branch_id)
+    for r in db.execute(q).all():
+        out.append({"date": r[0], "amount": _num(r[1]), "customer_id": r[2], "project_id": None,
+                    "paid_on": r[0], "invoice_id": None, "receipt_id": r[3], "on_account": True})
+    return out
 
 
 def _open_invoices(db: Session, up_to: date,
@@ -447,7 +574,7 @@ def _filter_options(db: Session, start: date, end: date) -> dict:
     }
     customers = db.execute(select(Customer.id, Customer.name, Customer.status)).all()
     projects = db.execute(
-        select(Project.id, Project.name, Project.customer_id, Project.status)).all()
+        select(Project.id, Project.name, Project.customer_id, Project.status, Project.branch_id)).all()
 
     def _live(value) -> bool:
         return str(getattr(value, "value", value) or "").lower() != "inactive"
@@ -464,7 +591,7 @@ def _filter_options(db: Session, start: date, end: date) -> dict:
             key=lambda r: (r["name"] or "").lower(),
         ),
         "projects": sorted(
-            ({"id": p[0], "name": p[1] or f"#{p[0]}", "customer_id": p[2],
+            ({"id": p[0], "name": p[1] or f"#{p[0]}", "customer_id": p[2], "branch_id": p[4],
               "billed": p[0] in billed_projects, "active": _live(p[3])}
              for p in projects if p[2] in shown or p[0] in billed_projects),
             key=lambda r: (r["name"] or "").lower(),
@@ -602,7 +729,7 @@ def _pipeline(db: Session, series: list[dict], period: Period,
             q = q.where(Project.customer_id == customer_id)
             po_q = po_q.where(PurchaseOrder.customer_id == customer_id)
         if project_id:
-            q = q.where(Timesheet.project_id == project_id)
+            q = q.where(project_clause(Timesheet.project_id, project_id))
     sheets = db.execute(q).all()
     amount = 0.0
     for _id, figures in sheets:
@@ -628,7 +755,7 @@ def _efficiency(db: Session, billed: float, months: int,
     q = (select(func.count(ProjectEmployee.id))
          .where(ProjectEmployee.is_active.is_(True), ProjectEmployee.is_exit.is_(False)))
     if project_id:
-        q = q.where(ProjectEmployee.project_id == project_id)
+        q = q.where(project_clause(ProjectEmployee.project_id, project_id))
     elif customer_id:
         q = q.join(Project, Project.id == ProjectEmployee.project_id).where(Project.customer_id == customer_id)
     deployed = int(db.execute(q).scalar() or 0)
@@ -649,7 +776,7 @@ def _leakage(db: Session, period: Period, customer_id: int | None = None,
         if customer_id:
             q = q.where(Project.customer_id == customer_id)
         if project_id:
-            q = q.where(Timesheet.project_id == project_id)
+            q = q.where(project_clause(Timesheet.project_id, project_id))
     rows = db.execute(q).all()
     lop = covered = no_billing = 0.0
     for (figures,) in rows:
@@ -814,7 +941,7 @@ def _deployed_rows(db: Session, customer_id: int | None = None,
     if customer_id:
         q = q.where(Project.customer_id == customer_id)
     if project_id:
-        q = q.where(ProjectEmployee.project_id == project_id)
+        q = q.where(project_clause(ProjectEmployee.project_id, project_id))
     rows = db.execute(q).all()
     return [{
         "pe_id": r[0], "rate": _num(r[1]), "unit": r[2],
@@ -1138,7 +1265,7 @@ def _cashflow(db: Session, deployed: list[dict], today: date,
         if customer_id:
             tq = tq.where(Project.customer_id == customer_id)
         if project_id:
-            tq = tq.where(Timesheet.project_id == project_id)
+            tq = tq.where(project_clause(Timesheet.project_id, project_id))
     sheets = db.execute(tq).all()
     unbilled = 0.0
     for _id, figures in sheets:
@@ -1362,7 +1489,7 @@ def alert_level(alerts: list[dict]) -> str:
 
 def revenue_report(db: Session, month_raw: str | None = None, today: date | None = None,
                    period_raw: str | None = None, customer_id: int | None = None,
-                   project_id: int | None = None) -> dict:
+                   project_id: int | None = None, branch_id: int | None = None) -> dict:
     """The whole report for one period, optionally narrowed to a customer/project.
 
     `month_raw` is the ANCHOR month in every mode — `?month=2026-09&period=quarter`
@@ -1376,8 +1503,12 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
     # One extra period back so the trend's first point, the MoM/QoQ comparison
     # and the YoY comparison all have their data.
     window_start = min(period.shift(-points).start, period.year_ago.previous.start)
+    explicit_project = project_id
+    # 2 Nov 2026 — a branch becomes the tuple of its projects (see `scope_projects`).
+    project_id = scope_projects(db, customer_id, project_id, branch_id)
     invoices = _invoices_in_window(db, window_start, period.end, customer_id, project_id)
-    payments = _payments_in_window(db, window_start, period.end, customer_id, project_id)
+    payments = _payments_in_window(db, window_start, period.end, customer_id, project_id,
+                                   branch_id=branch_id if not explicit_project else None)
     open_rows = _open_invoices(db, period.end, customer_id, project_id)
 
     headline = _headline(period, invoices, payments, open_rows)
@@ -1390,7 +1521,7 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
     # project scope the billed side is one account, so "attainment" against the
     # company target is meaningless — keep the targets (the modal edits them) but
     # drop every attainment / projection figure and flag the block as scoped.
-    targets["scoped"] = bool(customer_id or project_id)
+    targets["scoped"] = bool(customer_id or project_id or branch_id is not None)
     if targets["scoped"]:
         for k in ("month_attainment_pct", "run_rate_attainment_pct", "fy_attainment_pct",
                   "fy_projection_pct"):
@@ -1415,8 +1546,10 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
         "as_of": today.isoformat(),
         "filters": {
             "customer_id": customer_id,
-            "project_id": project_id,
-            "options": _filter_options(db, window_start, period.end),
+            "project_id": explicit_project,
+            "branch_id": branch_id,
+            "options": {**_filter_options(db, window_start, period.end),
+                        "branches": _branch_options(db, window_start, period.end)},
         },
         "headline": headline,
         "series": series,

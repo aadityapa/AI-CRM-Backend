@@ -156,6 +156,7 @@ def revenue(
     period: str | None = Query(None, description="month | quarter | fy (default month)"),
     customer_id: int | None = Query(None, ge=1, description="Narrow the whole report to one customer"),
     project_id: int | None = Query(None, ge=1, description="Narrow the whole report to one project"),
+    branch_id: int | None = Query(None, ge=0, description="Narrow to one customer branch's projects; 0 = no branch"),
     db: Session = Depends(get_crm_db),
     # CEO view (18 Sep 2026); since 19 Oct 2026 Finance + the Sales family read it
     # too (FINANCE_VIEW, by role — templates cannot widen it).
@@ -165,8 +166,8 @@ def revenue(
     the quarter containing September 2026, so existing `?month=` links (the
     month-close email, the dashboard tile) keep resolving unchanged."""
     try:
-        return envelope(revenue_report(db, month, period_raw=period,
-                                       customer_id=customer_id, project_id=project_id))
+        return envelope(revenue_report(db, month, period_raw=period, customer_id=customer_id,
+                                       project_id=project_id, branch_id=branch_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -273,6 +274,7 @@ def revenue_export(
     period: str | None = Query(None, description="month | quarter | fy (default month)"),
     customer_id: int | None = Query(None, ge=1),
     project_id: int | None = Query(None, ge=1),
+    branch_id: int | None = Query(None, ge=0),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(REVENUE_READ),   # whoever reads the page may take its workbook
 ):
@@ -281,8 +283,8 @@ def revenue_export(
     It takes the same four parameters as the page, so the download is always the
     workbook of what is on screen — a filtered view never exports unfiltered."""
     try:
-        report = revenue_report(db, month, period_raw=period,
-                                customer_id=customer_id, project_id=project_id)
+        report = revenue_report(db, month, period_raw=period, customer_id=customer_id,
+                                project_id=project_id, branch_id=branch_id)
         placements = placements_report(db, month_raw=month, period_raw=period,
                                        customer_id=customer_id, project_id=project_id)
     except ValueError as exc:

@@ -362,9 +362,21 @@ def list_receipts(customer_id: int | None = None, project_id: int | None = None,
         stmt = stmt.where(CustomerReceipt.payment_mode == payment_mode)
     if p.search:
         like = f"%{p.search}%"
+        # 2 Nov 2026 (screenshot): an INVOICE number found nothing here — the
+        # search never looked at the invoices a receipt pays. It now matches the
+        # tax / PI number of any invoice the receipt's cash or TDS went to, and
+        # the customer's legal name.
+        inv_ids = select(Invoice.id).where(or_(Invoice.invoice_number.ilike(like),
+                                               Invoice.proforma_number.ilike(like)))
+        paid_by = (select(InvoicePayment.receipt_id)
+                   .where(InvoicePayment.invoice_id.in_(inv_ids), InvoicePayment.receipt_id.isnot(None)))
+        tds_by = (select(TdsRecord.receipt_id)
+                  .where(TdsRecord.invoice_id.in_(inv_ids), TdsRecord.receipt_id.isnot(None)))
         stmt = stmt.where(or_(CustomerReceipt.reference_number.ilike(like),
                               CustomerReceipt.notes.ilike(like), Customer.name.ilike(like),
-                              CustomerBranch.branch_name.ilike(like)))
+                              Customer.legal_entity_name.ilike(like),
+                              CustomerBranch.branch_name.ilike(like),
+                              CustomerReceipt.id.in_(paid_by), CustomerReceipt.id.in_(tds_by)))
     sort_col = {"received_date": CustomerReceipt.received_date, "amount": CustomerReceipt.amount,
                 "customer_name": Customer.name, "branch_name": CustomerBranch.branch_name,
                 }.get(p.sort_by or "", CustomerReceipt.received_date)
@@ -382,7 +394,68 @@ def list_receipts(customer_id: int | None = None, project_id: int | None = None,
                        .where(CustomerReceipt.customer_id == customer_id) if customer_id
                        else select(func.coalesce(func.sum(CustomerReceipt.amount), 0))).scalar()
     meta = {**(meta or {}), "total_received": float(total or 0)}
+    if p.search:
+        # The invoices the term names, with what was received on each — so a
+        # search for an invoice that has NO received amount yet says so (and
+        # offers the invoice) instead of reading "no amounts received".
+        meta["invoice_hits"] = invoice_hits(db, p.search, customer_id=customer_id)
     return envelope(data=data, message="Customer receipts", meta=meta)
+
+
+INVOICE_HITS_LIMIT = 5
+
+
+def invoice_hits(db: Session, term: str, customer_id: int | None = None) -> list[dict]:
+    """Up to `INVOICE_HITS_LIMIT` invoices whose tax / PI number contains `term`:
+    number, customer, totals, what came in (cash + TDS), the stage, and the
+    receipts that paid it. Never raises — a failure is an empty list."""
+    from services import billing_rules
+    like = f"%{term}%"
+    try:
+        with db.begin_nested():
+            stmt = (select(Invoice).where(or_(Invoice.invoice_number.ilike(like),
+                                              Invoice.proforma_number.ilike(like)))
+                    .order_by(Invoice.id.desc()).limit(INVOICE_HITS_LIMIT))
+            if customer_id is not None:
+                stmt = stmt.where(customer_invoice_clause(customer_id))
+            invs = list(db.execute(stmt).scalars())
+            if not invs:
+                return []
+            ids = [i.id for i in invs]
+            receipts: dict[int, set[int]] = {}
+            for inv_id, rid in db.execute(select(InvoicePayment.invoice_id, InvoicePayment.receipt_id)
+                                          .where(InvoicePayment.invoice_id.in_(ids),
+                                                 InvoicePayment.receipt_id.isnot(None))).all():
+                receipts.setdefault(inv_id, set()).add(rid)
+            pids = {i.project_id for i in invs if i.project_id}
+            proj_cust = dict(db.execute(select(Project.id, Project.customer_id)
+                                        .where(Project.id.in_(pids))).all()) if pids else {}
+            cids = {c for c in ((i.po.customer_id if i.po is not None and i.po.customer_id
+                                 else proj_cust.get(i.project_id)) for i in invs) if c}
+            names = dict(db.execute(select(Customer.id, func.coalesce(Customer.legal_entity_name, Customer.name))
+                                    .where(Customer.id.in_(cids))).all()) if cids else {}
+            labels = dict(billing_rules.INVOICE_STAGES)
+            out = []
+            for i in invs:
+                cid = i.po.customer_id if i.po is not None and i.po.customer_id else proj_cust.get(i.project_id)
+                stage = billing_rules.stage_of_invoice(i)
+                out.append({
+                    "id": i.id, "kind": i.kind,
+                    "invoice_number": i.invoice_number, "proforma_number": i.proforma_number,
+                    "customer_id": cid, "customer_name": names.get(cid),
+                    "invoice_date": i.invoice_date.isoformat() if i.invoice_date else None,
+                    "grand_total": float(i.grand_total or 0),
+                    "received": float((i.paid_amount or 0) + (getattr(i, "tds_deducted", None) or 0)),
+                    "balance": float(i.balance_amount or 0),
+                    "stage": stage, "stage_label": labels.get(stage, stage),
+                    "receipt_ids": sorted(receipts.get(i.id, set())),
+                    "payment_block": payment_block(i) if i.kind != InvoiceKind.PROFORMA.value else None,
+                })
+            return out
+    except Exception:  # noqa: BLE001 — a hint, never a failure of the list
+        import logging
+        logging.getLogger(__name__).warning("receipt search: invoice hits failed", exc_info=True)
+        return []
 
 
 @router.get("/{receipt_id}")

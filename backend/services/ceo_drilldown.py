@@ -49,7 +49,7 @@ from services import hiring_dashboard as hiring
 from services.invoice_facets import invoice_facets
 from services.revenue_report import (
     TARGET_MONTH_KEY, TARGET_MONTH_PREFIX, Month, Period, _deployed_rows, _monthly_rate,
-    _setting_number, revenue_report,
+    _setting_number, project_clause, project_in, receipt_branch_scope, revenue_report, scope_projects,
 )
 
 logger = logging.getLogger("karnex.crm.ceo_drilldown")
@@ -176,7 +176,7 @@ def late_bucket(days: int, open_: bool = True) -> str | None:
 
 def _scope_note(customer_id, project_id) -> list[str]:
     if customer_id or project_id:
-        return ["Narrowed to the customer / project chosen on the dashboard — clear it there to see the whole company."]
+        return ["Narrowed to the customer / branch / project chosen on the dashboard — clear it there to see the whole company."]
     return []
 
 
@@ -197,7 +197,7 @@ def _invoice_scope(customer_id: int | None, project_id: int | None) -> list:
     if customer_id:
         out.append(Project.customer_id == customer_id)
     if project_id:
-        out.append(Invoice.project_id == project_id)
+        out.append(project_clause(Invoice.project_id, project_id))
     return out
 
 
@@ -395,6 +395,11 @@ def m_billed(db, period: Period, today: date, customer_id=None, project_id=None,
 
 
 def m_collected(db, period: Period, today: date, customer_id=None, project_id=None, scope=None) -> dict:
+    """2 Nov 2026 (user rule): money counts in the month it BELONGS to — a payment
+    mapped to an invoice in the month of that invoice's date, money still on
+    account in the month it arrived. The same rule as the dashboard tile
+    (`revenue_report._payments_in_window`), so this page adds up to it."""
+    counted_on = sa.func.coalesce(Invoice.invoice_date, InvoicePayment.payment_date)
     pay = db.execute(
         select(InvoicePayment.id, InvoicePayment.payment_date, InvoicePayment.amount, InvoicePayment.payment_mode,
                InvoicePayment.reference_number, InvoicePayment.receipt_id,
@@ -404,7 +409,7 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
         .join(Project, Project.id == Invoice.project_id)
         .join(Customer, Customer.id == Project.customer_id)
         .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
-        .where(InvoicePayment.payment_date >= period.start, InvoicePayment.payment_date <= period.end,
+        .where(counted_on >= period.start, counted_on <= period.end,
                *_invoice_scope(customer_id, project_id))
     ).all()
     rows = []
@@ -413,7 +418,9 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
         due = billing_rules.effective_due(idue, idate)
         late_by = (pdate - due).days if (pdate and due) else 0
         rows.append({
-            "id": pid, "payment_date": _iso(pdate), "_date": pdate, "amount": _r(amount),
+            "id": pid, "payment_date": _iso(pdate), "_date": idate or pdate,
+            "counted_in": (idate or pdate).strftime("%b %Y") if (idate or pdate) else None,
+            "amount": _r(amount),
             "mode": mode or "—", "reference": ref,
             "invoice": inum or f"#{iid}", "link": f"invoices/{iid}", "invoice_date": _iso(idate),
             "due_date": _iso(due), "days_to_pay": (pdate - idate).days if (pdate and idate) else None,
@@ -424,7 +431,7 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
             "segment": "late" if late_by > 0 else "on_time", "_po": po_id,
         })
     rows.sort(key=lambda r: (r["_date"] or date.min, r["id"]), reverse=True)
-    total = sum(r["amount"] for r in rows)
+    mapped_total = sum(r["amount"] for r in rows)
     late_amt = sum(r["amount"] for r in rows if r["segment"] == "late")
     weighted = sum(r["amount"] * (r["days_to_pay"] or 0) for r in rows if r["days_to_pay"] is not None)
 
@@ -441,43 +448,55 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
     po_rows.sort(key=lambda p: -p["collected_here"])
     no_po = round(sum(r["amount"] for r in rows if not r["_po"]), 2)
 
-    # Money in the bank that is not on an invoice yet (receipts on account).
+    # Money in the bank that is not on an invoice yet (receipts on account) —
+    # it counts in the month it ARRIVED until it is mapped.
     rq = (select(CustomerReceipt.id, CustomerReceipt.received_date, CustomerReceipt.amount,
                  CustomerReceipt.unallocated_amount, CustomerReceipt.payment_mode,
                  CustomerReceipt.reference_number, Customer.id, Customer.name, CustomerBranch.branch_name)
           .join(Customer, Customer.id == CustomerReceipt.customer_id)
           .outerjoin(CustomerBranch, CustomerBranch.id == CustomerReceipt.branch_id)
-          .where(CustomerReceipt.unallocated_amount > 0, CustomerReceipt.received_date <= period.end))
+          .where(CustomerReceipt.unallocated_amount > 0, CustomerReceipt.received_date >= period.start,
+                 CustomerReceipt.received_date <= period.end))
     if customer_id:
         rq = rq.where(CustomerReceipt.customer_id == customer_id)
+    rbranch = receipt_branch_scope(project_id)
+    if rbranch is not None:
+        rq = rq.where(CustomerReceipt.branch_id.is_(None) if rbranch == 0 else CustomerReceipt.branch_id == rbranch)
     on_account = [{
-        "id": rid, "received_date": _iso(d), "amount": _r(a), "on_account": _r(u), "mode": m or "—",
-        "reference": ref, "customer": cn, "customer_link": f"customers/{cid}", "branch": bn,
+        "id": rid, "received_date": _iso(d), "_date": d, "amount": _r(a), "on_account": _r(u), "mode": m or "—",
+        "reference": ref, "customer": cn, "customer_id": cid, "customer_link": f"customers/{cid}", "branch": bn,
         "link": f"received-amounts?receipt={rid}",
     } for rid, d, a, u, m, ref, cid, cn, bn in db.execute(rq.order_by(CustomerReceipt.received_date.desc())).all()] \
-        if not project_id else []
+        if not project_id or rbranch is not None else []
     on_account_total = sum(r["on_account"] for r in on_account)
+    total = mapped_total + on_account_total
 
-    monthly = _by_month(rows, period, "_date", "segment", ("on_time", "late"), "amount")
+    monthly = _by_month(
+        rows + [{"_date": r["_date"], "segment": "on_account", "amount": r["on_account"]} for r in on_account],
+        period, "_date", "segment", ("on_time", "late", "on_account"), "amount")
     modes: dict[str, float] = defaultdict(float)
     for r in rows:
         modes[r["mode"]] += r["amount"]
+    payers = {r["customer_id"] for r in rows} | {r["customer_id"] for r in on_account}
     return {
-        "title": "Cash collected", "question": f"Every payment received in {period.label} — from whom, against which invoice and PO",
+        "title": "Cash collected",
+        "question": f"Money that belongs to {period.label} — paid against its invoices, or received and not yet mapped",
         "kpis": [
-            kpi("collected", "Collected", round(total, 2), tone="success", sub=f"{len(rows)} payments"),
-            kpi("customers", "Customers who paid", len({r["customer_id"] for r in rows}), "int"),
-            kpi("days", "Avg days to pay", round(weighted / total, 1) if total else None, "days",
+            kpi("collected", "Collected", round(total, 2), tone="success",
+                sub=f"{len(rows)} payments" + (f" + {round(on_account_total):,} on account" if on_account_total else "")),
+            kpi("customers", "Customers who paid", len(payers), "int"),
+            kpi("days", "Avg days to pay", round(weighted / mapped_total, 1) if mapped_total else None, "days",
                 sub="from invoice date, by amount"),
-            kpi("late", "Paid after the due date", _pct(late_amt, total), "pct",
+            kpi("late", "Paid after the due date", _pct(late_amt, mapped_total), "pct",
                 "warning" if late_amt else "success", f"{round(late_amt):,} of the cash"),
             kpi("pos", "POs it came against", len(po_ids), "int", sub=f"{round(no_po):,} on invoices with no PO" if no_po else None),
             kpi("on_account", "Received, not yet mapped", round(on_account_total, 2), tone="warning" if on_account_total else "neutral",
                 sub=f"{len(on_account)} receipts on account"),
         ],
         "charts": [
-            chart("monthly", "Cash in month by month", monthly,
-                  [series("on_time", "On time", "success", "c"), series("late", "Paid late", "warning", "c")]),
+            chart("monthly", "Collected month by month (the invoice's month)", monthly,
+                  [series("on_time", "On time", "success", "c"), series("late", "Paid late", "warning", "c"),
+                   series("on_account", "On account (not mapped yet)", "brand", "c")]),
             chart("customers", "Who paid us", _by_customer(rows, ["amount"], "amount"),
                   [series("amount", "Collected", "success")]),
             chart("pos", "Purchase orders — collected vs what is left",
@@ -492,6 +511,7 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
         "default_segment": scope if scope in ("on_time", "late") else None,
         "tables": [
             table("payments", "Payments", [
+                col("counted_in", "Counted in"),
                 col("payment_date", "Paid on", "date"), col("customer", "Customer", link="customer_link"),
                 col("invoice", "Invoice", link="link"), col("invoice_date", "Invoice date", "date"),
                 col("po_number", "PO", link="po_link"), col("project", "Project", link="project_link"),
@@ -509,7 +529,10 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
         ],
         "related": [{"metric": "billed", "label": "Billed"}, {"metric": "outstanding", "label": "Outstanding"},
                     {"metric": "dso", "label": "DSO"}, {"metric": "po", "label": "Purchase orders"}],
-        "notes": ["Collected = payments recorded against Tax invoices, by payment date (GST included, as received).",
+        "notes": ["Collected = money that belongs to the period, GST included: a payment mapped to a Tax invoice "
+                  "counts in the month of that invoice's date (June and July invoices paid in September are "
+                  "June / July money); money received but not yet mapped counts in the month it arrived, and "
+                  "moves to the invoice's month once it is mapped.",
                   "Paid late = after the invoice's due date (its own, else invoice date + 30 days)."]
                  + _scope_note(customer_id, project_id),
     }
@@ -596,7 +619,7 @@ def m_margin(db, period: Period, today: date, customer_id=None, project_id=None,
     projects, employees = [], []
     for c in customers:
         for p in c["projects"]:
-            if project_id and p["project_id"] != project_id:
+            if not project_in(p["project_id"], project_id):
                 continue
             projects.append({**{k: v for k, v in p.items() if k != "employees"}, "customer": c["customer"],
                              "customer_link": f"customers/{c['customer_id']}", "link": f"projects/{p['project_id']}",
@@ -1005,7 +1028,7 @@ def m_deployed(db, period: Period, today: date, customer_id=None, project_id=Non
         if customer_id and c["customer_id"] != customer_id:
             continue
         for p in c["projects"]:
-            if project_id and p["project_id"] != project_id:
+            if not project_in(p["project_id"], project_id):
                 continue
             for e in p["employees"]:
                 live = e["deployed_today"] and not e["exited"]
@@ -1398,7 +1421,7 @@ FINANCE_METRICS = frozenset(k for k, (tab, _f) in METRICS.items() if tab == "fin
 
 def drilldown(db: Session, metric: str, month_raw: str | None = None, period_raw: str | None = None,
               today: date | None = None, customer_id: int | None = None, project_id: int | None = None,
-              scope: str | None = None) -> dict:
+              scope: str | None = None, branch_id: int | None = None) -> dict:
     """One drill-down page. Raises ValueError on an unknown metric / bad period."""
     metric = (metric or "").strip().lower()
     if metric not in METRICS:
@@ -1406,7 +1429,10 @@ def drilldown(db: Session, metric: str, month_raw: str | None = None, period_raw
     today = today or date.today()
     period = Period.parse(period_raw or ex.DEFAULT_PERIOD, month_raw, today)
     tab, fn = METRICS[metric]
-    body = fn(db, period, today, customer_id, project_id, (scope or "").strip().lower() or None)
+    # 2 Nov 2026 — a branch is the tuple of its projects (`revenue_report.scope_projects`).
+    scoped = scope_projects(db, customer_id, project_id, branch_id)
+    body = fn(db, period, today, customer_id, scoped, (scope or "").strip().lower() or None)
     return {"metric": metric, "tab": tab, "as_of": today.isoformat(), "period": ex._period_view(period, today),
-            "filters": {"customer_id": customer_id, "project_id": project_id, "scope": scope},
+            "filters": {"customer_id": customer_id, "project_id": project_id, "branch_id": branch_id,
+                        "scope": scope},
             "segments": [], "default_segment": None, "related": [], "notes": [], **body}

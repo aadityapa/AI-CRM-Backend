@@ -294,6 +294,7 @@ def ceo_dashboard(
     period: str | None = Query(None, description="month | quarter | fy (default fy)"),
     customer_id: int | None = Query(None, description="Finance tab only — narrow to one customer"),
     project_id: int | None = Query(None, description="Finance tab only — narrow to one project"),
+    branch_id: int | None = Query(None, ge=0, description="Finance tab only — one customer branch; 0 = no branch"),
     db: Session = Depends(get_crm_db),
     # The Finance tab (19 Oct 2026): Finance + the Sales family read it too
     # (reports.FINANCE_VIEW_ROLES, by role). Customer · Sales · People stay
@@ -310,8 +311,8 @@ def ceo_dashboard(
     if tab != "finance" and not user.is_admin:
         raise HTTPException(status_code=403, detail="Only the CEO / Admin can open this tab")
     try:
-        return envelope(executive_dashboard(db, tab, month, period,
-                                            customer_id=customer_id, project_id=project_id))
+        return envelope(executive_dashboard(db, tab, month, period, customer_id=customer_id,
+                                            project_id=project_id, branch_id=branch_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -323,6 +324,7 @@ def ceo_drilldown(
     period: str | None = Query(None, description="month | quarter | fy (default fy)"),
     customer_id: int | None = Query(None),
     project_id: int | None = Query(None),
+    branch_id: int | None = Query(None, ge=0),
     scope: str | None = Query(None, description="the chip the page opens on (e.g. overdue, bench)"),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(role_required("Finance", "Sales", "Sales_Head")),
@@ -338,7 +340,7 @@ def ceo_drilldown(
         raise HTTPException(status_code=403, detail="Only the CEO / Admin can open this page")
     try:
         return envelope(drilldown(db, key, month, period, customer_id=customer_id,
-                                  project_id=project_id, scope=scope))
+                                  project_id=project_id, scope=scope, branch_id=branch_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

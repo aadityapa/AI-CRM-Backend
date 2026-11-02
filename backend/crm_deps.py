@@ -346,7 +346,10 @@ def page_params(page: int = 1, limit: int = 20, search: str | None = None,
     page = max(1, page)
     limit = min(max(1, limit), 100)
     sort_dir = "asc" if str(sort_dir).lower() == "asc" else "desc"
-    return PageParams(page=page, limit=limit, search=(search or "").strip() or None,
+    # 2 Nov 2026: brackets / quotes / a full stop copied with an invoice number
+    # ("KRNX26-27-01-CT)") made every list read empty (`services/search_terms`).
+    from services.search_terms import clean_search
+    return PageParams(page=page, limit=limit, search=clean_search(search),
                       sort_by=sort_by, sort_dir=sort_dir)
 
 
