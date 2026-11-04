@@ -231,6 +231,18 @@ EVENTS: list[dict] = [
      "description": "Sent to the TAs assigned to the position (every TA when none is assigned) when a "
                     "candidate applies through the application link. The candidate waits at Sourcing.",
      "default_roles": ["TA"]},
+    # Karnex Careers (3 Nov 2026): one public page for every open position.
+    {"event": "careers.application",
+     "label": "Candidate applied on the careers page",
+     "description": "Sent to the TAs assigned to the position (every TA when none is assigned) when a "
+                    "candidate applies on the public careers page. They are already interested and wait at "
+                    "Sourcing for Technical Screening.",
+     "default_roles": ["TA"]},
+    {"event": "careers.general_application",
+     "label": "Résumé sent from the careers page (no position)",
+     "description": "Sent to TA when someone sends a résumé from the careers page without picking a "
+                    "position. They join Candidates and the Talent Pool.",
+     "default_roles": ["TA"]},
     {"event": "profile.candidate_held",
      "label": "Candidate put on hold / released",
      "description": "Sent to the TAs who work the candidate when anyone (TA, RMG, Sales, HR) puts the "

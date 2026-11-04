@@ -22,6 +22,7 @@ returns a status the upload reports.
 from __future__ import annotations
 
 import logging
+import re
 from html import escape
 from types import SimpleNamespace
 
@@ -225,6 +226,10 @@ def send_opening_mail(db: Session, profile, candidate, req, user, *,
     from services.candidate_comms import send_candidate_email
 
     to = mailable_email(to_email) or mailable_email(getattr(candidate, "email", None))
+    # A candidate who applied through the careers page / application link is
+    # already interested (3 Nov 2026) — never ask them again.
+    if not resend and (opening_states(db, [profile.id]).get(profile.id) or {}).get("state") == "interested":
+        return {"status": "already_interested", "email": to or None}
     if not to:
         return {"status": "no_email", "email": None}
     try:
@@ -267,6 +272,7 @@ _SKIP_WORDS = {
     "no_email": "No usable email — correct it with Edit, then send.",
     "already_sent": "Already emailed — use Resend on the row.",
     "opted_out": "Asked to leave the talent pool — no opening emails.",
+    "already_interested": "Already interested (applied themselves) — send them for Technical Screening.",
     "not_sent": "Could not be queued — email may be switched off in Settings.",
 }
 
@@ -338,7 +344,16 @@ def opening_states(db: Session, profile_ids) -> dict[int, dict]:
         .order_by(CandidateProfileActivityLog.id.desc())
     ).all():
         if pid not in out:
+            note, via = _split_via(comment or "")
             out[pid] = {"state": _STATE_BY_ACTION[action],
                         "at": ts.isoformat() if ts else None,
-                        "note": comment or ""}
+                        "note": note, "via": via}
     return out
+
+
+def _split_via(comment: str) -> tuple[str, str | None]:
+    """"[careers] Applied …" → ("Applied …", "careers"). An interested row written
+    by a public form (services/careers.mark_interested) carries its door, so
+    Applied Candidates can say "Applied on the careers page" (3 Nov 2026)."""
+    m = re.match(r"\[(careers|apply_link)\]\s*", comment)
+    return (comment[m.end():], m.group(1)) if m else (comment, None)

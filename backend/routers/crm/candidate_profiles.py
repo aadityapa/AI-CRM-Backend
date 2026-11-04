@@ -1463,6 +1463,9 @@ def send_opening_email(profile_id: int, payload: OpeningEmailIn,
                             detail="No usable email for this candidate — correct it with Edit, then send.")
     if res["status"] == "already_sent":
         raise HTTPException(status_code=409, detail="The opening email was already sent — use Resend.")
+    if res["status"] == "already_interested":
+        raise HTTPException(status_code=409, detail="This candidate applied themselves and is already "
+                            "interested — no opening email needed. Send them for Technical Screening.")
     if res["status"] == "opted_out":
         raise HTTPException(status_code=409, detail="This candidate asked to leave the talent pool — "
                                                     "no opening emails. Call them instead.")

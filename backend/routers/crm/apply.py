@@ -38,12 +38,9 @@ from sqlalchemy.orm import Session
 
 from crm_deps import CurrentUser, gated_read, get_crm_db, screener_or
 import rate_limit as _rl
-from models import (
-    Location, Opportunity, Requirement, RequirementActivityLog, RequirementStatus,
-    RequirementTaAssignment, Resume,
-)
+from models import Location, Requirement, RequirementStatus, Resume
 from schemas.common import envelope
-from services.crm_common import log_activity, save_upload_hashed
+from services.crm_common import save_upload_hashed
 from auth_secret import auth_secret as _shared_auth_secret
 
 router = APIRouter(tags=["CRM: Apply"])
@@ -361,90 +358,19 @@ def submit_application(
     }
     details = {k: v for k, v in details.items() if v}
     file_url, file_sha256, file_size = save_upload_hashed(file, "resumes")
-    # Dedupe identical submissions (e.g. double-clicked apply) by file bytes.
-    dup = db.execute(
-        select(Resume).where(Resume.requirement_id == req.id, Resume.file_sha256 == file_sha256)
-    ).scalars().first()
-    if dup is not None:
-        # Same file re-submitted: still make sure a Candidate exists for it (the
-        # original submission may predate immediate candidate creation).
-        if dup.candidate_id is None:
-            try:
-                from services.slot_booking import find_or_create_candidate_from_resume
-                cand = find_or_create_candidate_from_resume(db, dup)
-                dup.candidate_id = cand.id
-                db.commit()
-            except Exception:
-                db.rollback()
-        return envelope(data={"received": True}, message="Application already received")
-    resume = Resume(
-        requirement_id=req.id,
-        candidate_name=name,
-        email=(email or "").strip() or None,
-        phone=(phone or "").strip() or None,
-        source_portal="Apply Link",
-        applicant_experience=(experience or "").strip() or None,
-        application_details=details or None,
-        resume_file_url=file_url,
-        file_sha256=file_sha256,
-        file_size=file_size,
-    )
-    db.add(resume)
-    db.flush()  # assign resume.id before deriving the candidate
-    # Create/enrich the Candidate immediately so the applicant appears in the
-    # Candidate tab right away, with the details they submitted (experience,
-    # education, domain, skills, CTC) — and a Sourcing profile so they appear
-    # in the opportunity's Applicants tab too. Best-effort — never block the
-    # submission.
-    try:
-        from services.slot_booking import ensure_sourcing_profile, find_or_create_candidate_from_resume
-        # Savepoint: best-effort — on Postgres a failed statement here would
-        # otherwise poison the transaction and 500 the whole public submission.
-        with db.begin_nested():
-            cand = find_or_create_candidate_from_resume(db, resume)
-            resume.candidate_id = cand.id
-        ensure_sourcing_profile(db, resume, req, source="apply_link")
-    except Exception:
-        pass
-    existing = db.execute(
-        select(func.count()).select_from(Resume).where(Resume.requirement_id == req.id)
-    ).scalar() or 0
-    log_activity(db, RequirementActivityLog, "requirement_id", req.id, req.created_by,
-                 "RESUME_UPLOADED", f"Application received via link from {name}")
-    if req.status == RequirementStatus.POSTED_ON_PORTALS and existing == 0:
-        req.status = RequirementStatus.IN_PROGRESS
-        log_activity(db, RequirementActivityLog, "requirement_id", req.id, req.created_by,
-                     "STATUS_CHANGED", "Auto-moved Posted_On_Portals -> In_Progress (first application received)")
-    db.commit()
-    _notify_tas(db, req, resume, name)
-    return envelope(data={"received": True}, message="Application received")
+    # The ONE landing path for a public form (shared with the careers page,
+    # services/careers.record_application): Resume → Candidate → Sourcing profile
+    # → "already interested" (no opening email; TA presses Technical Screening).
+    from services.careers import APPLY_LINK_PORTAL, record_application
+    res = record_application(
+        db, req, name=name, email=email, phone=phone, experience=experience, details=details,
+        file_url=file_url, file_sha256=file_sha256, file_size=file_size,
+        portal=APPLY_LINK_PORTAL, via="apply_link")
+    return envelope(data={"received": True},
+                    message="Application already received" if res.get("duplicate") else "Application received")
 
 
 def _notify_tas(db: Session, req: Requirement, resume: Resume, name: str) -> None:
-    """Bell + mail to the position's assigned TAs (else every TA): a candidate
-    applied through the public link and is waiting at Sourcing. Best-effort —
-    the application is already committed; a mail failure must not 500 it."""
-    try:
-        from services.notify import notify_role, notify_user
-        opp = db.get(Opportunity, req.opportunity_id)
-        label = f"{getattr(opp, 'opp_id', '') or req.req_number} — {req.title}".strip(" —")
-        title = f"New application via link: {name}"
-        msg = (f"{name} applied to {label} through the public application link. "
-               "They are in the Applicants tab at Sourcing — review and move them to Technical Screening.")
-        link = (f"/admin/?view=crm&p=opportunities/{req.opportunity_id}" if req.opportunity_id
-                else f"/admin/?view=crm&p=requirements/{req.id}")
-        ta_ids = db.execute(
-            select(RequirementTaAssignment.user_id).where(RequirementTaAssignment.requirement_id == req.id)
-        ).scalars().all()
-        if ta_ids:
-            for uid in dict.fromkeys(ta_ids):
-                notify_user(db, uid, title, msg, link, event="apply_link.application",
-                            dedupe_key=f"apply_link:{resume.id}:{uid}",
-                            related_type="requirement", related_id=req.id)
-        else:
-            notify_role(db, "TA", title, msg, link, event="apply_link.application",
-                        dedupe_prefix=f"apply_link:{resume.id}",
-                        related_type="requirement", related_id=req.id)
-        db.commit()
-    except Exception:
-        db.rollback()
+    """Kept for callers: the notice now lives in services/careers.notify_tas."""
+    from services.careers import notify_tas
+    notify_tas(db, req, resume, name, via="apply_link")

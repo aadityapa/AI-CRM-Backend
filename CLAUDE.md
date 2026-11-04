@@ -7,8 +7,8 @@
 > the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
 > short copy and points here. Keep both in step.
 
-**Last updated:** 2 Nov 2026 (an invoice number is found on every list: search cleaning, all tabs, Received Amount; Record Payment redesign; branch-wise finance). **State:**
-migration head **0150**. Backend suite ~2,295 pass, 3 skipped; the known failure is `test_public_invoice_qr`. Dashboard `tsc` is green. Nothing is committed since `dd61630`, so **commit the
+**Last updated:** 3 Nov 2026 (Karnex Careers: one public link for every open position, RMG JD, applicants land at Sourcing already interested). **State:**
+migration head **0151**. Backend suite ~2,295 pass, 3 skipped; the known failure is `test_public_invoice_qr`. Dashboard `tsc` is green. Nothing is committed since `dd61630`, so **commit the
 working tree.**
 
 ### What the project is
@@ -39,7 +39,7 @@ Roles:
 | Layer | What |
 | --- | --- |
 | Backend | Python, **FastAPI** monolith (`backend/main.py` + `routers/crm/*`), uvicorn (1 worker unless `REDIS_URL`) |
-| CRM data | **PostgreSQL**, SQLAlchemy 2.0, **Alembic** (linear chain, head 0150) |
+| CRM data | **PostgreSQL**, SQLAlchemy 2.0, **Alembic** (linear chain, head 0151) |
 | Interview data | `auth_db.py` raw SQL, dual dialect (SQLite dev / Postgres prod), startup `ALTER`s, no Alembic |
 | AI | OpenAI. Text calls: **GPT-6 Astra** (interview) and **GPT-5.5** (everything else); gpt-4o-mini is retired for text. Voice: gpt-4o-mini-tts. Speech-to-text: gpt-transcribe. Live voice: gpt-realtime. All text calls go through `prompt_logger.tracked_chat_completion` and are priced in AI Costs. |
 | Files / media | Local driver or **S3** (boto3) for recordings and uploads; ffmpeg (imageio-ffmpeg) joins camera + screen |
@@ -61,6 +61,8 @@ Roles:
 - An upload waits at **Sourcing** until TA presses Technical Screening.
 - RMG / GM choose the AI or manual L1; TA schedules it.
 - The AI verdict is advice: the screener decides, and a reject closes the candidacy.
+- A candidate who applies through a public form (careers page, apply link) is already interested: no opening
+  email, no Interested step; they wait at Sourcing for TA's Technical Screening (3 Nov 2026).
 - The opening "are you interested?" email is **manual only**. Archive is manual, except that a held deal parks its
   candidates.
 - Status is **derived** (`services/candidate_status.py`), never stored, and it is the same on every screen.
@@ -121,6 +123,7 @@ Roles:
 - Customers, branches and policies; rate cards and CTC slab.
 - Opportunities, positions, headcount changes.
 - Sourcing: Talent Pool (search, synonyms, saved searches, retention / opt-out), resume library, apply link, ATS v2.
+- Karnex Careers: one public page (`/careers`) of every open position, fed live from Orbit (3 Nov 2026).
 - Screening Desk.
 - Interview ladder and My Interviews.
 - Sales / Sales Head / HR flows.
@@ -4448,6 +4451,66 @@ reply carries **`meta.invoice_hits`** (`invoice_hits`, ≤ `INVOICE_HITS_LIMIT`=
 customer, grand total, received (cash + TDS), balance, stage + label, the receipts that paid it and its `payment_block`.
 F-V2: the Invoices page jumps to the tab holding the match and names the others; Received Amount shows the invoice and
 where its money stands (see that repo's notes). Deploy: restart; rebuild F-V2.
+
+**3 Nov 2026 — Karnex Careers: one public link for every open position, migration 0151, head is now 0151
+(`tests/test_careers.py` 12):** user ask (after approving the mock-up) — "one link RMG posts on LinkedIn; it follows Orbit;
+the candidate sees the RMG JD; an application lands with TA at Sourcing, and since they filled the form they are already
+interested, so no opening email / Interested step; TA presses Technical Screening by hand". **`services/careers.py`** is the
+one module. **Listed** (`listed_clause` + `_latest_requirement`): the LATEST requirement of each opportunity, status in
+`SOURCING_STATUSES`, deal New / Active and Sales-Head APPROVED, and not `requirements.careers_hidden` (0151, Boolean
+NOT NULL default false — RMG's switch; nothing changes on deploy). Nothing is cached: every request reads Orbit, so a
+position appears once RMG approves it and drops off when filled / closed / held / the deal is parked. Payload per
+position: id · `code` (req_number) · title · location / `city` (requirement Location, else the opportunity's
+`tm_work_location`) · work mode · experience label + min/max · `openings` (total − joined, ≥ 1) · `posted`
+(engineering_reviewed_at, else created) · skills `{name, must}` (mandatory first; a card carries 4 + `skills_more`) ·
+`summary` (220 chars) and, on the position call only, `jd` = the RMG JD (`rmg_jd_text`, else description). ⚠️ **The
+customer is never named**: no customer field in any public payload, and `scrub_customer` replaces the customer's name /
+legal name inside the JD with "our client" (whole words, any case, names < 3 chars ignored). **Applying** —
+`record_application(db, req, …, portal, via, channel)` is now the ONE landing path for BOTH public forms
+(`routers/crm/apply.py` submit delegates to it; `apply._notify_tas` is a wrapper): duplicate file → no new row; Resume
+(`source_portal` "Careers Page" / "Apply Link", `application_details.source_channel` = LinkedIn / Naukri / … from `?src=`)
+→ Candidate (by email) → `ensure_sourcing_profile(source="careers"|"apply_link")` → **`assign_owner`** (a self-applied
+candidate's `ta_owner` = the position's first assigned TA, so they show in that TA's Sourcing queue; none assigned →
+left open, every TA is told) → **`mark_interested`**: a `CANDIDATE_INTERESTED` activity row whose comment starts
+`[careers]` / `[apply_link]` (`VIA_TAG`), only while the stored stage is Sourcing / Technical_Screening and not already
+interested → requirement activity, Posted_On_Portals → In_Progress on the first application → commit → `notify_tas`
+(events **`careers.application`** / `apply_link.application`, link → the position's Applied Candidates).
+`opening_interest.opening_states` now returns **`via`** (careers · apply_link · None) and strips the tag from `note`;
+`send_opening_mail` returns **`already_interested`** for such a candidacy (checked before the address; the single route
+answers 409 "applied themselves … send them for Technical Screening"; bulk skips with a reason). The candidacy stays at
+Sourcing; TA's Technical Screening is unchanged. **Routes** (`routers/crm/public_careers.py`, `_MODULES` += it): public
+`GET /api/public/careers` (positions newest first + `locations` with counts + totals, 120/min),
+`GET /api/public/careers/positions/{id}` (404 "no longer open"), `POST …/positions/{id}/apply` (multipart: name · email ·
+mobile · experience · notice · current / preferred location · CTCs · skills · LinkedIn · `consent` required · `src` ·
+résumé PDF/Word ≤ 10 MB; 10/min; refused unless `is_listed`), `POST /api/public/careers/general-apply` ("Didn't find your
+role?" — a Candidate record with the CV, i.e. Talent Pool, event **`careers.general_application`**, 5/min); staff
+`GET /api/careers/overview` (`screener_or(gated_read("requirements", TA, RMG, Sales, Sales_Head))`: `url` = public base +
+`/careers`, `base_reach`, every live position with `listed` + `applications`, `post_text` (PURE `post_text`: names the first
+3, "…and N more", hashtags), `channels`, `can_edit`) and `PUT /api/careers/positions/{requirement_id} {listed}`
+(`screener_or(gated_write("requirements", RMG, Sales_Head))`, `set_listed` logs `CAREERS_LISTING`). Both new events are in
+`email_flows.EVENTS`. **`GET /careers`** (+ `/careers/`) in `main.py` serves F-V2 `frontend/careers.html`, declared before
+the `/` mount (pinned by a source scan). Deploy: `python -m alembic upgrade head` (0151), restart; set Settings ▸
+Organisation ▸ Email & links ▸ Public base URL (the link must open from the internet). **Later the same day:** reported —
+the modal's "Open page" went to karnexgroup.com/careers and got `{"detail":"Not Found"}` while testing locally: the link
+is built from the Public base URL (production), and production does not run this build yet. Not a code fault; F-V2's
+"Open page" now previews on the dashboard's own origin. `FileResponse` moved to the module-level import (no inner import).
+**Then** — the copied link `http://localhost:2020/careers` answered `ERR_EMPTY_RESPONSE`: Settings' Public base URL said
+**http**://localhost:2020 while `start_app.bat` serves **HTTPS** on 2020 by default (a plain-HTTP request to a TLS port gets
+an empty reply). `invite_links.request_origin(request)` (the origin the browser used, no LAN-IP swap) + `GET
+/api/careers/overview`: when the configured base is not PUBLIC (`base_reach` private / unknown), the link uses that origin
+instead (`base_source` "request"); a public address still wins. Pinned by
+`test_a_local_public_address_gives_way_to_the_origin_in_use` (test_careers now 13).
+**Then** — "Didn't find your role? Send your resume" lands as a Candidate record with the CV (Candidates page + Talent Pool
+search); `public_general_apply` now stamps a blank `created_by_name` as "Careers page · <channel>" so the Candidates list
+says where it came from, and TA's notice says what to do. Pinned by
+`test_a_general_resume_lands_in_candidates_marked_from_the_careers_page` (test_careers now 14).
+**Then** — the apply form asks the **last working day** when the notice is "Serving notice", plus Current CTC and
+Preferred location. `careers.lwd_problem(notice, raw, today)` (PURE; required only while serving, ≥ today − 30 d,
+≤ today + 180 d → 400 with the reason) gates `public_apply` (new Form `last_working_day`, kept in `application_details`);
+`fill_candidate_from_application(cand, details)` (called in `record_application` after the candidate is found / made)
+writes notice · current / expected CTC (`slot_booking.APPLICATION_FACT_FIELDS`) and the last working day +
+`resignation_status` onto the candidate's BLANKS only, so Applied Candidates' Availability column shows "LWD …".
+`general-apply` takes `preferred_location` too. test_careers now 16.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

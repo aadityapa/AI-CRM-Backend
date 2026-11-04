@@ -92,6 +92,23 @@ def base_from_request(request) -> str:
     return raw
 
 
+def request_origin(request) -> str:
+    """The origin the browser actually used for this request — scheme, host and port
+    exactly as typed (a reverse proxy's X-Forwarded-* wins). No LAN-IP swap: this is
+    the address that is known to work for the person looking at the screen."""
+    if request is None:
+        return ""
+    headers = getattr(request, "headers", {}) or {}
+    fwd_host = (headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    if fwd_host:
+        proto = (headers.get("x-forwarded-proto") or "https").split(",")[0].strip() or "https"
+        return f"{proto}://{fwd_host}"
+    try:
+        return str(request.base_url).rstrip("/")
+    except Exception:
+        return ""
+
+
 def base_reach(base: str) -> str:
     """'public' · 'private' (LAN / localhost — opens only inside the office
     network) · 'unknown'. PURE. A link posted on a job portal must be public."""

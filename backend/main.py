@@ -28,7 +28,7 @@ from functools import lru_cache
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import mimetypes
@@ -10778,6 +10778,18 @@ if FRONTEND_DIR.exists():
                 ),
                 status_code=503,
             )
+
+    @app.get("/careers", include_in_schema=False)
+    @app.get("/careers/", include_in_schema=False)
+    def careers_page():
+        """Karnex Careers (3 Nov 2026) — the ONE public link RMG posts on LinkedIn.
+        A pretty URL for `frontend/careers.html`; `?src=linkedin` and `?job=<id>`
+        are read by the page itself. Declared before the `/` mount."""
+        page = FRONTEND_DIR / "careers.html"
+        if not page.exists():
+            return HTMLResponse("<h1>Careers page not deployed</h1>", status_code=404)
+        return FileResponse(str(page), media_type="text/html",
+                            headers={"Cache-Control": "no-cache"})
 
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 else:

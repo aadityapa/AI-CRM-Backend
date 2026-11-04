@@ -70,6 +70,9 @@ class Requirement(Base, TimestampMixin):
     #: RMG hold (25 Aug 2026): the status Resume returns to, and why it was held.
     held_from_status = sa.Column(sa.String(60), nullable=True)
     held_reason = sa.Column(sa.String(1000), nullable=True)
+    #: RMG's switch for the public careers page (0151): True = not listed there
+    #: even while it is open for sourcing (services/careers.py).
+    careers_hidden = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
     created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=False)
     sales_head_approved_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
     sales_head_approved_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
