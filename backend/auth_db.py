@@ -2889,6 +2889,55 @@ def interview_ids_by_invite(db_target: DbTarget, invite_tokens) -> dict[str, str
     return out
 
 
+#: meta keys the diagnosis reads (5 Nov 2026) — scalars only, never the JSON.
+PROGRESS_SUMMARY_META_KEYS = (
+    "finalization_reason", "final_status", "interview_started_epoch", "startup_login_accepted_at_utc",
+    "fast_bootstrap", "termination_reason", "terminated_at", "created_at_ist", "unstarted_hold_at",
+)
+
+
+def interview_progress_summary(db_target: DbTarget, invite_token: str) -> dict | None:
+    """One interview's progress row WITHOUT the heavy JSON (5 Nov 2026, the
+    Integrity tab's "What happened" panel): the scalar columns, the answer and
+    question counts, and the meta scalars in `PROGRESS_SUMMARY_META_KEYS`.
+    None when the token has no row; never raises."""
+    token = str(invite_token or "").strip()
+    if not token:
+        return None
+    cols = ("interview_id, status, current_index, report_status, report_error, last_activity_at, "
+            "finalized_at, created_at_ist, updated_at_ist, recovery_attempts, last_recovery_at")
+    try:
+        if _is_postgres(db_target):
+            counts = ("CASE WHEN jsonb_typeof(answers) = 'array' THEN jsonb_array_length(answers) ELSE 0 END AS answers_count, "
+                      "CASE WHEN jsonb_typeof(questions) = 'array' THEN jsonb_array_length(questions) ELSE 0 END AS questions_count")
+            metas = ", ".join(f"meta->>'{k}' AS m_{k}" for k in PROGRESS_SUMMARY_META_KEYS)
+            with _connect_postgres(str(db_target)) as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(f"SELECT {cols}, {counts}, {metas} FROM interview_progress WHERE invite_token = %s LIMIT 1",
+                                (token,))
+                    row = cur.fetchone()
+        else:
+            counts = ("CASE WHEN json_valid(answers) AND json_type(answers) = 'array' THEN json_array_length(answers) ELSE 0 END AS answers_count, "
+                      "CASE WHEN json_valid(questions) AND json_type(questions) = 'array' THEN json_array_length(questions) ELSE 0 END AS questions_count")
+            metas = ", ".join(
+                f"CASE WHEN json_valid(meta) THEN json_extract(meta, '$.{k}') END AS m_{k}" for k in PROGRESS_SUMMARY_META_KEYS)
+            with _connect_sqlite(Path(db_target)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(f"SELECT {cols}, {counts}, {metas} FROM interview_progress WHERE invite_token = ? LIMIT 1",
+                                   (token,)).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    data = dict(row)
+    meta = {k: data.pop(f"m_{k}", None) for k in PROGRESS_SUMMARY_META_KEYS}
+    data["meta"] = {k: v for k, v in meta.items() if v not in (None, "")}
+    data["answers_count"] = int(data.get("answers_count") or 0)
+    data["questions_count"] = int(data.get("questions_count") or 0)
+    data["recovery_attempts"] = int(data.get("recovery_attempts") or 0)
+    return data
+
+
 def interview_record_job_ids(db_target: DbTarget, interview_ids) -> dict[str, str]:
     """interview_id -> the job template id the interview ran on (13 Oct 2026, the
     "taken on another opportunity's template" warning on the profile).

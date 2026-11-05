@@ -1383,6 +1383,13 @@ def project_employee_detail_out(db: Session, pe: ProjectEmployee) -> dict:
     }
     data["po"] = project_po_summary(db, pe.project_id)
     data["po_status"] = data["po"].get("po_status")
+    # Planned release / extensions (4 Nov 2026).
+    from services.pe_release import payload as release_payload
+    try:
+        with db.begin_nested():
+            data["release"] = release_payload(db, pe)
+    except Exception:  # noqa: BLE001 — a database before 0152 must still open the page
+        data["release"] = None
     return data
 
 

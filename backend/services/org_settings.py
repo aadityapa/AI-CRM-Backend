@@ -55,6 +55,7 @@ KEYS: dict[str, tuple[str, str]] = {
     # Closed projects: team moves to the bench after the last working day (25 Sep 2026).
     "scheduler.project_closures": ("", "true"),
     "scheduler.employee_separations": ("", "true"),
+    "scheduler.release_reminders": ("", "true"),
     "scheduler.prompt_log_retention": ("", "true"),
     "scheduler.interview_feedback_due": ("", "true"),
     "scheduler.ai_interview_reminders": ("", "true"),

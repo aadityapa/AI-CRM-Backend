@@ -92,10 +92,14 @@ def upload_resume(
     # resume row AND logged on the profile's Activity Log).
     current_location: str = Form("", max_length=120),
     note: str = Form("", max_length=1000),
+    # Internal / External (4 Nov 2026). Blank = decided from the email domain.
+    candidate_type: str = Form("", max_length=16),
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("requirements", "TA")),
 ):
     req = get_requirement_or_404(db, requirement_id)
+    from services.internal_candidates import clean_type
+    chosen_type = clean_type(candidate_type)
     if req.status not in _UPLOAD_ALLOWED_STATUSES:
         raise HTTPException(
             status_code=400,
@@ -176,6 +180,8 @@ def upload_resume(
             cand = find_or_create_candidate_from_resume(db, resume)
             resume.candidate_id = cand.id
         profile = ensure_sourcing_profile(db, resume, req, ta_user=user)
+        if profile is not None and chosen_type and not getattr(profile, "candidate_type", None):
+            profile.candidate_type = chosen_type
         record_upload_note(db, profile, (note or "").strip(), user.id)
         # Locations blank after the form's "Current location" → tell the TA (29 Sep 2026).
         from services.slot_booking import remind_missing_location
@@ -1000,6 +1006,10 @@ def list_resumes(
     ats_status: str | None = None,
     ai_interview_status: str | None = None,
     applied_by: str | None = None,
+    #: 5 Nov 2026 — with `applied_by`, also keep the candidates who applied
+    #: THEMSELVES (careers page / application link). TA's default "Applied by =
+    #: me" hid them: nobody "applied" them, so they were in no TA's list.
+    with_public: bool = False,
     applied_from: date | None = None,
     applied_to: date | None = None,
     dismissed: bool = False,
@@ -1094,12 +1104,15 @@ def list_resumes(
         # candidate profile (ta_owner_name), stamped when the resume created
         # its Sourcing profile. Filter must be SERVER-side: the list is
         # paginated, so a client-side filter would silently miss other pages.
-        stmt = stmt.where(Resume.candidate_id.in_(
+        owned = Resume.candidate_id.in_(
             select(CandidateProfile.candidate_id).where(
                 CandidateProfile.opportunity_id == req.opportunity_id,
-                CandidateProfile.ta_owner_name == applied_by.strip(),
+                _applied_by_clause(applied_by, with_public),
             )
-        ))
+        )
+        if with_public:
+            owned = or_(owned, Resume.source_portal.in_(PUBLIC_PORTALS))
+        stmt = stmt.where(owned)
     # Applied-date window (11 Sep 2026, TA request): "what did I submit this
     # week". The resume's upload time IS the application time here.
     if applied_from is not None:
@@ -1120,7 +1133,7 @@ def list_resumes(
     # used to be appended to page 1 only, which is why the header said
     # "4 resumes" over a table showing 6 rows.
     extra = _profile_only_applied_rows(
-        db, req, search=p.search, applied_by=applied_by,
+        db, req, search=p.search, applied_by=applied_by, with_public=with_public,
         dismissed=dismissed,
         applied_from=applied_from, applied_to=applied_to,
         profile_ids=wanted_profile_ids,
@@ -1135,7 +1148,7 @@ def list_resumes(
         CandidateProfile.opportunity_id == req.opportunity_id,
         or_(CandidateProfile.is_hidden.is_(None), CandidateProfile.is_hidden.is_(False)))
     if applied_by:
-        counts_stmt = counts_stmt.where(CandidateProfile.ta_owner_name == applied_by.strip())
+        counts_stmt = counts_stmt.where(_applied_by_clause(applied_by, with_public))
     if stage_clause is not None:
         counts_stmt = counts_stmt.where(stage_clause)
     meta["status_counts"] = status_counts(db, counts_stmt)
@@ -1208,6 +1221,12 @@ def list_resumes(
     # printed on the Rejected rows; ONE query for the page's closed profiles.
     notes = closing_notes(db, [r.get("profile_id") for r in page_rows
                                if r.get("profile_pipeline_status") in _CLOSED])
+    # RMG / GM's screening Reject keeps the stage, so its reason is read off the
+    # screening note (4 Nov 2026).
+    from services.candidate_status import screening_rejection_notes
+    screen_notes = screening_rejection_notes(db, [
+        r.get("profile_id") for r in page_rows
+        if r.get("profile_pipeline_status") not in _CLOSED and r.get("rmg_screening_status") == "Rejected"])
     # The opening email and the candidate's answer (1 Oct 2026) — ONE query.
     from services.opening_interest import opening_states
     opening = opening_states(db, [r.get("profile_id") for r in page_rows])
@@ -1227,7 +1246,7 @@ def list_resumes(
         row["archive_reason"] = reasons.get(pid) if row["archived"] else None
         row["archivable"] = bool(pid and not row["archived"])
         row["closed"] = bool(pid and stage in _CLOSED)
-        row["closed_note"] = notes.get(pid) if pid and stage in _CLOSED else None
+        row["closed_note"] = (notes.get(pid) if stage in _CLOSED else screen_notes.get(pid)) if pid else None
         row["opening_mail"] = opening.get(pid) if pid else None
         row["hold"] = holds.get(pid) if pid else None
     _with_screening_extras(db, page_rows)
@@ -1288,7 +1307,9 @@ def _with_screening_extras(db: Session, rows: list[dict]) -> None:
     Three batched queries for the page; best-effort — a failure leaves the
     keys unset and the buttons hidden, never a 500."""
     from services.rmg_tasks import unreviewed_results
+    from services.internal_candidates import email_is_internal, internal_domains
     from services.screening_desk import direct_to_sales_block, fast_track_block, internal_matches
+    domains = internal_domains()
     pids = sorted({r["profile_id"] for r in rows if r.get("profile_id")})
     if not pids:
         return
@@ -1300,6 +1321,7 @@ def _with_screening_extras(db: Session, rows: list[dict]) -> None:
                 .where(CandidateProfile.id.in_(pids))
             ).all()
             profiles = {p.id: p for p, _ in pairs}
+            cands = {p.id: c for p, c in pairs}
             internal = internal_matches(db, [(p, c) for p, c in pairs])
             results = unreviewed_results(db, pids)
     except Exception:  # noqa: BLE001 — extras only; the list must load
@@ -1314,6 +1336,14 @@ def _with_screening_extras(db: Session, rows: list[dict]) -> None:
         row["internal_employee"] = emp
         row["fast_track_block"] = fast_track_block(profile, emp) if emp else None
         row["new_results"] = results.get(profile.id) or []
+        # Internal / External (4 Nov 2026): chosen by TA, else @company email or an
+        # employee match — the same rule services.internal_candidates.resolve uses.
+        chosen = getattr(profile, "candidate_type", None)
+        cand = cands.get(profile.id)
+        row["candidate_type"] = chosen or (
+            "Internal" if (emp or (cand is not None and email_is_internal(cand.email, domains)))
+            else "External")
+        row["candidate_type_chosen"] = bool(chosen)
 
 
 def _narrow_to_profiles(stmt, profile_ids: set[int]):
@@ -1518,8 +1548,24 @@ def _paginate_merged(db: Session, stmt, extra: list[dict], page: int, limit: int
                                       "total": total, "pages": pages}
 
 
+#: Where a candidate applied THEMSELVES — `candidate_profiles.source` and
+#: `resumes.source_portal` (services/careers.CAREERS_PORTAL / APPLY_LINK_PORTAL).
+PUBLIC_SOURCES = ("careers", "apply_link")
+PUBLIC_PORTALS = ("Careers Page", "Apply Link")
+
+
+def _applied_by_clause(applied_by: str, with_public: bool = False):
+    """SQL for "applied by <TA>" — plus, with `with_public`, every self-applied
+    candidacy (they have no TA who applied them). Never NULL."""
+    mine = CandidateProfile.ta_owner_name == (applied_by or "").strip()
+    if not with_public:
+        return mine
+    return or_(mine, sa.func.coalesce(CandidateProfile.source, "").in_(PUBLIC_SOURCES))
+
+
 def _profile_only_applied_rows(db: Session, req, *, search: str | None,
                                applied_by: str | None,
+                               with_public: bool = False,
                                dismissed: bool = False,
                                applied_from: date | None = None,
                                applied_to: date | None = None,
@@ -1593,7 +1639,8 @@ def _profile_only_applied_rows(db: Session, req, *, search: str | None,
         email = (cand.email or "").strip()
         if needle and needle not in f"{name} {email} {cand.phone or ''}".lower():
             continue
-        if want_ta and (profile.ta_owner_name or "") != want_ta:
+        if want_ta and (profile.ta_owner_name or "") != want_ta \
+                and not (with_public and (profile.source or "") in PUBLIC_SOURCES):
             continue
         applied_at = profile.applied_on or profile.created_at
         applied_day = applied_at.date() if applied_at else None

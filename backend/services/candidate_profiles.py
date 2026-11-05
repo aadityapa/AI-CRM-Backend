@@ -2096,6 +2096,9 @@ def profile_to_dict(
         "withdrawn_from_status": getattr(profile, "withdrawn_from_status", None),
         "candidate_pre_status": getattr(profile, "candidate_pre_status", None),
         "employee_ref": getattr(profile, "employee_ref", None),
+        # Internal / External as TA chose it (0152); NULL = derived (see
+        # services.internal_candidates). The detail route adds the resolved type.
+        "candidate_type": getattr(profile, "candidate_type", None),
         "created_by_name": getattr(profile, "created_by_name", None),
         "user_role": getattr(profile, "user_role", None),
         "comments_text": getattr(profile, "comments_text", None),

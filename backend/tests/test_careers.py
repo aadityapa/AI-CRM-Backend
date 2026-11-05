@@ -144,7 +144,7 @@ def test_the_page_lists_only_open_approved_positions_with_the_rmg_jd(db):
     titles = [p["title"] for p in data["positions"]]
     assert titles == ["Android Developer", "AUTOSAR Developer"]
     assert data["total_openings"] == 6
-    assert {c["city"] for c in data["locations"]} == {"Pune", "Bengaluru"}
+    assert {c["city"] for c in data["locations"]} == {"Pune", "Bangalore"}
     item = careers.careers_position(db, live.id)
     assert item["experience"] == "4–8 yrs" and item["location"] == "Pune, Maharashtra"
     # RMG JD, not the Sales description — and the customer is never named.
@@ -205,6 +205,26 @@ def test_a_careers_applicant_lands_at_sourcing_already_interested(db, sent):
     assert res["status"] == "already_interested"
 
 
+def test_where_applications_come_from_is_counted_per_channel(db, sent):
+    """5 Nov 2026, user ask: see which platform brings candidates. LinkedIn is the
+    `_apply` default; a plain link (no `?src=`) is the Karnex careers page."""
+    opp, req = _position(db)
+    _apply(db, req)
+    _apply(db, req, src="", email="direct@example.com", file=_upload("cv2.pdf"))
+    stats = {r["key"]: r for r in careers.channel_stats(db)}
+    assert [k for k in stats][:5] == ["linkedin", "naukri", "whatsapp", "indeed", "karnex"]
+    assert stats["linkedin"]["applications"] == 1 and stats["linkedin"]["last_30_days"] == 1
+    assert stats["karnex"]["applications"] == 1 and stats["karnex"]["label"] == "Karnex careers page"
+    assert stats["naukri"]["applications"] == 0 and stats["naukri"]["moved_on_pct"] is None
+    # A candidate who moved past TA's Sourcing counts as "in process".
+    prof = db.execute(select(CandidateProfile).where(CandidateProfile.opportunity_id == opp.id)
+                      .order_by(CandidateProfile.id)).scalars().first()
+    prof.pipeline_status = PipelineStatus.RMG_REVIEW; db.commit()
+    stats = {r["key"]: r for r in careers.channel_stats(db)}
+    assert stats["linkedin"]["in_process"] + stats["karnex"]["in_process"] == 1
+    assert "by_channel" in careers.staff_overview(db)
+
+
 def test_the_apply_link_is_treated_the_same(db, sent):
     opp, req = _position(db)
     ap.submit_application(
@@ -249,7 +269,8 @@ def test_post_text_and_pure_helpers():
     assert "• Role 0 — Pune, 3–6 yrs" in text and "…and 2 more" in text
     assert "https://karnexgroup.com/careers?src=linkedin" in text
     assert careers.channel_label("LinkedIn") == "LinkedIn"
-    assert careers.channel_label("<script>") == "Careers page"
+    assert careers.channel_label("<script>") == "Karnex careers page"   # 5 Nov 2026 wording
+    assert careers.is_direct("Careers page") and careers.is_direct(None) and not careers.is_direct("Naukri")
     assert careers.scrub_customer("Work for HARMAN and Harman's ECU team", ["Harman"]) == \
         "Work for our client and our client's ECU team"
     assert careers.scrub_customer("Aptiv", ["Ap"]) == "Aptiv"
@@ -350,3 +371,67 @@ def test_the_assigned_ta_owns_a_self_applied_candidate(db, sent):
     prof = db.execute(select(CandidateProfile).where(CandidateProfile.opportunity_id == opp.id)).scalars().one()
     assert prof.ta_owner_id == 1 and prof.ta_owner_name == "Tara"
     assert sent == [("user", 1, "careers.application")]
+
+
+def test_a_failing_cv_autofill_never_costs_the_sourcing_profile(db, sent, monkeypatch):
+    """5 Nov 2026 — reported: a careers application never reached Sourcing. The
+    form's skills / CTC autofill ran outside a savepoint; when it failed, the
+    candidate and the profile were lost with it."""
+    import services.candidates as sc
+
+    def boom(*_a, **_k):
+        raise RuntimeError("skill master clash")
+    monkeypatch.setattr(sc, "apply_cv_profile_to_candidate", boom)
+    import services.slot_booking as sb
+    monkeypatch.setattr(sb, "apply_cv_profile_to_candidate", boom, raising=False)
+    opp, req = _position(db)
+    out = _apply(db, req, skills="AUTOSAR, CAN")
+    assert out["data"]["received"] is True
+    prof = db.execute(select(CandidateProfile).where(CandidateProfile.opportunity_id == opp.id)).scalars().one()
+    assert prof.pipeline_status == PipelineStatus.SOURCING
+
+
+def test_the_same_cv_again_still_gets_its_sourcing_profile(db, sent, monkeypatch):
+    """A first attempt that saved the CV but no profile is repaired by the next one."""
+    monkeypatch.setattr(pc, "save_upload_hashed", lambda f, d: ("/u/cv.pdf", "sha-same", 10))
+    opp, req = _position(db)
+    db.add(Resume(requirement_id=req.id, candidate_name="Asha Rao", email="asha@example.com",
+                  source_portal=careers.CAREERS_PORTAL, resume_file_url="/u/cv.pdf",
+                  file_sha256="sha-same", file_size=10))
+    db.commit()
+    out = _apply(db, req)
+    assert out["data"]["received"] is True
+    prof = db.execute(select(CandidateProfile).where(CandidateProfile.opportunity_id == opp.id)).scalars().one()
+    assert prof.pipeline_status == PipelineStatus.SOURCING and prof.source == "careers"
+
+
+def test_applied_by_me_keeps_the_self_applied_candidates():
+    """TA's default "Applied by = me" hid every careers applicant (nobody applied
+    them); `with_public` keeps them."""
+    from routers.crm import resumes as rr
+    mine = str(rr._applied_by_clause("Tara").compile(compile_kwargs={"literal_binds": True}))
+    both = str(rr._applied_by_clause("Tara", True).compile(compile_kwargs={"literal_binds": True}))
+    assert "source" not in mine
+    assert "careers" in both and "apply_link" in both and "Tara" in both
+
+
+def test_the_ta_notice_links_straight_to_the_applicant(db, monkeypatch):
+    seen: list = []
+    import services.notify as n
+    monkeypatch.setattr(n, "notify_role", lambda _db, role, title, msg, link, **k: seen.append(link) or 1)
+    _, req = _position(db)
+    resume = Resume(requirement_id=req.id, candidate_name="Asha Rao", email="asha+x@example.com",
+                    resume_file_url="/u/cv.pdf", file_sha256="sha-link", file_size=10)
+    db.add(resume); db.commit()
+    careers.notify_tas(db, req, resume, "Asha Rao", via="careers")
+    assert seen and seen[0].endswith("&tab=resumes&q=asha%2Bx%40example.com")
+
+
+def test_stored_location_text_becomes_clean_unique_cities():
+    from services.careers import split_cities
+    assert split_cities("['Bangalore']") == ["Bangalore"]
+    assert split_cities("['Bangalore', 'Chennai']") == ["Bangalore", "Chennai"]
+    assert split_cities("['Chennai', 'Bangalore']") == ["Chennai", "Bangalore"]
+    assert split_cities(["Bengaluru", "bangalore", "Pune, Maharashtra"]) == ["Bangalore", "Pune"]
+    assert split_cities("Chennai / Hyderabad and Remote") == ["Chennai", "Hyderabad"]
+    assert split_cities(None) == [] and split_cities("[]") == []

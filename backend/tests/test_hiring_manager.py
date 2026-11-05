@@ -170,66 +170,32 @@ def test_without_an_hm_nothing_changes(db):
     assert hm.entry_block(db, p, PS.CUSTOMER_SCREENING.value) is None
 
 
-def test_the_review_gates_the_customer_and_a_rejection_closes_it(db):
+def test_the_candidate_review_and_signoff_gates_are_removed(db):
+    """5 Nov 2026 (user decision): the HM no longer reviews candidates before the
+    customer or signs off before the Sales Head — nothing is stamped, nothing blocks."""
+    from services.action_permissions import ACTIONS
     from services.candidate_profiles import _check_entry_requirement
+    assert hm.HM_CANDIDATE_GATES is False
+    assert "profile.hm_review" not in ACTIONS and "profile.hm_signoff" not in ACTIONS
     opp, req = _deal(db, 6)
     hm.set_hiring_managers(db, req, [HM_ID], None, RMG)
     p = _profile(db, opp, PS.SALES_SCREENING)
     hm.on_stage_arrival(db, p, PS.SALES_SCREENING.value, RMG)
-    assert p.hm_review_status == hm.PENDING
-    with pytest.raises(HTTPException) as exc:
-        _check_entry_requirement(db, p, PS.CUSTOMER_SCREENING.value)
-    assert exc.value.status_code == 409 and "Hiring Manager" in exc.value.detail
-    with pytest.raises(HTTPException):
-        hm.decide(db, p, "review", "reject", "no", HM)     # a reason is required
-    hm.decide(db, p, "review", "reject", "Not strong enough on CAN diagnostics", HM)
-    assert p.pipeline_status == PS.REJECTED and p.hm_review_status == hm.REJECTED
-    actions = [a for (a,) in db.execute(select(CandidateProfileActivityLog.action_type)
-                                        .where(CandidateProfileActivityLog.profile_id == p.id)).all()]
-    assert hm.REJECTED_AT_REVIEW in actions
-
-
-def test_an_approval_opens_the_customer_step(db):
-    from services.candidate_profiles import _check_entry_requirement
-    opp, req = _deal(db, 7)
-    hm.set_hiring_managers(db, req, [HM_ID], None, RMG)
-    p = _profile(db, opp, PS.SALES_SCREENING)
-    hm.on_stage_arrival(db, p, PS.SALES_SCREENING.value, RMG)
-    hm.decide(db, p, "review", "approve", None, HM)
-    assert p.hm_review_status == hm.APPROVED
-    _check_entry_requirement(db, p, PS.CUSTOMER_SCREENING.value)       # no longer blocked
-
-
-def test_the_signoff_comes_before_the_sales_head(db):
-    from services.candidate_profiles import _check_entry_requirement
-    opp, req = _deal(db, 8)
-    hm.set_hiring_managers(db, req, [HM_ID], None, RMG)
-    p = _profile(db, opp, PS.CUSTOMER_APPROVAL)
-    hm.on_stage_arrival(db, p, PS.CUSTOMER_APPROVAL.value, SALES)
-    with pytest.raises(HTTPException):
-        _check_entry_requirement(db, p, PS.HR_SCREENING.value)
-    with pytest.raises(HTTPException) as exc:
-        hm.decide(db, p, "review", "approve", None, HM)        # wrong step
-    assert exc.value.status_code == 409
-    hm.decide(db, p, "signoff", "approve", "Good fit", HM)
-    _check_entry_requirement(db, p, PS.HR_SCREENING.value)
-
-
-def test_removing_every_hm_releases_waiting_candidates(db):
-    opp, req = _deal(db, 9)
-    hm.set_hiring_managers(db, req, [HM_ID], None, RMG)
-    p = _profile(db, opp, PS.SALES_SCREENING)
-    hm.on_stage_arrival(db, p, PS.SALES_SCREENING.value, RMG)
-    db.commit()
-    hm.set_hiring_managers(db, req, [], None, RMG)
-    db.commit(); db.refresh(p)
     assert p.hm_review_status is None
+    _check_entry_requirement(db, p, PS.CUSTOMER_SCREENING.value)       # not blocked
+    opp2, req2 = _deal(db, 7)
+    hm.set_hiring_managers(db, req2, [HM_ID], None, RMG)
+    q = _profile(db, opp2, PS.CUSTOMER_APPROVAL)
+    hm.on_stage_arrival(db, q, PS.CUSTOMER_APPROVAL.value, SALES)
+    assert q.hm_final_status is None
+    assert hm.entry_block(db, q, PS.HR_SCREENING.value) is None
 
 
 def test_statuses_and_phases_name_the_hiring_manager():
-    assert derive_status(StatusFacts(PS.SALES_SCREENING.value, hm_review="Pending")).key == "hm_review"
-    assert derive_status(StatusFacts(PS.SALES_SCREENING.value, hm_review="Approved")).key == "sales_review"
-    assert derive_status(StatusFacts(PS.CUSTOMER_APPROVAL.value, hm_final="Pending")).key == "hm_signoff"
+    # The review / sign-off statuses are no longer derived (5 Nov 2026) …
+    assert derive_status(StatusFacts(PS.SALES_SCREENING.value, hm_review="Pending")).key != "hm_review"
+    assert derive_status(StatusFacts(PS.CUSTOMER_APPROVAL.value, hm_final="Pending")).key != "hm_signoff"
+    # … but a candidacy an HM closed before the change still reads as theirs.
     closed = StatusFacts(PS.REJECTED.value, ta_closed="hm")
     assert derive_status(closed).key == "hm_rejected" and stage_for(closed) == "sales_screening"
     assert stage_for(StatusFacts(PS.REJECTED.value, ta_closed="hm_final")) == "selection"
@@ -277,9 +243,10 @@ def test_the_hm_dashboard_shows_their_positions_and_decisions(db):
     out = hm.dashboard(db, HM)
     assert out["assigned"] is True
     assert [x["requirement_id"] for x in out["positions"]] == [req.id]      # never the other deal
-    assert [d["kind"] for d in out["decisions"]] == ["review"]
-    assert out["decisions"][0]["profile_id"] == p.id
-    assert out["tiles"]["positions"] == 1 and out["tiles"]["waiting"] == 1
+    # 5 Nov 2026: no candidate review / sign-off any more — nothing waits on the HM.
+    assert [d["kind"] for d in out["decisions"]] == []
+    assert p.hm_review_status is None
+    assert out["tiles"]["positions"] == 1 and out["tiles"]["waiting"] == 0
     nobody = CurrentUser(id=OTHER_HM, username="o", roles={"Hiring Manager"}, held_roles={"Hiring Manager"})
     empty = hm.dashboard(db, nobody)
     assert empty["assigned"] is False and empty["positions"] == []

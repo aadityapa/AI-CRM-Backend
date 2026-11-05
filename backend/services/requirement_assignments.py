@@ -13,6 +13,7 @@ page, `ta_options` is one role query + one names query.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -53,12 +54,24 @@ def _names(db: Session, ids) -> dict[int, str]:
 
 def inactive_user_ids(db: Session) -> set[int]:
     """Deactivated logins. An old stub without the `is_active` column → none."""
+    # 5 Nov 2026: read the flag in Python — `IS FALSE` fails on an integer column
+    # (the error was swallowed, so NO login ever read as inactive and deactivated
+    # TAs stayed in the Assign TAs picker).
     try:
         with db.begin_nested():
-            return {int(r[0]) for r in db.execute(sa.text(
-                f"SELECT id FROM {USERS_TABLE} WHERE is_active IS FALSE")).all()}
+            rows = db.execute(sa.text(f"SELECT id, is_active FROM {USERS_TABLE}")).all()
+        return {int(r[0]) for r in rows if r[1] is not None and str(r[1]).strip().lower() in ("0", "false", "f", "no")}
     except Exception:  # noqa: BLE001
         return set()
+
+
+#: A login whose name says it is a test account (e.g. "Test TA") is never offered
+#: as a sourcing TA (user ask, 5 Nov 2026).
+_TEST_NAME = re.compile(r"^\s*(test|demo|dummy)\b", re.IGNORECASE)
+
+
+def is_test_login(name: str | None) -> bool:
+    return bool(name and _TEST_NAME.match(name))
 
 
 def ta_options(db: Session) -> list[dict]:
@@ -69,7 +82,8 @@ def ta_options(db: Session) -> list[dict]:
         return []
     inactive = inactive_user_ids(db)
     names = _names(db, ids)
-    out = [{"id": int(i), "name": names.get(int(i), f"User #{i}")} for i in ids if int(i) not in inactive]
+    out = [{"id": int(i), "name": names.get(int(i), f"User #{i}")} for i in ids
+           if int(i) not in inactive and not is_test_login(names.get(int(i)))]
     return sorted(out, key=lambda r: r["name"].lower())
 
 

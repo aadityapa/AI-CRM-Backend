@@ -172,6 +172,9 @@ class CandidateProfile(Base, TimestampMixin):
     stage = sa.Column(sa.String(60), nullable=True)              # RMG / Sales / HR
     candidate_pre_status = sa.Column(sa.String(120), nullable=True)
     employee_ref = sa.Column(sa.String(255), nullable=True)
+    #: "Internal" | "External" — TA's choice at upload (0152). NULL = derived from the
+    #: email domain / an employee match (services/internal_candidates.py).
+    candidate_type = sa.Column(sa.String(16), nullable=True)
     created_by_name = sa.Column(sa.String(120), nullable=True)
     user_role = sa.Column(sa.String(40), nullable=True)
     comments_text = sa.Column(sa.Text, nullable=True)

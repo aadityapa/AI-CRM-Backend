@@ -6,11 +6,12 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from crm_deps import (  # noqa: F401
-    gated_write_action,
+    gated_write_action, role_required,
     CurrentUser, PageParams, gated_create, gated_read, gated_write, get_crm_db, page_params,
 )
 from models import (
@@ -409,6 +410,56 @@ def list_all_project_employees(
 
 
 # ---------------------------------------------------------------- PE detail / rates (literal /employees/... before /{project_id})
+
+class ReleaseIn(BaseModel):
+    kind: str = Field(default="release", pattern="^(release|extension)$")
+    release_date: date
+    informed_on: date | None = None
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ReleaseClearIn(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+def _release_gate():
+    from services.pe_release import RELEASE_ROLES
+    return role_required(*RELEASE_ROLES)
+
+
+@router.post("/employees/{pe_id}/release")
+def set_pe_release(
+    pe_id: int,
+    body: ReleaseIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(_release_gate()),
+):
+    """Planned release / extension the customer announced (4 Nov 2026). A PLAN —
+    reminders 30/15/5/2/1 days before, and the revenue forecast stops there. The
+    person still leaves through the Exit action."""
+    from services.pe_release import set_release
+
+    pe = get_pe_or_404(db, pe_id)
+    data = set_release(db, pe, body.release_date, body.kind, body.informed_on, body.note, user)
+    db.commit()
+    word = "Extension" if body.kind == "extension" else "Release date"
+    return envelope(data=data, message=f"{word} saved — {body.release_date:%d %b %Y}")
+
+
+@router.delete("/employees/{pe_id}/release")
+def clear_pe_release(
+    pe_id: int,
+    body: ReleaseClearIn | None = None,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(_release_gate()),
+):
+    from services.pe_release import clear_release
+
+    pe = get_pe_or_404(db, pe_id)
+    data = clear_release(db, pe, body.note if body else None, user)
+    db.commit()
+    return envelope(data=data, message="Release date removed")
+
 
 @router.get("/employees/{pe_id}")
 def get_project_employee_detail(
@@ -1177,6 +1228,58 @@ def cancel_project_close_endpoint(
     db.refresh(project)
     return envelope(data={"project": project_out(project), "exits_restored": restored},
                     message="Scheduled close cancelled")
+
+
+class TeamReleaseIn(BaseModel):
+    """One release / extension date for several people of a project (4 Nov 2026)."""
+    kind: str = Field(default="release", pattern="^(release|extension)$")
+    release_date: date
+    pe_ids: list[int] = Field(min_length=1, max_length=500)
+    informed_on: date | None = None
+    note: str | None = Field(default=None, max_length=1000)
+
+
+@router.post("/{project_id}/release")
+def set_team_release(
+    project_id: int,
+    body: TeamReleaseIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(_release_gate()),
+):
+    """Record the customer's release (or extension) for several people at once.
+    Each person is checked on their own (onboarding date, extension after the
+    current date); one refusal never blocks the others — it is named in `skipped`."""
+    from services.pe_release import set_release
+
+    project = get_project_or_404(db, project_id)
+    ids = list(dict.fromkeys(int(i) for i in body.pe_ids))
+    rows = db.execute(
+        select(ProjectEmployee).where(ProjectEmployee.id.in_(ids),
+                                      ProjectEmployee.project_id == project.id)
+    ).scalars().all()
+    by_id = {pe.id: pe for pe in rows}
+    saved, skipped = [], []
+    for pe_id in ids:
+        pe = by_id.get(pe_id)
+        if pe is None:
+            skipped.append({"pe_id": pe_id, "reason": "Not on this project"})
+            continue
+        try:
+            with db.begin_nested():
+                set_release(db, pe, body.release_date, body.kind, body.informed_on, body.note, user)
+            saved.append(pe_id)
+        except HTTPException as exc:
+            skipped.append({"pe_id": pe_id, "reason": str(exc.detail)})
+    if not saved:
+        db.rollback()
+        reason = skipped[0]["reason"] if skipped else "Nobody was picked"
+        raise HTTPException(status_code=400, detail=f"Nothing was saved — {reason}")
+    db.commit()
+    word = "Extension" if body.kind == "extension" else "Release date"
+    msg = f"{word} {body.release_date:%d %b %Y} saved for {len(saved)}"
+    if skipped:
+        msg += f" · {len(skipped)} skipped"
+    return envelope(data={"saved": saved, "skipped": skipped}, message=msg)
 
 
 # ---------------------------------------------------------------- team

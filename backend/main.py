@@ -125,6 +125,8 @@ from auth_db import (
     init_auth_db,
     list_recoverable_interview_progress,
     record_interview_recovery_attempt,
+    mark_interview_progress_report_status,
+    interview_progress_summary,
     interview_recovery_lock,
     RECOVERY_FINAL_REPORT_STATUSES,
     list_hr_candidate_decisions,
@@ -155,6 +157,7 @@ from auth_db import (
     _coerce_question_type,
     _normalized_manual_questions_for_job,
 )
+from services.interview_diagnosis import diagnose as diagnose_interview, session_never_started
 from hr.repository import (
     delete_record_by_id,
     delete_records_for_candidate,
@@ -2647,6 +2650,25 @@ def _recover_interviews_once(limit: int = 100) -> int:
                 continue
             status = str(row.get("status") or "").strip().lower()
             answers = sess.get("answers") or []
+            invite_tok = str((sess.get("meta", {}) or {}).get("invite_token") or row.get("invite_token") or "").strip()
+            if status != "terminated" and not answers and invite_tok:
+                schedule = get_schedule_by_token(AUTH_DB_TARGET, invite_tok)
+                if session_never_started(sess, schedule):
+                    # 5 Nov 2026: the invite lookup pre-builds the session (up
+                    # to a day early). A candidate who only opened the link and
+                    # did the Device Check was CLOSED here 60 minutes later as
+                    # "abandoned" — before their slot — and the link went dead.
+                    # Nothing happened yet: leave the schedule alone and park the
+                    # row (the next save on sign-in resets report_status).
+                    mark_interview_progress_report_status(
+                        AUTH_DB_TARGET, rid, "no_report_needed",
+                        report_error="Prepared when the candidate opened the link; not started yet")
+                    logger.info(
+                        "interview.recovery.skipped_unstarted",
+                        extra={"event": "interview.recovery.skipped_unstarted", "interview_id": rid,
+                               "invite_token": _invite_token_tag(invite_tok)},
+                    )
+                    continue
             if status == "terminated":
                 final_status = "terminated"
                 reason = "terminated_recovery"
@@ -10144,6 +10166,10 @@ def _crm_links_for_tokens(tokens: list[str]) -> dict[str, dict]:
                     "scheduled_by_name": names.get(lk.scheduled_by, "") if lk.scheduled_by else "",
                     "ai_score": float(lk.overall_score_percent) if lk.overall_score_percent is not None else None,
                     "ai_result": lk.result,
+                    # 5 Nov 2026: "Failed 0 %" on the row was really "never
+                    # attempted" — the link knew, the row did not say.
+                    "not_attempted": bool(getattr(lk, "not_attempted", False)),
+                    "voided": bool(getattr(lk, "voided_at", None)),
                     "level": lk.level,
                     "interview_record_id": lk.interview_record_id or None,
                 }
@@ -10351,7 +10377,27 @@ def interview_integrity_detail(request: Request, invite_token: str):
             "is_strike": t in _INTEGRITY_VIOLATION_TYPES,
         })
     row = next((i for i in _integrity_payload()["logs"] if i.get("invite_token") == token), None)
+    # 5 Nov 2026: "What happened" — the journey and a plain-words verdict, read
+    # from the schedule, the progress row (slim, no JSON), the device-check log,
+    # the CRM link and this process's lookup memory. Never fails the page.
+    diagnosis = None
+    try:
+        device_log = get_device_check_log(AUTH_DB_TARGET, token)
+        sched_for_diag = dict(rec)
+        if row:
+            sched_for_diag.setdefault("reason", row.get("reason"))
+        diagnosis = diagnose_interview(
+            sched_for_diag,
+            interview_progress_summary(AUTH_DB_TARGET, token),
+            device_log=device_log if isinstance(device_log, list) else [],
+            link={k: (row or {}).get(k) for k in ("ai_result", "ai_score", "not_attempted")},
+            prewarm=_invite_prewarm_snapshot(token),
+        )
+    except Exception:
+        logger.warning("integrity.diagnosis_failed", extra={"event": "integrity.diagnosis_failed",
+                                                           "invite_token": _invite_token_tag(token)}, exc_info=True)
     return {
+        "diagnosis": diagnosis,
         "invite_token": token,
         "candidate_name": rec.get("candidate_name", ""),
         "candidate_email": rec.get("candidate_email", ""),

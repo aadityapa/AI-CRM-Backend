@@ -149,9 +149,12 @@ def test_revenue_report_by_branch(book):
     pune_r = revenue_report(s, "2026-09", today=TODAY, customer_id=cust.id, branch_id=pune.id)
     assert pune_r["headline"]["billed"] == 100_000 and pune_r["headline"]["collected"] == 40_000
     assert pune_r["filters"]["branch_id"] == pune.id and pune_r["targets"]["scoped"]
-    # The branch's money on account counts as collected for that branch.
+    # 5 Nov 2026 (user rule): money still on account is NOT collected — it stays in
+    # Received Amount until mapped (the Dashboard shows it on its own).
     blr_r = revenue_report(s, "2026-09", today=TODAY, branch_id=blr.id)
-    assert blr_r["headline"]["billed"] == 50_000 and blr_r["headline"]["collected"] == 5_000
+    assert blr_r["headline"]["billed"] == 50_000 and blr_r["headline"]["collected"] == 0
+    from services.cash_month import on_account_summary
+    assert on_account_summary(s, TODAY, branch_id=blr.id)["amount"] == 5_000
     none_r = revenue_report(s, "2026-09", today=TODAY, branch_id=0)
     assert none_r["headline"]["billed"] == 20_000
     # A branch with no projects reads zero, never "everything".

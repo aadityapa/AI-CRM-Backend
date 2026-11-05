@@ -546,3 +546,21 @@ def test_a_closed_candidacy_cannot_be_held(db):
     with pytest.raises(HTTPException) as e:
         cp.set_candidate_hold(db, p, "hold", "TA", "valid reason", TA)
     assert e.value.status_code == 409
+
+
+def test_an_rmg_screening_reject_carries_its_reason(db):
+    """4 Nov 2026: RMG / GM's Reject at Technical Screening keeps the stage, so the
+    reason is read off the screening note (`screening_rejection_notes`)."""
+    from datetime import datetime, timezone
+    from services.candidate_status import screening_rejection_notes
+    p = _profile(db, screening="Rejected")
+    p.rmg_screening_note = "No CAN / UDS hands-on — only theory"
+    p.rmg_screening_by = TA.id
+    p.rmg_screening_at = datetime(2026, 11, 3, 10, 0, tzinfo=timezone.utc)
+    db.commit()
+    note = screening_rejection_notes(db, [p.id])[p.id]
+    assert note["status"] == "RMG_Screening"
+    assert note["reason"] == "No CAN / UDS hands-on — only theory"
+    assert note["by_id"] == TA.id and note["at"].startswith("2026-11-03")
+    live = _profile(db, screening="Shortlisted")
+    assert screening_rejection_notes(db, [live.id]) == {}

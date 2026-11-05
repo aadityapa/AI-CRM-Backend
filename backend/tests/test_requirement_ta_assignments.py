@@ -264,6 +264,47 @@ def test_deactivating_a_login_takes_them_off_every_sourcing_team(db, monkeypatch
     assert svc.release_user(db, TA_B, None, RMG.id) == []   # idempotent
 
 
+def test_the_assign_dialog_shows_workload_and_suggests_the_least_busy(db, monkeypatch):
+    """5 Nov 2026, user ask: hovering a TA in the Assign dialog shows how busy they
+    are, their last activity and their 5 most recent positions, and ONE TA is
+    suggested (advice — never required)."""
+    from models import Candidate, CandidateProfile, CandidateProfileActivityLog, PipelineStatus
+    from services import team_workload as tw
+    import services.notify as notify
+    monkeypatch.setattr(notify, "notify_user", lambda *a, **kw: None)
+    req = _req(db)
+    svc.set_assignments(db, req, [TA_A], None, RMG)
+    db.commit()
+    cand = Candidate(first_name="Asha", email="asha@example.com")
+    db.add(cand); db.flush()
+    prof = CandidateProfile(candidate_id=cand.id, opportunity_id=req.opportunity_id, ta_owner_id=TA_A,
+                            pipeline_status=PipelineStatus.SOURCING)
+    db.add(prof); db.flush()
+    db.add(CandidateProfileActivityLog(profile_id=prof.id, user_id=TA_A, action_type="SENT_FOR_SCREENING"))
+    db.commit()
+
+    loads = tw.workload_for(db, "ta", [TA_A, TA_B])
+    a, b = loads[TA_A], loads[TA_B]
+    assert a["active_positions"] == 1 and a["open_headcount"] == 2 and a["live_candidates"] == 1
+    assert a["recent"][0]["opp_id"] == "C-2026-00071" and a["recent"][0]["customer"] == "VISTEON"
+    assert a["last_activity"] == "Sent for screening" and a["last_activity_at"]
+    assert b["last_activity_at"] is None            # RMG's TA_ASSIGNED row is not B's activity
+    assert b["active_positions"] == 0 and b["recent"] == [] and b["level"] == "light"
+
+    rows = tw.with_workload(db, [{"id": TA_A, "name": "A"}, {"id": TA_B, "name": "B"},
+                                 {"id": TA_INACTIVE, "name": "C"}], "ta", exclude=set())
+    suggested = [r["id"] for r in rows if r["suggested"]]
+    assert len(suggested) == 1 and suggested[0] in {TA_B, TA_INACTIVE}   # never the busy one
+    # Already on the team → never suggested; fewer than two choices → no suggestion.
+    assert tw.pick_suggestion([{"id": 1, "name": "x", "workload": {"active_positions": 0}},
+                               {"id": 2, "name": "y", "workload": {"active_positions": 9}}], {1}) is None
+    assert tw.workload_level(0) == "light" and tw.workload_level(4) == "moderate" and tw.workload_level(9) == "heavy"
+    # A broken lookup never breaks the picker.
+    monkeypatch.setattr(tw, "workload_for", lambda *a, **kw: 1 / 0)
+    plain = [{"id": TA_A, "name": "A"}]
+    assert tw.with_workload(db, plain, "ta") is plain
+
+
 def test_set_user_active_releases_the_teams():
     """Source pin: the deactivate path calls `release_user` and reports the count."""
     import inspect

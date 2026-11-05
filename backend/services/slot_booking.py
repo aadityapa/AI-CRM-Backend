@@ -262,8 +262,13 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
     # Carry the applicant's self-reported details (experience, education, domain,
     # skills, CTC) from the apply form into the candidate profile so every role
     # sees them. Fills only empty fields; best-effort.
+    # 5 Nov 2026: in its OWN savepoint — it can create Skill masters, and on
+    # Postgres a failed insert left un-savepointed poisoned the caller's whole
+    # transaction, so a careers application landed with no candidate and no
+    # Sourcing profile (reported: "not received in Sourcing").
     try:
-        apply_cv_profile_to_candidate(db, candidate, profile_from_resume_application(resume))
+        with db.begin_nested():
+            apply_cv_profile_to_candidate(db, candidate, profile_from_resume_application(resume))
     except Exception:
         logger.warning("apply_form_autofill_failed for resume %s", getattr(resume, "id", "?"), exc_info=True)
     return candidate

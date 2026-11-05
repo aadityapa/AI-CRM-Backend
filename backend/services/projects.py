@@ -130,6 +130,9 @@ def project_employee_out(pe: ProjectEmployee, emp: Employee | None = None) -> di
         "is_exit": pe.is_exit,
         "exit_date": pe.exit_date.isoformat() if pe.exit_date else None,
         "billing_date": pe.billing_date.isoformat() if pe.billing_date else None,
+        # Planned release the customer gave (0152) — a plan, not an exit.
+        "release_date": (pe.release_date.isoformat()
+                         if getattr(pe, "release_date", None) else None),
         "settlement_pending": bool(getattr(pe, "settlement_pending", False)),
         # Full Commercial Details history, oldest first (relationship order).
         # billing_rate above stays the CURRENT rate; this is the whole story,

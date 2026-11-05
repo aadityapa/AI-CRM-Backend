@@ -167,7 +167,8 @@ def public_general_apply(
         # Who added them: the careers page (never overwrites a TA who added them first),
         # so the Candidates list reads "by Careers page · LinkedIn" and can be filtered.
         if not cand.created_by_id and not (cand.created_by_name or "").strip():
-            cand.created_by_name = f"Careers page · {channel}"[:255]
+            cand.created_by_name = (careers.DIRECT_LABEL if careers.is_direct(channel)
+                                    else f"Careers page · {channel}")[:255]
         db.commit()
     except Exception:
         db.rollback()
@@ -226,9 +227,9 @@ def careers_overview(request: Request, db: Session = Depends(get_crm_db),
         "base_reach": reach,
         "base_source": source,
         "post_text": careers.post_text(listed, url),
-        "channels": [{"key": k, "label": v} for k, v in
-                     (("linkedin", "LinkedIn"), ("naukri", "Naukri"), ("whatsapp", "WhatsApp"),
-                      ("indeed", "Indeed"))],
+        # The fifth pill is the plain link (no `?src=`) — "Karnex careers page".
+        "channels": [{"key": k, "label": v} for k, v in careers.POSTED_CHANNELS if k != careers.DIRECT_KEY],
+        "direct_channel": {"key": "", "label": careers.DIRECT_LABEL},
         "can_edit": _may_edit(db, user),
     })
 

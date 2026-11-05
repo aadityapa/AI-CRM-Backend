@@ -7,9 +7,20 @@
 > the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
 > short copy and points here. Keep both in step.
 
-**Last updated:** 3 Nov 2026 (Karnex Careers: one public link for every open position, RMG JD, applicants land at Sourcing already interested). **State:**
-migration head **0151**. Backend suite ~2,295 pass, 3 skipped; the known failure is `test_public_invoice_qr`. Dashboard `tsc` is green. Nothing is committed since `dd61630`, so **commit the
-working tree.**
+**Last updated:** 5 Nov 2026, last (UI: the unmapped-money panel is Finance-only; Margin / Expenses / Net revenue off
+"How the year unfolded"). Before: (Finance tab: unmapped money panel, "Counted by: Work month / Cash received
+month" switch, "Collected changed after the month closed" note; the Revenue report uses the PO's customer; billed /
+collected by WORK month, on-account money off Collected; HM candidate review / sign-off removed; move a receipt's
+branch). Later 5 Nov: an invite session prepared when the candidate opens the link early is no longer
+closed by the recovery job; a "What happened" diagnosis on every Integrity row; careers applications always reach
+Sourcing and show in TA's default list. Earlier 5 Nov: drill-page month bars list that month's invoices; Release date / Extension on the green
+project band; TA / Hiring Manager workload + a suggested pick in the Assign dialog; careers applications name their
+channel + a channel analysis; the Karnex JD drafted from the customer's JD, downloadable as PDF / Word). 4 Nov: received
+never above billed, Predicted every month, release / extension dates, internal candidates skip HR, Expenses, TDS, reopen
+& resume. **State:** migration head **0152** (no migration on 5 Nov). The shell came back late on 5 Nov and the
+suites were run from /tmp copies: backend 2,356 pass / 3 skipped (only the known `test_public_invoice_qr` fails); F-V2
+`tsc` green, vitest 392 with only the two known failures (`brand.test` needs the runtime pages, `opportunitySchema`
+"Remote"). Nothing is committed since `dd61630`, so **commit the working tree.**
 
 ### What the project is
 
@@ -66,6 +77,11 @@ Roles:
 - The opening "are you interested?" email is **manual only**. Archive is manual, except that a held deal parks its
   candidates.
 - Status is **derived** (`services/candidate_status.py`), never stored, and it is the same on every screen.
+- Internal vs External (4 Nov 2026): TA's choice, else a company email (`hiring.internal_email_domains`, default
+  karnex.in) or an Employees match. After the Sales Head approves the terms an internal candidate goes straight to
+  Pre-Onboarding with the Employees details — no HR Discussion / HR Round.
+- A closed deal can be **Reopened & resumed** (from Closed Won / Lost / Partial / Rejected): its requirement returns
+  to `closed_from_status` and its candidates come back (4 Nov 2026).
 
 **AI interviews**
 - A template decides the timing, the mix and the follow-ups; the schedule's copy never overrides it.
@@ -84,12 +100,22 @@ Roles:
 - Payments are blocked until the customer approves and the IRN is recorded.
 - Record Payment may optionally take the money from a Received Amount on account, or add it as a new one; a payment
   can be reversed with a reason (2 Nov 2026).
-- Dashboards count "collected" in the month of the INVOICE it pays; money still on account counts in the month it
-  arrived (2 Nov 2026).
+- Dashboards count billed AND collected in the invoice's WORK month (its timesheet's month; a manual invoice its
+  invoice date). Money still on account is NOT collected — it stays in Received Amount and the Finance tab shows it on
+  its own; a "Cash received month" switch shows money by the day it arrived (5 Nov 2026).
+- One customer per invoice everywhere, the Revenue report included: the PO's customer, else the project's (5 Nov 2026).
+- The Hiring Manager confirms the JD only; the candidate review / sign-off approvals were removed (5 Nov 2026).
 - TDS settles the invoice and is followed as "pending from client".
 - Branch scope (2 Nov 2026): an invoice's branch is the project's, else the PO billing branch (ledger, receivables);
   revenue figures follow the project's branch; money on account follows the receipt's branch.
 - Data window: work months from `billing.data_start_month` (default 2026-03).
+- A project employee's **release date is a plan** (reminders 30/15/5/2/1 days before + the forecast); the real exit
+  is still the Exit action. Predicted revenue = deployed team × rate up to the earlier of exit and release (4 Nov 2026).
+- **Net revenue = billed − expenses**; net profit also takes off people cost. Expenses are before GST (4 Nov 2026).
+- **Received is shown beside billed on billed's basis** (4 Nov 2026, later): billed is before GST, a customer pays
+  the value with GST, so a dashboard compares `received_ex` / `balance_ex` (`billing_rules.before_gst_split`, each
+  invoice's share before GST) — received + due = billed, received never reads above billed. Cash with GST, bank and
+  TDS are shown separately.
 
 **UI rules**
 - Customer pickers list active customers only. Name lookups use `/api/customers/names`.
@@ -129,6 +155,7 @@ Roles:
 - Sales / Sales Head / HR flows.
 - Hiring Manager.
 - Employees and separation.
+- Internal / External candidate type; internal skips the HR rounds (4 Nov 2026).
 
 **Projects and billing**
 - Projects and closure; leave and comp-off.
@@ -137,12 +164,20 @@ Roles:
 - Received amounts with proof / TDS / later mapping; Record Payment linked to them; payment reversal. Record Payment opens a credit's Map invoices in place (F-V2, 2 Nov 2026).
 - Branch-wise Customer ledger, Who owes us, Revenue report, Profit tab and CEO Finance tab + drill pages (2 Nov 2026).
 - Address snapshot; customer Activity Log.
+- Planned release / extension per project employee with reminders (4 Nov 2026); also from the Project page (per
+  person + "Team release date" for several) and the Project Employees list.
+- Expenses (Finance) → net revenue / net profit (4 Nov 2026).
+- Karnex JD drafted from the customer's JD; the RMG JD downloads as PDF / Word (5 Nov 2026).
+- Assign TAs / Hiring Managers shows each person's workload and suggests one (advice only, 5 Nov 2026).
+- Careers applications carry their channel; the Careers link card analyses channels (5 Nov 2026).
 
 **Insight**
 - Revenue report v3, CEO dashboard (5 tabs + drill pages), Billing Tracker, hiring control tower.
 - Clickable charts on every dashboard tab and drill page.
 - Role work desks / My Tasks with filters.
 - Reports: recruiter productivity, invoice summary.
+- CEO Finance tab: predicted revenue (month / quarter / year, customer + project counts), net revenue, TDS
+  collection (4 Nov 2026).
 
 **Platform**
 - Roles & permissions, audit log, forced password change, backup, support tickets.
@@ -167,7 +202,6 @@ Roles:
    - F12: the old `crm/taxInvoice/` generator.
 4. **Known gaps:**
    - Dashboards / revenue treat a part-billed sheet as invoiced.
-   - The revenue report groups by the project's customer, not the PO's.
    - `/apply` + `/book` are missing from the frontend proxy lists (P0).
    - P1: the CTC hours cap is client-only.
    - Optimistic concurrency exists on Opportunity only (8.2).
@@ -4511,6 +4545,182 @@ Preferred location. `careers.lwd_problem(notice, raw, today)` (PURE; required on
 writes notice · current / expected CTC (`slot_booking.APPLICATION_FACT_FIELDS`) and the last working day +
 `resignation_status` onto the candidate's BLANKS only, so Applied Candidates' Availability column shows "LWD …".
 `general-apply` takes `preferred_location` too. test_careers now 16.
+
+**4 Nov 2026 — nine asks: careers cities, release / extension + predicted revenue, internal candidates, TDS + predicted
++ expenses on the CEO dashboard, RMG screening reason, reopen & resume, migration 0152, head is now 0152
+(`tests/test_release_forecast_expenses.py` 15; `test_careers` +1, `test_ta_decision` +1, `test_offer_approval_gate` +3,
+`test_opportunity_stage_cascade` +3, `test_executive_dashboard` +1, `test_ceo_drilldown` re-pinned):**
+(1) **Careers cities** — `services/careers.split_cities(raw)` (PURE): strips `['…']` / quotes, splits on `, / ; | & and`,
+folds aliases (`CITY_ALIASES`: Bengaluru / BLR → Bangalore, Bombay → Mumbai, Gurgaon → Gurugram …), drops states and
+"India / Remote / Hybrid", unique in order. Each position carries `cities`; the location list counts every city of a
+position once; F-V2 `careers_logic.inLocation` matches any of them.
+(2) **Billed vs received** — explained, NOT changed (user to decide): the Billed page puts billed BEFORE GST beside
+received cash + TDS against the invoice value INCLUDING GST (`ceo_drilldown.m_billed`, `received = paid + tds`).
+(3) **Release / extension** — 0152 `project_employees.release_date / release_note / release_informed_on /
+release_set_by / release_set_at` + `project_employee_release_events` (kind release · extension · cleared, old → new).
+`services/pe_release.py`: PURE `planned_end` (earlier of exit and release), `reminder_due` (`REMINDER_DAYS` 30/15/5/2/1),
+`release_problem` (an extension must move the date later; not before onboarding; ≤ 3 years); `set_release` /
+`clear_release` (history row + bell / email `project_employee.release_changed`), `payload` (detail `release` block),
+`run_release_reminders` (daily job `release_reminders`, `scheduler.release_reminders`; event
+`project_employee.release_reminder` to Sales_Head · Sales Manager · RMG + the setter, deduped per PE + date + day). Routes
+`POST` / `DELETE /api/projects/employees/{pe}/release` behind `role_required("Sales Manager", "Sales_Head", "RMG", "GM")`.
+⚠️ The release is a PLAN: actual cost / margin keep reading `exit_date`; only forecasts read `revenue_report.plan_end`.
+`_deployed_rows` carries `release`; `_forecast` stops at the planned end.
+(4) **Internal candidates** — 0152 `candidate_profiles.candidate_type` (Internal | External | NULL = derived).
+`services/internal_candidates.py`: `email_is_internal` (PURE; domain or sub-domain), `clean_type` (400 on junk),
+`resolve` (chosen · email · employee · default), `types_for`, `prefill_onboarding` (Employees → profile, blanks only).
+`sales_head_decision` approve: internal → **Preboarding** (+ `ONBOARDING_PREFILLED` row, HR told
+"Internal employee approved — Pre-Onboarding"), external → HR_Screening as before. HM sign-off blocks Preboarding too.
+Upload form `candidate_type` (Form), `ProfileCreate.candidate_type`, `PUT /api/candidate-profiles/{id}/candidate-type`
+(`hold_gate`), detail `candidate_kind`, Applied Candidates rows `candidate_type` / `candidate_type_chosen`.
+(5–7) **CEO Finance tab** (`executive_dashboard._finance`, each new block via `_safe` — a failure never blanks the tab):
+`tds` (`_tds_summary`: deducted on the period's invoices · Form 16A received in the period · pending from clients today,
+oldest, by customer, monthly), `forecast` (`services/revenue_forecast.predicted_trend`: month × 12 · quarter × 4 · FY × 2
+from the current one — predicted · billed so far · lost to releases · heads · customers · projects · releasing — plus
+the upcoming releases), `net` (`services/expenses.net_figures` + by category); every `monthly` row adds `predicted`
+(current month on), `expenses`, `net_revenue`, `net_profit`. Drill page **Billed month by month** adds a `predicted`
+series for the current and coming months of the period (`ceo_drilldown._with_predicted`). **Expenses**: 0152 `expenses`
+(date · category · description · vendor · amount before GST · tax_amount · paid via · reference · proof · notes);
+`routers/crm/expenses.py` (`_MODULES` += it) `GET/POST /api/expenses`, `PUT/DELETE /{id}`, `GET /meta`, `POST /proof`,
+`GET /summary?period=&month=` — `role_required("Finance")` (Admin / CEO implicit). Both new tables are in
+`data_backup.DATASETS`.
+(8) **RMG screening reason** — `candidate_status.screening_rejection_notes` → Applied Candidates `closed_note` with
+status `RMG_Screening` for a candidate rejected at Technical Screening (the stage stays Sourcing, so `closing_notes` never
+saw it).
+(9) **Reopen & resume** — 0152 `requirements.closed_from_status`; the cascade stamps it when the deal closes (the status
+before a hold, if it was held) and `requirement_status_for_stage(..., closed_from)` returns it on Active; profiles come
+back through the existing `_set_profiles_hidden(False)`. Deploy: `python -m alembic upgrade head` (0152), restart.
+
+**4 Nov 2026 (later) — received never above billed, Predicted on every month, bank / TDS + filters on the Billed page,
+release from the Project page (`test_ceo_drilldown` +1 / re-pinned, `test_executive_dashboard` re-pinned,
+`test_release_forecast_expenses` +1; no migration):** three screenshot reports. (1) ⚠️ **"Billed 80.7 L, Received 89.2 L"**:
+billed is `sub_total` (before GST) but received was cash + TDS against the value WITH GST, so a fully paid month read
+18 % above billed. Money was already counted in the invoice's month (a June receipt mapped to an April invoice is
+April's). PURE **`billing_rules.before_gst_split(sub_total, grand_total, received, balance)`** → `{received_ex,
+balance_ex}` = each invoice's share before GST, received capped at billed and due at what is left. `ceo_drilldown.
+load_invoices` rows carry `received_ex` / `balance_ex` plus `bank` (cash), `tds` / `tds_collected` / `tds_pending`
+(`_tds_state`, one query, savepointed); `m_billed` tiles Received / Still to collect / Overdue use them (the with-GST
+figure on the second line; `go.where` = `received_ex` / `balance_ex` / `overdue_ex`), new tiles **Received in bank**,
+**TDS deducted by clients**, **TDS pending from clients**, a **"Money in — bank and TDS (with GST)"** chart, table
+columns Received / Due (excl. GST), In bank, TDS deducted, TDS pending (`BILLED_COLUMNS`). `executive_dashboard._finance`
+monthly adds `received_ex` for the "How the year unfolded" chart. (2) **Predicted on every month** — `_with_predicted`
+and `_finance` compute `revenue_forecast.month_prediction` for past months too (= what the team deployed then should
+have billed; beside billed it shows the gap); rows carry `future`. (3) **Filters on the Finance drill pages**:
+`drilldown()` puts `filters.options` (`_scope_options` — the Revenue report's customer / project / branch choices) on
+every Finance-tab metric. (4) **Team release** — `POST /api/projects/{project_id}/release` `{kind, release_date,
+pe_ids, informed_on?, note?}` (`TeamReleaseIn`, same `_release_gate()` = Sales Manager · Sales Head · RMG · GM): each
+person through `pe_release.set_release` in its own savepoint; a refusal (before onboarding, extension with no release,
+not on this project) is named in `skipped`; nobody saved → 400. Declared beside `/{project_id}/close`. Deploy: restart.
+
+**5 Nov 2026 — month bars open their invoices, team workload, careers channels, the Karnex JD (no migration;
+`tests/test_karnex_jd.py` 6, `test_requirement_ta_assignments` +1, `test_careers` +1 / re-pinned, `test_ceo_drilldown`
++assertions).** ⚠️ Written while the sandbox shell was down — **these tests were not run; run them before deploying.**
+(1) **Drill tables carry `month_key`**: `ceo_drilldown._strip` adds `month_key` (YYYY-MM of the row's `_date`) to every
+table row, so a month bar on a drill page narrows the table to exactly the rows it counted (F-V2). Reported: clicking
+"Sep 26" on the Billed page searched the table for the text "Sep 26" and showed nothing. Pinned: each month bar's
+`sub_total` = Σ of the rows with that `month_key`.
+(2) **`services/team_workload.py`** — `with_workload(db, options, kind "ta"|"hm", exclude)` dresses the Assign dialog's
+choices with `workload {active_positions (requirement not settled — SETTLED_REQUIREMENT_VALUES), open_headcount,
+live_candidates (TA: owned live candidacies; HM: candidates waiting for their review / sign-off), last_activity / _at
+(the newest row they wrote on a candidacy or position log), recent (the 5 positions most recently assigned), level light ≤ 2 ·
+moderate ≤ 5 · heavy, score}` and ONE `suggested` (PURE `pick_suggestion`: lowest `load_score` = positions × 10 +
+candidates, then least recently given a position, then name; never someone already on the team; none with < 2 choices).
+Six queries, savepointed, never raises. Wired into `GET /api/requirements/{id}/ta-assignments` and `/hiring-managers`
+`options`. Advice only — the PUT is unchanged.
+(3) **Careers channels** (`services/careers.py`): the plain link (no `?src=`) is now `DIRECT_LABEL` "Karnex careers page"
+(was "Careers page"; `is_direct` reads both). `POSTED_CHANNELS` = LinkedIn · Naukri · WhatsApp · Indeed · Karnex careers
+page. `channel_stats(db)` → per channel applications · last 30 days · in process (past Sourcing, live) · joined · closed ·
+`moved_on_pct` (three queries) → `staff_overview.by_channel`; `/api/careers/overview` adds `direct_channel`.
+(4) **The Karnex JD** — `services/karnex_jd.py`:
+- PURE `split_sections` reads the customer JD by its own headings (`SECTION_HINTS`; a "Label: value" heading keeps its
+  value).
+- PURE `draft_karnex_jd(JdFacts, customer_text, customer_names)`: facts on top (Job title · Experience · Location · Work
+  mode · Openings), then About the role · Key responsibilities · Must-have skills (the position's mandatory skills first)
+  · Good-to-have · Experience · Education. Duplicates dropped; the customer's name / legal name → "our client"
+  (`careers.scrub_customer`); a heading-less JD becomes the responsibilities.
+- `parse_jd` (text → facts + sections), `render_docx` (python-docx) / `render_pdf` (reportlab) with the Karnex header,
+  `jd_filename`; DB side `jd_facts`, `customer_jd_text` (the opportunity's customer_jd files), `build_draft`.
+- Routes (`routers/crm/requirements.py`): `GET /api/requirements/{id}/karnex-jd/draft` (JD_EDIT_GATE) and
+  `GET …/rmg-jd.pdf` / `…/rmg-jd.docx` (any login that can see the position; 409 without RMG JD text).
+- Deterministic, no model call. RMG reviews it in the JD & skills dialog (approve mode too); the saved text is the RMG JD
+  the ATS / AI interview read. ⚠️ The attached sample ("Android Auto CarPlay Validation 1.docx") could not be opened in
+  this session — compare the PDF / Word layout with it and adjust `render_*`.
+Deploy: restart.
+
+**5 Nov 2026 (later) — an early link-open no longer kills the interview; "What happened" on the Integrity row;
+careers applications reach Sourcing (`tests/test_interview_diagnosis.py` 9, `test_careers` +4; no migration).**
+⚠️ Written with the shell down — NOT run. Three reports.
+(1) **Interview closed before the candidate started** (PASUPULETI BALA VENKATA SAI: Completed, "Started —", finished
+01:54 pm for a 03:00 pm slot, AI L1 0 % Failed, no recording). Cause: the invite lookup prewarms the session up to 24 h
+ahead (`_maybe_prewarm_invite_session` → interview_progress status "started"); the candidate opened the link at 12:53;
+60 min later `_recover_interviews_once` treated the untouched session as abandoned, finalized it, closed the link and
+synced a "not attempted" report. Fix: `services/interview_diagnosis.session_never_started(session, schedule)` (no
+answers, no `interview_started_epoch` / `startup_login_accepted_at_utc`, schedule not active / completed / terminated,
+no `interview_started_at`) → the worker marks the row `no_report_needed` ("Prepared when the candidate opened the link;
+not started yet", log `interview.recovery.skipped_unstarted`) and moves on; the next save at sign-in resets the report
+status, so a real abandonment later is still closed. ⚠️ The reported candidate's link stays closed — TA uses
+**Reschedule AI L1**. (2) **Diagnosis**: `auth_db.interview_progress_summary(db, token)` (slim — counts via
+`jsonb_array_length` / `json_array_length`, meta scalars via `->>` / `json_extract`, never the JSON) +
+`services/interview_diagnosis.diagnose(schedule, progress, device_log=, link=, prewarm=, now=)` (PURE) →
+`{headline, tone, explanation[], next_steps[], steps[scheduled · opened · device · verified · signed_in ·
+first_question · answers · ended · report · recording], flags[], facts{}}`; `GET /interview/integrity-logs/{token}`
+returns it as `diagnosis` (failure logged `integrity.diagnosis_failed`, `None`). `_crm_links_for_tokens` rows carry
+`not_attempted` / `voided`. (3) **Careers → Sourcing**: `services/careers.land_candidacy(db, resume, req, details, via,
+channel)` → (profile, new · existing · no_candidate · no_profile) does candidate → profile → owner → interested, each in
+its own savepoint, logs an ERROR when a resume lands without a profile, and on an EXISTING candidacy writes
+`REAPPLIED_PUBLIC` ("applied again … nothing moved"). `record_application`'s duplicate-CV path now runs it too (a CV whose
+first attempt saved no profile is repaired). `slot_booking.find_or_create_candidate_from_resume` runs
+`apply_cv_profile_to_candidate` in its OWN savepoint (it can insert Skill masters; un-savepointed, one failure poisoned
+the whole Postgres transaction and the candidacy was lost). `GET /api/requirements/{id}/resumes` takes `with_public`
+(with `applied_by`, also keeps self-applied candidacies — profile `source` careers / apply_link, resume `source_portal`
+Careers Page / Apply Link; `routers/crm/resumes._applied_by_clause`, `PUBLIC_SOURCES`, `PUBLIC_PORTALS`) — TA's default
+"Applied by = me" hid every careers applicant. The TA notice links `…&tab=resumes&q=<email>`.
+`requirements.positions_by_opportunity` orders by requirement id, so the LATEST requirement's id wins. **Test TAs** are a
+data fix: Access Control ▸ Users ▸ Manage ▸ Deactivate (releases every sourcing team) or untick TA in Edit roles. Deploy:
+restart.
+
+**5 Nov 2026 (latest) — no "Test TA" in the Assign TAs picker (no migration; NOT run — shell down):** screenshot — two
+inactive "Test TA" logins were offered (one even "Suggested"). ⚠️ `requirement_assignments.inactive_user_ids` ran
+`WHERE is_active IS FALSE`, which errors on an integer column; the error was swallowed, so no login ever read as
+inactive. It now reads `id, is_active` and decides in Python (0 / false / f / no). `ta_options` also drops logins whose
+name starts with test / demo / dummy (`is_test_login`), so the workload suggestion can never pick one. Deploy: restart.
+
+**5 Nov 2026 (night) — work month on the dashboards, on-account money off them, HM candidate approvals removed,
+move a receipt's branch (no migration; tests run later the same night — see the next note):** (1) ⚠️ `revenue_report.work_window_clause(start, end)`
++ PURE `work_date(ts_year, ts_month, invoice_date)`: Billed and Collected count an invoice in its WORK month (the
+timesheet's year/month; a manual invoice its invoice date) — user rule, the invoice date may be changed.
+`_invoices_in_window` rows: `invoice_date` = the counting date, `issued_on` = the printed date (DSO uses it);
+`_payments_in_window` places mapped payments in the invoice's work month and NO LONGER adds money on account (it stays in
+Received Amount until mapped). `ceo_drilldown.load_invoices` `_date` = work date; `m_billed` / `m_collected` use the work
+window; Collected's on-account tile + table stay as information, never added to the total. (2) The HM's candidate review
+and sign-off approvals are removed: `profile.hm_review` / `profile.hm_signoff` gone from `action_permissions.ACTIONS`, the
+`/hm-review` / `/hm-signoff` routes deleted, `hiring_managers.HM_CANDIDATE_GATES = False` (no stamp, no entry block),
+`candidate_status` no longer derives `hm_review` / `hm_signoff`, the work desk drops those two HM tabs. The HM JD
+confirmation stays. (3) Received Amount rows with a branch get a "Move to another branch" button (F-V2) over the existing
+`POST /api/customer-receipts/assign-branch` (refuses a receipt mapped to the old branch's invoices — unmap first).
+
+**5 Nov 2026 (latest) — unmapped money on the Dashboard, the PO's customer in the revenue report, "mapping changed"
+note, "Counted by" switch (`tests/test_cash_month.py` 2; `test_hiring_manager`, `test_approval_permissions`,
+`test_branch_wise_finance`, `test_invoice_payments` re-pinned to the night's rules; no migration).** (1) **Unmapped money**
+— new `services/cash_month.py`: `on_account_summary(db, today, customer_id, branch_id, project_explicit)` = every
+`CustomerReceipt` with `unallocated_amount > 0` as of today (a backlog, not a period figure): total, receipts, oldest
+date + days, top `TOP_CUSTOMERS`=5 customers; a single-project scope → `out_of_scope` (on-account money names no
+project). `executive_dashboard._finance` returns it as **`on_account`**. Still never counted as Collected. (2) ⚠️ **One
+customer per invoice in the Revenue report too**: `revenue_report.INVOICE_CUSTOMER_ID = coalesce(PurchaseOrder.customer_id,
+Project.customer_id)` (needs PurchaseOrder outer-joined) — `_invoices_in_window`, `_payments_in_window`, `_open_invoices`
+join `Customer` on it and `_invoice_filters` filters with `billing_rules.invoice_customer_clause`; `ceo_drilldown.
+load_invoices` / `m_collected` / `_invoice_scope` the same. Timesheet / deployment-level reads (`_pipeline`, `_efficiency`,
+`_leakage`, `_deployed_rows`, `scope_projects`) keep the project's customer on purpose. (3) **Mapping changed after the
+month closed** — `_payments_in_window` rows carry `mapped_at` (`InvoicePayment.created_at`); PURE
+`cash_month.mapping_changes(months, payments)` → per month `mapping_changed_on` (latest day a payment counted in it was
+recorded AFTER the month ended) + `mapped_later`; old rows without a timestamp are ignored. (4) **Cash received month** —
+`cash_payments` (mapped payments by `payment_date`) + `cash_on_account` (unallocated part of receipts by `received_date`) →
+PURE `cash_by_month` → `cash_in` / `cash_mapped` / `cash_on_account` on every Finance `monthly` row. No double count: a
+receipt-based payment carries the receipt's date and only the receipt's UNALLOCATED part is added. Each block in `_safe`.
+Suite (from a /tmp copy): 2,356 pass, 3 skipped; only the known `test_public_invoice_qr` fails. Deploy: restart.
+**Later (UI only, no server change):** the unmapped-money panel shows to a FINANCE login only (Admin / CEO no longer
+see it — `on_account` is still in the payload), and "How the year unfolded" no longer draws Margin, Expenses or Net
+revenue. See F-V2 `CLAUDE.md`.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

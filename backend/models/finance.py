@@ -300,6 +300,30 @@ class CustomerReceipt(Base):
     payments = relationship("InvoicePayment", back_populates="receipt")
 
 
+class Expense(Base):
+    """A company expense Finance records (0152, 4 Nov 2026): rent, software,
+    travel, recruitment fees … Net revenue = billed − expenses; net profit also
+    takes off people cost. Amounts are before GST (`tax_amount` kept beside)."""
+    __tablename__ = "expenses"
+    id = sa.Column(sa.Integer, primary_key=True)
+    expense_date = sa.Column(sa.Date, nullable=False, index=True)
+    category = sa.Column(sa.String(64), nullable=False, index=True)
+    description = sa.Column(sa.String(255), nullable=False)
+    vendor = sa.Column(sa.String(255), nullable=True)
+    amount = sa.Column(sa.Numeric(14, 2), nullable=False)
+    tax_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    paid_via = sa.Column(sa.String(64), nullable=True)
+    reference = sa.Column(sa.String(128), nullable=True)
+    proof_url = sa.Column(sa.String(512), nullable=True)
+    proof_name = sa.Column(sa.String(255), nullable=True)
+    notes = sa.Column(sa.Text, nullable=True)
+    branch_id = sa.Column(sa.Integer, sa.ForeignKey("customer_branches.id"), nullable=True)
+    created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    updated_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(),
+                           onupdate=sa.func.now(), nullable=False)
+
+
 class TdsRecord(Base):
     __tablename__ = "tds_records"
     id = sa.Column(sa.Integer, primary_key=True)

@@ -574,3 +574,35 @@ def test_ta_applies_only_to_deals_in_sourcing(db):
     assert recruiter_only(CurrentUser(id=9, username="ta", full_name="TA", roles={"TA"}))
     assert not recruiter_only(CurrentUser(id=9, username="x", full_name="X", roles={"TA", "RMG"}))
     assert not recruiter_only(SALES)
+
+
+# ------------------------------------------- reopen & resume (4 Nov 2026)
+
+def test_reopening_a_closed_deal_resumes_the_position_where_it_stopped(db):
+    """Customer paused hiring → Sales closed the deal; when hiring restarts,
+    Reopen & resume puts the requirement back at its own sourcing status."""
+    opp, req = _deal(db, req_status=RS.POSTED_ON_PORTALS)
+    cascade_stage_to_requirements(db, opp, PS.CLOSED_LOST.value, SALES.id, "Customer paused hiring")
+    db.commit(); db.refresh(req)
+    assert req.status == RS.CANCELLED
+    assert req.closed_from_status == RS.POSTED_ON_PORTALS.value
+
+    cascade_stage_to_requirements(db, opp, PS.ACTIVE.value, SALES.id, "Hiring again")
+    db.commit(); db.refresh(req)
+    assert req.status == RS.POSTED_ON_PORTALS
+    assert req.closed_from_status is None
+
+
+def test_reopen_after_a_close_out_of_a_hold_goes_back_to_before_the_hold(db):
+    opp, req = _deal(db, req_status=RS.ON_HOLD, held_from=RS.IN_PROGRESS.value)
+    cascade_stage_to_requirements(db, opp, PS.CLOSED_WON.value, SALES.id, "")
+    db.commit(); db.refresh(req)
+    assert req.closed_from_status == RS.IN_PROGRESS.value
+    cascade_stage_to_requirements(db, opp, PS.ACTIVE.value, SALES.id, "")
+    db.commit(); db.refresh(req)
+    assert req.status == RS.IN_PROGRESS
+
+
+def test_pure_rule_restores_closed_from():
+    assert requirement_status_for_stage(PS.ACTIVE.value, RS.CLOSED.value, None,
+                                        RS.IN_PROGRESS.value) == RS.IN_PROGRESS.value

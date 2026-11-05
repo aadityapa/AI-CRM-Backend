@@ -112,11 +112,17 @@ PRE_SOURCING_STATUSES = frozenset({
 
 
 def requirement_status_for_stage(stage: str, current_status: str,
-                                 held_from: str | None) -> str | None:
+                                 held_from: str | None,
+                                 closed_from: str | None = None) -> str | None:
     """The status the requirement should take, or None to leave it alone.
 
     Pure decision function — no DB, no side effects — so every branch is
     testable without a session. The caller applies the result.
+
+    `closed_from` (4 Nov 2026, user ask: "the customer paused hiring, Sales closed the
+    opportunity; when it opens again we resume where we paused"): the status the
+    deal's own CLOSE took the requirement from. Reopening (Active) gives it back. A
+    requirement RMG cancelled by hand has no `closed_from`, so it is never revived.
     """
     from models import RequirementStatus
 
@@ -139,6 +145,8 @@ def requirement_status_for_stage(stage: str, current_status: str,
         # Cancelled requirement back to life behind RMG's back.
         if current_status == RequirementStatus.ON_HOLD.value:
             return held_from or RequirementStatus.OPEN_FOR_SOURCING.value
+        if closed_from and current_status in ("Closed", "Cancelled"):
+            return closed_from
         return None
 
     return None
@@ -175,9 +183,18 @@ def cascade_stage_to_requirements(db: Session, opp: Opportunity, new_stage: str,
     changed: list[dict] = []
     for req in reqs:
         current = req.status.value if hasattr(req.status, "value") else str(req.status)
-        target = requirement_status_for_stage(new_stage, current, req.held_from_status)
+        closed_from = getattr(req, "closed_from_status", None)
+        target = requirement_status_for_stage(new_stage, current, req.held_from_status, closed_from)
         if not target or target == current:
             continue
+
+        if new_stage in STAGE_CLOSES_REQUIREMENT:
+            # Remember where sourcing stood (a held one: where it stood BEFORE the
+            # hold), so reopening the deal resumes exactly there.
+            req.closed_from_status = (req.held_from_status if current == RequirementStatus.ON_HOLD.value
+                                      and req.held_from_status else current)
+        elif closed_from and current in ("Closed", "Cancelled"):
+            req.closed_from_status = None   # reopened — the bookkeeping is spent
 
         if target == RequirementStatus.ON_HOLD.value:
             # Remember where to come back to, exactly as the manual RMG hold does.

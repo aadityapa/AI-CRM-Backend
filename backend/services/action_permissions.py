@@ -122,14 +122,7 @@ ACTIONS: dict[str, Action] = {
         "Approve the JD & skills RMG approved (opens the position for sourcing) or send them "
         "back to RMG with what to change — only on positions the person is Hiring Manager for.",
         ("Hiring Manager",), APPROVAL, "Hiring Manager"),
-    "profile.hm_review": Action(
-        "Hiring Manager: review candidates",
-        "Approve or reject a candidate RMG handed to Sales, before the profile goes to the customer.",
-        ("Hiring Manager",), APPROVAL, "Hiring Manager"),
-    "profile.hm_signoff": Action(
-        "Hiring Manager: sign off the selection",
-        "Sign off (or reject) the customer's selection and the terms before the Sales Head approves them.",
-        ("Hiring Manager",), APPROVAL, "Hiring Manager"),
+    # "profile.hm_review" / "profile.hm_signoff" removed 5 Nov 2026 (user decision).
     "leave.approve": Action(
         "Approve leave applications",
         "Approve a pending leave application.",

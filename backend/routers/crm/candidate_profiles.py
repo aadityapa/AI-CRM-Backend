@@ -843,6 +843,8 @@ def create_profile_core(db: Session, payload: ProfileCreate, user: CurrentUser,
     values = payload.model_dump(exclude_unset=True)
     values.pop("commercial_approved", None)
     notes = (values.pop("notes", None) or "").strip()
+    from services.internal_candidates import clean_type
+    values["candidate_type"] = clean_type(values.pop("candidate_type", None))
     _reject_impossible_ctc(values)
     profile = CandidateProfile(**values)
     if payload.commercial_approved is not None:
@@ -925,6 +927,13 @@ def get_profile(profile_id: int,
     data["internal_employee"] = internal
     data["fast_track_block"] = fast_track_block(profile, internal)
     data["direct_to_sales_block"] = direct_to_sales_block(profile)
+    # Internal / External (4 Nov 2026): what it is and why (chosen · email · employee).
+    from services.internal_candidates import resolve as resolve_type
+    try:
+        with db.begin_nested():
+            data["candidate_kind"] = resolve_type(db, profile)
+    except Exception:  # noqa: BLE001 — a lookup failure never blanks the page
+        data["candidate_kind"] = None
     # The Hiring Manager's two gates (22 Oct 2026) — None when the deal has no HM.
     from services import hiring_managers
     data["hiring_manager"] = hiring_managers.payload(db, profile)
@@ -1589,6 +1598,36 @@ def fast_track_to_sales(
     who = employee.get("employee_code") or employee.get("name") or "internal candidate"
     return envelope(data=profile_to_dict(profile),
                     message=f"Sent to Sales for customer screening ({who}) — L1 and L2 skipped")
+
+
+class CandidateTypeIn(BaseModel):
+    candidate_type: str | None = Field(default=None, max_length=16)
+
+
+@router.put("/{profile_id}/candidate-type")
+def set_candidate_type(
+    profile_id: int,
+    payload: CandidateTypeIn,
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(hold_gate),
+):
+    """Internal / External (4 Nov 2026). Blank = let the email / employee record
+    decide. An internal candidate skips HR Discussion / HR Round after the Sales
+    Head's approval and goes straight to Pre-Onboarding."""
+    from services.internal_candidates import clean_type, resolve
+
+    profile = get_profile_or_404(db, profile_id)
+    before = getattr(profile, "candidate_type", None)
+    profile.candidate_type = clean_type(payload.candidate_type)
+    if profile.candidate_type != before:
+        log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                     "CANDIDATE_TYPE",
+                     f"Candidate type: {before or 'auto'} -> {profile.candidate_type or 'auto'}")
+    db.commit()
+    db.refresh(profile)
+    kind = resolve(db, profile)
+    return envelope(data={"candidate_type": profile.candidate_type, "candidate_kind": kind},
+                    message=f"Marked as an {kind['type'].lower()} candidate")
 
 
 @router.post("/{profile_id}/direct-to-sales")
@@ -2486,22 +2525,11 @@ def _hm_decide(db: Session, profile_id: int, kind: str, payload: HmDecisionIn, u
     return envelope(data=data, message=message)
 
 
-@router.post("/{profile_id}/hm-review")
-def hm_review(profile_id: int, payload: HmDecisionIn,
-              db: Session = Depends(get_crm_db),
-              user: CurrentUser = Depends(gated_write_action("profile.hm_review", "profiles"))):
-    """The Hiring Manager reviews a candidate RMG handed to Sales (22 Oct 2026):
-    approve → Sales may submit to the customer; reject → closed."""
-    return _hm_decide(db, profile_id, "review", payload, user)
-
-
-@router.post("/{profile_id}/hm-signoff")
-def hm_signoff(profile_id: int, payload: HmDecisionIn,
-               db: Session = Depends(get_crm_db),
-               user: CurrentUser = Depends(gated_write_action("profile.hm_signoff", "profiles"))):
-    """The Hiring Manager signs off the final selection + terms before the
-    Sales Head approves them; reject → closed."""
-    return _hm_decide(db, profile_id, "signoff", payload, user)
+# 5 Nov 2026 (user decision): the Hiring Manager's candidate review and final
+# sign-off approvals are REMOVED — the routes `/hm-review` and `/hm-signoff` and
+# the actions `profile.hm_review` / `profile.hm_signoff` are gone, and no stage
+# waits for them (`hiring_managers.HM_CANDIDATE_GATES = False`). The HM still
+# confirms the JD (`requirement.hm_approve`).
 
 
 @router.post("/{profile_id}/sales-head-decision")
@@ -2550,6 +2578,20 @@ def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
         # themselves (POST /{id}/hr-round-request) — no automatic request here.
         target = PipelineStatus.HR_SCREENING.value
         title = "Offer approved by Sales Head"
+        # An INTERNAL candidate (an existing Karnex employee) skips HR Discussion and
+        # the HR round (4 Nov 2026, user decision): straight to Pre-Onboarding, with the
+        # onboarding record filled from the Employees tab.
+        from services.internal_candidates import is_internal, prefill_onboarding
+        internal = is_internal(db, profile)
+        if internal:
+            target = PipelineStatus.PREBOARDING.value
+            title = "Offer approved by Sales Head — internal employee, onboarding next"
+            filled = prefill_onboarding(db, profile)
+            if filled:
+                log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
+                             "ONBOARDING_PREFILLED",
+                             "Internal employee — onboarding details taken from the Employees "
+                             "record: " + ", ".join(f.replace("_", " ") for f in filled))
     elif payload.decision == "send_back":
         target = PipelineStatus.SHORTLISTED.value
         title = "Offer sent back — redo the terms"
@@ -2581,7 +2623,17 @@ def sales_head_decision(profile_id: int, payload: SalesHeadDecisionIn,
             notify_role(db, "Sales", f"{title}: {cname}", body, link, exclude_user_id=user.id,
                         event=event, actor=user,
                         related_type="candidate", related_id=profile.candidate_id)
-        if payload.decision == "approve":
+        if payload.decision == "approve" and target == PipelineStatus.PREBOARDING.value:
+            from services.notify import notify_roles
+            notify_roles(db, ["HR"],
+                         f"Internal employee approved — Pre-Onboarding: {cname}",
+                         f"Sales Head approved {cname}'s terms. {cname} is an existing Karnex "
+                         "employee, so HR Discussion and the HR round are skipped: the onboarding "
+                         "record is filled from the Employees tab — check it and mark Joined.",
+                         link, exclude_user_id=user.id, actor=user,
+                         event="candidate.hr_screening",
+                         related_type="candidate", related_id=profile.candidate_id)
+        elif payload.decision == "approve":
             # Approval is the hand-off to HR Screening (2 Sep 2026): TA is asked
             # to schedule the HR round, RMG and HR are told the candidate is
             # theirs next. HR also hears through the stage-arrival route; the

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -733,6 +733,54 @@ JD_EDIT_ROLES = ("RMG", "Sales", "Sales_Head", "TA")
 #: admits whoever screens as RMG — a GM custom role, or an RMG whose access comes
 #: from a template without the requirements Edit grant.
 JD_EDIT_GATE = screener_or(gated_write("requirements", *JD_EDIT_ROLES))
+
+
+# ---- The Karnex JD (5 Nov 2026, services/karnex_jd.py) ----------------------
+
+@router.get("/{requirement_id}/karnex-jd/draft")
+def karnex_jd_draft(requirement_id: int, db: Session = Depends(get_crm_db),
+                    user: CurrentUser = Depends(JD_EDIT_GATE)):
+    """A Karnex JD drafted from the customer's JD on the opportunity + the
+    position's facts — RMG reviews / edits it and saves it as the RMG JD."""
+    from services import karnex_jd
+    req = get_requirement_or_404(db, requirement_id)
+    ensure_visible(user, req, db=db)
+    draft = karnex_jd.build_draft(db, req)
+    msg = ("Drafted from the customer's JD — check it and change what you need"
+           if draft["has_customer_jd"]
+           else "No customer JD file on the opportunity — drafted from the position's details")
+    return envelope(draft, message=msg)
+
+
+def _rmg_jd_file(requirement_id: int, db: Session, user: CurrentUser, kind: str) -> Response:
+    from services import karnex_jd
+    req = get_requirement_or_404(db, requirement_id)
+    ensure_visible(user, req, db=db)
+    text = (req.rmg_jd_text or "").strip()
+    if not text:
+        raise HTTPException(status_code=409, detail="This position has no RMG JD yet — add it from JD & skills first")
+    opp_no = getattr(getattr(req, "opportunity", None), "opp_id", None)
+    ref = " · ".join(x for x in (opp_no, req.req_number) if x)
+    if kind == "pdf":
+        body, mime = karnex_jd.render_pdf(text, title=req.title, ref=ref), "application/pdf"
+    else:
+        body = karnex_jd.render_docx(text, title=req.title, ref=ref)
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    name = karnex_jd.jd_filename(req.title, req.req_number, kind)
+    return Response(content=body, media_type=mime,
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.get("/{requirement_id}/rmg-jd.pdf")
+def rmg_jd_pdf(requirement_id: int, db: Session = Depends(get_crm_db),
+               user: CurrentUser = Depends(get_current_user)):
+    return _rmg_jd_file(requirement_id, db, user, "pdf")
+
+
+@router.get("/{requirement_id}/rmg-jd.docx")
+def rmg_jd_docx(requirement_id: int, db: Session = Depends(get_crm_db),
+                user: CurrentUser = Depends(get_current_user)):
+    return _rmg_jd_file(requirement_id, db, user, "docx")
 
 
 class JdSkillsIn(BaseModel):

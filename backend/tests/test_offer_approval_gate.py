@@ -230,3 +230,41 @@ def test_decision_needs_a_candidate_awaiting_approval(db):
     with pytest.raises(HTTPException) as err:
         _decide(db, p, "approve")
     assert err.value.status_code == 400
+
+
+# ------------------------------------------------- internal candidates (4 Nov 2026)
+
+def test_an_internal_candidate_skips_hr_and_goes_to_preboarding(db):
+    """A @karnex.in candidate is internal: the Sales Head still approves the
+    terms, then the candidate goes straight to Pre-Onboarding (no HR rounds)."""
+    p = _profile(db)
+    cand = db.get(Candidate, p.candidate_id)
+    cand.email = f"praveen{p.id}@karnex.in"
+    db.flush()
+    _submit(db, p)
+    _decide(db, p, "approve")
+    db.refresh(p)
+    assert p.pipeline_status == PS.PREBOARDING
+
+
+def test_tas_choice_wins_over_the_email(db):
+    p = _profile(db)
+    cand = db.get(Candidate, p.candidate_id)
+    cand.email = f"ext{p.id}@karnex.in"
+    p.candidate_type = "External"
+    db.flush()
+    _submit(db, p)
+    _decide(db, p, "approve")
+    db.refresh(p)
+    assert p.pipeline_status == PS.HR_SCREENING
+
+
+def test_internal_email_rule_and_clean_type():
+    from services.internal_candidates import clean_type, email_is_internal
+    assert email_is_internal("abc@karnex.in", ("karnex.in",))
+    assert email_is_internal("ABC@HR.Karnex.in", ("karnex.in",))
+    assert not email_is_internal("abc@karnex.in.evil.com", ("karnex.in",))
+    assert not email_is_internal("abc@gmail.com", ("karnex.in",))
+    assert clean_type("internal") == "Internal" and clean_type("") is None
+    with pytest.raises(HTTPException):
+        clean_type("contractor")

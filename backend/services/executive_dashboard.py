@@ -273,17 +273,66 @@ def _finance(db: Session, period: Period, today: date,
                                    branch_id=branch_id if not project_id else None)
     deployed = _deployed_rows(db, customer_id, scoped)
 
+    # 4 Nov 2026: predicted revenue (deployed team × rate up to the planned
+    # release), TDS and company expenses ride on the same month rows.
+    from services.expenses import by_category, by_month, expenses_in, net_figures
+    from services.revenue_forecast import month_prediction, predicted_trend
+
+    exp_rows = _safe(lambda: expenses_in(db, period.start, period.end), [], "expenses")
+    exp_month = by_month(exp_rows)
+    from services.billing_rules import before_gst_split
+    for i in invoices:
+        # 4 Nov 2026 (user rule): received against an invoice on the SAME basis as billed —
+        # its before-GST share — so the "Received" bar can never stand above "Billed".
+        paid_in_full = str(i.get("status") or "").lower() == "paid"
+        got = i["grand_total"] if paid_in_full else max(0.0, i["grand_total"] - i["balance"])
+        i["received_ex"] = before_gst_split(i["sub_total"], i["grand_total"], got, 0.0)["received_ex"]
     monthly = []
     for m in _months_in(period):
         billed = sum(i["sub_total"] for i in invoices if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end)
+        received_ex = sum(i["received_ex"] for i in invoices
+                          if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end)
         collected = sum(p["amount"] for p in payments if p["date"] and m.start <= p["date"] <= m.end)
         cost = sum(_cost_in(r, m) for r in deployed if _overlaps(r, m))
         future = m.start > today
+        spent = exp_month.get(m.key, 0.0)
+        # Every month (past ones too): what the deployed team should have billed.
+        predicted = round(month_prediction(deployed, m)["amount"], 2)
         monthly.append({
             "key": m.key, "label": m.start.strftime("%b %y"), "billed": round(billed, 2),
-            "collected": round(collected, 2), "cost": round(cost, 2),
+            "collected": round(collected, 2), "received_ex": round(received_ex, 2), "cost": round(cost, 2),
             "margin": round(billed - cost, 2), "future": future,
+            "predicted": predicted,
+            "expenses": round(spent, 2),
+            "net_revenue": round(billed - spent, 2),
+            "net_profit": round(billed - cost - spent, 2),
         })
+    # 5 Nov 2026 (user ask): money by the day it ARRIVED (the "Cash received
+    # month" switch), and a note on past months whose Collected moved because
+    # money was mapped after the month closed.
+    from services import cash_month
+    from services.revenue_report import _invoice_filters
+    months = list(_months_in(period))
+    explicit_project = bool(project_id)
+    cash = _safe(lambda: cash_month.cash_by_month(
+        months,
+        cash_month.cash_payments(db, period.start, period.end, _invoice_filters(customer_id, scoped)),
+        cash_month.cash_on_account(db, period.start, period.end, customer_id, branch_id,
+                                   explicit_project)), {}, "cash month")
+    changes = _safe(lambda: cash_month.mapping_changes(months, payments), {}, "mapping changes")
+    for row in monthly:
+        row.update(cash.get(row["key"], {}))
+        row.update(changes.get(row["key"], {"mapping_changed_on": None, "mapped_later": 0.0}))
+    on_account = _safe(lambda: cash_month.on_account_summary(db, today, customer_id, branch_id,
+                                                             explicit_project), None, "on account")
+
+    billed_total = sum(r["billed"] for r in monthly)
+    cost_total = sum(r["cost"] for r in monthly)
+    net = net_figures(billed_total, cost_total, sum(r["expenses"] for r in monthly))
+    net["by_category"] = by_category(exp_rows)
+    billed_by_month = {r["key"]: r["billed"] for r in monthly}
+    forecast = _safe(lambda: predicted_trend(deployed, today, billed_by_month), None, "forecast")
+    tds = _safe(lambda: _tds_summary(db, period, today, customer_id, scoped), None, "tds")
 
     by_type = rep["dimensions"]["by_type"]
     return {
@@ -298,6 +347,10 @@ def _finance(db: Session, period: Period, today: date,
         "alerts": rep["alerts"],
         "series": rep["series"],
         "monthly": monthly,
+        "net": net,
+        "forecast": forecast,
+        "tds": tds,
+        "on_account": on_account,
         "by_type": by_type,
         "filters": rep.get("filters"),
         "top_customers": rep["by_customer"]["rows"][:DONUT_SLICES],
@@ -307,6 +360,67 @@ def _finance(db: Session, period: Period, today: date,
             "risk": rep["by_customer"]["concentration_risk"],
             "top_customer": rep["by_customer"]["top_customer"],
         },
+    }
+
+
+def _safe(fn, default, what: str):
+    """A new panel must never blank the Finance tab (a database before 0152)."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001
+        logger.warning("CEO finance %s failed", what, exc_info=True)
+        return default
+
+
+def _tds_summary(db: Session, period: Period, today: date,
+                 customer_id: int | None = None, project_id=None) -> dict:
+    """TDS the customers withheld (4 Nov 2026, user ask "TDS collection on the
+    CEO dashboard"): deducted on the period's invoices (by invoice date, the
+    billed rule), certificates received in the period (Form 16A, by payment
+    date), and what is still pending from clients TODAY, oldest first."""
+    from models import Customer, TdsPayment, TdsRecord
+    from services.revenue_report import _invoice_filters
+
+    base = (select(TdsRecord.id, TdsRecord.tds_amount, TdsRecord.tds_paid, TdsRecord.tds_balance,
+                   Invoice.invoice_date, Invoice.invoice_number, Invoice.id, Project.customer_id,
+                   Customer.name, TdsRecord.created_at)
+            .join(Invoice, Invoice.id == TdsRecord.invoice_id)
+            .join(Project, Project.id == Invoice.project_id)
+            .join(Customer, Customer.id == Project.customer_id)
+            .where(*_invoice_filters(customer_id, project_id)))
+    rows = db.execute(base).all()
+    in_period = [r for r in rows if r[4] and period.start <= r[4] <= period.end]
+    pending = [r for r in rows if float(r[3] or 0) > 0.005]
+    rq = (select(TdsPayment.amount, TdsPayment.payment_date)
+          .join(TdsRecord, TdsRecord.id == TdsPayment.tds_record_id)
+          .join(Invoice, Invoice.id == TdsRecord.invoice_id)
+          .join(Project, Project.id == Invoice.project_id)
+          .where(TdsPayment.payment_date >= period.start, TdsPayment.payment_date <= period.end,
+                 *_invoice_filters(customer_id, project_id)))
+    received_rows = db.execute(rq).all()
+    by_cust: dict[str, float] = defaultdict(float)
+    cust_ids: dict[str, int] = {}
+    for r in pending:
+        by_cust[r[8]] += float(r[3] or 0)
+        cust_ids[r[8]] = r[7]
+    monthly = []
+    for m in _months_in(period):
+        monthly.append({
+            "key": m.key, "label": m.start.strftime("%b %y"),
+            "deducted": round(sum(float(r[1] or 0) for r in in_period if m.start <= r[4] <= m.end), 2),
+            "received": round(sum(float(a or 0) for a, d in received_rows if d and m.start <= d <= m.end), 2),
+        })
+    oldest = min((r[4] for r in pending if r[4]), default=None)
+    return {
+        "deducted": round(sum(float(r[1] or 0) for r in in_period), 2),
+        "deducted_invoices": len(in_period),
+        "received": round(sum(float(a or 0) for a, _d in received_rows), 2),
+        "pending": round(sum(float(r[3] or 0) for r in pending), 2),
+        "pending_count": len(pending),
+        "oldest_pending_days": (today - oldest).days if oldest else None,
+        "pending_by_customer": [{"customer": k, "customer_id": cust_ids.get(k), "amount": round(v, 2)}
+                                for k, v in sorted(by_cust.items(), key=lambda kv: -kv[1])[:DONUT_SLICES]],
+        "monthly": monthly,
     }
 
 

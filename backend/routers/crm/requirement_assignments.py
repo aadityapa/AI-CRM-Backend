@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from crm_deps import CurrentUser, action_only, get_crm_db
 from schemas.common import envelope
 from services import requirement_assignments as svc
+from services import team_workload
 from routers.crm.requirement_positions import POS_READ, _visible_requirement
 
 router = APIRouter(prefix="/api/requirements", tags=["CRM: Requirement TA assignments"])
@@ -47,11 +48,11 @@ def list_ta_assignments(requirement_id: int, db: Session = Depends(get_crm_db),
                         user: CurrentUser = Depends(POS_READ)):
     req = _visible_requirement(db, requirement_id, user)
     can = _can_assign(db, user)
-    return envelope(
-        data={"assignments": svc.assignments_by_requirement(db, [req.id]).get(req.id, []),
-              "options": svc.ta_options(db) if can else []},
-        meta={"can_assign": can},
-    )
+    team = svc.assignments_by_requirement(db, [req.id]).get(req.id, [])
+    # 5 Nov 2026 — each choice carries its workload + one `suggested` (advice only).
+    options = (team_workload.with_workload(db, svc.ta_options(db), "ta", {m["user_id"] for m in team})
+               if can else [])
+    return envelope(data={"assignments": team, "options": options}, meta={"can_assign": can})
 
 
 @router.put("/{requirement_id}/ta-assignments")
@@ -85,9 +86,11 @@ def list_hiring_managers(requirement_id: int, db: Session = Depends(get_crm_db),
     from services import hiring_managers as hm
     req = _visible_requirement(db, requirement_id, user)
     can = _can_assign(db, user)
+    team = hm.hms_by_requirement(db, [req.id]).get(req.id, [])
+    options = (team_workload.with_workload(db, hm.hm_options(db), "hm", {m["user_id"] for m in team})
+               if can else [])
     return envelope(
-        data={"hiring_managers": hm.hms_by_requirement(db, [req.id]).get(req.id, []),
-              "options": hm.hm_options(db) if can else []},
+        data={"hiring_managers": team, "options": options},
         # `is_mine`: this login is a Hiring Manager of the position — they set
         # its priority / hold and decide its JD (the panel shows those controls).
         meta={"can_assign": can, "status": getattr(req.status, "value", req.status),

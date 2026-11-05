@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
@@ -48,7 +49,8 @@ logger = logging.getLogger("karnex.crm.careers")
 CAREERS_PORTAL = "Careers Page"
 APPLY_LINK_PORTAL = "Apply Link"
 
-#: `?src=` on the careers link → the words TA sees. Anything else reads "Careers page".
+#: `?src=` on the careers link → the words TA sees. Anything else reads
+#: `DIRECT_LABEL` ("Karnex careers page", 5 Nov 2026; was "Careers page").
 CHANNELS = {
     "linkedin": "LinkedIn", "naukri": "Naukri", "whatsapp": "WhatsApp", "indeed": "Indeed",
     "instagram": "Instagram", "facebook": "Facebook", "twitter": "X (Twitter)", "x": "X (Twitter)",
@@ -65,9 +67,73 @@ CARD_SKILLS = 4
 POST_NAMES = 3
 
 
+#: The plain link with no `?src=` (someone opened the careers page directly, or
+#: the "Karnex careers page" pill in the CRM). 5 Nov 2026, user ask: name it.
+DIRECT_KEY = "karnex"
+DIRECT_LABEL = "Karnex careers page"
+#: Older applications stored this before 5 Nov 2026 — read as the direct channel.
+_OLD_DIRECT_LABELS = {"Careers page", ""}
+#: The channels the CRM offers (the order the analysis prints them in).
+POSTED_CHANNELS = (("linkedin", "LinkedIn"), ("naukri", "Naukri"), ("whatsapp", "WhatsApp"),
+                   ("indeed", "Indeed"), (DIRECT_KEY, DIRECT_LABEL))
+
+
 def channel_label(src: str | None) -> str:
     key = re.sub(r"[^a-z]", "", str(src or "").lower())[:20]
-    return CHANNELS.get(key, "Careers page")
+    return CHANNELS.get(key, DIRECT_LABEL)
+
+
+def is_direct(channel: str | None) -> bool:
+    return (channel or "").strip() in _OLD_DIRECT_LABELS | {DIRECT_LABEL}
+
+
+def channel_stats(db: Session, today: date | None = None) -> list[dict]:
+    """Where careers-page applications come from (5 Nov 2026, user ask: "so we can
+    analyse which platform is more helpful"). One row per channel — the five the
+    CRM offers first, then any other `?src=` seen — with: applications, the last 30
+    days, in process (past TA's Sourcing, still live), joined, closed, and the share
+    that moved on ((in process + joined) ÷ applications). Three queries."""
+    from services.candidate_profiles import REJECTED_BUCKET
+    today = today or date.today()
+    since = today - timedelta(days=30)
+    rows = db.execute(
+        select(Resume.application_details, Resume.created_at, Resume.candidate_id, Requirement.opportunity_id)
+        .join(Requirement, Requirement.id == Resume.requirement_id, isouter=True)
+        .where(Resume.source_portal == CAREERS_PORTAL)
+    ).all()
+    cand_ids = {int(c) for _, _, c, _ in rows if c}
+    stage: dict[tuple[int, int], str] = {}
+    if cand_ids:
+        for cid, oid, st in db.execute(
+            select(CandidateProfile.candidate_id, CandidateProfile.opportunity_id, CandidateProfile.pipeline_status)
+            .where(CandidateProfile.candidate_id.in_(sorted(cand_ids)))
+        ).all():
+            stage[(int(cid), int(oid))] = getattr(st, "value", st)
+    labels = dict(POSTED_CHANNELS)
+    key_of = {v: k for k, v in CHANNELS.items()}
+    out: dict[str, dict] = {k: {"key": k, "label": v, "applications": 0, "last_30_days": 0, "in_process": 0,
+                                "joined": 0, "closed": 0} for k, v in POSTED_CHANNELS}
+    early = {PipelineStatus.SOURCING.value, PipelineStatus.TECHNICAL_SCREENING.value}
+    for details, created, cid, oid in rows:
+        ch = (details or {}).get("source_channel") if isinstance(details, dict) else None
+        key = DIRECT_KEY if is_direct(ch) else key_of.get(ch, re.sub(r"[^a-z]", "", str(ch).lower())[:20] or DIRECT_KEY)
+        row = out.setdefault(key, {"key": key, "label": labels.get(key) or ch or key, "applications": 0,
+                                   "last_30_days": 0, "in_process": 0, "joined": 0, "closed": 0})
+        row["applications"] += 1
+        when = created.date() if hasattr(created, "date") else created
+        if when and when >= since:
+            row["last_30_days"] += 1
+        st = stage.get((int(cid), int(oid))) if cid and oid else None
+        if st == PipelineStatus.JOINED.value:
+            row["joined"] += 1
+        elif st in REJECTED_BUCKET:
+            row["closed"] += 1
+        elif st and st not in early:
+            row["in_process"] += 1
+    for r in out.values():
+        n = r["applications"]
+        r["moved_on_pct"] = round(100 * (r["in_process"] + r["joined"]) / n, 1) if n else None
+    return list(out.values())
 
 
 def channel_key(src: str | None) -> str:
@@ -196,6 +262,54 @@ def _summary(jd: str) -> str:
     return cut.rstrip(",.;:-") + "…"
 
 
+# Spellings that mean the same city (lower-case key → the name we print).
+CITY_ALIASES = {
+    "bengaluru": "Bangalore", "bangalore": "Bangalore", "blr": "Bangalore",
+    "bombay": "Mumbai", "mumbai": "Mumbai", "madras": "Chennai", "chennai": "Chennai",
+    "gurgaon": "Gurugram", "gurugram": "Gurugram", "poona": "Pune", "pune": "Pune",
+    "calcutta": "Kolkata", "kolkata": "Kolkata", "hyderabad": "Hyderabad", "noida": "Noida",
+    "new delhi": "Delhi", "delhi": "Delhi", "ncr": "Delhi NCR", "delhi ncr": "Delhi NCR",
+}
+_CITY_SPLIT = re.compile(r"[,/;|&]|\band\b", re.IGNORECASE)
+_CITY_JUNK = re.compile(r"[\[\]{}()\"'`]")
+_NOT_A_CITY = {"", "india", "remote", "onsite", "on-site", "hybrid", "wfh", "na", "n/a", "none",
+               "other", "any", "anywhere", "tbd", "pan india"}
+
+
+def split_cities(raw) -> list[str]:
+    """Every city a stored location names, clean and unique (PURE).
+
+    The opportunity form saves the work location as a list, and older rows hold its
+    Python text: "['Bangalore', 'Chennai']". Brackets and quotes are dropped, the text is
+    split on commas / slashes / "and", spellings are folded ("Bengaluru" = "Bangalore")
+    and each city is kept once, in the order given. A state after the city ("Pune,
+    Maharashtra") stays out only when it is a known state."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        parts = [str(x) for x in raw]
+    else:
+        parts = _CITY_SPLIT.split(_CITY_JUNK.sub(" ", str(raw)))
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        for bit in (_CITY_SPLIT.split(_CITY_JUNK.sub(" ", part)) if isinstance(raw, (list, tuple, set)) else [part]):
+            name = re.sub(r"\s+", " ", bit).strip(" .-")
+            key = name.lower()
+            if key in _NOT_A_CITY or key in _STATES:
+                continue
+            name = CITY_ALIASES.get(key) or name[:1].upper() + name[1:]
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                out.append(name)
+    return out
+
+
+_STATES = {"maharashtra", "karnataka", "tamil nadu", "tamilnadu", "telangana", "haryana",
+           "uttar pradesh", "west bengal", "kerala", "gujarat", "andhra pradesh", "rajasthan",
+           "madhya pradesh", "goa", "punjab", "odisha"}
+
+
 def _positions(db: Session, rows, *, full: bool) -> list[dict]:
     from services.requirements import joined_counts_for_opportunities
     reqs = [r for r, _ in rows]
@@ -206,11 +320,13 @@ def _positions(db: Session, rows, *, full: bool) -> list[dict]:
     out = []
     for req, opp in rows:
         loc = locs.get(req.location_id)
-        city = (loc.city if loc else "") or ""
-        location = ", ".join(x for x in ((loc.city, loc.state) if loc else ()) if x)
-        if not location:
-            location = str(((opp.details or {}).get("tm_work_location")) or "").strip()
-            city = location.split(",")[0].strip()
+        cities = split_cities(loc.city) if loc and loc.city else []
+        if cities:
+            location = ", ".join(x for x in (" · ".join(cities), (loc.state or "").strip()) if x)
+        else:
+            cities = split_cities((opp.details or {}).get("tm_work_location"))
+            location = " · ".join(cities)
+        city = cities[0] if cities else ""
         total = int(req.no_of_positions or 1)
         open_n = max(1, total - int(joined.get(req.opportunity_id, 0)))
         jd = scrub_customer(_jd(req), names.get(opp.customer_id, []))
@@ -221,6 +337,7 @@ def _positions(db: Session, rows, *, full: bool) -> list[dict]:
             "title": (req.title or "").strip(),
             "location": location,
             "city": city or "Other",
+            "cities": cities or ["Other"],
             "work_mode": _mode_label(req.work_mode),
             "experience": experience_label(req.experience_min, req.experience_max),
             "experience_min": float(req.experience_min) if req.experience_min is not None else None,
@@ -242,9 +359,11 @@ def careers_listing(db: Session) -> dict:
     positions = _positions(db, _live_rows(db), full=False)
     cities: dict[str, dict] = {}
     for p in positions:
-        c = cities.setdefault(p["city"], {"city": p["city"], "positions": 0, "openings": 0})
-        c["positions"] += 1
-        c["openings"] += p["openings"]
+        # A position open in two cities is counted under each of them.
+        for name in p.get("cities") or [p["city"]]:
+            c = cities.setdefault(name.lower(), {"city": name, "positions": 0, "openings": 0})
+            c["positions"] += 1
+            c["openings"] += p["openings"]
     return {
         "positions": positions,
         "locations": sorted(cities.values(), key=lambda c: (-c["positions"], c["city"])),
@@ -281,7 +400,13 @@ def staff_overview(db: Session) -> dict:
         it["opportunity_id"] = req.opportunity_id
     total_apps = db.execute(select(func.count()).select_from(Resume)
                             .where(Resume.source_portal == CAREERS_PORTAL)).scalar() or 0
-    return {"positions": items, "applications_total": int(total_apps)}
+    try:
+        with db.begin_nested():
+            by_channel = channel_stats(db)
+    except Exception:  # noqa: BLE001 — the analysis is extra; the card must still open
+        logger.warning("careers channel stats failed", exc_info=True)
+        by_channel = []
+    return {"positions": items, "applications_total": int(total_apps), "by_channel": by_channel}
 
 
 def post_text(listed: list[dict], url: str) -> str:
@@ -388,7 +513,7 @@ def mark_interested(db: Session, profile: CandidateProfile | None, via: str, cha
     if (opening_states(db, [profile.id]).get(profile.id) or {}).get("state") == "interested":
         return False
     where = "the Karnex careers page" if via == "careers" else "the position's application link"
-    ch = f" ({channel})" if channel and channel != "Careers page" else ""
+    ch = f" ({channel})" if channel and not is_direct(channel) else ""
     log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, None, INTERESTED_ACTION,
                  f"{VIA_TAG.get(via, '')} Applied through {where}{ch} — already interested; "
                  "no opening email needed. TA: check the details, then send for Technical Screening.")
@@ -413,6 +538,53 @@ def assign_owner(db: Session, profile: CandidateProfile, req: Requirement) -> bo
     return True
 
 
+def land_candidacy(db: Session, resume: Resume, req: Requirement, details: dict,
+                   via: str, channel: str = "") -> tuple[CandidateProfile | None, str]:
+    """Candidate record → Sourcing profile → owner → "already interested", each
+    step in its own savepoint so one failing step never undoes the others
+    (5 Nov 2026 — reported: a careers application never reached Sourcing; the
+    single all-or-nothing block lost the candidacy on any error, silently).
+
+    Returns (profile | None, how): how ∈ "new" · "existing" · "no_candidate" ·
+    "no_profile". An EXISTING candidacy on the opportunity is never moved (the
+    `ensure_sourcing_profile` rule); a note on its activity log says they applied
+    again, so TA sees why nothing new appeared. Never raises; flushes only."""
+    from services.slot_booking import ensure_sourcing_profile, find_or_create_candidate_from_resume
+    if resume.candidate_id is None:
+        try:
+            # The candidate record takes the typed locations / facts on its blanks
+            # (find_or_create_candidate_from_resume → copy_locations_to_candidate).
+            with db.begin_nested():
+                cand = find_or_create_candidate_from_resume(db, resume)
+                resume.candidate_id = cand.id
+                fill_candidate_from_application(cand, details or {})
+        except Exception:
+            logger.exception("careers: no candidate record for resume %s (%s)", resume.id, resume.email)
+            return None, "no_candidate"
+    before = db.execute(
+        select(CandidateProfile.id).where(
+            CandidateProfile.candidate_id == resume.candidate_id,
+            CandidateProfile.opportunity_id == req.opportunity_id,
+        )
+    ).scalar()
+    profile = ensure_sourcing_profile(db, resume, req, source=via)
+    if profile is None:
+        logger.error("careers: resume %s landed WITHOUT a Sourcing profile (requirement %s)", resume.id, req.id)
+        return None, "no_profile"
+    how = "existing" if before else "new"
+    try:
+        with db.begin_nested():
+            assign_owner(db, profile, req)
+            if not mark_interested(db, profile, via, channel) and how == "existing":
+                stage = getattr(profile.pipeline_status, "value", profile.pipeline_status)
+                where = "the Karnex careers page" if via == "careers" else "the position's application link"
+                log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, None, "REAPPLIED_PUBLIC",
+                             f"Applied again through {where} — the candidacy is already at {stage}; nothing moved.")
+    except Exception:
+        logger.warning("careers: owner / interested note failed for profile %s", profile.id, exc_info=True)
+    return profile, how
+
+
 def record_application(db: Session, req: Requirement, *, name: str, email: str, phone: str,
                        experience: str, details: dict, file_url: str, file_sha256: str,
                        file_size: int, portal: str, via: str, channel: str = "") -> dict:
@@ -426,16 +598,17 @@ def record_application(db: Session, req: Requirement, *, name: str, email: str, 
         select(Resume).where(Resume.requirement_id == req.id, Resume.file_sha256 == file_sha256)
     ).scalars().first()
     if dup is not None:
-        if dup.candidate_id is None:
-            try:
-                from services.slot_booking import find_or_create_candidate_from_resume
-                with db.begin_nested():
-                    cand = find_or_create_candidate_from_resume(db, dup)
-                    dup.candidate_id = cand.id
-                db.commit()
-            except Exception:
-                db.rollback()
-        return {"received": True, "duplicate": True, "resume_id": dup.id, "profile_id": None}
+        # Same CV on the same position again. 5 Nov 2026: still make sure the
+        # candidacy exists — an earlier attempt that failed half-way (resume saved,
+        # no profile) used to stay invisible in Sourcing for ever.
+        profile, _ = land_candidacy(db, dup, req, dup.application_details or {}, via, channel)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("careers: could not commit the repeat application for resume %s", dup.id)
+        return {"received": True, "duplicate": True, "resume_id": dup.id,
+                "profile_id": getattr(profile, "id", None)}
 
     if channel:
         details = {**details, "source_channel": channel}
@@ -453,29 +626,14 @@ def record_application(db: Session, req: Requirement, *, name: str, email: str, 
     )
     db.add(resume)
     db.flush()
-    profile = None
-    try:
-        from services.slot_booking import ensure_sourcing_profile, find_or_create_candidate_from_resume
-        # The candidate record takes the typed locations / facts on its blanks
-        # (find_or_create_candidate_from_resume → copy_locations_to_candidate).
-        with db.begin_nested():
-            cand = find_or_create_candidate_from_resume(db, resume)
-            resume.candidate_id = cand.id
-            fill_candidate_from_application(cand, details)
-        profile = ensure_sourcing_profile(db, resume, req, source=via)
-        if profile is not None:
-            with db.begin_nested():
-                assign_owner(db, profile, req)
-                mark_interested(db, profile, via, channel)
-    except Exception:
-        logger.warning("public application bootstrap failed for resume %s", resume.id, exc_info=True)
+    profile, _ = land_candidacy(db, resume, req, details, via, channel)
     existing = db.execute(
         select(func.count()).select_from(Resume).where(Resume.requirement_id == req.id, Resume.id != resume.id)
     ).scalar() or 0
     where = "the careers page" if via == "careers" else "the application link"
     log_activity(db, RequirementActivityLog, "requirement_id", req.id, req.created_by,
                  "RESUME_UPLOADED", f"Application received via {where} from {name}"
-                 + (f" ({channel})" if channel and channel != "Careers page" else ""))
+                 + (f" ({channel})" if channel and not is_direct(channel) else ""))
     if req.status == RequirementStatus.POSTED_ON_PORTALS and existing == 0:
         req.status = RequirementStatus.IN_PROGRESS
         log_activity(db, RequirementActivityLog, "requirement_id", req.id, req.created_by,
@@ -496,7 +654,7 @@ def notify_tas(db: Session, req: Requirement, resume: Resume, name: str, *,
         label = f"{getattr(opp, 'opp_id', '') or req.req_number} — {req.title}".strip(" —")
         if via == "careers":
             title = f"New application from the careers page: {name}"
-            src = f" via {channel}" if channel and channel != "Careers page" else ""
+            src = f" via {channel}" if channel and not is_direct(channel) else ""
             msg = (f"{name} applied to {label} on the Karnex careers page{src}. They are already interested "
                    "(no opening email needed) and wait in Applied Candidates at Sourcing — check the details "
                    "and send them for Technical Screening.")
@@ -507,7 +665,10 @@ def notify_tas(db: Session, req: Requirement, resume: Resume, name: str, *,
                    "interested and wait in Applied Candidates at Sourcing — review and move them to "
                    "Technical Screening.")
             event, prefix = "apply_link.application", "apply_link"
-        link = (f"/admin/?view=crm&p=requirements/{req.id}&tab=resumes"
+        # `q` = the applicant's email, so the row is found even when TA's list is
+        # narrowed (Applied by = me); a q link never applies that default.
+        q = quote((resume.email or name or "").strip())
+        link = (f"/admin/?view=crm&p=requirements/{req.id}&tab=resumes" + (f"&q={q}" if q else "")
                 if req.id else f"/admin/?view=crm&p=opportunities/{req.opportunity_id}")
         ta_ids = db.execute(
             select(RequirementTaAssignment.user_id).where(RequirementTaAssignment.requirement_id == req.id)

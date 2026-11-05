@@ -245,6 +245,10 @@ def test_the_migration_snapshots_match_the_registry():
     entries 0111 changed or added) they must describe the registry exactly —
     a new approval without a backfill would never reach a saved Approvals list."""
     merged = {**_snapshot("0108"), **_snapshot("0111"), **_snapshot("0145"), **_snapshot("0146")}
+    # 5 Nov 2026: the HM candidate review / sign-off approvals were removed; 0145
+    # still seeded them, and a saved list naming them is cleaned on read.
+    for gone in ("profile.hm_review", "profile.hm_signoff"):
+        merged.pop(gone, None)
     assert merged == {k: ap.ACTIONS[k].roles for k in ap.APPROVAL_ACTIONS}
 
 

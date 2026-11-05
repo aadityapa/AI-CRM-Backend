@@ -489,10 +489,8 @@ def _derive(f: StatusFacts) -> CandidateStatus:
                        hint=f"Reason: {reason}" if reason else None)
     if stage == PS.SHORTLISTED.value and f.terms_sent_back:
         return _status("terms_sent_back")
-    if stage == PS.SALES_SCREENING.value and f.hm_review == HM_PENDING:
-        return _status("hm_review")
-    if stage == PS.CUSTOMER_APPROVAL.value and f.hm_final == HM_PENDING:
-        return _status("hm_signoff")
+    # The HM review / sign-off statuses are no longer derived (5 Nov 2026 — the
+    # two approvals were removed); an old Pending stamp reads as the stage.
     if stage in _BUDGET_STAGES and f.budget_status in _BUDGET_STATUS_KEY:
         return _status(_BUDGET_STATUS_KEY[f.budget_status])
     if stage in _FIXED:
@@ -1154,6 +1152,39 @@ def closing_notes(db, profile_ids) -> dict[int, dict]:
     for d in latest.values():
         d["by"] = names.get(d["by_id"]) if d["by_id"] else None
     return latest
+
+
+SCREENING_REJECTED_NOTE = "RMG_Screening"
+
+
+def screening_rejection_notes(db, profile_ids) -> dict[int, dict]:
+    """Why RMG / GM rejected a candidate at Technical Screening (4 Nov 2026, user
+    ask: "show the reason like the L2 / customer rejections").
+
+    A screening Reject does not move the stage (the candidacy stays at Sourcing /
+    Technical Screening with `rmg_screening_status = Rejected`), so no STATUS_CHANGE
+    row exists for `closing_notes` to read. The reason is the screening note the
+    decision required. Same shape as `closing_notes`, status `RMG_Screening`. One query
+    + one names lookup.
+    """
+    from models import CandidateProfile
+    from services.revenue_report import _user_names
+    from sqlalchemy import select
+
+    ids = list({int(i) for i in profile_ids if i is not None})
+    if not ids:
+        return {}
+    rows = db.execute(select(CandidateProfile.id, CandidateProfile.rmg_screening_note,
+                             CandidateProfile.rmg_screening_by, CandidateProfile.rmg_screening_at)
+                      .where(CandidateProfile.id.in_(ids),
+                             CandidateProfile.rmg_screening_status == "Rejected")).all()
+    out = {int(pid): {"status": SCREENING_REJECTED_NOTE, "reason": (note or "").strip() or None,
+                      "by_id": by, "at": at.isoformat() if at else None}
+           for pid, note, by, at in rows}
+    names = _user_names(db, {d["by_id"] for d in out.values() if d["by_id"]})
+    for d in out.values():
+        d["by"] = names.get(d["by_id"]) if d["by_id"] else None
+    return out
 
 
 def applied_buckets(db, stmt) -> tuple[list[int], list[int]]:

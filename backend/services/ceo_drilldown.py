@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session, load_only
 
 from models import (
     Customer, CustomerBranch, CustomerReceipt, Invoice, InvoicePayment, POStatus,
-    PaymentStatus, Project, PurchaseOrder, TdsRecord,
+    PaymentStatus, Project, PurchaseOrder, TdsRecord, Timesheet,
 )
 from models.finance import InvoiceKind
 from services import billing_rules
@@ -50,6 +50,7 @@ from services.invoice_facets import invoice_facets
 from services.revenue_report import (
     TARGET_MONTH_KEY, TARGET_MONTH_PREFIX, Month, Period, _deployed_rows, _monthly_rate,
     _setting_number, project_clause, project_in, receipt_branch_scope, revenue_report, scope_projects,
+    INVOICE_CUSTOMER_ID, work_date, work_window_clause,
 )
 
 logger = logging.getLogger("karnex.crm.ceo_drilldown")
@@ -195,10 +196,31 @@ _INVOICE_COLS = (
 def _invoice_scope(customer_id: int | None, project_id: int | None) -> list:
     out = [Invoice.kind != InvoiceKind.PROFORMA.value]
     if customer_id:
-        out.append(Project.customer_id == customer_id)
+        # ONE customer per invoice: the PO's, else the project's (5 Nov 2026).
+        out.append(billing_rules.invoice_customer_clause(customer_id))
     if project_id:
         out.append(project_clause(Invoice.project_id, project_id))
     return out
+
+
+before_gst_split = billing_rules.before_gst_split
+
+
+def _tds_state(db: Session, invoice_ids: list[int]) -> dict[int, tuple[float, float]]:
+    """invoice id → (TDS the client has paid over — Form 16A, TDS still pending)."""
+    if not invoice_ids:
+        return {}
+    try:
+        with db.begin_nested():
+            rows = db.execute(
+                select(TdsRecord.invoice_id, sa.func.coalesce(sa.func.sum(TdsRecord.tds_paid), 0),
+                       sa.func.coalesce(sa.func.sum(TdsRecord.tds_balance), 0))
+                .where(TdsRecord.invoice_id.in_(invoice_ids)).group_by(TdsRecord.invoice_id)
+            ).all()
+    except Exception:  # noqa: BLE001 — TDS columns are extra; the page must still load
+        logger.warning("TDS state for the drill page failed", exc_info=True)
+        return {}
+    return {iid: (_r(p), _r(b)) for iid, p, b in rows}
 
 
 def load_invoices(db: Session, where: list, today: date, customer_id=None, project_id=None) -> list[dict]:
@@ -206,25 +228,31 @@ def load_invoices(db: Session, where: list, today: date, customer_id=None, proje
     what was received (cash + TDS), when it is due and how late, the PO it draws on,
     and the work month / employee / branch (`invoice_facets`)."""
     rows = db.execute(
-        select(Invoice, Project.customer_id, Customer.name, Project.name, PurchaseOrder.po_number)
+        select(Invoice, Customer.id, Customer.name, Project.name, PurchaseOrder.po_number,
+               Timesheet.year, Timesheet.month)
         .options(load_only(*_INVOICE_COLS))
         .join(Project, Project.id == Invoice.project_id)
-        .join(Customer, Customer.id == Project.customer_id)
         .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
+        .join(Customer, Customer.id == INVOICE_CUSTOMER_ID)
+        .outerjoin(Timesheet, Timesheet.id == Invoice.timesheet_id)
         .where(*_invoice_scope(customer_id, project_id), *where)
     ).all()
     facets = invoice_facets(db, [r[0] for r in rows])
+    tds_state = _tds_state(db, [r[0].id for r in rows])
     out = []
-    for inv, cid, cname, pname, po_number in rows:
+    for inv, cid, cname, pname, po_number, ts_year, ts_month in rows:
         f = facets.get(inv.id, {})
         stage = billing_rules.stage_of_invoice(inv)
         paid, tds = _r(inv.paid_amount), _r(inv.tds_deducted)
         balance = _r(inv.balance_amount) if stage != "paid" else 0.0
+        sub, grand = _r(inv.sub_total), _r(inv.grand_total)
+        tds_got, tds_open = tds_state.get(inv.id, (0.0, 0.0))
         due = billing_rules.effective_due(inv.due_date, inv.invoice_date)
         late = billing_rules.days_late(inv.due_date, inv.invoice_date, today) if balance > 0 else 0
         out.append({
             "id": inv.id, "link": f"invoices/{inv.id}", "invoice": inv.invoice_number or f"#{inv.id}",
-            "invoice_date": _iso(inv.invoice_date), "_date": inv.invoice_date,
+            # 5 Nov 2026: grouped by WORK month (the invoice date may be changed).
+            "invoice_date": _iso(inv.invoice_date), "_date": work_date(ts_year, ts_month, inv.invoice_date),
             "work_month": f.get("month_label"), "work_period": f.get("period_label"),
             "customer_id": cid, "customer": cname, "customer_link": f"customers/{cid}" if cid else None,
             "project_id": inv.project_id, "project": pname,
@@ -236,6 +264,11 @@ def load_invoices(db: Session, where: list, today: date, customer_id=None, proje
             "part": f"Part {inv.split_no}" if inv.split_no else None,
             "sub_total": _r(inv.sub_total), "tax": _r(inv.tax_amount), "grand_total": _r(inv.grand_total),
             "paid": paid, "tds": tds, "received": round(paid + tds, 2), "balance": balance,
+            # 4 Nov 2026 (user rule: received can never read above billed) — the share of the
+            # money received / still due that belongs to the value BEFORE GST, so these three
+            # add up to `sub_total` the way received + due add up to the invoice value.
+            **before_gst_split(sub, grand, round(paid + tds, 2), balance),
+            "bank": paid, "tds_collected": tds_got, "tds_pending": tds_open,
             "due_date": _iso(due), "_due": due, "days_late": max(0, late),
             "late_bucket": late_bucket(late, balance > 0),
             "stage": stage, "stage_label": billing_rules.STAGE_LABELS.get(stage, stage),
@@ -245,9 +278,24 @@ def load_invoices(db: Session, where: list, today: date, customer_id=None, proje
     return out
 
 
+def _month_key(d) -> str | None:
+    try:
+        return d.strftime("%Y-%m") if d else None
+    except AttributeError:
+        return None
+
+
 def _strip(rows: list[dict]) -> list[dict]:
-    """Drop the private (`_`) keys before a row goes on the wire."""
-    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+    """Drop the private (`_`) keys before a row goes on the wire. A row bucketed by
+    `_date` (the date the month-by-month charts use) keeps it as `month_key`, so a
+    month bar can narrow the table to exactly the rows it counted (5 Nov 2026)."""
+    out = []
+    for r in rows:
+        row = {k: v for k, v in r.items() if not k.startswith("_")}
+        if "_date" in r and "month_key" not in row:
+            row["month_key"] = _month_key(r["_date"])
+        out.append(row)
+    return out
 
 
 INVOICE_COLUMNS = [
@@ -261,15 +309,19 @@ INVOICE_COLUMNS = [
 ]
 
 
-def _with_gst_column(columns: list[dict]) -> list[dict]:
-    """The invoice columns with GST right after the value before GST — the Billed page's
-    "GST on it" tile needs a column it can sort by."""
-    out = []
-    for c in columns:
-        out.append(c)
-        if c["key"] == "sub_total":
-            out.append(col("tax", "GST", "money"))
-    return out
+BILLED_COLUMNS = [
+    col("invoice", "Invoice", link="link"), col("invoice_date", "Invoice date", "date"),
+    col("work_month", "Work month"), col("customer", "Customer", link="customer_link"),
+    col("branch", "Branch"), col("project", "Project", link="project_link"),
+    col("employee", "Employee", link="employee_link"), col("po_number", "PO", link="po_link"),
+    col("sub_total", "Billed (excl. GST)", "money"), col("received_ex", "Received (excl. GST)", "money"),
+    col("balance_ex", "Due (excl. GST)", "money"), col("tax", "GST", "money"),
+    col("grand_total", "Invoice value", "money"), col("bank", "In bank", "money"),
+    col("tds", "TDS deducted", "money"), col("tds_pending", "TDS pending", "money"),
+    col("balance", "Balance due", "money"), col("due_date", "Due", "date"),
+    col("days_late", "Days late", "days"), col("stage_label", "Where it stands", "badge"),
+]
+
 
 
 def _months(period: Period) -> list[Month]:
@@ -330,63 +382,125 @@ def _by_customer(rows: list[dict], value_keys: list[str], sort_key: str) -> list
 # --------------------------------------------------------------------------- finance: billed
 
 
+def _with_predicted(db, monthly: list[dict], period: Period, today: date,
+                    customer_id=None, project_id=None) -> list[dict]:
+    """Predicted billing (services/revenue_forecast) on EVERY month of the period
+    (4 Nov 2026, user ask: the release / extension dates feed "Billed month by month";
+    later the same day: "the Predicted bar does not show" — it was only drawn for the
+    current month onward, so a past month showed nothing). A past month's prediction
+    is what the team deployed then should have billed — beside the billed bar it shows
+    the gap (unbilled sheets, leave, LOP); the months still to come are appended."""
+    try:
+        from services.revenue_forecast import month_prediction
+        deployed = _deployed_rows(db, customer_id, project_id)
+    except Exception:  # noqa: BLE001 — a forecast must never blank the page
+        logger.warning("predicted revenue for the billed page failed", exc_info=True)
+        return monthly
+    by_key = {m["key"]: m for m in monthly}
+    keys = monthly[0].keys() if monthly else ()
+    out = []
+    for m in _months(period):
+        row = by_key.get(m.key) or {"label": m.start.strftime("%b %y"), "key": m.key,
+                                    **{k: 0.0 for k in keys if k not in ("label", "key")}}
+        row["predicted"] = round(month_prediction(deployed, m)["amount"], 2)
+        row["future"] = m.start > today
+        out.append(row)
+    return out
+
+
 def m_billed(db, period: Period, today: date, customer_id=None, project_id=None, scope=None) -> dict:
-    rows = load_invoices(db, [Invoice.invoice_date >= period.start, Invoice.invoice_date <= period.end],
+    rows = load_invoices(db, [work_window_clause(period.start, period.end)],
                          today, customer_id, project_id)
-    billed = sum(r["sub_total"] for r in rows)
-    tax = sum(r["tax"] for r in rows)
-    received = sum(r["received"] for r in rows)
-    due = sum(r["balance"] for r in rows)
-    overdue = sum(r["balance"] for r in rows if r["days_late"] > 0)
-    paid_n = sum(1 for r in rows if r["stage"] == "paid")
-    stage_defs = [(k, billing_rules.STAGE_LABELS[k], STAGE_TONE[k]) for k in _LIVE_STAGES]
     for r in rows:
-        r["overdue_amount"] = r["balance"] if r["days_late"] > 0 else 0.0
-    monthly = _month_sums(rows, period, "_date", ["sub_total", "received", "balance", "overdue_amount"], today)
-    for m in monthly:
-        m["overdue"] = m.pop("overdue_amount")
+        late = r["days_late"] > 0
+        r["overdue_amount"] = r["balance"] if late else 0.0
+        r["overdue_ex"] = r["balance_ex"] if late else 0.0
+    s = lambda k: round(sum(float(r.get(k) or 0) for r in rows), 2)  # noqa: E731
+    billed, tax, grand = s("sub_total"), s("tax"), s("grand_total")
+    received_ex, due_ex, overdue_ex = s("received_ex"), s("balance_ex"), s("overdue_ex")
+    received, due, overdue = s("received"), s("balance"), s("overdue_amount")
+    bank, tds, tds_got, tds_open = s("bank"), s("tds"), s("tds_collected"), s("tds_pending")
+    paid_n = sum(1 for r in rows if r["stage"] == "paid")
+    open_n = sum(1 for r in rows if r["balance"] > 0)
+    late_n = sum(1 for r in rows if r["days_late"] > 0 and r["balance"] > 0)
+    stage_defs = [(k, billing_rules.STAGE_LABELS[k], STAGE_TONE[k]) for k in _LIVE_STAGES]
+
+    monthly = _month_sums(rows, period, "_date", ["sub_total", "received_ex", "balance_ex", "overdue_ex"], today)
+    monthly = _with_predicted(db, monthly, period, today, customer_id, project_id)
+    money = _month_sums(rows, period, "_date",
+                        ["grand_total", "bank", "tds", "tds_collected", "tds_pending", "balance"], today)
     mix = [{"label": billing_rules.STAGE_LABELS[k],
-            "amount": round(sum(r["grand_total"] for r in rows if r["stage"] == k), 2),
-            "balance": round(sum(r["balance"] for r in rows if r["stage"] == k), 2)} for k in _LIVE_STAGES]
+            "amount": round(sum(r["sub_total"] for r in rows if r["stage"] == k), 2),
+            "received": round(sum(r["received_ex"] for r in rows if r["stage"] == k), 2),
+            "balance": round(sum(r["balance_ex"] for r in rows if r["stage"] == k), 2)} for k in _LIVE_STAGES]
     return {
         "title": "Billed", "question": f"Every invoice raised in {period.label} — and where each one stands now",
         "kpis": [
-            kpi("billed", "Billed (excl. GST)", round(billed, 2), tone="brand", sub=f"{len(rows)} invoices",
+            kpi("billed", "Billed (excl. GST)", billed, tone="brand", sub=f"{len(rows)} invoices",
                 go={"segments": [], "sort": "sub_total"}),
-            kpi("gst", "GST on it", round(tax, 2), sub=f"invoice value {round(billed + tax):,}",
-                go={"segments": [], "where": "tax", "sort": "tax"}),
-            kpi("received", "Received so far", round(received, 2), tone="success",
-                sub=f"{_pct(received, billed + tax) or 0:.0f}% of the invoice value",
-                go={"segments": [], "where": "received", "sort": "received"}),
-            kpi("due", "Still to collect", round(due, 2), tone="warning" if due else "success",
-                sub=f"{sum(1 for r in rows if r['balance'] > 0)} invoices open",
-                go={"segments": [], "where": "balance", "sort": "balance"}),
-            kpi("overdue", "Of which overdue", round(overdue, 2), tone="danger" if overdue else "success",
-                sub=f"{sum(1 for r in rows if r['days_late'] > 0 and r['balance'] > 0)} invoices past due",
-                go={"segments": [], "where": "overdue_amount", "sort": "days_late"}),
+            kpi("received", "Received against it", received_ex, tone="success",
+                sub=f"{_pct(received_ex, billed) or 0:.0f}% of billed · with GST {round(received):,}",
+                go={"segments": [], "where": "received_ex", "sort": "received_ex"}),
+            kpi("due", "Still to collect", due_ex, tone="warning" if due_ex else "success",
+                sub=f"{open_n} invoices open · with GST {round(due):,}",
+                go={"segments": [], "where": "balance_ex", "sort": "balance_ex"}),
+            kpi("overdue", "Of which overdue", overdue_ex, tone="danger" if overdue_ex else "success",
+                sub=f"{late_n} invoices past due · with GST {round(overdue):,}",
+                go={"segments": [], "where": "overdue_ex", "sort": "days_late"}),
             kpi("paid", "Fully paid", paid_n, "int", "success", f"of {len(rows)} invoices",
                 go={"segments": ["paid"]}),
+            kpi("gst", "GST on it", tax, sub=f"invoice value {round(grand):,}",
+                go={"segments": [], "where": "tax", "sort": "tax"}),
+            kpi("bank", "Received in bank", bank, tone="success",
+                sub=f"cash after TDS · {_pct(bank, grand) or 0:.0f}% of the invoice value",
+                go={"segments": [], "where": "bank", "sort": "bank"}),
+            kpi("tds", "TDS deducted by clients", tds, tone="info",
+                sub=f"collected (Form 16A) {round(tds_got):,}",
+                go={"segments": [], "where": "tds", "sort": "tds"}),
+            kpi("tds_pending", "TDS pending from clients", tds_open, tone="warning" if tds_open else "success",
+                sub=f"{sum(1 for r in rows if r['tds_pending'] > 0)} invoices",
+                go={"segments": [], "where": "tds_pending", "sort": "tds_pending"}),
         ],
         "charts": [
             chart("monthly", "Billed month by month", monthly,
-                  [series("sub_total", "Billed", "brand"), series("received", "Received", "success"),
-                   series("balance", "Still due", "warning"), series("overdue", "Overdue", "danger")],
-                  subtitle="By invoice date — billed excl. GST; received and due on the invoice value"),
-            chart("customers", "Who we billed", _by_customer(rows, ["sub_total", "received", "balance"], "sub_total"),
-                  [series("sub_total", "Billed", "brand"), series("received", "Received", "success"),
-                   series("balance", "Still due", "warning")]),
+                  [series("sub_total", "Billed", "brand"), series("received_ex", "Received", "success"),
+                   series("balance_ex", "Still due", "warning"), series("overdue_ex", "Overdue", "danger"),
+                   series("predicted", "Predicted", "violet")],
+                  subtitle="By work month, all before GST — received and due are each invoice's share before GST, "
+                           "so received + still due = billed and received never reads above billed. "
+                           "Predicted = deployed team × rate up to each planned release date"),
+            chart("money", "Money in — bank and TDS (with GST)", money,
+                  [series("grand_total", "Invoice value", "brand"), series("bank", "Received in bank", "success"),
+                   series("tds", "TDS deducted", "info"), series("tds_collected", "TDS collected", "violet"),
+                   series("tds_pending", "TDS pending", "warning"), series("balance", "Still due", "danger")],
+                  subtitle="By invoice month, on the invoice value with GST: what reached the bank, what the "
+                           "client withheld as TDS (collected = Form 16A received) and what is still owed"),
+            chart("customers", "Who we billed",
+                  _by_customer(rows, ["sub_total", "received_ex", "balance_ex"], "sub_total"),
+                  [series("sub_total", "Billed", "brand"), series("received_ex", "Received", "success"),
+                   series("balance_ex", "Still due", "warning")]),
             chart("stages", "Where the money stands", mix,
-                  [series("amount", "Invoice value", "brand"), series("balance", "Still due", "warning")]),
+                  [series("amount", "Billed", "brand"), series("received", "Received", "success"),
+                   series("balance", "Still due", "warning")]),
         ],
         "segments": segments(rows, stage_defs, "grand_total"),
         "default_segment": scope if scope in _LIVE_STAGES else None,
-        "tables": [table("invoices", "Invoices", _with_gst_column(INVOICE_COLUMNS), _strip(rows))],
+        "tables": [table("invoices", "Invoices", BILLED_COLUMNS, _strip(rows))],
         "related": [{"metric": "collected", "label": "Cash collected"},
                     {"metric": "outstanding", "label": "Outstanding"},
                     {"metric": "margin", "label": "Gross margin"}],
-        "notes": ["Billed = Tax invoices dated in the period, value before GST (Proformas are not money yet).",
+        "notes": ["Billed = Tax invoices whose WORK month falls in the period (the timesheet's month; a manual "
+                  "invoice uses its invoice date), value before GST. Proformas are not money yet.",
+                  "Money is counted against the invoice it was mapped to: a received amount that arrived in June "
+                  "and was mapped to an April invoice is April's money.",
+                  "A customer pays the invoice value WITH GST (cash + TDS). To compare it with billed, "
+                  "Received / Still to collect / Overdue show each invoice's share before GST — "
+                  "so received + still to collect = billed, and received can never read above billed. "
+                  "The figures with GST are on each tile's second line and in the 'Money in' chart.",
+                  "Received in bank = cash only. TDS deducted = what clients withheld; collected = Form 16A "
+                  "received, pending = still owed by the client.",
                   "Where it stands follows the invoice: awaiting the customer's approval → e-invoice (IRN) → "
-                  "unpaid → partly paid → paid. Received = cash + TDS the customer withheld."]
+                  "unpaid → partly paid → paid."]
                  + _scope_note(customer_id, project_id),
     }
 
@@ -399,27 +513,29 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
     mapped to an invoice in the month of that invoice's date, money still on
     account in the month it arrived. The same rule as the dashboard tile
     (`revenue_report._payments_in_window`), so this page adds up to it."""
-    counted_on = sa.func.coalesce(Invoice.invoice_date, InvoicePayment.payment_date)
     pay = db.execute(
         select(InvoicePayment.id, InvoicePayment.payment_date, InvoicePayment.amount, InvoicePayment.payment_mode,
                InvoicePayment.reference_number, InvoicePayment.receipt_id,
                Invoice.id, Invoice.invoice_number, Invoice.invoice_date, Invoice.due_date, Invoice.po_id,
-               Project.customer_id, Customer.name, Project.id, Project.name, PurchaseOrder.po_number)
+               Customer.id, Customer.name, Project.id, Project.name, PurchaseOrder.po_number,
+               Timesheet.year, Timesheet.month)
         .join(Invoice, Invoice.id == InvoicePayment.invoice_id)
         .join(Project, Project.id == Invoice.project_id)
-        .join(Customer, Customer.id == Project.customer_id)
         .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
-        .where(counted_on >= period.start, counted_on <= period.end,
+        .join(Customer, Customer.id == INVOICE_CUSTOMER_ID)
+        .outerjoin(Timesheet, Timesheet.id == Invoice.timesheet_id)
+        .where(work_window_clause(period.start, period.end),
                *_invoice_scope(customer_id, project_id))
     ).all()
     rows = []
     for (pid, pdate, amount, mode, ref, rid, iid, inum, idate, idue, po_id, cid, cname, prj_id, prj,
-         po_number) in pay:
+         po_number, ts_year, ts_month) in pay:
         due = billing_rules.effective_due(idue, idate)
         late_by = (pdate - due).days if (pdate and due) else 0
+        counted = work_date(ts_year, ts_month, idate or pdate)
         rows.append({
-            "id": pid, "payment_date": _iso(pdate), "_date": idate or pdate,
-            "counted_in": (idate or pdate).strftime("%b %Y") if (idate or pdate) else None,
+            "id": pid, "payment_date": _iso(pdate), "_date": counted,
+            "counted_in": counted.strftime("%b %Y") if counted else None,
             "amount": _r(amount),
             "mode": mode or "—", "reference": ref,
             "invoice": inum or f"#{iid}", "link": f"invoices/{iid}", "invoice_date": _iso(idate),
@@ -469,11 +585,11 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
     } for rid, d, a, u, m, ref, cid, cn, bn in db.execute(rq.order_by(CustomerReceipt.received_date.desc())).all()] \
         if not project_id or rbranch is not None else []
     on_account_total = sum(r["on_account"] for r in on_account)
-    total = mapped_total + on_account_total
+    # 5 Nov 2026 (user rule): money on account stays in Received Amount until it is
+    # mapped — it is LISTED below for Finance but never counted as collected.
+    total = mapped_total
 
-    monthly = _by_month(
-        rows + [{"_date": r["_date"], "segment": "on_account", "amount": r["on_account"]} for r in on_account],
-        period, "_date", "segment", ("on_time", "late", "on_account"), "amount")
+    monthly = _by_month(rows, period, "_date", "segment", ("on_time", "late"), "amount")
     modes: dict[str, float] = defaultdict(float)
     for r in rows:
         modes[r["mode"]] += r["amount"]
@@ -483,20 +599,20 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
         "question": f"Money that belongs to {period.label} — paid against its invoices, or received and not yet mapped",
         "kpis": [
             kpi("collected", "Collected", round(total, 2), tone="success",
-                sub=f"{len(rows)} payments" + (f" + {round(on_account_total):,} on account" if on_account_total else "")),
+                sub=f"{len(rows)} payments mapped to invoices"),
             kpi("customers", "Customers who paid", len(payers), "int"),
             kpi("days", "Avg days to pay", round(weighted / mapped_total, 1) if mapped_total else None, "days",
                 sub="from invoice date, by amount"),
             kpi("late", "Paid after the due date", _pct(late_amt, mapped_total), "pct",
                 "warning" if late_amt else "success", f"{round(late_amt):,} of the cash"),
             kpi("pos", "POs it came against", len(po_ids), "int", sub=f"{round(no_po):,} on invoices with no PO" if no_po else None),
-            kpi("on_account", "Received, not yet mapped", round(on_account_total, 2), tone="warning" if on_account_total else "neutral",
-                sub=f"{len(on_account)} receipts on account"),
+            kpi("on_account", "In Received Amount, not mapped yet", round(on_account_total, 2),
+                tone="warning" if on_account_total else "neutral",
+                sub=f"{len(on_account)} receipts — not counted until mapped"),
         ],
         "charts": [
-            chart("monthly", "Collected month by month (the invoice's month)", monthly,
-                  [series("on_time", "On time", "success", "c"), series("late", "Paid late", "warning", "c"),
-                   series("on_account", "On account (not mapped yet)", "brand", "c")]),
+            chart("monthly", "Collected month by month (the invoice's work month)", monthly,
+                  [series("on_time", "On time", "success"), series("late", "Paid late", "warning")]),
             chart("customers", "Who paid us", _by_customer(rows, ["amount"], "amount"),
                   [series("amount", "Collected", "success")]),
             chart("pos", "Purchase orders — collected vs what is left",
@@ -529,10 +645,10 @@ def m_collected(db, period: Period, today: date, customer_id=None, project_id=No
         ],
         "related": [{"metric": "billed", "label": "Billed"}, {"metric": "outstanding", "label": "Outstanding"},
                     {"metric": "dso", "label": "DSO"}, {"metric": "po", "label": "Purchase orders"}],
-        "notes": ["Collected = money that belongs to the period, GST included: a payment mapped to a Tax invoice "
-                  "counts in the month of that invoice's date (June and July invoices paid in September are "
-                  "June / July money); money received but not yet mapped counts in the month it arrived, and "
-                  "moves to the invoice's month once it is mapped.",
+        "notes": ["Collected = payments mapped to Tax invoices, GST included, counted in the invoice's WORK month "
+                  "(June and July work paid in September is June / July money).",
+                  "Money received but not mapped to an invoice yet stays in Received Amount and is not counted "
+                  "here until Finance maps it (listed in the last table).",
                   "Paid late = after the invoice's due date (its own, else invoice date + 30 days)."]
                  + _scope_note(customer_id, project_id),
     }
@@ -1419,6 +1535,18 @@ METRICS = {
 FINANCE_METRICS = frozenset(k for k, (tab, _f) in METRICS.items() if tab == "finance")
 
 
+def _scope_options(db: Session, period: Period) -> dict | None:
+    """Every customer / branch / project for the pickers (the Revenue report's lists)."""
+    from services.revenue_report import _branch_options, _filter_options
+    try:
+        with db.begin_nested():
+            return {**_filter_options(db, period.start, period.end),
+                    "branches": _branch_options(db, period.start, period.end)}
+    except Exception:  # noqa: BLE001 — the pickers are extra; the page must still load
+        logger.warning("drill page filter options failed", exc_info=True)
+        return None
+
+
 def drilldown(db: Session, metric: str, month_raw: str | None = None, period_raw: str | None = None,
               today: date | None = None, customer_id: int | None = None, project_id: int | None = None,
               scope: str | None = None, branch_id: int | None = None) -> dict:
@@ -1432,7 +1560,11 @@ def drilldown(db: Session, metric: str, month_raw: str | None = None, period_raw
     # 2 Nov 2026 — a branch is the tuple of its projects (`revenue_report.scope_projects`).
     scoped = scope_projects(db, customer_id, project_id, branch_id)
     body = fn(db, period, today, customer_id, scoped, (scope or "").strip().lower() or None)
+    filters = {"customer_id": customer_id, "project_id": project_id, "branch_id": branch_id, "scope": scope}
+    if tab == "finance":
+        # 4 Nov 2026 (user ask: "all required filters") — the customer → branch → project
+        # pickers the Revenue report and the Finance tab use, on every Finance drill page.
+        filters["options"] = _scope_options(db, period)
     return {"metric": metric, "tab": tab, "as_of": today.isoformat(), "period": ex._period_view(period, today),
-            "filters": {"customer_id": customer_id, "project_id": project_id, "branch_id": branch_id,
-                        "scope": scope},
+            "filters": filters,
             "segments": [], "default_segment": None, "related": [], "notes": [], **body}

@@ -162,6 +162,14 @@ class ProjectEmployee(Base):
     role_title = sa.Column(sa.String(255), nullable=True)  # assignment label for reports
     # Set on exit when leave balances remain to settle; cleared on remap (UC-09).
     settlement_pending = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    #: Planned release date the customer gave (0152, 4 Nov 2026). A PLAN, never an
+    #: exit: it drives reminders and the revenue forecast; the real exit is still
+    #: the Exit action. An extension moves it later.
+    release_date = sa.Column(sa.Date, nullable=True)
+    release_note = sa.Column(sa.Text, nullable=True)
+    release_informed_on = sa.Column(sa.Date, nullable=True)
+    release_set_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    release_set_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
     __table_args__ = (sa.UniqueConstraint("project_id", "employee_id", name="uq_project_employee"),)
 
     project = relationship("Project", back_populates="employees")
@@ -171,6 +179,22 @@ class ProjectEmployee(Base):
     rates = relationship("ProjectEmployeeRate", back_populates="project_employee",
                          cascade="all, delete-orphan",
                          order_by="ProjectEmployeeRate.effective_from")
+
+
+class ProjectEmployeeReleaseEvent(Base):
+    """Every release / extension the customer announced for an assignment (0152)."""
+
+    __tablename__ = "project_employee_release_events"
+    id = sa.Column(sa.Integer, primary_key=True)
+    project_employee_id = sa.Column(sa.Integer, sa.ForeignKey("project_employees.id", ondelete="CASCADE"),
+                                    nullable=False, index=True)
+    kind = sa.Column(sa.String(16), nullable=False)  # release | extension | cleared
+    old_date = sa.Column(sa.Date, nullable=True)
+    new_date = sa.Column(sa.Date, nullable=True)
+    note = sa.Column(sa.Text, nullable=True)
+    informed_on = sa.Column(sa.Date, nullable=True)
+    created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 
 
 class ProjectEmployeeLeaveDetail(Base):

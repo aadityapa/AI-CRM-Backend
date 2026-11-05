@@ -53,17 +53,37 @@ def test_billed_adds_up_to_the_tile_and_says_where_each_invoice_stands(book):
     segs = {s["key"]: s["count"] for s in page["segments"]}
     assert segs["paid"] == 1 and segs["partially_paid"] == 1
     # The monthly chart is grouped columns like "Who we billed" (28 Oct 2026): it adds up
-    # to the table, carries no stacks and stops at the current month.
+    # to the table and carries no stacks. 4 Nov 2026: the months still to come in the
+    # period carry the PREDICTED billing (deployed team up to the planned release).
     monthly = page["charts"][0]
-    assert [s["key"] for s in monthly["series"]] == ["sub_total", "received", "balance", "overdue"]
+    assert [s["key"] for s in monthly["series"]] == ["sub_total", "received_ex", "balance_ex", "overdue_ex",
+                                                     "predicted"]
     assert not any(s.get("stack") for s in monthly["series"])
     assert round(sum(m["sub_total"] for m in monthly["rows"]), 2) == tile
-    assert round(sum(m["balance"] for m in monthly["rows"]), 2) == round(sum(r["balance"] for r in rows), 2)
-    assert monthly["rows"][-1]["key"] <= TODAY.strftime("%Y-%m")
+    # 5 Nov 2026: every table row names its month, so a month bar can narrow the table
+    # to exactly the invoices it counted.
+    for m in monthly["rows"]:
+        in_month = [r for r in rows if r.get("month_key") == m["key"]]
+        assert round(sum(r["sub_total"] for r in in_month), 2) == round(m["sub_total"], 2)
+    assert round(sum(m["balance_ex"] for m in monthly["rows"]), 2) == \
+        round(sum(r["balance_ex"] for r in rows), 2)
+    # 4 Nov 2026 (later): Predicted on EVERY month of the period, past months included.
+    assert all("predicted" in m for m in monthly["rows"])
+    # Received never reads above billed: before-GST share, received + due = billed per invoice.
+    for r in rows:
+        assert r["received_ex"] <= r["sub_total"] + 0.01
+        assert r["received_ex"] + r["balance_ex"] <= r["sub_total"] + 0.02
+    for m in monthly["rows"]:
+        assert m["received_ex"] <= m["sub_total"] + 0.01
+    # Bank + TDS: cash after TDS, TDS deducted / pending, all on the invoice value with GST.
+    assert {c["key"] for c in page["tables"][0]["columns"]} >= {"bank", "tds", "tds_pending", "received_ex"}
+    assert any(c["key"] == "money" for c in page["charts"])
     # Every tile says which rows it stands for (28 Oct 2026) — and those rows add up to it.
     kpis = {k["key"]: k for k in page["kpis"]}
     assert all(k.get("go") for k in kpis.values())
-    for key, field in (("received", "received"), ("due", "balance"), ("overdue", "overdue_amount"), ("gst", "tax")):
+    assert {"bank", "tds", "tds_pending"} <= set(kpis)
+    for key, field in (("received", "received_ex"), ("due", "balance_ex"), ("overdue", "overdue_ex"),
+                       ("gst", "tax"), ("bank", "bank"), ("tds", "tds"), ("tds_pending", "tds_pending")):
         go = kpis[key]["go"]
         assert go["where"] == field
         shown = [r for r in rows if float(r.get(field) or 0) != 0]
@@ -71,6 +91,18 @@ def test_billed_adds_up_to_the_tile_and_says_where_each_invoice_stands(book):
     assert kpis["paid"]["go"]["segments"] == ["paid"]
     assert len([r for r in rows if r["segment"] == "paid"]) == kpis["paid"]["value"]
     assert any(c["key"] == "tax" for c in page["tables"][0]["columns"])
+
+
+def test_before_gst_split_never_reads_above_billed():
+    from services.billing_rules import before_gst_split
+    # ₹1,00,000 + 18% GST, fully paid with GST: received before GST = billed, nothing due.
+    assert before_gst_split(100_000, 118_000, 118_000, 0) == {"received_ex": 100_000.0, "balance_ex": 0.0}
+    # Half paid: half of billed received, half due.
+    assert before_gst_split(100_000, 118_000, 59_000, 59_000) == {"received_ex": 50_000.0, "balance_ex": 50_000.0}
+    # Over-recorded receipt (data slip): capped at billed.
+    assert before_gst_split(100_000, 118_000, 130_000, 0)["received_ex"] == 100_000.0
+    # No grand total on record: falls back to the figures as they are.
+    assert before_gst_split(0, 0, 0, 0) == {"received_ex": 0.0, "balance_ex": 0.0}
 
 
 def test_collected_lists_every_payment_with_its_po_and_timing(book):

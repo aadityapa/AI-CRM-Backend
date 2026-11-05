@@ -290,9 +290,17 @@ def request_jd_changes(db: Session, req: Requirement, reason: str, user) -> None
 
 # ------------------------------------------------- candidate review + sign-off ---
 
+#: 5 Nov 2026 (user decision): the HM's candidate review and final sign-off are
+#: removed — no stage waits for the Hiring Manager any more. Kept as a switch so
+#: the code below stays readable if the business ever wants them back.
+HM_CANDIDATE_GATES = False
+
+
 def on_stage_arrival(db: Session, profile, new_status: str, user) -> None:
     """Open the HM gate when a candidate reaches Sales Screening (review) or
     Customer Approval (sign-off) on a position that has an HM. Never raises."""
+    if not HM_CANDIDATE_GATES:
+        return
     try:
         if new_status == PS.SALES_SCREENING.value:
             col, event, ask = "review", EVENT_REVIEW_REQUESTED, (
@@ -325,11 +333,16 @@ def on_stage_arrival(db: Session, profile, new_status: str, user) -> None:
 
 def entry_block(db: Session, profile, new_status: str) -> str | None:
     """Why `new_status` cannot be entered yet (an HM decision is due), else None."""
+    if not HM_CANDIDATE_GATES:
+        return None  # a candidate already stamped Pending before 5 Nov is not held
     if new_status == PS.CUSTOMER_SCREENING.value and profile.hm_review_status == PENDING:
         if opportunity_hm_ids(db, profile.opportunity_id):
             return ("The Hiring Manager has not reviewed this candidate yet — the profile goes to "
                     "the customer once they approve it.")
-    if new_status == PS.HR_SCREENING.value and profile.hm_final_status == PENDING:
+    # An internal candidate goes from the Sales Head's approval straight to
+    # Pre-Onboarding (4 Nov 2026) — the sign-off gate holds that move too.
+    if (new_status in (PS.HR_SCREENING.value, PS.PREBOARDING.value)
+            and profile.hm_final_status == PENDING):
         if opportunity_hm_ids(db, profile.opportunity_id):
             return ("Waiting for the Hiring Manager's sign-off on this selection — the Sales Head "
                     "approves after it.")

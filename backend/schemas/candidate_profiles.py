@@ -17,6 +17,8 @@ class ProfileCreate(BaseModel):
     #: Free-text note typed on the New Profile form (7 Sep 2026): recorded on
     #: the activity log. It used to be sent by the UI and silently dropped.
     notes: str | None = Field(default=None, max_length=2000)
+    #: "Internal" | "External" (4 Nov 2026); blank = decided from the email.
+    candidate_type: str | None = Field(default=None, max_length=16)
 
 
 class ProfileUpdate(BaseModel):

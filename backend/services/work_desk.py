@@ -480,7 +480,7 @@ def _hm_tabs(db: Session, user) -> list[dict]:
     if not req_ids:
         # The tiles still show (reading "All clear"): an HM on no position yet
         # must not get an empty Dashboard (23 Oct 2026).
-        return [_tab(k, []) for k in ("hm_jd", "hm_review", "hm_signoff", "hm_positions")]
+        return [_tab(k, []) for k in ("hm_jd", "hm_positions")]
     reqs = db.execute(select(Requirement, Opportunity)
                       .join(Opportunity, Opportunity.id == Requirement.opportunity_id)
                       .where(Requirement.id.in_(req_ids))).all()
@@ -491,9 +491,8 @@ def _hm_tabs(db: Session, user) -> list[dict]:
                 action="Review JD & skills")
           for r, o in reqs if r.status == RequirementStatus.PENDING_HM_REVIEW]
     out = [_tab("hm_jd", jd)]
-    for key, col, stage, action in (
-            ("hm_review", CandidateProfile.hm_review_status, PS.SALES_SCREENING.value, "Review candidate"),
-            ("hm_signoff", CandidateProfile.hm_final_status, PS.CUSTOMER_APPROVAL.value, "Sign off")):
+    # The HM candidate review / sign-off tabs are gone (5 Nov 2026, user decision).
+    for key, col, stage, action in ():
         items = []
         for p, cand, opp, _rid in _profiles(db, [stage], owner_id=None,
                                              where=(col == hm.PENDING,

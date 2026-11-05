@@ -200,6 +200,29 @@ def test_period_defaults_to_the_financial_year_and_month_is_the_anchor(book):
     assert q["period"]["key"] == "2026-Q2"
 
 
+def test_finance_carries_tds_forecast_and_net_revenue(book):
+    """4 Nov 2026: TDS collection, predicted revenue (with customer / project
+    counts) and net revenue = billed − expenses ride on the Finance tab."""
+    from models import Expense
+    book.add(Expense(expense_date=date(2026, 5, 10), category="Rent & office",
+                     description="May rent", amount=50000))
+    book.commit()
+    f = _tab(book, "finance", period=None)["data"]
+    assert f["tds"] is not None and {"deducted", "received", "pending", "monthly"} <= set(f["tds"])
+    fc = f["forecast"]
+    assert fc and len(fc["month"]) == 12 and len(fc["quarter"]) == 4 and len(fc["fy"]) == 2
+    assert {"predicted", "customers", "projects", "heads"} <= set(fc["month"][0])
+    net = f["net"]
+    assert net["expenses"] == 50000
+    assert net["net_revenue"] == round(net["billed"] - 50000, 2)
+    may = next(m for m in f["monthly"] if m["key"] == "2026-05")
+    assert may["expenses"] == 50000 and may["net_revenue"] == round(may["billed"] - 50000, 2)
+    # 4 Nov 2026 (later): predicted on EVERY month (a past month = what the deployed team
+    # should have billed), and "received (excl. GST)" never reads above billed.
+    assert all(m["predicted"] is not None for m in f["monthly"])
+    assert all(m["received_ex"] <= m["billed"] + 0.01 for m in f["monthly"])
+
+
 def test_unknown_tab_is_a_value_error(book):
     with pytest.raises(ValueError):
         ed.executive_dashboard(book, "hr", today=TODAY)

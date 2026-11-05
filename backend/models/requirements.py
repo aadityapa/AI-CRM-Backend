@@ -73,6 +73,9 @@ class Requirement(Base, TimestampMixin):
     #: RMG's switch for the public careers page (0151): True = not listed there
     #: even while it is open for sourcing (services/careers.py).
     careers_hidden = sa.Column(sa.Boolean, nullable=False, server_default=sa.false())
+    #: The status a deal's CLOSE took the requirement from (0152). Reopening the
+    #: opportunity puts it back there, so sourcing resumes where it paused.
+    closed_from_status = sa.Column(sa.String(60), nullable=True)
     created_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=False)
     sales_head_approved_by = sa.Column(sa.Integer, sa.ForeignKey(USERS_FK), nullable=True)
     sales_head_approved_at = sa.Column(sa.DateTime(timezone=True), nullable=True)

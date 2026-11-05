@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_ as sa_and, func, or_ as sa_or, select
 from sqlalchemy.orm import Session
 
 import sqlalchemy as sa
@@ -431,10 +431,38 @@ def _invoice_filters(customer_id: int | None, project_id: int | None) -> list:
     """
     out = [Invoice.kind != InvoiceKind.PROFORMA.value]
     if customer_id:
-        out.append(Project.customer_id == customer_id)
+        # 5 Nov 2026: ONE customer per invoice — the PO's, else the project's
+        # (billing_rules.invoice_customer_clause), as on every other screen.
+        from services.billing_rules import invoice_customer_clause
+        out.append(invoice_customer_clause(customer_id))
     if project_id:
         out.append(project_clause(Invoice.project_id, project_id))
     return out
+
+
+#: The customer an invoice is reported under (5 Nov 2026): the PO's, else the
+#: project's — `billing_rules.invoice_customer_id`. Needs PurchaseOrder outer-joined.
+INVOICE_CUSTOMER_ID = func.coalesce(PurchaseOrder.customer_id, Project.customer_id)
+
+
+def work_window_clause(start: date, end: date):
+    """An invoice is counted in its WORK month (5 Nov 2026, user rule — the
+    invoice date may be changed, the work month cannot): its timesheet's
+    year/month, else (a manual invoice) its invoice date. Integer arithmetic
+    only, so it runs on Postgres and SQLite alike. Needs `Timesheet` outer-joined."""
+    key = Timesheet.year * 100 + Timesheet.month
+    return sa_or(
+        sa_and(Timesheet.id.is_(None), Invoice.invoice_date >= start, Invoice.invoice_date <= end),
+        sa_and(Timesheet.id.is_not(None),
+               key >= start.year * 100 + start.month, key <= end.year * 100 + end.month),
+    )
+
+
+def work_date(ts_year, ts_month, invoice_date):
+    """PURE — the date an invoice is counted on: the 1st of its work month."""
+    if ts_year and ts_month:
+        return date(int(ts_year), int(ts_month), 1)
+    return invoice_date
 
 
 def _invoices_in_window(db: Session, start: date, end: date,
@@ -451,24 +479,29 @@ def _invoices_in_window(db: Session, start: date, end: date,
             Invoice.id, Invoice.invoice_number, Invoice.invoice_date, Invoice.due_date,
             Invoice.sub_total, Invoice.tax_amount, Invoice.grand_total,
             Invoice.balance_amount, Invoice.payment_status,
-            Project.customer_id, Customer.name,
+            Customer.id, Customer.name,
             Project.id, Project.branch_id, Opportunity.opp_type, Opportunity.created_by,
             CustomerBranch.branch_name, Project.name,
             Invoice.timesheet_id, Timesheet.employee_id,
             Employee.first_name, Employee.last_name, Employee.employee_code, Employee.current_ctc,
+            Timesheet.year, Timesheet.month,
         )
         .join(Project, Project.id == Invoice.project_id)
-        .join(Customer, Customer.id == Project.customer_id)
+        .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
+        .join(Customer, Customer.id == INVOICE_CUSTOMER_ID)
         .outerjoin(Opportunity, Opportunity.id == Project.opportunity_id)
         .outerjoin(CustomerBranch, CustomerBranch.id == Project.branch_id)
         .outerjoin(Timesheet, Timesheet.id == Invoice.timesheet_id)
         .outerjoin(Employee, Employee.id == Timesheet.employee_id)
-        .where(Invoice.invoice_date >= start, Invoice.invoice_date <= end,
+        .where(work_window_clause(start, end),
                *_invoice_filters(customer_id, project_id))
     ).all()
+    # `invoice_date` here is the date the invoice COUNTS on (its work month);
+    # `issued_on` is the date printed on it (due dates and DSO use that one).
     return [
         {
-            "id": r[0], "number": r[1], "invoice_date": r[2], "due_date": r[3],
+            "id": r[0], "number": r[1], "invoice_date": work_date(r[23], r[24], r[2]),
+            "issued_on": r[2], "due_date": r[3],
             "sub_total": _num(r[4]), "tax": _num(r[5]), "grand_total": _num(r[6]),
             "balance": _num(r[7]), "status": getattr(r[8], "value", r[8]),
             "customer_id": r[9], "customer": r[10],
@@ -500,35 +533,27 @@ def _payments_in_window(db: Session, start: date, end: date,
     Every row: `date` (the month it counts in), `paid_on` (the day the money
     arrived), `amount`, `customer_id`, `project_id`, `invoice_id`, `receipt_id`,
     `on_account`."""
-    counted_on = func.coalesce(Invoice.invoice_date, InvoicePayment.payment_date)
+    # 5 Nov 2026 (user rules): payments count in the invoice's WORK month, and
+    # money still on account (not mapped to an invoice) is NOT on the dashboard —
+    # it stays in Received Amount until Finance maps it.
     rows = db.execute(
-        select(counted_on, InvoicePayment.amount, Project.customer_id, Invoice.project_id,
-               InvoicePayment.payment_date, Invoice.id, InvoicePayment.receipt_id)
+        select(Invoice.invoice_date, InvoicePayment.amount, INVOICE_CUSTOMER_ID, Invoice.project_id,
+               InvoicePayment.payment_date, Invoice.id, InvoicePayment.receipt_id,
+               Timesheet.year, Timesheet.month, InvoicePayment.created_at)
         .join(Invoice, Invoice.id == InvoicePayment.invoice_id)
         .join(Project, Project.id == Invoice.project_id)
-        .where(counted_on >= start, counted_on <= end,
+        .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
+        .outerjoin(Timesheet, Timesheet.id == Invoice.timesheet_id)
+        .where(work_window_clause(start, end),
                *_invoice_filters(customer_id, project_id))
     ).all()
-    out = [{"date": r[0], "amount": _num(r[1]), "customer_id": r[2], "project_id": r[3],
-            "paid_on": r[4], "invoice_id": r[5], "receipt_id": r[6], "on_account": False}
-           for r in rows]
-    # A project names no money on account; a BRANCH does (the received amount
-    # carries the branch that paid), so a branch scope keeps it.
-    if project_id and branch_id is None:
-        return out
-    q = (select(CustomerReceipt.received_date, CustomerReceipt.unallocated_amount,
-                CustomerReceipt.customer_id, CustomerReceipt.id)
-         .where(CustomerReceipt.unallocated_amount > 0,
-                CustomerReceipt.received_date >= start, CustomerReceipt.received_date <= end))
-    if customer_id:
-        q = q.where(CustomerReceipt.customer_id == customer_id)
-    if branch_id is not None:
-        q = q.where(CustomerReceipt.branch_id.is_(None) if branch_id == 0
-                    else CustomerReceipt.branch_id == branch_id)
-    for r in db.execute(q).all():
-        out.append({"date": r[0], "amount": _num(r[1]), "customer_id": r[2], "project_id": None,
-                    "paid_on": r[0], "invoice_id": None, "receipt_id": r[3], "on_account": True})
-    return out
+    return [{"date": work_date(r[7], r[8], r[0] or r[4]), "amount": _num(r[1]),
+             "customer_id": r[2], "project_id": r[3], "paid_on": r[4], "invoice_id": r[5],
+             "receipt_id": r[6], "on_account": False,
+             # When the payment was recorded / mapped — the dashboard's "mapping
+             # changed after the month closed" note reads it (5 Nov 2026).
+             "mapped_at": r[9]}
+            for r in rows]
 
 
 def _open_invoices(db: Session, up_to: date,
@@ -537,7 +562,8 @@ def _open_invoices(db: Session, up_to: date,
         select(Invoice.invoice_number, Invoice.invoice_date, Invoice.due_date, Invoice.balance_amount,
                Customer.name)
         .join(Project, Project.id == Invoice.project_id)
-        .join(Customer, Customer.id == Project.customer_id)
+        .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
+        .join(Customer, Customer.id == INVOICE_CUSTOMER_ID)
         .where(Invoice.payment_status != PaymentStatus.PAID, Invoice.invoice_date <= up_to,
                Invoice.balance_amount > 0, *_invoice_filters(customer_id, project_id))
     ).all()
@@ -933,7 +959,8 @@ def _deployed_rows(db: Session, customer_id: int | None = None,
                 ProjectEmployee.exit_date, ProjectEmployee.is_exit, ProjectEmployee.is_active,
                 Employee.current_ctc, Employee.first_name, Employee.last_name,
                 Project.customer_id, Customer.name,
-                Project.id, Project.name, ProjectEmployee.employee_id, Employee.employee_code)
+                Project.id, Project.name, ProjectEmployee.employee_id, Employee.employee_code,
+                ProjectEmployee.release_date)
          .join(Employee, Employee.id == ProjectEmployee.employee_id)
          .join(Project, Project.id == ProjectEmployee.project_id)
          .join(Customer, Customer.id == Project.customer_id)
@@ -952,7 +979,17 @@ def _deployed_rows(db: Session, customer_id: int | None = None,
         "customer_id": r[11], "customer": r[12],
         "project_id": r[13], "project": r[14],
         "employee_id": r[15], "employee_code": r[16],
+        # Planned release the customer gave (0152) — the FORECAST stops there;
+        # actuals (cost, margin) keep reading `exit`.
+        "release": r[17],
     } for r in rows]
+
+
+def plan_end(d: dict):
+    """The day billing is expected to stop: the earlier of exit and the planned
+    release. PURE."""
+    dates = [x for x in (d.get("exit"), d.get("release")) if x]
+    return min(dates) if dates else None
 
 
 def _margin(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
@@ -1315,13 +1352,15 @@ def _forecast(period: Period, deployed: list[dict], po_balance: float) -> dict:
         heads = 0
         roll_offs = []
         for d in deployed:
-            frac = _overlap_fraction(d["start"], d["exit"], m)
+            end = plan_end(d)
+            frac = _overlap_fraction(d["start"], end, m)
             if frac <= 0:
                 continue
             heads += 1
             amount += _monthly_rate(d["rate"], d["unit"]) * frac
-            if d["exit"] and m.start <= d["exit"] <= m.end:
-                roll_offs.append({"name": d["name"], "customer": d["customer"], "exit": d["exit"].isoformat()})
+            if end and m.start <= end <= m.end:
+                roll_offs.append({"name": d["name"], "customer": d["customer"], "exit": end.isoformat(),
+                                  "planned": end != d["exit"]})
         cumulative += amount
         months.append({"month": m.key, "label": m.start.strftime("%b %y"), "amount": round(amount, 2),
                        "heads": heads, "roll_offs": roll_offs[:TOP_OVERDUE],
@@ -1333,7 +1372,7 @@ def _forecast(period: Period, deployed: list[dict], po_balance: float) -> dict:
         "po_shortfall": round(max(0.0, cumulative - po_balance), 2),
         "assumptions": f"Active project employees × monthly rate (Daily × {FORECAST_DAYS_PER_MONTH}, "
                        f"Hourly × {FORECAST_DAYS_PER_MONTH}×{FORECAST_HOURS_PER_DAY}, Yearly ÷ 12), "
-                       "prorated for onboarding and exit dates; new hires not included.",
+                       "prorated for onboarding, exit and planned release dates; new hires not included.",
     }
 
 
@@ -1342,7 +1381,7 @@ def _collections(db: Session, period: Period, invoices: list[dict], open_rows: l
     as_of = today if period.contains(today) else period.end
     window_start = as_of - timedelta(days=DSO_WINDOW_DAYS)
     billed_window = sum(i["sub_total"] + i["tax"] for i in invoices
-                        if window_start < i["invoice_date"] <= as_of)
+                        if window_start < (i.get("issued_on") or i["invoice_date"]) <= as_of)
     outstanding = _sum(open_rows, "balance")
     dso = round(outstanding / billed_window * DSO_WINDOW_DAYS, 1) if billed_window > 0 else None
     q = (select(InvoicePayment.amount, InvoicePayment.payment_date, Invoice.invoice_date)

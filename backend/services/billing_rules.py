@@ -115,6 +115,21 @@ INVOICE_STAGES = (
 INVOICE_STAGE_KEYS = tuple(k for k, _ in INVOICE_STAGES)
 
 
+def before_gst_split(sub_total: float, grand_total: float, received: float, balance: float) -> dict:
+    """PURE (4 Nov 2026). Money against an invoice is paid on its value WITH GST
+    (cash + TDS); billed is the value BEFORE GST. Put side by side, ₹89 L received
+    read above ₹81 L billed (user report). This gives the before-GST share of what
+    came in and what is still due, so `received_ex + balance_ex == sub_total` and
+    received can never read above billed. An over-payment is capped at the invoice."""
+    sub, grand = max(0.0, float(sub_total or 0)), max(0.0, float(grand_total or 0))
+    share = (sub / grand) if grand > 0 else 1.0
+    got = min(max(0.0, float(received or 0)), grand or float(received or 0)) * share
+    got = min(got, sub)
+    due = min(max(0.0, float(balance or 0)), grand or float(balance or 0)) * share
+    due = max(0.0, min(due, sub - got))
+    return {"received_ex": round(got, 2), "balance_ex": round(due, 2)}
+
+
 def invoice_stage(*, kind, payment_status, paid_amount, tds_deducted,
                   customer_approved: bool, irn: bool) -> str:
     """PURE twin of `invoice_stage_case()`.

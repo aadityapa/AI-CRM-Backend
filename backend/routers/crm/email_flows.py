@@ -63,6 +63,16 @@ EVENTS: list[dict] = [
      "description": "Sent when someone sets a project's last working day: who rolls off, on which "
                     "day, and the reason — so RMG can line up the next assignment before the bench.",
      "default_roles": ["RMG", "HR", "Sales_Head", "Admin"]},
+    {"event": "project_employee.release_reminder",
+     "label": "Planned release coming up",
+     "description": "Sent 30, 15, 5, 2 and 1 days before the release date the customer gave for an "
+                    "employee on a project — time to get an extension, a new project, or plan the exit.",
+     "default_roles": ["Sales_Head", "Sales Manager", "RMG"]},
+    {"event": "project_employee.release_changed",
+     "label": "Release / extension recorded",
+     "description": "Sent when someone records, extends or withdraws an employee's planned release "
+                    "date on a project.",
+     "default_roles": ["Sales_Head", "Sales Manager", "RMG"]},
     {"event": "project.closed",
      "label": "Project closed — team on the bench",
      "description": "Sent the day a project's team is moved to the bench (after its last working "
@@ -900,6 +910,7 @@ def scheduler_status(db: Session = Depends(get_crm_db),
               "pe_leave_credit": "Monthly leave credit",
               "project_closures": "Close projects after their last working day",
               "employee_separations": "Mark employees Inactive after their last working day",
+              "release_reminders": "Planned release reminders (30 / 15 / 5 / 2 / 1 days)",
               "prompt_log_retention": "AI call log retention (keeps cost figures)"}
     runs = last_runs()
 

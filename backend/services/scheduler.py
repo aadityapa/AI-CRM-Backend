@@ -66,6 +66,7 @@ DEFAULTS = {
     "scheduler.project_closures": "true",
     #: Employees whose last working day has passed become Inactive (16 Oct 2026).
     "scheduler.employee_separations": "true",
+    "scheduler.release_reminders": "true",
     #: Drop the heavy prompt/response text from AI call logs past the retention
     #: window and purge the expired response cache. Tokens, audio minutes, cost
     #: and interview attribution are KEPT — the cost report needs them for
@@ -616,6 +617,13 @@ def run_employee_separations_job(db, today: date | None = None) -> dict:
     return run_employee_separations(db, today)
 
 
+def run_release_reminders_job(db, today: date | None = None) -> dict:
+    """Planned releases 30 / 15 / 5 / 2 / 1 days away → remind Sales Manager /
+    Sales Head / RMG (services/pe_release, 4 Nov 2026)."""
+    from services.pe_release import run_release_reminders
+    return run_release_reminders(db, today)
+
+
 def run_feedback_due_job(db=None) -> dict:
     """Interviews that are over with no verdict → remind their owner
     (`services/interview_followups`). Runs on EVERY pass — a reminder a day
@@ -690,6 +698,7 @@ JOBS = {
     "pe_leave_credit": ("scheduler.pe_leave_credit", run_pe_leave_credit_job),
     "project_closures": ("scheduler.project_closures", run_project_closures_job),
     "employee_separations": ("scheduler.employee_separations", run_employee_separations_job),
+    "release_reminders": ("scheduler.release_reminders", run_release_reminders_job),
     "prompt_log_retention": ("scheduler.prompt_log_retention", run_prompt_log_retention),
     "interview_feedback_due": ("scheduler.interview_feedback_due", run_feedback_due_job),
     "ai_interview_reminders": ("scheduler.ai_interview_reminders", run_ai_interview_reminders_job),

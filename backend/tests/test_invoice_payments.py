@@ -142,7 +142,14 @@ def test_collected_counts_in_the_invoice_month_and_on_account_in_the_received_mo
     for x in rows:
         k = x["date"].strftime("%Y-%m")
         by_month[k] = by_month.get(k, 0) + float(x["amount"])
-    assert by_month == {"2026-06": 100_000, "2026-07": 80_000, "2026-09": 20_000}, \
-        "Sept cash moves to Jun / Jul once mapped; the 20k still on account stays in Sept"
-    sept = _payments_in_window(db, date(2026, 9, 1), date(2026, 9, 30))
-    assert [x["on_account"] for x in sept] == [True]
+    # 5 Nov 2026 (user rule): the 20k still on account is NOT collected anywhere —
+    # it waits in Received Amount (the Dashboard shows it on its own) until mapped.
+    assert by_month == {"2026-06": 100_000, "2026-07": 80_000}, \
+        "Sept cash moves to Jun / Jul once mapped; money still on account is not collected"
+    assert _payments_in_window(db, date(2026, 9, 1), date(2026, 9, 30)) == []
+    # By the day the cash arrived (the "Cash received month" switch) all 200k is September's.
+    from services import cash_month
+    sep = [type("M", (), {"key": "2026-09", "start": date(2026, 9, 1), "end": date(2026, 9, 30)})()]
+    paid = cash_month.cash_payments(db, date(2026, 9, 1), date(2026, 9, 30), [])
+    held = cash_month.cash_on_account(db, date(2026, 9, 1), date(2026, 9, 30))
+    assert cash_month.cash_by_month(sep, paid, held)["2026-09"]["cash_in"] == 200_000

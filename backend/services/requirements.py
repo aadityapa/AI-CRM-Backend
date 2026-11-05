@@ -568,6 +568,9 @@ def positions_by_opportunity(db: Session, opportunity_ids) -> dict[int, dict]:
                Opportunity.pipeline_stage)
         .join(Opportunity, Opportunity.id == Requirement.opportunity_id)
         .where(Requirement.opportunity_id.in_(ids))
+        # Oldest first so the LATEST requirement's id / status win below — the
+        # one careers, the Apply link and Applied Candidates use (5 Nov 2026).
+        .order_by(Requirement.id)
     ).all()
     if not reqs:
         return {}

@@ -31,7 +31,8 @@ from models.profiles import (  # noqa: F401
 )
 from models.projects import (  # noqa: F401
     BillingFrequency, BillingUnit, CommEntryType, Project, ProjectCommunicationMatrix,
-    ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate, ProjectLeavePolicy,
+    ProjectEmployee, ProjectEmployeeLeaveDetail, ProjectEmployeeRate, ProjectEmployeeReleaseEvent,
+    ProjectLeavePolicy,
     ProjectStatus,
 )
 from models.timesheets import (  # noqa: F401
@@ -39,7 +40,7 @@ from models.timesheets import (  # noqa: F401
     TimesheetAttachment, TimesheetEntry, TimesheetStatus,
 )
 from models.finance import (  # noqa: F401
-    CompanyBankAccount, CreditNote, CreditNoteLine, CustomerReceipt, Invoice, InvoiceLine, InvoicePayment, InvoiceRevision,
+    CompanyBankAccount, CreditNote, CreditNoteLine, CustomerReceipt, Expense, Invoice, InvoiceLine, InvoicePayment, InvoiceRevision,
     InvoiceRevisionStatus, PaymentStatus, POActivityLog,
     POProjectAllocation, POStatus, POType, PurchaseOrder, TdsPayment, TdsRecord, TdsStatus,
 )
