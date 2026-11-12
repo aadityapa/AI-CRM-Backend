@@ -42,6 +42,7 @@ from models import (
     RequirementStatus, RequirementTaAssignment, Resume, Skill,
 )
 from services.crm_common import log_activity
+from services.ctc import ctc_display, parse_ctc_to_rupees
 
 logger = logging.getLogger("karnex.crm.careers")
 
@@ -497,6 +498,28 @@ def fill_candidate_from_application(cand, details: dict | None) -> list[str]:
     return written
 
 
+def ctc_problem(raw: str | None, label: str) -> str | None:
+    """PURE. A typed CTC we cannot read, in the candidate's words (6 Nov 2026).
+    "10 L", "10.2L", "24.5", "10,00,000", "₹10 lakh", "1.2 Cr" all read; a blank is fine."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if parse_ctc_to_rupees(text) is None:
+        return (f"Please write your {label} in lakhs — for example 10 L, 10.5 L "
+                "or 10,00,000.")
+    return None
+
+
+def normalise_ctc_details(details: dict | None) -> dict:
+    """PURE. The application keeps its CTC in ONE form — "10.5 LPA" — whatever was
+    typed, so every screen prints it the same way. Unreadable text stays as typed."""
+    out = dict(details or {})
+    for key in ("current_ctc", "expected_ctc"):
+        if out.get(key):
+            out[key] = ctc_display(out[key]) or out[key]
+    return out
+
+
 VIA_TAG = {"careers": "[careers]", "apply_link": "[apply_link]"}
 
 
@@ -612,6 +635,7 @@ def record_application(db: Session, req: Requirement, *, name: str, email: str, 
 
     if channel:
         details = {**details, "source_channel": channel}
+    details = normalise_ctc_details(details)
     resume = Resume(
         requirement_id=req.id,
         candidate_name=name,

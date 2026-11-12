@@ -47,23 +47,15 @@ def _years_from_str(v) -> float | None:
 
 
 def _ctc_from_str(v) -> float | None:
-    """Parse a self-reported CTC ('12 LPA', '18,00,000', '1.5 Cr') to rupees."""
+    """Parse a self-reported CTC ('12 LPA', '18,00,000', '1.5 Cr', '10.2L') to rupees.
+
+    6 Nov 2026: ONE rule — `services.ctc.parse_ctc_to_rupees`. This copy had no
+    ceiling, so "700000 LPA" (rupees typed in the careers form's lakh box) was
+    stored as ₹70,000 crore and the row read "Over budget · ₹1000000.0 L"."""
     if not v:
         return None
-    s = str(v).lower().replace(",", "")
-    m = re.search(r"(\d+(?:\.\d+)?)", s)
-    if not m:
-        return None
-    try:
-        num = float(m.group(1))
-    except (TypeError, ValueError):
-        return None
-    if "cr" in s or "crore" in s:
-        return num * 10_000_000
-    if "lpa" in s or "lakh" in s or "lac" in s:
-        return num * 100_000
-    # Bare number: small values are almost certainly in lakhs; large ones rupees.
-    return num * 100_000 if num < 1000 else num
+    from services.ctc import parse_ctc_to_rupees
+    return parse_ctc_to_rupees(v)
 
 
 def _skills_from_str(v) -> list[str]:
@@ -229,9 +221,12 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
     """Match an existing Candidate by email (or full name when no email),
     else create one. candidates.email is NOT NULL + unique, so a placeholder
     is synthesized when the resume has no email. Flushes; caller commits."""
+    from services.candidate_names import settle_upload_name, tidy_name
+
     candidate = None
+    created = False
     email = (resume.email or "").strip().lower()
-    first, last = split_candidate_name(resume.candidate_name)
+    first, last = split_candidate_name(tidy_name(resume.candidate_name) or resume.candidate_name)
     if email:
         candidate = db.execute(
             select(Candidate).where(func.lower(Candidate.email) == email)
@@ -251,6 +246,7 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
         )
         db.add(candidate)
         db.flush()
+        created = True
     else:
         # Backfill core identifiers on an already-known candidate.
         if not candidate.phone and resume.phone:
@@ -271,6 +267,12 @@ def find_or_create_candidate_from_resume(db: Session, resume: Resume) -> Candida
             apply_cv_profile_to_candidate(db, candidate, profile_from_resume_application(resume))
     except Exception:
         logger.warning("apply_form_autofill_failed for resume %s", getattr(resume, "id", "?"), exc_info=True)
+    # 12 Nov 2026: ONE name — the master's. A known candidate keeps the name TA
+    # may already have fixed; the resume row shows it (services/candidate_names).
+    try:
+        settle_upload_name(db, candidate, resume, created=created)
+    except Exception:  # noqa: BLE001 — never fail an upload over a name
+        logger.warning("settle_upload_name_failed for resume %s", getattr(resume, "id", "?"), exc_info=True)
     return candidate
 
 

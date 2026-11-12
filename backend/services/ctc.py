@@ -31,6 +31,49 @@ _BARE_NUMBER_IS_LAKHS_BELOW = 1_000.0
 
 _NUM_RE = re.compile(r"(\d+(?:[.,]\d+)*)")
 
+#: A figure written with a lakh unit at or above this is rupees typed in a lakh box.
+_RUPEES_IN_A_LAKH_BOX_FROM = 10_000.0
+
+
+def lakhs_text(rupees) -> str | None:
+    """PURE. ₹10,25,000 → "10.25 LPA" — how every screen prints a CTC."""
+    try:
+        num = float(rupees)
+    except (TypeError, ValueError):
+        return None
+    if num <= 0:
+        return None
+    lakhs = round(num / 100_000, 2)
+    text = f"{lakhs:.2f}".rstrip("0").rstrip(".")
+    return f"{text} LPA"
+
+
+def ctc_display(raw) -> str | None:
+    """PURE. Whatever was typed ("700000 LPA", "10.2L", "₹10,00,000", "24.5") →
+    "7 LPA" / "10.2 LPA" / "10 LPA" / "24.5 LPA". Unreadable text is kept as
+    typed (a person may have written "negotiable"); blank → None."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    rupees = parse_ctc_to_rupees(text)
+    return lakhs_text(rupees) if rupees is not None else text
+
+
+def repair_stored_rupees(value) -> float | None:
+    """PURE. A STORED rupee figure above the ceiling is a lakh-box slip ×1e5:
+    ₹70,00,00,00,000 → ₹7,00,000. Returns the repaired figure, or None when it
+    does not need (or cannot take) a repair."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num <= MAX_CTC_RUPEES:
+        return None
+    fixed = num / 100_000
+    if _RUPEES_IN_A_LAKH_BOX_FROM <= fixed <= MAX_CTC_RUPEES:
+        return round(fixed, 2)
+    return None
+
 
 def parse_ctc_to_rupees(value) -> float | None:
     """Free-text CTC → rupees. None when it cannot be read confidently."""
@@ -63,7 +106,16 @@ def parse_ctc_to_rupees(value) -> float | None:
     if re.search(r"\bcr\b|crore", text):
         num *= 10_000_000
     elif re.search(r"lpa|lakh|lacs?\b|\bl\b|\dl\b", text):
-        num *= 100_000
+        # 6 Nov 2026 (user report): the careers form added " LPA" to whatever the
+        # candidate typed, and people type rupees — "700000 LPA" read as ₹70,000
+        # crore. A lakh figure of 10,000+ is a rupee figure typed in a lakh box;
+        # 1,000–9,999 "LPA" (₹10–100 crore) cannot be read either way.
+        if num >= _RUPEES_IN_A_LAKH_BOX_FROM:
+            pass
+        elif num >= _BARE_NUMBER_IS_LAKHS_BELOW:
+            return None
+        else:
+            num *= 100_000
     elif re.search(r"\bk\b|thousand|\dk\b", text):
         num *= 1_000
     elif num < _BARE_NUMBER_IS_LAKHS_BELOW:

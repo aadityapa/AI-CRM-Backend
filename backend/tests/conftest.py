@@ -14,4 +14,8 @@ import pytest
 @pytest.fixture(autouse=True)
 def _billing_data_window_open(monkeypatch):
     monkeypatch.setenv("BILLING_DATA_START_MONTH", "2000-01")
+    # 8 Nov 2026: people cost is hidden by default (`finance.track_people_cost`);
+    # the margin / cost tests were written with it shown. Tests of the switch set
+    # it themselves.
+    monkeypatch.setenv("FINANCE_TRACK_PEOPLE_COST", "true")
     yield

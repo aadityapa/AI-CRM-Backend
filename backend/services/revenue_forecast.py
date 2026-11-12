@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import date
 
 from services.revenue_report import (
-    Month, Period, _monthly_rate, _overlap_fraction, plan_end,
+    Month, Period, _monthly_rate, _overlap_fraction, monthly_value_in, plan_end,
 )
 
 #: How many buckets ahead each zoom shows (the current bucket included).
@@ -28,16 +28,15 @@ def month_prediction(deployed: list[dict], m: Month) -> dict:
     without_release = 0.0
     people, customers, projects, releasing = set(), set(), set(), []
     for d in deployed:
-        rate = _monthly_rate(d["rate"], d["unit"])
+        # 6 Nov 2026: the rate in force in THAT month (rate history), not today's.
         frac = _overlap_fraction(d["start"], plan_end(d), m)
-        base = _overlap_fraction(d["start"], d.get("exit"), m)
-        without_release += rate * base
+        without_release += monthly_value_in(d, d["start"], d.get("exit"), m)
         rel = d.get("release")
         if rel and m.start <= rel <= m.end and (not d.get("exit") or rel < d["exit"]):
             releasing.append(d)
         if frac <= 0:
             continue
-        amount += rate * frac
+        amount += monthly_value_in(d, d["start"], plan_end(d), m)
         people.add(d.get("pe_id"))
         if d.get("customer_id"):
             customers.add(d["customer_id"])

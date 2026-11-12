@@ -162,7 +162,9 @@ def test_pipeline_efficiency_and_leakage(ledger):
     assert p["approved_uninvoiced"] == {"count": 1, "amount": 150000}
     assert p["active_po_balance"] == 1800000
     # Trailing 3 months billed: Jul 0, Aug 500k, Sep 800k → avg 433,333.33
-    assert p["avg_monthly_billed"] == 433333.33 and p["po_cover_months"] == 4.2
+    assert p["avg_monthly_billed"] == 433333.33
+    # 8 Nov 2026: cover = PO balance ÷ what the team deployed today bills a month.
+    assert p["cover_basis"] == "team" and p["po_cover_months"] == round(1800000 / p["monthly_burn"], 1)
     assert r["efficiency"] == {"deployed_heads": 2, "revenue_per_head": 400000,
                                # v3: a quarter/FY view needs the per-month figure
                                # for the month view's number to stay comparable.
@@ -230,8 +232,12 @@ def test_margin_uses_annual_ctc_over_twelve_and_reports_missing_ctc(ledger):
     emp.current_ctc = 1200000   # ₹12 L p.a. → ₹1 L / month per assignment
     ledger.commit()
     m = revenue_report(ledger, "2026-09", today=TODAY)["margin"]
-    assert m["cost"] == 200000 and m["gross_margin"] == 600000 and m["gross_margin_pct"] == 75.0
-    by = {r["customer"]: r for r in m["by_customer"]}
+    # September is still running on TODAY (18 Sep): cost stops today (8 Nov 2026) —
+    # 18 of 30 days of 2 × ₹1 L = ₹1.2 L.
+    assert m["cost"] == 120000 and m["gross_margin"] == 680000 and m["gross_margin_pct"] == 85.0
+    closed = revenue_report(ledger, "2026-09", today=date(2026, 10, 5))["margin"]
+    assert closed["cost"] == 200000, "a closed month carries its whole cost"
+    by = {r["customer"]: r for r in closed["by_customer"]}
     assert by["HARMAN"]["margin"] == 500000 and by["VISTEON"]["margin"] == 100000
     assert m["loss_making"] == []
 
@@ -443,12 +449,13 @@ def test_a_timesheet_driven_invoice_is_attributed_to_its_employee(ledger):
     row = be["rows"][0]
     assert row["employee"] == "Dev" and row["billed"] == 300000 and row["invoices"] == 1
     # Two active assignments × ₹1 L a month = ₹2 L of cost against ₹3 L billed.
-    assert row["cost"] == 200000 and row["margin"] == 100000
+    # Cost up to TODAY (18 of 30 days of 2 × ₹1 L) — 8 Nov 2026.
+    assert row["cost"] == 120000 and row["margin"] == 180000
     assert be["linked_billed"] == 300000 and be["unlinked_billed"] == 800000
     assert be["coverage_pct"] == round(300000 / 1100000 * 100, 1)
     assert be["billing_heads"] == 1 and be["idle_count"] == 0
-    # A quarter costs three months of CTC, not one.
-    q = revenue_report(ledger, "2026-09", today=TODAY, period_raw="quarter")["by_employee"]
+    # A quarter costs three months of CTC, not one (a closed quarter — cost stops today).
+    q = revenue_report(ledger, "2026-09", today=date(2026, 10, 5), period_raw="quarter")["by_employee"]
     assert q["rows"][0]["cost"] == 600000
     assert q["rows"][0]["billed_per_month"] == 100000
 

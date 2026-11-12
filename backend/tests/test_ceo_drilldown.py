@@ -52,45 +52,48 @@ def test_billed_adds_up_to_the_tile_and_says_where_each_invoice_stands(book):
     assert by["INV-3"]["days_late"] > 0 and by["INV-3"]["link"].startswith("invoices/")
     segs = {s["key"]: s["count"] for s in page["segments"]}
     assert segs["paid"] == 1 and segs["partially_paid"] == 1
-    # The monthly chart is grouped columns like "Who we billed" (28 Oct 2026): it adds up
-    # to the table and carries no stacks. 4 Nov 2026: the months still to come in the
-    # period carry the PREDICTED billing (deployed team up to the planned release).
+    # 7 Nov 2026 (CEO ask): the first chart IS the dashboard's "How the year unfolded" —
+    # the ten money words (kind "money") — so the ticks chosen there open here unchanged.
     monthly = page["charts"][0]
-    assert [s["key"] for s in monthly["series"]] == ["sub_total", "received_ex", "balance_ex", "overdue_ex",
-                                                     "predicted"]
+    assert monthly["key"] == "money_monthly" and monthly["kind"] == "money"
+    assert [s["key"] for s in monthly["series"]] == [
+        "revenue_ex", "revenue_inc", "receivable_bank", "receivable_tds", "received_bank",
+        "received_tds", "due_bank", "due_tds", "total_due", "predicted"]
     assert not any(s.get("stack") for s in monthly["series"])
-    assert round(sum(m["sub_total"] for m in monthly["rows"]), 2) == tile
-    # 5 Nov 2026: every table row names its month, so a month bar can narrow the table
-    # to exactly the invoices it counted.
+    assert round(sum(m["revenue_ex"] for m in monthly["rows"]), 2) == tile
+    # Every table row names its month, so a month bar narrows the table to exactly its invoices.
     for m in monthly["rows"]:
         in_month = [r for r in rows if r.get("month_key") == m["key"]]
-        assert round(sum(r["sub_total"] for r in in_month), 2) == round(m["sub_total"], 2)
-    assert round(sum(m["balance_ex"] for m in monthly["rows"]), 2) == \
-        round(sum(r["balance_ex"] for r in rows), 2)
-    # 4 Nov 2026 (later): Predicted on EVERY month of the period, past months included.
-    assert all("predicted" in m for m in monthly["rows"])
-    # Received never reads above billed: before-GST share, received + due = billed per invoice.
+        assert round(sum(r["revenue_ex"] for r in in_month), 2) == round(m["revenue_ex"], 2)
+        assert round(sum(r["total_due"] for r in in_month), 2) == round(m["total_due"], 2)
+        assert m["invoices"] == len(in_month)
+    # Predicted on EVERY month, with its project / people count for the tooltip.
+    assert all("predicted" in m and "predicted_projects" in m for m in monthly["rows"])
+    # The page matches the dashboard's own split (services/money_split) to the rupee.
+    dash = ed.executive_dashboard(book, "finance", "2026-09", "fy", today=TODAY)["data"]["money"]
+    for k in ("revenue_ex", "revenue_inc", "receivable_bank", "receivable_tds", "received_bank",
+              "received_tds", "due_bank", "due_tds", "total_due"):
+        assert page["money"][k] == pytest.approx(dash[k], abs=0.05), k
+    # Per invoice: receivable = bank + TDS; due = receivable − received, never negative.
     for r in rows:
-        assert r["received_ex"] <= r["sub_total"] + 0.01
-        assert r["received_ex"] + r["balance_ex"] <= r["sub_total"] + 0.02
-    for m in monthly["rows"]:
-        assert m["received_ex"] <= m["sub_total"] + 0.01
-    # Bank + TDS: cash after TDS, TDS deducted / pending, all on the invoice value with GST.
-    assert {c["key"] for c in page["tables"][0]["columns"]} >= {"bank", "tds", "tds_pending", "received_ex"}
-    assert any(c["key"] == "money" for c in page["charts"])
-    # Every tile says which rows it stands for (28 Oct 2026) — and those rows add up to it.
+        assert r["receivable_bank"] + r["receivable_tds"] == pytest.approx(r["revenue_inc"], abs=0.02)
+        assert r["total_due"] == pytest.approx(r["due_bank"] + r["due_tds"], abs=0.02)
+        assert min(r["due_bank"], r["due_tds"]) >= 0
+    assert by["INV-2"]["total_due"] == 0                                   # paid in full
+    cols = {c["key"]: c for c in page["tables"][0]["columns"]}
+    assert {"revenue_ex", "revenue_inc", "received_bank", "received_tds", "total_due"} <= set(cols)
+    assert cols["receivable_bank"].get("hidden") and not cols["total_due"].get("hidden")
+    # Every tile says which rows it stands for — and those rows add up to it.
     kpis = {k["key"]: k for k in page["kpis"]}
     assert all(k.get("go") for k in kpis.values())
-    assert {"bank", "tds", "tds_pending"} <= set(kpis)
-    for key, field in (("received", "received_ex"), ("due", "balance_ex"), ("overdue", "overdue_ex"),
-                       ("gst", "tax"), ("bank", "bank"), ("tds", "tds"), ("tds_pending", "tds_pending")):
+    for key in ("receivable_bank", "receivable_tds", "received_bank", "received_tds",
+                "due_bank", "due_tds", "total_due"):
         go = kpis[key]["go"]
-        assert go["where"] == field
-        shown = [r for r in rows if float(r.get(field) or 0) != 0]
-        assert round(sum(float(r[field]) for r in shown), 2) == kpis[key]["value"], key
+        assert go["where"] == key
+        assert round(sum(float(r[key]) for r in rows if float(r.get(key) or 0) != 0), 2) == kpis[key]["value"], key
+    assert kpis["revenue_ex"]["value"] == tile
     assert kpis["paid"]["go"]["segments"] == ["paid"]
     assert len([r for r in rows if r["segment"] == "paid"]) == kpis["paid"]["value"]
-    assert any(c["key"] == "tax" for c in page["tables"][0]["columns"])
 
 
 def test_before_gst_split_never_reads_above_billed():

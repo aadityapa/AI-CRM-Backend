@@ -79,3 +79,30 @@ def test_guard_boundary_is_inclusive():
 
 def test_guard_ignores_none():
     assert ctc_looks_wrong(None) is None
+
+
+# --- 6 Nov 2026: rupees typed in a lakh box -------------------------------
+
+@pytest.mark.parametrize("text,lakhs", [
+    ("700000 LPA", 7), ("1000000 LPA", 10), ("10 L", 10), ("10.2L", 10.2), ("24.5L", 24.5),
+    ("24.5", 24.5), ("₹10,00,000", 10), ("10 lakh", 10), ("1.2 Cr", 120),
+])
+def test_what_a_candidate_types_reads_in_lakhs(text, lakhs):
+    """The careers form added " LPA" to what was typed; people type rupees."""
+    assert parse_ctc_to_rupees(text) == pytest.approx(lakhs * LAKH)
+
+
+def test_a_lakh_figure_between_1000_and_9999_cannot_be_read():
+    assert parse_ctc_to_rupees("2500 LPA") is None
+
+
+def test_display_and_repair_helpers():
+    from services.ctc import ctc_display, lakhs_text, repair_stored_rupees
+    assert ctc_display("700000 LPA") == "7 LPA"
+    assert ctc_display("10.25L") == "10.25 LPA"
+    assert ctc_display("negotiable") == "negotiable"
+    assert ctc_display("") is None
+    assert lakhs_text(2_540_000) == "25.4 LPA"
+    assert repair_stored_rupees(1e11) == 1_000_000      # "1000000 LPA" stored ×1e5
+    assert repair_stored_rupees(1_000_000) is None      # already sane
+    assert repair_stored_rupees(1e15) is None           # cannot be read either way

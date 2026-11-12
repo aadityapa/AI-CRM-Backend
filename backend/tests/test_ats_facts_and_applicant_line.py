@@ -62,13 +62,13 @@ def test_every_row_gets_the_same_candidate_line():
     # A Candidates-tab application: nothing typed on the application itself.
     row = {"application_details": None, "applicant_experience": None}
     _with_applicant_facts(row, avail)
-    assert row["application_details"] == {"current_ctc": "11", "expected_ctc": "12", "current_location": "Noida",
+    assert row["application_details"] == {"current_ctc": "11 LPA", "expected_ctc": "12 LPA", "current_location": "Noida",
                                           "preferred_location": "Chennai", "notice_period": "30 days"}
     assert row["applicant_experience"] == "4"
     # An upload: what TA typed for THIS application wins.
     row = {"application_details": {"current_ctc": "9.46", "notice_period": "Immediate"}, "applicant_experience": "3.2"}
     _with_applicant_facts(row, avail)
-    assert row["application_details"]["current_ctc"] == "9.46"
+    assert row["application_details"]["current_ctc"] == "9.46 LPA"  # printed in lakhs (6 Nov 2026)
     assert row["application_details"]["notice_period"] == "Immediate"
     assert row["applicant_experience"] == "3.2"
 

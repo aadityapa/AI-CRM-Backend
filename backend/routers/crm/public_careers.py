@@ -11,6 +11,7 @@ STAFF:
 
     GET  /api/careers/overview                        the link, the post, every live position
     PUT  /api/careers/positions/{requirement_id}      {listed} — RMG / GM / Sales Head switch
+    GET  /api/careers/applications                    every public-form applicant (TA · RMG · GM)
 
 What is listed, what the JD is and how an application lands: services/careers.py.
 The customer is never named on the public side.
@@ -21,7 +22,7 @@ import re
 from datetime import date
 from types import SimpleNamespace
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -39,6 +40,8 @@ _PHONE_RE = re.compile(r"^[+()\-\s\d]{7,20}$")
 
 CAREERS_READ = screener_or(gated_read("requirements", "TA", "RMG", "Sales", "Sales_Head"))
 CAREERS_WRITE = screener_or(gated_write("requirements", "RMG", "Sales_Head"))
+#: The Careers Applications tab (6 Nov 2026, user rule: TA, RMG and GM; Admin / CEO implicit).
+APPLICATIONS_READ = screener_or(gated_read("requirements", "TA", "RMG"))
 
 
 # ------------------------------------------------------------------ public
@@ -118,6 +121,10 @@ def public_apply(
     lwd, lwd_err = careers.lwd_problem(notice_period, last_working_day, date.today())
     if lwd_err:
         raise HTTPException(status_code=400, detail=lwd_err)
+    for raw, label in ((current_ctc, "current CTC"), (expected_ctc, "expected CTC")):
+        ctc_err = careers.ctc_problem(raw, label)
+        if ctc_err:
+            raise HTTPException(status_code=400, detail=ctc_err)
     url, sha, size = _save_resume(file)
     channel = careers.channel_label(src)
     details = _details(notice_period=notice_period, current_location=current_location,
@@ -249,3 +256,38 @@ def set_position_listing(requirement_id: int, body: ListingIn, db: Session = Dep
     word = "is on" if body.listed else "is off"
     return envelope(data={"id": req.id, "listed": body.listed, "changed": changed},
                     message=f"{req.title} {word} the careers page")
+
+
+@router.get("/api/careers/applications")
+def careers_applications(
+    search: str | None = Query(None, max_length=200),
+    requirement_id: int | None = None,
+    customer_id: int | None = None,
+    channel: str | None = Query(None, max_length=30),
+    via: str | None = Query(None, max_length=20),
+    phase: str | None = Query(None, max_length=30),
+    date_from: date | None = None,
+    date_to: date | None = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(APPLICATIONS_READ),
+):
+    """Every candidate who applied through the careers page, a position's application
+    link or the general "send your resume" form — newest first, with where they came
+    from and which position (services/careers_applications.py)."""
+    from services import careers_applications as apps
+    from services.candidate_status import STAGES
+    from services.search_terms import clean_search
+    if via and via not in {k for k, _ in apps.VIA}:
+        raise HTTPException(status_code=400, detail="Unknown application route")
+    if phase and phase not in {k for k, _ in STAGES} | {"none"}:
+        raise HTTPException(status_code=400, detail="Unknown stage")
+    if date_from and date_to and date_to < date_from:
+        raise HTTPException(status_code=400, detail="'To' is before 'From'")
+    f = apps.AppFilters(search=clean_search(search) or None, requirement_id=requirement_id,
+                        customer_id=customer_id, channel=(channel or "").strip().lower() or None,
+                        via=via or None, phase=phase or None, date_from=date_from, date_to=date_to,
+                        page=page, limit=limit)
+    items, meta = apps.applications(db, f)
+    return envelope(data=items, meta=meta)

@@ -742,8 +742,30 @@ def _ageing(open_rows: list[dict], today: date) -> dict:
             "overdue_90_plus": buckets[-1]["amount"], "top_overdue_customers": top}
 
 
+def trailing_monthly_billed(invoices: list[dict], period: Period, today: date | None,
+                            series: list[dict] | None = None) -> float:
+    """Average billed per MONTH over the last RUNWAY_AVG_MONTHS calendar months
+    ending at the period's last month (or the current month, whichever is
+    earlier). PURE.
+
+    6 Nov 2026: this used to average the last 3 SERIES points ÷ months — at the FY
+    zoom the points are whole financial years, so two near-empty older FYs pulled
+    the average down and PO cover read 67.5 months on the CEO dashboard."""
+    if today is None:
+        recent = [s["billed"] for s in (series or [])[-RUNWAY_AVG_MONTHS:]]
+        return (sum(recent) / len(recent) / period.months) if recent else 0.0
+    current = Month(today.year, today.month)
+    end = period.last_month if period.last_month.key <= current.key else current
+    keys = {end.shift(-i).key for i in range(RUNWAY_AVG_MONTHS)}
+    total = sum(i["sub_total"] for i in invoices
+                if i.get("invoice_date") and _month_key(i["invoice_date"]) in keys)
+    return total / RUNWAY_AVG_MONTHS
+
+
 def _pipeline(db: Session, series: list[dict], period: Period,
-              customer_id: int | None = None, project_id: int | None = None) -> dict:
+              customer_id: int | None = None, project_id: int | None = None,
+              invoices: list[dict] | None = None, today: date | None = None,
+              deployed: list[dict] | None = None) -> dict:
     invoiced = select(Invoice.id).where(Invoice.timesheet_id == Timesheet.id).exists()
     q = (select(Timesheet.id, Timesheet.approved_figures)
          .where(Timesheet.status == TimesheetStatus.APPROVED, ~invoiced))
@@ -764,13 +786,18 @@ def _pipeline(db: Session, series: list[dict], period: Period,
     po_balance = _num(db.execute(po_q).scalar())
     # The runway is always expressed in MONTHS, whatever the zoom, so the number
     # means the same thing on all three views.
-    recent = [s["billed"] for s in series[-RUNWAY_AVG_MONTHS:]]
-    avg = (sum(recent) / len(recent) / period.months) if recent else 0.0
+    avg = trailing_monthly_billed(invoices or [], period, today, series)
+    # 8 Nov 2026: cover = balance ÷ what the team deployed today bills a month;
+    # the recent-invoice average is only the fallback (no team on record).
+    burn = current_monthly_burn(deployed or [], today) if today else 0.0
+    per_month = burn if burn > 0 else avg
     return {
         "approved_uninvoiced": {"count": len(sheets), "amount": round(amount, 2)},
         "active_po_balance": round(po_balance, 2),
         "avg_monthly_billed": round(avg, 2),
-        "po_cover_months": round(po_balance / avg, 1) if avg > 0 else None,
+        "monthly_burn": round(burn, 2),
+        "cover_basis": "team" if burn > 0 else ("billing" if avg > 0 else None),
+        "po_cover_months": round(po_balance / per_month, 1) if per_month > 0 else None,
     }
 
 
@@ -881,8 +908,7 @@ def _targets(db: Session, period: Period, invoices: list[dict], series: list[dic
     fy_billed = sum(i["sub_total"] for i in invoices if _month_key(i["invoice_date"]) in elapsed_keys)
     # The trailing average used for the FY projection must be per MONTH, whatever
     # the series points measure.
-    recent = [s["billed"] for s in series[-RUNWAY_AVG_MONTHS:]]
-    avg_recent = (sum(recent) / len(recent) / period.months) if recent else 0.0
+    avg_recent = trailing_monthly_billed(invoices, period, today, series)
     months_remaining = 12 - len(elapsed_keys)
     fy_projection = round(fy_billed + avg_recent * months_remaining, 2)
 
@@ -938,6 +964,41 @@ def _monthly_rate(rate: float, unit) -> float:
     return rate
 
 
+def cost_until(exit_: date | None, today: date | None) -> date | None:
+    """PURE. The last day an assignment's people cost counts in a report: its exit,
+    but never after today.
+
+    8 Nov 2026: a running period (this month / quarter / FY) used to be charged
+    the cost of the days still to come — FY 2026-27 counted 12 months of salary
+    against 7 months of billing, and Gross margin read −95 %. Billing can only
+    exist up to today, so cost stops there too. A closed period is unaffected
+    (today is after its end)."""
+    if today is None:
+        return exit_
+    return min(exit_, today) if exit_ else today
+
+
+def current_monthly_burn(deployed: list[dict], today: date) -> float:
+    """PURE. What the team deployed TODAY bills in a month: each live assignment's
+    monthly rate in force today (rate history first, else the assignment's rate).
+
+    8 Nov 2026: PO cover divides the PO balance by this. It used to divide by the
+    last three months' INVOICES, which follow the work month — when billing runs
+    late, or catches up on old months, three quiet months read as "₹56 k a month"
+    and PO cover showed 2,265 months."""
+    total = 0.0
+    for d in deployed:
+        start, end = d.get("start"), plan_end(d)
+        if (start and start > today) or (end and end < today):
+            continue
+        rate, unit = d.get("rate") or 0.0, d.get("unit")
+        for frm, r, u in d.get("rates") or []:
+            if frm and frm <= today:
+                rate, unit = r, u or unit
+        total += _monthly_rate(rate, unit)
+    return total
+
+
 def _overlap_fraction(start: date | None, end: date | None, window) -> float:
     """Share of `window` (by days) an assignment running start..end covers.
 
@@ -964,12 +1025,19 @@ def _deployed_rows(db: Session, customer_id: int | None = None,
          .join(Employee, Employee.id == ProjectEmployee.employee_id)
          .join(Project, Project.id == ProjectEmployee.project_id)
          .join(Customer, Customer.id == Project.customer_id)
-         .where(ProjectEmployee.is_active.is_(True)))
+         # 6 Nov 2026: `exit_project_employee` sets is_active = False, so this
+         # filter used to DROP every person who had left — their months vanished
+         # from people cost, gross margin, headcount by month and "Predicted"
+         # (April predicted 61.8 L against 84.6 L billed). An exited assignment
+         # stays; its exit date ends it. A row switched off without an exit
+         # (removed by mistake) is still left out.
+         .where(sa_or(ProjectEmployee.is_active.is_(True), ProjectEmployee.is_exit.is_(True))))
     if customer_id:
         q = q.where(Project.customer_id == customer_id)
     if project_id:
         q = q.where(project_clause(ProjectEmployee.project_id, project_id))
     rows = db.execute(q).all()
+    history = _rate_history(db, [r[0] for r in rows])
     return [{
         "pe_id": r[0], "rate": _num(r[1]), "unit": r[2],
         # Exited with no date recorded = gone for good (never counted again).
@@ -982,7 +1050,53 @@ def _deployed_rows(db: Session, customer_id: int | None = None,
         # Planned release the customer gave (0152) — the FORECAST stops there;
         # actuals (cost, margin) keep reading `exit`.
         "release": r[17],
+        # Effective-dated rates [(from, rate, unit)] — a past month is predicted
+        # at the rate in force THEN, not today's (6 Nov 2026).
+        "rates": history.get(r[0], []),
     } for r in rows]
+
+
+def _rate_history(db: Session, pe_ids: list[int]) -> dict[int, list[tuple]]:
+    """{pe_id: [(effective_from, rate, unit), …]} oldest first. One query; never
+    raises (a database without the table predicts at today's rate)."""
+    if not pe_ids:
+        return {}
+    from models.projects import ProjectEmployeeRate
+    out: dict[int, list[tuple]] = defaultdict(list)
+    try:
+        with db.begin_nested():
+            for pid, frm, rate, unit in db.execute(
+                    select(ProjectEmployeeRate.project_employee_id, ProjectEmployeeRate.effective_from,
+                           ProjectEmployeeRate.rate, ProjectEmployeeRate.billing_unit)
+                    .where(ProjectEmployeeRate.project_employee_id.in_(pe_ids))
+                    .order_by(ProjectEmployeeRate.project_employee_id,
+                              ProjectEmployeeRate.effective_from, ProjectEmployeeRate.id)).all():
+                if frm is not None:
+                    out[pid].append((frm, _num(rate), unit))
+    except Exception:  # noqa: BLE001
+        return {}
+    return dict(out)
+
+
+def monthly_value_in(d: dict, start: date | None, end: date | None, window) -> float:
+    """What one assignment bills inside `window` (a Month): its monthly rate ×
+    the share of the window it covers, the rate taken from the rate history
+    segment by segment (a raise on the 15th bills half the month at each rate).
+    PURE. With no history, today's rate (`d["rate"]`, `d["unit"]`)."""
+    rates = d.get("rates") or []
+    if not rates:
+        return _monthly_rate(d["rate"], d["unit"]) * _overlap_fraction(start, end, window)
+    total = 0.0
+    for idx, (frm, rate, unit) in enumerate(rates):
+        seg_start = None if idx == 0 else frm  # before the first row: its rate applies
+        nxt = rates[idx + 1][0] if idx + 1 < len(rates) else None
+        seg_end = (nxt - timedelta(days=1)) if nxt else None
+        lo = max(x for x in (start, seg_start) if x) if (start or seg_start) else None
+        hi = min(x for x in (end, seg_end) if x) if (end or seg_end) else None
+        if lo and hi and hi < lo:
+            continue
+        total += _monthly_rate(rate, unit or d["unit"]) * _overlap_fraction(lo, hi, window)
+    return total
 
 
 def plan_end(d: dict):
@@ -992,11 +1106,13 @@ def plan_end(d: dict):
     return min(dates) if dates else None
 
 
-def _margin(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
+def _margin(period: Period, invoices: list[dict], deployed: list[dict],
+            today: date | None = None) -> dict:
     """Billed minus people cost, by customer.
 
     `current_ctc` is the ANNUAL figure, so a period costs CTC / 12 × months,
-    prorated by the share of the period each assignment actually covered.
+    prorated by the share of the period each assignment actually covered — up to
+    today at most (`cost_until`).
     """
     this = _in(period, invoices)
     billed_by: dict[int, float] = defaultdict(float)
@@ -1008,7 +1124,7 @@ def _margin(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
     heads_by: dict[int, int] = defaultdict(int)
     missing_ctc = 0
     for d in deployed:
-        frac = _overlap_fraction(d["start"], d["exit"], period)
+        frac = _overlap_fraction(d["start"], cost_until(d["exit"], today), period)
         if frac <= 0:
             continue
         names.setdefault(d["customer_id"], d["customer"])
@@ -1044,7 +1160,8 @@ def _margin(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
 # --------------------------------------------------------------------------- v3 sections
 
 
-def _by_project(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
+def _by_project(period: Period, invoices: list[dict], deployed: list[dict],
+                today: date | None = None) -> dict:
     """Project-wise billing, cost and margin — the delivery view of the same money."""
     this = _in(period, invoices)
     total = _sum(this, "sub_total")
@@ -1064,7 +1181,7 @@ def _by_project(period: Period, invoices: list[dict], deployed: list[dict]) -> d
     heads: dict[int, int] = defaultdict(int)
     missing = 0
     for d in deployed:
-        frac = _overlap_fraction(d["start"], d["exit"], period)
+        frac = _overlap_fraction(d["start"], cost_until(d["exit"], today), period)
         if frac <= 0:
             continue
         pid = d["project_id"]
@@ -1101,7 +1218,8 @@ def _by_project(period: Period, invoices: list[dict], deployed: list[dict]) -> d
     }
 
 
-def _by_employee(period: Period, invoices: list[dict], deployed: list[dict]) -> dict:
+def _by_employee(period: Period, invoices: list[dict], deployed: list[dict],
+                 today: date | None = None) -> dict:
     """Employee-wise revenue, via `Invoice.timesheet_id → timesheets.employee_id`.
 
     Only timesheet-driven invoices name a person. Manual invoices are reported
@@ -1131,7 +1249,7 @@ def _by_employee(period: Period, invoices: list[dict], deployed: list[dict]) -> 
     # which is authoritative; the invoice join only supplies the revenue.
     by_emp: dict[int, dict] = {}
     for d in deployed:
-        frac = _overlap_fraction(d["start"], d["exit"], period)
+        frac = _overlap_fraction(d["start"], cost_until(d["exit"], today), period)
         if frac <= 0:
             continue
         eid = d["employee_id"]
@@ -1448,7 +1566,9 @@ def _dimensions(db: Session, period: Period, invoices: list[dict]) -> dict:
 def _alerts(period: Period, headline: dict, targets: dict, by_customer: dict, ageing: dict,
             pipeline: dict, margin: dict, invoices: list[dict],
             by_project: dict | None = None, by_employee: dict | None = None,
-            cashflow: dict | None = None) -> list[dict]:
+            cashflow: dict | None = None, track_cost: bool = True) -> list[dict]:
+    """`track_cost` False (8 Nov 2026, `finance.track_people_cost` off): CTCs are
+    not kept up to date, so no alert that compares billing with people cost."""
     out: list[dict] = []
 
     def add(key, level, title, detail):
@@ -1484,21 +1604,22 @@ def _alerts(period: Period, headline: dict, targets: dict, by_customer: dict, ag
             "Escalate collection — " + ", ".join(c["customer"] for c in ageing["top_overdue_customers"][:3]) + ".")
     cover = pipeline["po_cover_months"]
     if cover is not None and cover < PO_COVER_WARN_MONTHS:
-        add("po_cover", "bad" if cover < 1 else "warn", f"PO cover is {cover} month(s) at the current billing pace",
+        add("po_cover", "bad" if cover < 1 else "warn", f"PO cover is {cover} month(s) at what the team deployed today bills",
             f"Active PO balance ₹{pipeline['active_po_balance']:,.0f}; start renewals now.")
-    if margin["loss_making"]:
+    if track_cost and margin["loss_making"]:
         names = ", ".join(r["customer"] for r in margin["loss_making"][:3])
         add("loss_making", "warn", f"{len(margin['loss_making'])} loss-making account(s) this period", names + ".")
-    if by_project and by_project["loss_making"]:
+    if track_cost and by_project and by_project["loss_making"]:
         names = ", ".join(r["project"] for r in by_project["loss_making"][:3])
         add("loss_making_projects", "warn",
             f"{len(by_project['loss_making'])} project(s) billing below their people cost", names + ".")
     if by_employee and by_employee["idle_count"] >= IDLE_HEADS_WARN:
         add("idle_heads", "warn",
             f"{by_employee['idle_count']} deployed head(s) billed nothing this period",
-            f"Carrying ₹{by_employee['idle_cost']:,.0f} of cost — check the bench and unbilled timesheets.")
+            (f"Carrying ₹{by_employee['idle_cost']:,.0f} of cost — check the bench and unbilled timesheets."
+             if track_cost else "Check the bench and the timesheets still to invoice."))
     # Cash is the one number that ends a company, so it outranks a soft month.
-    if cashflow and not cashflow["covers_cost"]:
+    if track_cost and cashflow and not cashflow["covers_cost"]:
         short = cashflow["people_cost_total"] - cashflow["expected_total_at_pace"]
         add("cash_shortfall", "bad",
             f"Expected collections fall ₹{short:,.0f} short of people cost over "
@@ -1551,10 +1672,17 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
     open_rows = _open_invoices(db, period.end, customer_id, project_id)
 
     headline = _headline(period, invoices, payments, open_rows)
+    # 6 Nov 2026: say when the comparison is not like-for-like — a previous
+    # period starting before the data start month (Settings ▸ Billing) holds only
+    # a few months, and at the FY zoom "vs last FY" and "YoY" are one figure.
+    from services.money_split import comparison_partial
+    headline["comparison_partial"] = comparison_partial(period.previous.start)
+    headline["yoy_same_as_previous"] = period.kind == "fy"
     series = _series(period, invoices, payments)
     by_customer = _by_customer(period, invoices, payments)
     ageing = _ageing(open_rows, today)
-    pipeline = _pipeline(db, series, period, customer_id, project_id)
+    deployed = _deployed_rows(db, customer_id, project_id)
+    pipeline = _pipeline(db, series, period, customer_id, project_id, invoices, today, deployed)
     targets = _targets(db, period, invoices, series, today)
     # 27 Oct 2026 (filter audit): targets are COMPANY figures. With a customer /
     # project scope the billed side is one account, so "attainment" against the
@@ -1566,12 +1694,15 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
                   "fy_projection_pct"):
             if k in targets:
                 targets[k] = None
-    deployed = _deployed_rows(db, customer_id, project_id)
-    margin = _margin(period, invoices, deployed)
-    by_project = _by_project(period, invoices, deployed)
-    by_employee = _by_employee(period, invoices, deployed)
+    margin = _margin(period, invoices, deployed, today)
+    by_project = _by_project(period, invoices, deployed, today)
+    by_employee = _by_employee(period, invoices, deployed, today)
     cashflow = _cashflow(db, deployed, today, customer_id, project_id)
+    from services.org_settings import track_people_cost
+    track_cost = track_people_cost()
     return {
+        # 8 Nov 2026 — False: the UI hides people cost, margin and net profit.
+        "track_people_cost": track_cost,
         # `month` stays the anchor month so the UI's month control round-trips.
         "month": period.anchor.key,
         "period": period.kind,
@@ -1606,7 +1737,7 @@ def revenue_report(db: Session, month_raw: str | None = None, today: date | None
         "cashflow": cashflow,
         "dimensions": _dimensions(db, period, invoices),
         "alerts": _alerts(period, headline, targets, by_customer, ageing, pipeline, margin,
-                          invoices, by_project, by_employee, cashflow),
+                          invoices, by_project, by_employee, cashflow, track_cost),
     }
 
 

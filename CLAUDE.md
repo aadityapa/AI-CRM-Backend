@@ -7,7 +7,15 @@
 > the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
 > short copy and points here. Keep both in step.
 
-**Last updated:** 5 Nov 2026, last (UI: the unmapped-money panel is Finance-only; Margin / Expenses / Net revenue off
+**Last updated:** 12 Nov 2026 (one candidate name everywhere — Edit applicant / the Candidates page rename the
+master AND every position's resume row (`services/candidate_names.py`); an upload for a known candidate keeps the
+master's name; parsed names are tidied; no migration). Before: 8 Nov 2026, last (people cost & gross margin hidden until CTCs are tracked — Settings ▸ Organisation ▸
+Billing ▸ "Show people cost & gross margin" (`finance.track_people_cost`, default OFF); no migration). Before: 8 Nov 2026, later (people cost stops at TODAY in every running period — gross margin no longer charges the months still to come; PO cover = active PO balance ÷ what the team deployed today bills a month, the invoice average only a fallback; no migration). Before: 8 Nov 2026 (UI only: Customer, Sales, People and the Billing Tracker tabs — and the Finance tab's "Cash received month" view — use the interactive story chart, F-V2 `StoryChart`; no server change). Before: 7 Nov 2026 (the Billed drill page speaks the ten money words — every invoice carries the
+bank / TDS split, the first chart is the dashboard's "How the year unfolded" (`kind: money`), columns can start hidden).
+Before: 6 Nov 2026, later (CEO money words: Revenue Ex / Inc Tax · Receivable / Received / Due — Bank and
+TDS · Total Due · Predicted with project count; exited people no longer vanish from past months — Predicted, people
+cost, gross margin; PO cover fixed at the FY zoom). Earlier 6 Nov: (careers CTC read in lakhs — "10 L" / "10,00,000" / "1000000 LPA" all = ₹10 L, stored
+slips repaired by 0153; a **Careers Applications** tab for TA / RMG / GM). Before: 5 Nov 2026, last (UI: the unmapped-money panel is Finance-only; Margin / Expenses / Net revenue off
 "How the year unfolded"). Before: (Finance tab: unmapped money panel, "Counted by: Work month / Cash received
 month" switch, "Collected changed after the month closed" note; the Revenue report uses the PO's customer; billed /
 collected by WORK month, on-account money off Collected; HM candidate review / sign-off removed; move a receipt's
@@ -17,8 +25,8 @@ Sourcing and show in TA's default list. Earlier 5 Nov: drill-page month bars lis
 project band; TA / Hiring Manager workload + a suggested pick in the Assign dialog; careers applications name their
 channel + a channel analysis; the Karnex JD drafted from the customer's JD, downloadable as PDF / Word). 4 Nov: received
 never above billed, Predicted every month, release / extension dates, internal candidates skip HR, Expenses, TDS, reopen
-& resume. **State:** migration head **0152** (no migration on 5 Nov). The shell came back late on 5 Nov and the
-suites were run from /tmp copies: backend 2,356 pass / 3 skipped (only the known `test_public_invoice_qr` fails); F-V2
+& resume. **State:** migration head **0153** (6 Nov; 0152 before). The shell came back late on 5 Nov and the
+suites were run from /tmp copies (6 Nov, later: backend 2,379 pass / 3 skipped); earlier backend 2,356 pass / 3 skipped (only the known `test_public_invoice_qr` fails); F-V2
 `tsc` green, vitest 392 with only the two known failures (`brand.test` needs the runtime pages, `opportunitySchema`
 "Remote"). Nothing is committed since `dd61630`, so **commit the working tree.**
 
@@ -50,7 +58,7 @@ Roles:
 | Layer | What |
 | --- | --- |
 | Backend | Python, **FastAPI** monolith (`backend/main.py` + `routers/crm/*`), uvicorn (1 worker unless `REDIS_URL`) |
-| CRM data | **PostgreSQL**, SQLAlchemy 2.0, **Alembic** (linear chain, head 0151) |
+| CRM data | **PostgreSQL**, SQLAlchemy 2.0, **Alembic** (linear chain, head 0153) |
 | Interview data | `auth_db.py` raw SQL, dual dialect (SQLite dev / Postgres prod), startup `ALTER`s, no Alembic |
 | AI | OpenAI. Text calls: **GPT-6 Astra** (interview) and **GPT-5.5** (everything else); gpt-4o-mini is retired for text. Voice: gpt-4o-mini-tts. Speech-to-text: gpt-transcribe. Live voice: gpt-realtime. All text calls go through `prompt_logger.tracked_chat_completion` and are priced in AI Costs. |
 | Files / media | Local driver or **S3** (boto3) for recordings and uploads; ffmpeg (imageio-ffmpeg) joins camera + screen |
@@ -77,6 +85,8 @@ Roles:
 - The opening "are you interested?" email is **manual only**. Archive is manual, except that a held deal parks its
   candidates.
 - Status is **derived** (`services/candidate_status.py`), never stored, and it is the same on every screen.
+- **One candidate name** (12 Nov 2026): the Candidates master holds it; every `resumes.candidate_name` is a copy;
+  a rename anywhere goes through `candidate_names.rename_candidate`.
 - Internal vs External (4 Nov 2026): TA's choice, else a company email (`hiring.internal_email_domains`, default
   karnex.in) or an Employees match. After the Sales Head approves the terms an internal candidate goes straight to
   Pre-Onboarding with the Employees details — no HR Discussion / HR Round.
@@ -112,6 +122,16 @@ Roles:
 - A project employee's **release date is a plan** (reminders 30/15/5/2/1 days before + the forecast); the real exit
   is still the Exit action. Predicted revenue = deployed team × rate up to the earlier of exit and release (4 Nov 2026).
 - **Net revenue = billed − expenses**; net profit also takes off people cost. Expenses are before GST (4 Nov 2026).
+- **People cost is hidden until CTCs are kept up to date** (8 Nov 2026): `finance.track_people_cost` default false —
+  gross margin, net profit, people cost in the cash flow and every loss-making / short-of-cost alert are off; the
+  figures are still computed.
+- **The CEO money words (6 Nov 2026, `services/money_split.py`)**, per invoice work month: Revenue (Ex. Tax) =
+  sub_total · Revenue (Inc Tax) = grand_total · Receivable TDS = booked TDS, else (open invoice) expected at
+  `finance.tds_rate_percent` on the value before GST · Receivable Bank = Inc − TDS · Received Bank = cash ·
+  Received TDS = Form 16A in · Due = receivable − received (bank, TDS) · Total Due = both. Collection rate on the
+  Finance tab = (Received Bank + TDS) ÷ Revenue (Inc Tax).
+- **Exited assignments stay in `_deployed_rows`** (their exit date ends them); only a PE switched off with no exit
+  is left out. Predicted uses the rate history in force each month.
 - **Received is shown beside billed on billed's basis** (4 Nov 2026, later): billed is before GST, a customer pays
   the value with GST, so a dashboard compares `received_ex` / `balance_ex` (`billing_rules.before_gst_split`, each
   invoice's share before GST) — received + due = billed, received never reads above billed. Cash with GST, bank and
@@ -170,6 +190,7 @@ Roles:
 - Karnex JD drafted from the customer's JD; the RMG JD downloads as PDF / Word (5 Nov 2026).
 - Assign TAs / Hiring Managers shows each person's workload and suggests one (advice only, 5 Nov 2026).
 - Careers applications carry their channel; the Careers link card analyses channels (5 Nov 2026).
+- Careers Applications tab (TA · RMG · GM): every public applicant with channel, position, facts and status (6 Nov 2026).
 
 **Insight**
 - Revenue report v3, CEO dashboard (5 tabs + drill pages), Billing Tracker, hiring control tower.
@@ -4721,6 +4742,123 @@ Suite (from a /tmp copy): 2,356 pass, 3 skipped; only the known `test_public_inv
 **Later (UI only, no server change):** the unmapped-money panel shows to a FINANCE login only (Admin / CEO no longer
 see it — `on_account` is still in the payload), and "How the year unfolded" no longer draws Margin, Expenses or Net
 revenue. See F-V2 `CLAUDE.md`.
+
+**6 Nov 2026 — careers CTC read in lakhs; Careers Applications tab, migration 0153, head is now 0153
+(`tests/test_careers_applications.py` 4, `test_ctc_units` +12, `test_ats_facts_and_applicant_line` re-pinned):**
+screenshot report — Manoj S (10 L expected, budget ₹24.4 L) read "CTC 700000 LPA · Exp. 1000000 LPA" and "Over budget ·
+₹1000000.0 L vs ₹25.4 L". ⚠️ Cause: the careers form's CTC boxes were `type="number"` labelled LPA and careers.js appended
+" LPA" to whatever was typed; people typed rupees, and `slot_booking._ctc_from_str` (its own parser, no ceiling) stored
+₹1e11. (1) **`services/ctc.parse_ctc_to_rupees`**: a lakh-unit figure ≥ `_RUPEES_IN_A_LAKH_BOX_FROM`=10,000 is rupees
+("1000000 LPA" = ₹10 L); 1,000–9,999 "LPA" → None; PURE `lakhs_text(rupees)` ("10.25 LPA"), `ctc_display(raw)` (what
+every screen prints; unreadable text kept as typed), `repair_stored_rupees(value)`. `_ctc_from_str` now delegates to it.
+(2) **Careers apply** (`public_careers.public_apply`): `careers.ctc_problem(raw, label)` → 400 "Type your expected CTC in
+lakhs, e.g. 10 L" for an unreadable figure, BEFORE the CV is saved; `careers.normalise_ctc_details` (in
+`record_application`) stores "N LPA". (3) **Applied Candidates** rows print `ctc_display` of the stored CTC
+(`resumes._with_applicant_facts`). (4) **0153** divides candidate / profile CTCs above ₹50 Cr by 1,00,000 when the result
+is ≥ ₹10,000, and rewrites careers / apply-link resumes' `application_details` CTC as "N LPA" (frozen parse copy; `[0153]`
+lines; downgrade no-op). (5) **`services/careers_applications.py`** — `applications(db, AppFilters)`: every resume with
+`source_portal` Careers Page / Apply Link + every candidate created by "Careers page · …" (general resume), newest first,
+each with via (careers · apply_link · general), channel + key, contact (real email only), experience, notice / LWD,
+locations, CTC in lakhs, `over_budget` vs the requirement's `budget_ctc_max`, skills, LinkedIn, resume, ATS, position /
+opportunity / customer, TA owner, derived `status` + `phase`, and `path` (Applied Candidates row, or the candidate).
+Filters search · requirement · customer · channel · via · phase (incl. "none", "closed") · date range; meta `counts`
+(by via / channel / phase / position, today / 7 / 30 days, over budget) over the filtered set, `overall` over everything,
+`options` (positions with counts, customers, channels). Route **`GET /api/careers/applications`** behind
+`APPLICATIONS_READ = screener_or(gated_read("requirements", "TA", "RMG"))` (GM via the screening approval; Admin / CEO
+implicit). Deploy: `python -m alembic upgrade head` (0153), restart; F-V2 careers page `?v=4`.
+
+**6 Nov 2026 (later) — the CEO money words, why Predicted read below Billed, PO cover at the FY zoom
+(`tests/test_money_split_and_prediction.py` 9; no migration):** CEO ask with two screenshots — rename "How the year
+unfolded" to Revenue (Ex. Tax) · Revenue (Inc Tax) · Receivable Bank · Receivable TDS · Received Bank · Received TDS ·
+Due Bank · Due TDS · Total Due · Predicted revenue (project count); "April billed 84.6 L, predicted 61.8 L — how?";
+check every Finance tile. (1) ⚠️ **Root cause of the low Predicted**: `revenue_report._deployed_rows` filtered
+`ProjectEmployee.is_active`, and `exit_project_employee` sets `is_active = False` — so everyone who had LEFT vanished
+from every past month: Predicted, people cost, gross margin (94 % on ₹30.9 L read high for this reason too), the
+People tab's month-end deployed / bench, the Customer tab's deployed trend. Now `is_active OR is_exit`; the exit date
+ends the assignment (a PE switched off with no exit is still left out). (2) Predicted also used TODAY's rate for every
+month: `_rate_history` (one query over `project_employee_rates`) + PURE `monthly_value_in(d, start, end, window)` —
+the rate in force day by day (a raise on the 15th bills half the month at each rate; before the first row its rate
+applies; no rows = the PE's rate). `revenue_forecast.month_prediction` uses it. What Predicted still cannot see: hours
+billed above 21 × 8 on an Hourly rate, a cross-month sheet billing more than one month, manual invoices, rate rows
+never entered. (3) **PO cover**: PURE `trailing_monthly_billed(invoices, period, today)` = the last RUNWAY_AVG_MONTHS
+(3) calendar months ending at min(period's last month, this month) — the old "last 3 series points ÷ months" averaged
+whole FYs at the FY zoom (two near-empty FYs → 67.5 months). Used by `_pipeline` and the FY projection.
+(4) **`services/money_split.py`** — the rule is the module docstring: per invoice, `invoice_money(inv, cash, tds,
+rate)`; `money_by_month(months, invoices, payments, tds_by_invoice, rate)` (mapped cash only; on-account money is not
+received), `totals`, `tds_by_invoice` (TdsRecord amount + paid, savepointed), `expected_tds_rate()` (Settings
+`finance.tds_rate_percent`, default 10 %), `comparison_partial(previous_start)`. ⚠️ An OPEN invoice with no TDS booked is
+EXPECTED to carry TDS at that rate on the value before GST (capped at what is unpaid) and reported as `expected_tds`;
+a fully paid invoice with none booked had none. Finance `monthly[]` rows and Customer `monthly[]` rows carry the ten
+keys + `invoices`; Finance rows add `predicted_projects / _heads / _customers`; Finance payload adds `money` (period
+totals + `tds_rate_pct`). (5) `revenue_report` headline adds `comparison_partial` (the previous period starts before
+Settings ▸ Billing ▸ Data starts from — "+525 % vs last FY" compared a year with one month) and `yoy_same_as_previous`
+(FY zoom). Deploy: restart.
+
+**7 Nov 2026 — the Billed page reads in the dashboard's money words (`tests/test_ceo_drilldown.py` re-pinned; no
+migration):** CEO ask — a month clicked on "How the year unfolded" lands on the Billed page with the same ticks.
+`services/ceo_drilldown.with_money_split(db, rows)` stamps every `load_invoices` row with `money_split.invoice_money`
+(cash = the invoice's paid amount, TDS = its TdsRecord — the dashboard's own rule; pinned equal to the Finance tab's
+`money` to the paisa) and returns the period totals; `m_billed` returns them as **`money`**. KPIs are the ten words
+(+ Overdue, Fully paid), each with `go.where` = its own field. The first chart is **`money_monthly`** with
+**`kind: "money"`** (`MONEY_SERIES` — the ten keys in the CEO's order, predicted last), rows carry `invoices`,
+`expected_tds` and — via `_with_predicted` — `predicted_projects / _heads / _customers`. The old "Billed month by
+month" and "Money in" charts are gone; "Who we billed" and "By where each invoice stands" use the new words.
+`col(..., hidden=True)` marks a column that starts off in the page's column chooser (`BILLED_COLUMNS`: 11 of 21 show).
+`_compact()` prints ₹ Cr / L in tile subs. Deploy: restart.
+
+**8 Nov 2026 — the Finance tab's story chart on every CEO tab (F-V2 only, no server change):** Customer ("How the
+year unfolded", "Deployed on customer sites"), Sales, People and the Billing Tracker open with F-V2
+`crm/pages/dashboard/StoryChart.tsx` in their own colours; every column opens what the old bar opened. Details in F-V2
+`CLAUDE.md`.
+
+**8 Nov 2026 (later) — people cost stops at today; PO cover by the deployed team (`tests/test_money_split_and_prediction.py`
++2, `test_revenue_report` re-pinned; no migration):** a dashboard screenshot read Gross margin −95 % (₹14.9 L billed on
+₹29.0 L people cost) and PO cover 2,265 months. (1) ⚠️ `revenue_report.cost_until(exit, today)` (PURE) — an assignment's
+cost counts up to its exit but never past TODAY. `_margin`, `_by_project`, `_by_employee` (new `today` arg) and
+`executive_dashboard._cost_in(row, window, today)` (Finance / Customer monthly cost, customer → project → person tree)
+use it. Before, a running FY was charged all 12 months of CTC against the months billed so far. A closed period is
+unchanged (today is after its end). The current month still carries its days of cost before its invoices exist (work is
+billed after the month) — `pipeline.approved_uninvoiced` is the work waiting to be invoiced. (2) PURE
+`current_monthly_burn(deployed, today)` = Σ monthly rate in force today of every live assignment (start ≤ today ≤
+`plan_end`, rate history first) — the Customer tab's / PO drill page's own rule. `_pipeline(..., deployed)` returns
+`monthly_burn`, `cover_basis` ("team" | "billing" | null) and `po_cover_months` = PO balance ÷ burn, falling back to
+`trailing_monthly_billed` only when no team is deployed. The trailing invoice average follows the WORK month, so late or
+catch-up billing left three near-empty months and divided ₹12.69 Cr by ₹56 k. `revenue_report` now loads `deployed`
+before `_pipeline`; the PO-cover alert says "at what the team deployed today bills".
+
+**8 Nov 2026 (last) — gross margin hidden until people cost is tracked (`tests/test_money_split_and_prediction.py` +2;
+no migration):** user: "for now Gross margin — we do not track expense". New Settings key
+**`finance.track_people_cost`** (env `FINANCE_TRACK_PEOPLE_COST`, default **"false"**, a `_BOOL_KEYS` switch) and
+`org_settings.track_people_cost()` (never raises). `revenue_report` returns `track_people_cost` and
+`_alerts(..., track_cost=)` drops `loss_making`, `loss_making_projects` and `cash_shortfall` (and the idle-heads alert
+no longer names a cost) when it is off; `executive_dashboard._finance` passes the flag on, `_customer` adds it and drops
+its `loss:<customer>` alerts. Nothing else changes server-side — margin / cost are still computed, so switching it on
+brings every figure back. ⚠️ `tests/conftest.py` sets `FINANCE_TRACK_PEOPLE_COST=true` for the suite (the margin tests
+were written with cost shown); a test of the switch sets it itself. F-V2 hides the UI (see that repo's notes). Deploy:
+restart.
+
+**12 Nov 2026 — one candidate name everywhere (`tests/test_candidate_names.py`, 7; no migration):** reported — TA
+uploads a candidate (single upload or bulk ZIP), the name comes out wrong, TA fixes it with Edit applicant, and the
+Candidates master (profile, Screening Desk, Talent Pool, other positions) keeps the old name. **`services/candidate_names.py`**:
+PURE `tidy_name` (underscores → spaces, drops file / CV noise words `_NOISE_WORDS` resume · cv · updated · final … and
+digit-only tokens, ALL CAPS / all lower → Title Case, mixed case kept; never blanks a name), `split_name` (first word /
+the rest — middle left empty, most screens print first + last), `full_name`, `same_name`, `is_placeholder`
+(`PLACEHOLDER_NAMES` unknown · candidate · na …); DB `sync_resume_names(db, cand)` (every resume of the candidate gets the
+master's full name) and **`rename_candidate(db, cand, new, user_id=, where=, parts=)`** — writes the master (`parts` =
+(first, middle, last) as typed on the Candidates form, else the full name split), syncs every resume, logs
+`NAME_CHANGED` "Name changed from “old” to “new” (where)" on each of the candidate's profiles (savepointed); exact compare,
+so a case-only fix counts; blank / unchanged = no-op. Wired: (1) **`PUT /api/resumes/{id}`** (Edit applicant) →
+`routers/crm/resumes._update_candidate_master` — ⚠️ the dialog re-sends EVERY field, so only a value that differs from
+what the row held before the edit reaches the master (`before`); name → `rename_candidate`; phone → master; email →
+master unless another candidate owns it (the reply says so); the message appends "name updated in Candidates and N
+other position(s)". (2) **`PUT /api/candidates/{id}`** — any of first / middle / last → `rename_candidate(parts=...)`
+(400 on a blank first name), message "name updated on N position(s)"; this is also the profile-only Edit applicant and the
+bulk-ZIP Verify path. (3) **Uploads** — `slot_booking.find_or_create_candidate_from_resume` ends with
+`settle_upload_name(db, cand, resume, created=)`: a NEW candidate takes the tidied name; a KNOWN one keeps the master's
+name and the new resume row shows it (a parsed bulk-ZIP name must not overwrite a name TA fixed) — unless the master's
+name is a placeholder, which takes the uploaded one. The single-upload reply says "already in Candidates as “X” — use Edit
+applicant to change the name everywhere" (F-V2 shows it). Same for careers / apply-link applications and an applied held
+duplicate. Names already out of step stay as they are until someone edits them (no backfill). Deploy: restart.
 
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.

@@ -36,6 +36,7 @@ from services.candidate_status import (
     phase_access_clause, profile_ids_in_phase, profile_ids_with_status, status_counts,
 )
 from services.crm_common import log_activity, paginate, save_upload_hashed
+from services.ctc import ctc_display
 from services.requirements import get_requirement_or_404
 from services.stage_access import allowed_stages as stages_for_login
 from services.resumes import (
@@ -162,6 +163,7 @@ def upload_resume(
     )
     db.add(resume)
     db.flush()  # assign resume.id before deriving the candidate
+    typed_name = resume.candidate_name
     # Create/enrich the Candidate now so the applicant appears in the Candidate
     # tab immediately (name/email/phone/CV; apply-form details when present) —
     # and a Sourcing profile so they appear in the APPLICANTS tab too. Every
@@ -207,7 +209,14 @@ def upload_resume(
                      "STATUS_CHANGED", "Auto-moved Posted_On_Portals -> In_Progress (first resume received)")
     db.commit()
     db.refresh(resume)
-    return envelope(serialize_resume(resume), message="Resume uploaded")
+    msg = "Resume uploaded"
+    # 12 Nov 2026: a candidate already in Candidates keeps that name — say so,
+    # so TA knows where to fix it (Edit applicant changes it everywhere).
+    from services.candidate_names import same_name, tidy_name
+    if resume.candidate_name and not same_name(resume.candidate_name, tidy_name(typed_name)):
+        msg += (f" · already in Candidates as “{resume.candidate_name}” — use Edit applicant"
+                " to change the name everywhere")
+    return envelope(serialize_resume(resume), message=msg)
 
 
 # ------------------------------------------------------------ parse (quick apply)
@@ -1761,6 +1770,11 @@ def _with_applicant_facts(row: dict, avail: dict | None) -> None:
             merged[key] = facts[key]
     if not str(merged.get("notice_period") or "").strip() and notice:
         merged["notice_period"] = notice
+    # 6 Nov 2026: every CTC prints in lakhs whatever was typed ("700000 LPA",
+    # "10.2L", "₹10,00,000" → "7 LPA", "10.2 LPA", "10 LPA").
+    for key in ("current_ctc", "expected_ctc"):
+        if merged.get(key) not in (None, ""):
+            merged[key] = ctc_display(merged.get(key))
     row["application_details"] = merged or None
     if not str(row.get("applicant_experience") or "").strip() and facts.get("experience"):
         row["applicant_experience"] = facts["experience"]
@@ -1887,6 +1901,9 @@ def update_resume(
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(status_code=400, detail="No fields to update")
+    # What TA saw before the edit — the dialog re-sends every field, so only a
+    # value that really CHANGED may reach the candidate master (12 Nov 2026).
+    before = {"name": resume.candidate_name, "email": resume.email, "phone": resume.phone}
     if "candidate_name" in changes and changes["candidate_name"]:
         resume.candidate_name = changes["candidate_name"].strip()
     if "email" in changes:
@@ -1928,11 +1945,48 @@ def update_resume(
                     CandidateProfile.candidate_id == cand.id,
                     CandidateProfile.opportunity_id == req_row.opportunity_id)).scalars():
                 prof.expected_ctc = cand.expected_ctc
+    master_note = _update_candidate_master(db, resume, changes, before, user)
     log_activity(db, RequirementActivityLog, "requirement_id", resume.requirement_id, user.id,
                  "RESUME_UPDATED", f"Resume details updated for {resume.candidate_name}")
     db.commit()
     db.refresh(resume)
-    return envelope(serialize_resume(resume), message="Resume updated")
+    return envelope(serialize_resume(resume), message="Resume updated" + (f" · {master_note}" if master_note else ""))
+
+
+def _update_candidate_master(db: Session, resume, changes: dict, before: dict, user) -> str:
+    """12 Nov 2026: a name / email / phone TA corrects on Edit applicant is the
+    CANDIDATE's — write it to the Candidates master and every other position's
+    row (services/candidate_names). Returns a short note for the reply."""
+    from services.candidate_names import rename_candidate
+
+    if not resume.candidate_id:
+        return ""
+    cand = db.get(Candidate, resume.candidate_id)
+    if cand is None:
+        return ""
+    notes: list[str] = []
+    new_name = (changes.get("candidate_name") or "").strip()
+    if new_name and new_name != (before.get("name") or "").strip():
+        out = rename_candidate(db, cand, new_name, user_id=user.id, where="Edit applicant")
+        if out["changed"]:
+            others = max(0, out["resumes"] - 1)
+            notes.append("name updated in Candidates" + (f" and {others} other position(s)" if others else ""))
+    new_phone = (changes.get("phone") or "").strip()
+    if "phone" in changes and new_phone and new_phone != (before.get("phone") or "").strip() \
+            and new_phone != (cand.phone or ""):
+        cand.phone = new_phone
+        notes.append("phone updated in Candidates")
+    new_email = (changes.get("email") or "").strip().lower()
+    if "email" in changes and new_email and new_email != (before.get("email") or "").strip().lower() \
+            and new_email != (cand.email or "").lower():
+        taken = db.execute(select(Candidate.id).where(
+            func.lower(Candidate.email) == new_email, Candidate.id != cand.id)).first()
+        if taken:
+            notes.append(f"email not changed in Candidates — {new_email} belongs to another candidate")
+        else:
+            cand.email = new_email
+            notes.append("email updated in Candidates")
+    return "; ".join(notes)
 
 
 @router.delete("/api/resumes/{resume_id}")

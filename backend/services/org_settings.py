@@ -83,6 +83,11 @@ KEYS: dict[str, tuple[str, str]] = {
     "billing.split_po_enabled": ("", "true"),
     "billing.split_po_max_parts": ("", "10"),
     "billing.allow_expired_po": ("", "true"),
+    # 8 Nov 2026 (user: "we do not track expense"): people cost (CTC) is not kept
+    # up to date yet, so gross margin, net profit, the people-cost side of the cash
+    # flow and every loss-making / short-of-cost alert are hidden until this is on.
+    # The figures are still computed; the switch only decides whether they show.
+    "finance.track_people_cost": ("FINANCE_TRACK_PEOPLE_COST", "false"),
     # The first work month the application works with (23 Oct 2026, user: "we
     # only need data from FY 2026-27 — March 2026 onwards"). Timesheets due,
     # billing queues, the billing tracker and the "awaiting" lists start here;
@@ -168,7 +173,16 @@ _FORMATS: dict[str, tuple[re.Pattern, str]] = {
 
 
 #: On / off switches whose value must read as a boolean.
-_BOOL_KEYS = ("billing.split_po_enabled", "billing.allow_expired_po")
+_BOOL_KEYS = ("billing.split_po_enabled", "billing.allow_expired_po", "finance.track_people_cost")
+
+
+def track_people_cost() -> bool:
+    """Whether the dashboards show people cost, gross margin and net profit
+    (Settings ▸ Organisation ▸ Billing). Off by default; never raises."""
+    try:
+        return setting_bool("finance.track_people_cost")
+    except Exception:  # noqa: BLE001 — a settings read must never break a report
+        return False
 _BOOL_WORDS = ("1", "0", "true", "false", "yes", "no", "on", "off")
 #: The schema caps a split at 10 parts (`GenerateInvoiceIn.splits`).
 MAX_SPLIT_PARTS = 10

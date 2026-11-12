@@ -45,8 +45,8 @@ from services.placements_report import (
 from services.project_closure import BENCH, DEPLOYED, deployment_by_employee
 from services.revenue_report import (
     DEFAULT_TERMS_DAYS, SERIES_BY_PERIOD, Month, Period, _deployed_rows, _invoices_in_window,
-    _monthly_rate, _overlap_fraction, _payments_in_window, _user_names, revenue_report,
-    scope_projects,
+    _monthly_rate, _overlap_fraction, _payments_in_window, _user_names, cost_until,
+    revenue_report, scope_projects,
 )
 
 logger = logging.getLogger("karnex.crm.executive_dashboard")
@@ -123,13 +123,14 @@ def _overlaps(row: dict, window) -> bool:
     return True
 
 
-def _cost_in(row: dict, window) -> float:
+def _cost_in(row: dict, window, today: date | None = None) -> float:
     """People cost of one assignment inside the window — CTC / 12 × months × overlap,
-    the SAME rule as `revenue_report._margin`."""
+    the SAME rule as `revenue_report._margin`, never past today (8 Nov 2026)."""
     if row.get("ctc") is None:
         return 0.0
     months = ((window.end.year - window.start.year) * 12 + window.end.month - window.start.month + 1)
-    return row["ctc"] / 12.0 * months * _overlap_fraction(row.get("start"), row.get("exit"), window)
+    return row["ctc"] / 12.0 * months * _overlap_fraction(
+        row.get("start"), cost_until(row.get("exit"), today), window)
 
 
 def _open_balances(db: Session, up_to: date, today: date) -> list[dict]:
@@ -287,18 +288,28 @@ def _finance(db: Session, period: Period, today: date,
         paid_in_full = str(i.get("status") or "").lower() == "paid"
         got = i["grand_total"] if paid_in_full else max(0.0, i["grand_total"] - i["balance"])
         i["received_ex"] = before_gst_split(i["sub_total"], i["grand_total"], got, 0.0)["received_ex"]
+    # 6 Nov 2026: the bank / TDS split the CEO reads (services/money_split).
+    from services import money_split
+    tds_rate = money_split.expected_tds_rate()
+    tds_map = _safe(lambda: money_split.tds_by_invoice(db, [i["id"] for i in invoices]), {}, "tds split")
+    money = money_split.money_by_month(_months_in(period), invoices, payments, tds_map, tds_rate)
     monthly = []
     for m in _months_in(period):
         billed = sum(i["sub_total"] for i in invoices if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end)
         received_ex = sum(i["received_ex"] for i in invoices
                           if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end)
         collected = sum(p["amount"] for p in payments if p["date"] and m.start <= p["date"] <= m.end)
-        cost = sum(_cost_in(r, m) for r in deployed if _overlaps(r, m))
+        cost = sum(_cost_in(r, m, today) for r in deployed if _overlaps(r, m))
         future = m.start > today
         spent = exp_month.get(m.key, 0.0)
         # Every month (past ones too): what the deployed team should have billed.
-        predicted = round(month_prediction(deployed, m)["amount"], 2)
+        pred = month_prediction(deployed, m)
+        predicted = round(pred["amount"], 2)
         monthly.append({
+            **money.get(m.key, {}),
+            "predicted_projects": len(pred["projects"]),
+            "predicted_heads": len(pred["people"]),
+            "predicted_customers": len(pred["customers"]),
             "key": m.key, "label": m.start.strftime("%b %y"), "billed": round(billed, 2),
             "collected": round(collected, 2), "received_ex": round(received_ex, 2), "cost": round(cost, 2),
             "margin": round(billed - cost, 2), "future": future,
@@ -335,8 +346,13 @@ def _finance(db: Session, period: Period, today: date,
     tds = _safe(lambda: _tds_summary(db, period, today, customer_id, scoped), None, "tds")
 
     by_type = rep["dimensions"]["by_type"]
+    money_total = money_split.totals(monthly)
+    money_total["predicted"] = round(sum(r["predicted"] for r in monthly), 2)
+    money_total["tds_rate_pct"] = round(tds_rate * 100, 2)
     return {
+        "track_people_cost": rep.get("track_people_cost", True),
         "headline": rep["headline"],
+        "money": money_total,
         "targets": rep["targets"],
         "margin": {k: v for k, v in rep["margin"].items() if k != "by_customer"},
         "collections": rep["collections"],
@@ -507,19 +523,19 @@ def _customer(db: Session, period: Period, today: date) -> dict:
     for cid in {*names}:
         billed = cust_billed.get(cid, 0.0)
         c_rows = [r for r in deployed if r["customer_id"] == cid]
-        cost = sum(_cost_in(r, period) for r in c_rows)
+        cost = sum(_cost_in(r, period, today) for r in c_rows)
         pids = sorted({p for p, (_, c) in proj_names.items() if c == cid},
                       key=lambda p: -proj_billed.get(p, 0.0))
         projects = []
         for pid in pids:
             p_rows = [r for r in c_rows if r["project_id"] == pid]
             p_billed = proj_billed.get(pid, 0.0)
-            p_cost = sum(_cost_in(r, period) for r in p_rows)
+            p_cost = sum(_cost_in(r, period, today) for r in p_rows)
             employees = []
             for r in sorted(p_rows, key=lambda r: -emp_billed.get((pid, r["employee_id"]), 0.0)):
                 kind, reason = kinds.get(r["pe_id"], (UNKNOWN, "No onboarding date on the assignment"))
                 e_billed = emp_billed.get((pid, r["employee_id"]), 0.0)
-                e_cost = _cost_in(r, period)
+                e_cost = _cost_in(r, period, today)
                 employees.append({
                     "pe_id": r["pe_id"], "employee_id": r["employee_id"], "employee": r["name"],
                     "employee_code": r["employee_code"], "rate": r["rate"],
@@ -598,6 +614,12 @@ def _customer(db: Session, period: Period, today: date) -> dict:
     top_ids = [c["customer_id"] for c in customers[:DONUT_SLICES] if c["billed"] > 0]
     top_names = {c["customer_id"]: c["customer"] for c in customers}
     others_label = f"Others ({len(customers) - len(top_ids)})" if len(customers) > len(top_ids) else None
+    # 6 Nov 2026: the same bank / TDS split as the Finance tab (services/money_split).
+    from services import money_split
+    money = _safe(lambda: money_split.money_by_month(
+        _months_in(period), invoices, payments,
+        money_split.tds_by_invoice(db, [i["id"] for i in invoices]),
+        money_split.expected_tds_rate()), {}, "customer money split")
     monthly = []
     for m in _months_in(period):
         rows = [i for i in invoices if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end]
@@ -607,10 +629,11 @@ def _customer(db: Session, period: Period, today: date) -> dict:
             if label:
                 per[label] += i["sub_total"]
         monthly.append({
+            **money.get(m.key, {}),
             "key": m.key, "label": m.start.strftime("%b %y"), "future": m.start > today,
             "billed": round(sum(i["sub_total"] for i in rows), 2),
             "collected": round(sum(p["amount"] for p in payments if p["date"] and m.start <= p["date"] <= m.end), 2),
-            "cost": round(sum(_cost_in(r, m) for r in deployed if _overlaps(r, m)), 2),
+            "cost": round(sum(_cost_in(r, m, today) for r in deployed if _overlaps(r, m)), 2),
             "customers": {k: round(v, 2) for k, v in per.items()},
         })
     series_names = [top_names[c] for c in top_ids] + ([others_label] if others_label else [])
@@ -621,6 +644,8 @@ def _customer(db: Session, period: Period, today: date) -> dict:
     deployed_trend, deployed_customers = _deployed_trend(assignments, locations, period, today)
     location_names = sorted({loc for b in deployed_trend.values() for r in b for loc in r["locations"]})
 
+    from services.org_settings import track_people_cost
+    track_cost = track_people_cost()
     alerts: list[dict] = []
     if top1 is not None and top1 >= CONCENTRATION_WARN_PCT:
         _alert(alerts, "concentration", "warn", f"{customers[0]['customer']} is {top1:.0f}% of billing",
@@ -637,10 +662,12 @@ def _customer(db: Session, period: Period, today: date) -> dict:
             _alert(alerts, f"drop:{c['customer_id']}", "warn",
                    f"{c['customer']} down {abs(c['change_pct']):.0f}% {period.comparison_label}",
                    f"₹{c['billed']:,.0f} now against ₹{c['previous']:,.0f} — find out why before the account fades.")
-        if c["billed"] > 0 and c["margin"] < 0:
+        if track_cost and c["billed"] > 0 and c["margin"] < 0:
             _alert(alerts, f"loss:{c['customer_id']}", "bad", f"{c['customer']} is loss-making",
                    f"Billed ₹{c['billed']:,.0f} against ₹{c['cost']:,.0f} of people cost.")
     return {
+        # 8 Nov 2026 — False: people cost and margin are hidden (Settings ▸ Billing).
+        "track_people_cost": track_cost,
         "summary": {
             "customers": len(customers),
             "customers_billing": sum(1 for c in customers if c["billed"] > 0),

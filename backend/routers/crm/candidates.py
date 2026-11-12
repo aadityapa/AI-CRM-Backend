@@ -638,11 +638,28 @@ def update_candidate(candidate_id: int, payload: CandidateUpdate,
         raise HTTPException(status_code=409,
                             detail=f"A candidate with email '{new_email}' already exists")
     _reject_impossible_ctc(updates)
+    # 12 Nov 2026: a name changed here is the candidate's everywhere — every
+    # position's Applied Candidates row carries a copy (services/candidate_names).
+    name_keys = {"first_name", "middle_name", "last_name"}
+    name_change = None
+    if name_keys & set(updates):
+        from services.candidate_names import rename_candidate
+        parts = tuple((updates.get(k) if k in updates else getattr(candidate, k, None)) or None
+                      for k in ("first_name", "middle_name", "last_name"))
+        if not str(parts[0] or "").strip():
+            raise HTTPException(status_code=400, detail="First name is required")
+        for k in name_keys:
+            updates.pop(k, None)
+        name_change = rename_candidate(db, candidate, None, user_id=user.id,
+                                       where="Candidates page", parts=parts)
     for field, value in updates.items():
         setattr(candidate, field, value)
     db.commit()
     db.refresh(candidate)
-    return envelope(data=candidate_to_dict(candidate), message="Candidate updated")
+    msg = "Candidate updated"
+    if name_change and name_change["changed"] and name_change["resumes"]:
+        msg += f" · name updated on {name_change['resumes']} position(s)"
+    return envelope(data=candidate_to_dict(candidate), message=msg)
 
 
 @router.delete("/{candidate_id}")

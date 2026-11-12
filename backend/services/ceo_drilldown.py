@@ -95,12 +95,17 @@ def kpi(key: str, label: str, value, fmt: str = "money", tone: str = "neutral", 
     return out
 
 
-def col(key: str, label: str, fmt: str = "text", link: str | None = None, align: str | None = None) -> dict:
+def col(key: str, label: str, fmt: str = "text", link: str | None = None, align: str | None = None,
+        hidden: bool = False) -> dict:
+    """A table column. `hidden` = off until the reader ticks it in the page's column
+    chooser (7 Nov 2026 — the Billed page carries 20 columns; 11 show at first)."""
     out = {"key": key, "label": label, "format": fmt}
     if link:
         out["link"] = link
     if align or fmt in ("money", "int", "pct", "days", "num"):
         out["align"] = align or "right"
+    if hidden:
+        out["hidden"] = True
     return out
 
 
@@ -309,18 +314,51 @@ INVOICE_COLUMNS = [
 ]
 
 
+#: 7 Nov 2026 (CEO ask) — the Billed page speaks the dashboard's ten money words
+#: (services/money_split). The rarely read columns start hidden (column chooser).
 BILLED_COLUMNS = [
-    col("invoice", "Invoice", link="link"), col("invoice_date", "Invoice date", "date"),
+    col("invoice", "Invoice", link="link"), col("invoice_date", "Invoice date", "date", hidden=True),
     col("work_month", "Work month"), col("customer", "Customer", link="customer_link"),
-    col("branch", "Branch"), col("project", "Project", link="project_link"),
-    col("employee", "Employee", link="employee_link"), col("po_number", "PO", link="po_link"),
-    col("sub_total", "Billed (excl. GST)", "money"), col("received_ex", "Received (excl. GST)", "money"),
-    col("balance_ex", "Due (excl. GST)", "money"), col("tax", "GST", "money"),
-    col("grand_total", "Invoice value", "money"), col("bank", "In bank", "money"),
-    col("tds", "TDS deducted", "money"), col("tds_pending", "TDS pending", "money"),
-    col("balance", "Balance due", "money"), col("due_date", "Due", "date"),
+    col("branch", "Branch", hidden=True), col("project", "Project", link="project_link", hidden=True),
+    col("employee", "Employee", link="employee_link"), col("po_number", "PO", link="po_link", hidden=True),
+    col("revenue_ex", "Revenue (Ex. Tax)", "money"), col("tax", "GST", "money", hidden=True),
+    col("revenue_inc", "Revenue (Inc Tax)", "money"),
+    col("receivable_bank", "Receivable Bank", "money", hidden=True),
+    col("receivable_tds", "Receivable TDS", "money", hidden=True),
+    col("received_bank", "Received Bank", "money"), col("received_tds", "Received TDS", "money"),
+    col("due_bank", "Due Bank", "money", hidden=True), col("due_tds", "Due TDS", "money", hidden=True),
+    col("total_due", "Total Due", "money"), col("due_date", "Due", "date", hidden=True),
     col("days_late", "Days late", "days"), col("stage_label", "Where it stands", "badge"),
 ]
+
+#: The ten money words, in the CEO's order: (key, label, tone).
+MONEY_SERIES = (
+    ("revenue_ex", "Revenue (Ex. Tax)", "brand"), ("revenue_inc", "Revenue (Inc Tax)", "brand"),
+    ("receivable_bank", "Receivable Bank", "info"), ("receivable_tds", "Receivable TDS", "violet"),
+    ("received_bank", "Received Bank", "success"), ("received_tds", "Received TDS", "success"),
+    ("due_bank", "Due Bank", "warning"), ("due_tds", "Due TDS", "warning"),
+    ("total_due", "Total Due", "danger"), ("predicted", "Predicted revenue (project count)", "neutral"),
+)
+MONEY_KEYS = tuple(k for k, _l, _t in MONEY_SERIES if k != "predicted")
+
+
+def with_money_split(db: Session, rows: list[dict]) -> dict:
+    """Stamp every invoice row of `load_invoices` with the ten money words — the SAME
+    rule as the dashboard (`money_split.invoice_money`): cash = the invoice's paid
+    amount, TDS = its TdsRecord. Returns the period totals (+ `expected_tds`,
+    `tds_rate_pct`). Never raises — a failed TDS read only drops the TDS split."""
+    from services import money_split
+
+    rate = money_split.expected_tds_rate()
+    tds = money_split.tds_by_invoice(db, [r["id"] for r in rows])
+    for r in rows:
+        inv = {"sub_total": r["sub_total"], "grand_total": r["grand_total"], "balance": r["balance"],
+               "status": "Paid" if r["stage"] == "paid" else ""}
+        r.update({k: round(v, 2) for k, v in money_split.invoice_money(inv, r["paid"], tds.get(r["id"]), rate).items()})
+    total = money_split.totals(rows)
+    total["tds_rate_pct"] = round(rate * 100, 2)
+    total["invoices"] = len(rows)
+    return total
 
 
 
@@ -402,103 +440,133 @@ def _with_predicted(db, monthly: list[dict], period: Period, today: date,
     for m in _months(period):
         row = by_key.get(m.key) or {"label": m.start.strftime("%b %y"), "key": m.key,
                                     **{k: 0.0 for k in keys if k not in ("label", "key")}}
-        row["predicted"] = round(month_prediction(deployed, m)["amount"], 2)
+        pred = month_prediction(deployed, m)
+        row["predicted"] = round(pred["amount"], 2)
+        # 7 Nov 2026 — "Predicted revenue (project count)": the tooltip names them.
+        row["predicted_projects"] = len(pred["projects"])
+        row["predicted_heads"] = len(pred["people"])
+        row["predicted_customers"] = len(pred["customers"])
         row["future"] = m.start > today
         out.append(row)
     return out
 
 
+def _compact(v: float) -> str:
+    """₹ in the dashboard's words: 1.23 Cr · 4.5 L · ₹12,000."""
+    v = float(v or 0)
+    if abs(v) >= 1e7:
+        return f"₹{v / 1e7:.2f} Cr"
+    if abs(v) >= 1e5:
+        return f"₹{v / 1e5:.1f} L"
+    return f"₹{round(v):,}"
+
+
 def m_billed(db, period: Period, today: date, customer_id=None, project_id=None, scope=None) -> dict:
+    """7 Nov 2026 (CEO ask) — the Billed page reads in the dashboard's ten money words:
+    every invoice carries Revenue (Ex. / Inc Tax) · Receivable / Received / Due — Bank and
+    TDS · Total Due (`with_money_split`, the dashboard's own rule), and the first chart is
+    the dashboard's "How the year unfolded" (`kind: money`), so the ticks the CEO chose
+    there open here unchanged."""
     rows = load_invoices(db, [work_window_clause(period.start, period.end)],
                          today, customer_id, project_id)
     for r in rows:
         late = r["days_late"] > 0
         r["overdue_amount"] = r["balance"] if late else 0.0
         r["overdue_ex"] = r["balance_ex"] if late else 0.0
+    try:
+        money = with_money_split(db, rows)
+    except Exception:  # noqa: BLE001 — the split is extra; the invoices must still list
+        logger.warning("money split for the billed page failed", exc_info=True)
+        money = {}
+        for r in rows:
+            for k in MONEY_KEYS:
+                r.setdefault(k, 0.0)
     s = lambda k: round(sum(float(r.get(k) or 0) for r in rows), 2)  # noqa: E731
-    billed, tax, grand = s("sub_total"), s("tax"), s("grand_total")
-    received_ex, due_ex, overdue_ex = s("received_ex"), s("balance_ex"), s("overdue_ex")
-    received, due, overdue = s("received"), s("balance"), s("overdue_amount")
-    bank, tds, tds_got, tds_open = s("bank"), s("tds"), s("tds_collected"), s("tds_pending")
+    rev_ex, rev_inc, tax = s("revenue_ex"), s("revenue_inc"), s("tax")
+    rec_bank, rec_tds = s("receivable_bank"), s("receivable_tds")
+    got_bank, got_tds = s("received_bank"), s("received_tds")
+    due_bank, due_tds, total_due = s("due_bank"), s("due_tds"), s("total_due")
+    overdue = s("overdue_amount")
+    expected = s("expected_tds")
     paid_n = sum(1 for r in rows if r["stage"] == "paid")
-    open_n = sum(1 for r in rows if r["balance"] > 0)
+    open_n = sum(1 for r in rows if r["total_due"] > 0)
     late_n = sum(1 for r in rows if r["days_late"] > 0 and r["balance"] > 0)
+    count = lambda k: sum(1 for r in rows if float(r.get(k) or 0) > 0)  # noqa: E731
     stage_defs = [(k, billing_rules.STAGE_LABELS[k], STAGE_TONE[k]) for k in _LIVE_STAGES]
 
-    monthly = _month_sums(rows, period, "_date", ["sub_total", "received_ex", "balance_ex", "overdue_ex"], today)
+    monthly = _month_sums(rows, period, "_date", list(MONEY_KEYS) + ["expected_tds"], today)
+    for m in monthly:
+        m["invoices"] = sum(1 for r in rows if _month_key(r["_date"]) == m["key"])
     monthly = _with_predicted(db, monthly, period, today, customer_id, project_id)
-    money = _month_sums(rows, period, "_date",
-                        ["grand_total", "bank", "tds", "tds_collected", "tds_pending", "balance"], today)
-    mix = [{"label": billing_rules.STAGE_LABELS[k],
-            "amount": round(sum(r["sub_total"] for r in rows if r["stage"] == k), 2),
-            "received": round(sum(r["received_ex"] for r in rows if r["stage"] == k), 2),
-            "balance": round(sum(r["balance_ex"] for r in rows if r["stage"] == k), 2)} for k in _LIVE_STAGES]
+    for m in monthly:
+        m.setdefault("invoices", 0)
+    mix = [{"label": billing_rules.STAGE_LABELS[k], "key": k,
+            "revenue_inc": round(sum(r["revenue_inc"] for r in rows if r["stage"] == k), 2),
+            "received": round(sum(r["received_bank"] + r["received_tds"] for r in rows if r["stage"] == k), 2),
+            "total_due": round(sum(r["total_due"] for r in rows if r["stage"] == k), 2)} for k in _LIVE_STAGES]
+    pct_of = lambda part, whole: f"{_pct(part, whole) or 0:.0f}%"  # noqa: E731
+    word = "year" if period.kind == "fy" else "period"
     return {
-        "title": "Billed", "question": f"Every invoice raised in {period.label} — and where each one stands now",
+        "title": "Billed", "question": f"Every invoice of {period.label} — what it is worth, what came in and what is still due",
+        "money": money,
         "kpis": [
-            kpi("billed", "Billed (excl. GST)", billed, tone="brand", sub=f"{len(rows)} invoices",
-                go={"segments": [], "sort": "sub_total"}),
-            kpi("received", "Received against it", received_ex, tone="success",
-                sub=f"{_pct(received_ex, billed) or 0:.0f}% of billed · with GST {round(received):,}",
-                go={"segments": [], "where": "received_ex", "sort": "received_ex"}),
-            kpi("due", "Still to collect", due_ex, tone="warning" if due_ex else "success",
-                sub=f"{open_n} invoices open · with GST {round(due):,}",
-                go={"segments": [], "where": "balance_ex", "sort": "balance_ex"}),
-            kpi("overdue", "Of which overdue", overdue_ex, tone="danger" if overdue_ex else "success",
-                sub=f"{late_n} invoices past due · with GST {round(overdue):,}",
-                go={"segments": [], "where": "overdue_ex", "sort": "days_late"}),
+            kpi("revenue_ex", "Revenue (Ex. Tax)", rev_ex, tone="brand", sub=f"{len(rows)} invoices · before GST",
+                go={"segments": [], "sort": "revenue_ex"}),
+            kpi("revenue_inc", "Revenue (Inc Tax)", rev_inc, tone="brand", sub=f"GST {_compact(tax)}",
+                go={"segments": [], "sort": "revenue_inc"}),
+            kpi("receivable_bank", "Receivable Bank", rec_bank, tone="info",
+                sub=f"Inc Tax − TDS · {pct_of(rec_bank, rev_inc)}", go={"segments": [], "where": "receivable_bank", "sort": "receivable_bank"}),
+            kpi("receivable_tds", "Receivable TDS", rec_tds, tone="violet",
+                sub=(f"{_compact(expected)} expected at {money.get('tds_rate_pct', 10):g}%" if expected else f"{count('receivable_tds')} invoices"),
+                go={"segments": [], "where": "receivable_tds", "sort": "receivable_tds"}),
+            kpi("received_bank", "Received Bank", got_bank, tone="success",
+                sub=f"{pct_of(got_bank, rec_bank)} of receivable bank", go={"segments": [], "where": "received_bank", "sort": "received_bank"}),
+            kpi("received_tds", "Received TDS", got_tds, tone="success",
+                sub=f"{pct_of(got_tds, rec_tds)} of receivable TDS · Form 16A", go={"segments": [], "where": "received_tds", "sort": "received_tds"}),
+            kpi("due_bank", "Due Bank", due_bank, tone="warning" if due_bank else "success",
+                sub=f"{count('due_bank')} invoices", go={"segments": [], "where": "due_bank", "sort": "due_bank"}),
+            kpi("due_tds", "Due TDS", due_tds, tone="warning" if due_tds else "success",
+                sub=f"pending from clients · {count('due_tds')} invoices", go={"segments": [], "where": "due_tds", "sort": "due_tds"}),
+            kpi("total_due", "Total Due", total_due, tone="danger" if total_due else "success",
+                sub=f"{open_n} invoices open", go={"segments": [], "where": "total_due", "sort": "total_due"}),
+            kpi("overdue", "Overdue", overdue, tone="danger" if overdue else "success",
+                sub=f"{late_n} invoices past due", go={"segments": [], "where": "overdue_amount", "sort": "days_late"}),
             kpi("paid", "Fully paid", paid_n, "int", "success", f"of {len(rows)} invoices",
                 go={"segments": ["paid"]}),
-            kpi("gst", "GST on it", tax, sub=f"invoice value {round(grand):,}",
-                go={"segments": [], "where": "tax", "sort": "tax"}),
-            kpi("bank", "Received in bank", bank, tone="success",
-                sub=f"cash after TDS · {_pct(bank, grand) or 0:.0f}% of the invoice value",
-                go={"segments": [], "where": "bank", "sort": "bank"}),
-            kpi("tds", "TDS deducted by clients", tds, tone="info",
-                sub=f"collected (Form 16A) {round(tds_got):,}",
-                go={"segments": [], "where": "tds", "sort": "tds"}),
-            kpi("tds_pending", "TDS pending from clients", tds_open, tone="warning" if tds_open else "success",
-                sub=f"{sum(1 for r in rows if r['tds_pending'] > 0)} invoices",
-                go={"segments": [], "where": "tds_pending", "sort": "tds_pending"}),
         ],
         "charts": [
-            chart("monthly", "Billed month by month", monthly,
-                  [series("sub_total", "Billed", "brand"), series("received_ex", "Received", "success"),
-                   series("balance_ex", "Still due", "warning"), series("overdue_ex", "Overdue", "danger"),
-                   series("predicted", "Predicted", "violet")],
-                  subtitle="By work month, all before GST — received and due are each invoice's share before GST, "
-                           "so received + still due = billed and received never reads above billed. "
-                           "Predicted = deployed team × rate up to each planned release date"),
-            chart("money", "Money in — bank and TDS (with GST)", money,
-                  [series("grand_total", "Invoice value", "brand"), series("bank", "Received in bank", "success"),
-                   series("tds", "TDS deducted", "info"), series("tds_collected", "TDS collected", "violet"),
-                   series("tds_pending", "TDS pending", "warning"), series("balance", "Still due", "danger")],
-                  subtitle="By invoice month, on the invoice value with GST: what reached the bank, what the "
-                           "client withheld as TDS (collected = Form 16A received) and what is still owed"),
+            {**chart("money_monthly", f"How the {word} unfolded", monthly,
+                     [series(k, label, tone) for k, label, tone in MONEY_SERIES],
+                     subtitle="Every figure by the invoice's work month · Bank = cash, TDS = what the customer withholds · "
+                              "Predicted = the deployed team × the rate in force that month"),
+             "kind": "money"},
             chart("customers", "Who we billed",
-                  _by_customer(rows, ["sub_total", "received_ex", "balance_ex"], "sub_total"),
-                  [series("sub_total", "Billed", "brand"), series("received_ex", "Received", "success"),
-                   series("balance_ex", "Still due", "warning")]),
-            chart("stages", "Where the money stands", mix,
-                  [series("amount", "Billed", "brand"), series("received", "Received", "success"),
-                   series("balance", "Still due", "warning")]),
+                  _by_customer(rows, ["revenue_ex", "received_bank", "received_tds", "total_due"], "revenue_ex"),
+                  [series("revenue_ex", "Revenue (Ex. Tax)", "brand"), series("received_bank", "Received Bank", "success"),
+                   series("received_tds", "Received TDS", "info"), series("total_due", "Total Due", "danger")]),
+            chart("stages", "By where each invoice stands", mix,
+                  [series("revenue_inc", "Revenue (Inc Tax)", "brand"), series("received", "Received (Bank + TDS)", "success"),
+                   series("total_due", "Total Due", "danger")]),
         ],
-        "segments": segments(rows, stage_defs, "grand_total"),
+        "segments": segments(rows, stage_defs, "revenue_inc"),
         "default_segment": scope if scope in _LIVE_STAGES else None,
         "tables": [table("invoices", "Invoices", BILLED_COLUMNS, _strip(rows))],
         "related": [{"metric": "collected", "label": "Cash collected"},
                     {"metric": "outstanding", "label": "Outstanding"},
                     {"metric": "margin", "label": "Gross margin"}],
-        "notes": ["Billed = Tax invoices whose WORK month falls in the period (the timesheet's month; a manual "
-                  "invoice uses its invoice date), value before GST. Proformas are not money yet.",
+        "notes": ["Every invoice counts in its WORK month (the timesheet's month; a manual invoice uses its "
+                  "invoice date). Tax invoices only — a Proforma is not money yet.",
+                  "Revenue (Ex. Tax) = the value before GST. Revenue (Inc Tax) = what the invoice asks for, GST included.",
+                  "Receivable TDS = the TDS the customer deducted, as booked on the invoice. An invoice still open "
+                  f"with no TDS booked is expected to carry TDS at {money.get('tds_rate_pct', 10):g}% of the value before GST "
+                  "(Settings ▸ Finance ▸ TDS rate); a fully paid invoice with none booked had none. "
+                  "Receivable Bank = Revenue (Inc Tax) − Receivable TDS.",
+                  "Received Bank = cash recorded against the invoice. Received TDS = TDS certificates received "
+                  "(Form 16A). Due = Receivable − Received, for each; Total Due = Due Bank + Due TDS.",
                   "Money is counted against the invoice it was mapped to: a received amount that arrived in June "
-                  "and was mapped to an April invoice is April's money.",
-                  "A customer pays the invoice value WITH GST (cash + TDS). To compare it with billed, "
-                  "Received / Still to collect / Overdue show each invoice's share before GST — "
-                  "so received + still to collect = billed, and received can never read above billed. "
-                  "The figures with GST are on each tile's second line and in the 'Money in' chart.",
-                  "Received in bank = cash only. TDS deducted = what clients withheld; collected = Form 16A "
-                  "received, pending = still owed by the client.",
+                  "and was mapped to an April invoice is April's money. Money still on account is not received yet.",
+                  "Predicted = each deployed person's monthly rate (the rate in force that month) × the part of the "
+                  "month they worked, up to their exit or planned release date.",
                   "Where it stands follows the invoice: awaiting the customer's approval → e-invoice (IRN) → "
                   "unpaid → partly paid → paid."]
                  + _scope_note(customer_id, project_id),
