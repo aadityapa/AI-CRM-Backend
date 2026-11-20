@@ -369,7 +369,8 @@ def apply_round_off(invoice: Invoice, enabled: bool) -> None:
     paid = Decimal(str(invoice.paid_amount or 0))
     # TDS the customer withheld settles the invoice too (0136).
     tds = Decimal(str(getattr(invoice, "tds_deducted", 0) or 0))
-    balance = (grand_total - paid - tds).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    adj = Decimal(str(getattr(invoice, "settled_adjustment", 0) or 0))  # 0154
+    balance = (grand_total - paid - tds - adj).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     invoice.balance_amount = max(balance, Decimal("0"))
     if invoice.balance_amount <= 0 and (paid > 0 or tds > 0):
         invoice.payment_status = PaymentStatus.PAID
@@ -989,6 +990,8 @@ def serialize_invoice(invoice: Invoice, detail: bool = False, db: Session | None
         "balance_amount": _num(invoice.balance_amount),
         # TDS the customer withheld — settles the invoice beside the cash (0136).
         "tds_deducted": _num(getattr(invoice, "tds_deducted", 0) or 0),
+        # Settled in full by Finance / Admin (0154): the balance adjusted, not cash.
+        "settled_adjustment": _num(getattr(invoice, "settled_adjustment", 0) or 0),
         "invoice_pdf_url": invoice.invoice_pdf_url,
         # Proforma → Tax lifecycle (0107)
         "kind": invoice.kind or InvoiceKind.TAX.value,

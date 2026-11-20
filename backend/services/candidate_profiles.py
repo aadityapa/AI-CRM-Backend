@@ -1820,6 +1820,7 @@ _EMPTY_AI_STATUS: dict = {
     "ai_hr_decision": None,
     "ai_hr_decision_label": None,
     "ai_effective_result": None,
+    "ai_suggestion": None,
     "ai_is_overridden": False,
     "ai_interview_completed_at": None,
     "ai_report_link": None,
@@ -1903,6 +1904,8 @@ def latest_ai_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[
             continue  # first row per profile is the one we want, per the ordering
         clean_email = (email or "").strip().lower()
         out[link.profile_id] = {
+            # Raw (Pending / Passed / Failed) for the "has it finished?" checks;
+            # every screen DISPLAYS `ai_effective_result` (18 Nov 2026).
             "ai_interview_status": link.result,
             "ai_interview_result": link.result,
             "ai_overall_score_percent": (
@@ -1912,6 +1915,8 @@ def latest_ai_interviews(db: Session, profiles: list[CandidateProfile]) -> dict[
             "ai_hr_decision": link.hr_decision,
             "ai_hr_decision_label": hr_decision_label(link.hr_decision),
             "ai_effective_result": link.effective_result,
+            # 18 Nov 2026: the AI's own Passed / Failed — advice, never the status.
+            "ai_suggestion": link.ai_suggestion,
             "ai_is_overridden": bool(link.hr_decision) and link.effective_result != link.result,
             "ai_not_attempted": bool(link.not_attempted),
             "ai_interview_completed_at": (

@@ -74,7 +74,8 @@ CATEGORIES: dict[str, tuple[str, str, str, bool]] = {
     "decide": ("Submit to Sales", "Rounds are judged — submit to Sales, ask for an L2, or reject. "
                "The desk also lists who you handed over lately and where they are now.",
                "send", True),
-    "ai_failed": ("AI L1 to decide", "AI L1 not cleared or put on hold — proceed, take a manual L1, or reject.",
+    "ai_failed": ("AI L1 to decide", "AI L1 finished (In Review) or put on hold — read the report, then "
+                  "select, take a manual L1, or reject. The AI's score is advice.",
                   "alert", True),
     "approvals": ("Positions to approve", "New positions waiting for your JD & skills approval.",
                   "check", False),
@@ -111,9 +112,12 @@ _STEP_CATEGORY = {
     # 27 Oct 2026 (filter audit): an AI L1 put ON HOLD is the screener's call (it
     # used to read "cleared"); one NOT ATTEMPTED is TA's to reschedule — never a fail.
     "ai_on_hold": "ai_failed", "ai_not_attempted": "booking",
+    # 18 Nov 2026: every finished AI L1 waits for a person's decision.
+    "ai_review": "ai_failed",
 }
 _BOOK_CHIP = {"l1_book": "Technical L1", "l2_book": "Technical L2", "ai_book": "AI L1",
-              "ai_not_attempted": "AI L1 · not attempted", "ai_on_hold": "AI L1 · on hold"}
+              "ai_not_attempted": "AI L1 · not attempted", "ai_on_hold": "AI L1 · on hold",
+              "ai_review": "AI L1 · In Review"}
 #: Categories sent in FULL — the Feedback-due panel and the results list group and
 #: count every item; the others print a top-`MAX_ITEMS` list.
 FULL_LIST_CATEGORIES = frozenset({"feedback", "results"})
@@ -235,7 +239,10 @@ def unreviewed_results(db: Session, profile_ids=None, *, now: datetime | None = 
         out.setdefault(link.profile_id, []).append({
             "key": key, "kind": "ai", "label": "AI L1", "result": link.effective_result,
             "score": score, "when": _iso(_aware(link.completed_at)), "by": "AI interview",
-            "passed": link.effective_result in ("Passed", "Selected"),
+            "passed": link.effective_result == "Selected",
+            # 18 Nov 2026: "In Review" until RMG / GM decide; the AI's own read
+            # is advice beside it.
+            "ai_suggestion": link.ai_suggestion,
             # The interview's OWN report (Reports tab), not the profile.
             "report_link": ai_report_link(emails.get(link.candidate_id), link.interview_record_id),
         })
@@ -363,7 +370,10 @@ def _results_items(db: Session, desk_ids: set[int], now: datetime) -> list[dict]
         items.append(_item(f"results:{p.id}", _name(cand),
                            " · ".join(x for x in (opp.opp_id, opp.title,
                                                   f"+{len(results) - 1} more" if len(results) > 1 else None) if x),
-                           chip=label, tone="ok" if top["passed"] else "bad", when=top["when"],
+                           chip=label,
+                           tone=("warn" if top["result"] in ("In Review", "On Hold")   # 18 Nov 2026: yours to decide
+                                 else "ok" if top["passed"] else "bad"),
+                           when=top["when"],
                            path=path, action="Review report", profile_id=p.id))
     items.sort(key=lambda i: i["when"] or "", reverse=True)
     return items

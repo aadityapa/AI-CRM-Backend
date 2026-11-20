@@ -26,6 +26,19 @@ first question MINUS every second spent paused (``pause_total_sec`` plus the
 running pause). A pause is capped at ``max_pause_sec()`` — past that it ends by
 itself, so a recruiter who walks away can never leave a candidate frozen.
 
+Phase 3 (13 Nov 2026) — from the moment the link opens:
+
+* the **lobby**: the candidate's page reports where it is (opened · rules ·
+  device check · gesture · signed in …) from the first second, before sign-in,
+  so the Integrity tab can show "In lobby" and a recruiter can call to guide
+  them (how to sit, the light, the phone away);
+* a **silent watch**: a receive-only WebRTC stream of the camera and the
+  screen, in real time (the recording view runs ~15 s behind). The candidate
+  is TOLD they are being watched (user decision — fairer, and safer under the
+  DPDP Act). At most ``MAX_WATCHERS`` at once;
+* **terminate**: a recruiter ends the interview with a reason; the report and
+  the Integrity row say "Ended by the recruiter — <reason>".
+
 Everything here is PURE (no I/O): ``now`` is passed in, so every rule is
 testable without a clock or a database.
 """
@@ -55,6 +68,23 @@ PRESENCE_WINDOW_SEC = 45
 
 STATE_RUNNING = "running"
 STATE_PAUSED = "paused"
+
+#: Recruiters watching one interview at once (each is a stream from the
+#: candidate's laptop — more would load it).
+MAX_WATCHERS = 2
+#: A recruiter's reason for ending an interview, at least this long.
+MIN_TERMINATE_REASON = 5
+MAX_REASON_CHARS = 300
+
+#: Where the candidate's page is, in the order it goes (the lobby).
+LOBBY_STAGES = ("opened", "rules", "device_check", "gesture", "calibration", "verify", "waiting",
+                "signed_in", "room_scan", "interview", "finished")
+LOBBY_STAGE_WORDS = {
+    "opened": "Opened the link", "rules": "Reading the rules", "device_check": "On the device check",
+    "gesture": "On the gesture check", "calibration": "Calibrating the eye monitor",
+    "verify": "Verifying identity", "waiting": "Waiting for the start time", "signed_in": "Signed in",
+    "room_scan": "Showing the room", "interview": "In the interview", "finished": "Finished",
+}
 
 
 class LiveError(ValueError):
@@ -126,12 +156,18 @@ def empty_control() -> dict:
         "questions": [],       # [{id, text, by, at}] — queued, asked on resume
         "asked": [],           # [{id, text, by, at, index}] — already put to the candidate
         "call": None,          # {id, offer, by, at, video}
+        "watch": {},           # viewer id -> {id, offer, by, at} — receive-only streams
+        "terminated": None,    # {reason, by, at} — a recruiter ended the interview
         "log": [],             # [{at, by, action, text}]
     }
 
 
 def empty_reply() -> dict:
-    return {"call_id": "", "answer": "", "seen_at": None, "applied_question_ids": []}
+    return {"call_id": "", "answer": "", "seen_at": None, "applied_question_ids": [],
+            # watch id -> answer SDP (13 Nov 2026)
+            "watch_answers": {},
+            # where the candidate's page is: {stage, at, first_at, stages: [{stage, at}]}
+            "lobby": None}
 
 
 def normalize_control(raw: Any) -> dict:
@@ -156,6 +192,12 @@ def normalize_control(raw: Any) -> dict:
         base["call"] = None
     if not isinstance(base.get("message"), dict) or not base["message"].get("text"):
         base["message"] = None
+    if not isinstance(base.get("watch"), dict):
+        base["watch"] = {}
+    base["watch"] = {str(k): v for k, v in base["watch"].items()
+                     if isinstance(v, dict) and v.get("id") and v.get("offer")}
+    if not isinstance(base.get("terminated"), dict) or not base["terminated"].get("by"):
+        base["terminated"] = None
     try:
         base["rev"] = int(base.get("rev") or 0)
     except (TypeError, ValueError):
@@ -171,6 +213,10 @@ def normalize_reply(raw: Any) -> dict:
                 base[key] = raw[key]
     if not isinstance(base.get("applied_question_ids"), list):
         base["applied_question_ids"] = []
+    if not isinstance(base.get("watch_answers"), dict):
+        base["watch_answers"] = {}
+    if not isinstance(base.get("lobby"), dict) or not base["lobby"].get("stage"):
+        base["lobby"] = None
     return base
 
 
@@ -254,7 +300,7 @@ def recruiter_present(ctrl: dict, now: float) -> bool:
 
 def candidate_poll_ms(ctrl: dict, now: float) -> int:
     """How soon the candidate's page should check again."""
-    if is_paused(ctrl, now) or ctrl.get("call") or recruiter_present(ctrl, now):
+    if is_paused(ctrl, now) or ctrl.get("call") or ctrl.get("watch") or recruiter_present(ctrl, now):
         return FAST_POLL_MS
     return CANDIDATE_POLL_SEC * 1000
 
@@ -341,9 +387,132 @@ def end_call(ctrl: dict, by_name: str, now: float) -> dict:
     return ctrl
 
 
+def _valid_sdp(sdp: str) -> bool:
+    return sdp.startswith("v=") and len(sdp) <= MAX_SDP_CHARS
+
+
+def prune_watchers(ctrl: dict, now: float) -> bool:
+    """Drop watch streams whose recruiter closed the panel (no presence within
+    the window). True when ``ctrl`` changed."""
+    alive = {str(j.get("id")) for j in ctrl.get("joined") or []
+             if _age(now, j.get("at")) < PRESENCE_WINDOW_SEC}
+    before = dict(ctrl.get("watch") or {})
+    kept = {vid: w for vid, w in before.items() if vid in alive}
+    if len(kept) == len(before):
+        return False
+    ctrl["watch"] = kept
+    return True
+
+
+def _age(now: float, at: Any) -> float:
+    try:
+        return float(now) - float(at or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def start_watch(ctrl: dict, viewer_id: str, offer_sdp: str, by_name: str, now: float) -> dict:
+    """A recruiter starts watching silently (receive-only). Replaces that
+    recruiter's earlier watch; refuses past ``MAX_WATCHERS`` other watchers."""
+    sdp = str(offer_sdp or "")
+    if not _valid_sdp(sdp):
+        raise LiveError("Watching could not start (invalid connection details). Please try again.")
+    prune_watchers(ctrl, now)
+    watch = dict(ctrl.get("watch") or {})
+    others = [v for v in watch if v != str(viewer_id)]
+    if len(others) >= MAX_WATCHERS:
+        raise LiveError(f"{MAX_WATCHERS} recruiters are already watching this interview — try again when one stops.")
+    watch[str(viewer_id)] = {"id": uuid.uuid4().hex[:12], "offer": sdp, "by": by_name, "at": now}
+    ctrl["watch"] = watch
+    _log(ctrl, now, by_name, "watch_started")
+    return _bump(ctrl)
+
+
+def end_watch(ctrl: dict, viewer_id: str, by_name: str, now: float) -> dict:
+    watch = dict(ctrl.get("watch") or {})
+    if watch.pop(str(viewer_id), None) is not None:
+        ctrl["watch"] = watch
+        _log(ctrl, now, by_name, "watch_ended")
+        _bump(ctrl)
+    return ctrl
+
+
+def terminate(ctrl: dict, reason: str, by_name: str, now: float) -> dict:
+    """A recruiter ends the interview. Ends the pause, the call and every watch;
+    idempotent once terminated."""
+    if ctrl.get("terminated"):
+        return ctrl
+    clean = _clean_text(reason, MAX_REASON_CHARS)
+    if len(clean) < MIN_TERMINATE_REASON:
+        raise LiveError(f"Say why you are ending the interview (at least {MIN_TERMINATE_REASON} characters).")
+    if ctrl.get("paused_at"):
+        ctrl["pause_total_sec"] = float(ctrl.get("pause_total_sec") or 0) + running_pause_sec(ctrl, now)
+        ctrl["paused_at"] = None
+        ctrl["state"] = STATE_RUNNING
+    ctrl["call"] = None
+    ctrl["watch"] = {}
+    ctrl["message"] = None
+    ctrl["terminated"] = {"reason": clean, "by": by_name, "at": now}
+    _log(ctrl, now, by_name, "terminated", clean)
+    return _bump(ctrl)
+
+
+def termination_reason(ctrl: dict) -> str:
+    """The words the report and the Integrity row print."""
+    t = ctrl.get("terminated") or {}
+    return f"Ended by the recruiter ({t.get('by') or 'recruiter'}): {t.get('reason') or ''}".strip()
+
+
+def set_lobby(reply: dict, stage: str, now: float) -> bool:
+    """Record where the candidate's page is. True the FIRST time the page ever
+    reported (the recruiter is told the candidate opened the link)."""
+    clean = str(stage or "").strip().lower()
+    if clean not in LOBBY_STAGES:
+        clean = "opened"
+    lobby = reply.get("lobby") if isinstance(reply.get("lobby"), dict) else None
+    first = lobby is None
+    lobby = dict(lobby or {"first_at": now, "stages": []})
+    if lobby.get("stage") != clean:
+        lobby["stages"] = (list(lobby.get("stages") or []) + [{"stage": clean, "at": now}])[-20:]
+    lobby["stage"] = clean
+    lobby["at"] = now
+    reply["lobby"] = lobby
+    reply["seen_at"] = now
+    return first
+
+
+def lobby_view(reply: dict, now: float) -> dict | None:
+    lobby = reply.get("lobby") if isinstance(reply.get("lobby"), dict) else None
+    if not lobby:
+        return None
+    stage = str(lobby.get("stage") or "opened")
+    return {
+        "stage": stage,
+        "words": LOBBY_STAGE_WORDS.get(stage, stage),
+        "at": lobby.get("at"),
+        "first_at": lobby.get("first_at"),
+        "online": _age(now, reply.get("seen_at")) < CANDIDATE_POLL_SEC * 4,
+        "stages": list(lobby.get("stages") or [])[-12:],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Candidate side
 # ---------------------------------------------------------------------------
+
+def set_watch_answer(reply: dict, ctrl: dict, watch_id: str, answer_sdp: str, now: float) -> dict:
+    live_ids = {str(w.get("id")) for w in (ctrl.get("watch") or {}).values()}
+    if str(watch_id) not in live_ids:
+        raise LiveError("The recruiter stopped watching.")
+    sdp = str(answer_sdp or "")
+    if not _valid_sdp(sdp):
+        raise LiveError("Invalid watch answer.")
+    answers = {k: v for k, v in (reply.get("watch_answers") or {}).items() if k in live_ids}
+    answers[str(watch_id)] = sdp
+    reply["watch_answers"] = answers
+    reply["seen_at"] = now
+    return reply
+
 
 def set_answer(reply: dict, ctrl: dict, call_id: str, answer_sdp: str, now: float) -> dict:
     call = ctrl.get("call") or {}
@@ -379,6 +548,17 @@ def candidate_view(ctrl: dict, reply: dict, now: float) -> dict:
         "poll_sec": CANDIDATE_POLL_SEC,
         "poll_ms": candidate_poll_ms(ctrl, now),
         "call": None,
+        # 13 Nov 2026 — silent watch (the page shows "A recruiter is watching")
+        # and a recruiter ending the interview. The reason stays internal.
+        "watched": bool(ctrl.get("watch")),
+        "watchers": [first_name(w.get("by") or "") for w in (ctrl.get("watch") or {}).values()],
+        # Every live watch (so the page can close a stream the recruiter stopped).
+        "watch_ids": [str(w.get("id")) for w in (ctrl.get("watch") or {}).values()],
+        "watch": [{"id": w.get("id"), "offer": w.get("offer")}
+                  for w in (ctrl.get("watch") or {}).values()
+                  if str(w.get("id")) not in (reply.get("watch_answers") or {})],
+        "terminated": ({"by": first_name((ctrl.get("terminated") or {}).get("by") or "")}
+                       if ctrl.get("terminated") else None),
     }
     if call:
         view["call"] = {
@@ -391,8 +571,16 @@ def candidate_view(ctrl: dict, reply: dict, now: float) -> dict:
     return view
 
 
-def staff_view(ctrl: dict, reply: dict, now: float) -> dict:
+def turn_configured() -> bool:
+    """True when a TURN relay is set — without one, real-time video fails on
+    many office and home networks (13 Nov 2026: the panel warns)."""
+    return bool(str(os.getenv("INTERVIEW_TURN_URLS") or "").strip())
+
+
+def staff_view(ctrl: dict, reply: dict, now: float, viewer_id: str = "") -> dict:
     call = ctrl.get("call") or None
+    mine = (ctrl.get("watch") or {}).get(str(viewer_id)) if viewer_id else None
+    watch_answer = (reply.get("watch_answers") or {}).get(str((mine or {}).get("id"))) if mine else None
     answered = bool(call and str(reply.get("call_id") or "") == str(call.get("id")) and reply.get("answer"))
     seen_at = reply.get("seen_at")
     return {
@@ -419,12 +607,20 @@ def staff_view(ctrl: dict, reply: dict, now: float) -> dict:
         "poll_sec": STAFF_POLL_SEC,
         "presence_every_sec": PRESENCE_EVERY_SEC,
         "ice_servers": ice_servers(),
+        "turn_configured": turn_configured(),
+        "watch": ({"id": mine.get("id"), "answered": bool(watch_answer), "answer": watch_answer}
+                  if mine else None),
+        "watchers": [{"by": w.get("by"), "at": w.get("at")} for w in (ctrl.get("watch") or {}).values()],
+        "max_watchers": MAX_WATCHERS,
+        "terminated": ctrl.get("terminated"),
+        "lobby": lobby_view(reply, now),
     }
 
 
 def report_summary(ctrl: dict, now: float) -> dict | None:
     """The report's "Recruiter joined" section — None when nobody did anything."""
-    if not ctrl.get("joined") and not ctrl.get("pause_count") and not ctrl.get("asked") and not ctrl.get("log"):
+    if (not ctrl.get("joined") and not ctrl.get("pause_count") and not ctrl.get("asked")
+            and not ctrl.get("log") and not ctrl.get("terminated")):
         return None
     return {
         "joined": [{"name": j.get("name"), "at": j.get("at")} for j in ctrl.get("joined") or []],
@@ -433,6 +629,8 @@ def report_summary(ctrl: dict, now: float) -> dict | None:
         "questions": [{"text": q.get("text"), "by": q.get("by"), "index": q.get("index")}
                       for q in ctrl.get("asked") or []],
         "calls": sum(1 for e in ctrl.get("log") or [] if e.get("action") == "call_started"),
+        "watches": sum(1 for e in ctrl.get("log") or [] if e.get("action") == "watch_started"),
+        "terminated": ctrl.get("terminated"),
         "log": [{"at": e.get("at"), "by": e.get("by"), "action": e.get("action"), "text": e.get("text")}
                 for e in (ctrl.get("log") or [])[-40:]],
     }

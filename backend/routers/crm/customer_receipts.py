@@ -121,6 +121,10 @@ class ReceiptIn(BaseModel):
     #: Proof of the credit (19 Oct 2026) — the url `POST /proof` returned.
     proof_url: str | None = Field(default=None, max_length=512)
     proof_name: str | None = Field(default=None, max_length=255)
+    #: Part of this credit for invoices of an earlier financial year, not kept in
+    #: Orbit (20 Nov 2026) — set aside; only the rest is mapped / on account.
+    prior_period_amount: Decimal | None = Field(default=None, ge=0)
+    prior_period_note: str | None = Field(default=None, max_length=1000)
 
 
 class ProofIn(BaseModel):
@@ -167,6 +171,9 @@ class ReceiptUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=4000)
     #: The paying branch; null clears it (only while nothing mapped belongs elsewhere).
     branch_id: int | None = None
+    #: The earlier-financial-year part, set aside (0154); 0 clears it.
+    prior_period_amount: Decimal | None = Field(default=None, ge=0)
+    prior_period_note: str | None = Field(default=None, max_length=1000)
 
 
 class AllocateItemIn(BaseModel):
@@ -271,6 +278,10 @@ def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None
         "reference_number": r.reference_number,
         "notes": r.notes,
         "unallocated_amount": float(r.unallocated_amount or 0),
+        # The earlier-financial-year part set aside (0154) — never mapped, never counted.
+        "prior_period_amount": float(getattr(r, "prior_period_amount", 0) or 0),
+        "prior_period_note": getattr(r, "prior_period_note", None),
+        "counted_amount": float(_d(r.amount) - _d(getattr(r, "prior_period_amount", 0))),
         "allocated_amount": float(sum((_d(p.amount) for p in payments), Decimal("0"))),
         "tds_total": float(getattr(r, "tds_total", 0) or 0),
         "tds_pending": float(sum((_d(t.tds_balance) for t in booked), Decimal("0"))),
@@ -593,8 +604,15 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         if t.invoice_id in seen:
             raise HTTPException(status_code=400, detail="TDS is listed twice for one invoice")
         seen.add(t.invoice_id)
+    prior = _d(body.prior_period_amount)
+    if prior >= _d(body.amount):
+        raise HTTPException(status_code=400,
+                            detail="The earlier-year part must be less than the amount received — "
+                                   "a credit only for earlier years need not be recorded here")
     receipt = CustomerReceipt(
         customer_id=body.customer_id, branch_id=getattr(branch, "id", None),
+        prior_period_amount=prior,
+        prior_period_note=((body.prior_period_note or "").strip() or None) if prior > 0 else None,
         received_date=body.received_date, amount=_d(body.amount),
         payment_mode=body.payment_mode or None,
         reference_number=(body.reference_number or "").strip() or None,
@@ -614,7 +632,7 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         tds_svc.book(db, inv, figures, section=t.section, receipt_id=receipt.id, user_id=user.id)
         tds_total += _d(figures["amount"])
     receipt.tds_total = tds_total
-    plan, left = allocate(body.amount, invoices)
+    plan, left = allocate(_d(body.amount) - prior, invoices)
     receipt.unallocated_amount = left
     for inv, take in plan:
         db.add(InvoicePayment(
@@ -628,6 +646,8 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
     db.commit()
     db.refresh(receipt)
     msg = f"Received {float(receipt.amount):,.2f} recorded — {len(plan)} invoice(s) settled"
+    if prior > 0:
+        msg += f", {float(prior):,.2f} set aside for an earlier financial year"
     if tds_total > 0:
         msg += f", TDS {float(tds_total):,.2f} pending from client"
     if left > 0:
@@ -724,14 +744,24 @@ def update_receipt(receipt_id: int, body: ReceiptUpdate, db: Session = Depends(g
     applied = sum((_d(p.amount) for p in payments), Decimal("0"))
     if "payment_mode" in sent and body.payment_mode and body.payment_mode not in PAYMENT_MODES:
         raise HTTPException(status_code=400, detail=f"Payment mode must be one of: {', '.join(PAYMENT_MODES)}")
-    if "amount" in sent and body.amount is not None:
-        new_amt = _d(body.amount)
-        if new_amt < applied:
-            raise HTTPException(status_code=400,
-                                detail=f"{float(applied):,.2f} of this receipt is already applied to invoices — "
-                                       f"unmap an invoice first, or enter at least that amount")
+    new_amt = _d(body.amount) if ("amount" in sent and body.amount is not None) else _d(receipt.amount)
+    new_prior = (_d(body.prior_period_amount) if "prior_period_amount" in sent
+                 else _d(getattr(receipt, "prior_period_amount", 0)))
+    if new_amt < applied:
+        raise HTTPException(status_code=400,
+                            detail=f"{float(applied):,.2f} of this receipt is already applied to invoices — "
+                                   f"unmap an invoice first, or enter at least that amount")
+    if new_prior > new_amt - applied:
+        raise HTTPException(status_code=400,
+                            detail=f"Only {float(new_amt - applied):,.2f} is not mapped to invoices — the "
+                                   f"earlier-year part cannot be more than that (unmap an invoice first)")
+    if "amount" in sent or "prior_period_amount" in sent:
         receipt.amount = new_amt
-        receipt.unallocated_amount = (new_amt - applied).quantize(TWO)
+        receipt.prior_period_amount = new_prior
+        receipt.unallocated_amount = (new_amt - applied - new_prior).quantize(TWO)
+    if "prior_period_note" in sent or "prior_period_amount" in sent:
+        note = (body.prior_period_note if "prior_period_note" in sent else receipt.prior_period_note) or ""
+        receipt.prior_period_note = note.strip()[:1000] or None if new_prior > 0 else None
     if "received_date" in sent and body.received_date is not None:
         receipt.received_date = body.received_date
     if "payment_mode" in sent:
@@ -863,7 +893,11 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
 def unmap_invoice(receipt_id: int, invoice_id: int, db: Session = Depends(get_crm_db),
                   user: CurrentUser = Depends(RC_WRITE)):
     """Take one invoice off the receipt: its cash goes back on account and the
-    TDS booked with this receipt on it is removed (409 once received)."""
+    TDS booked with this receipt on it is removed.
+
+    TDS already marked received (Form 16A) blocks Finance with the place to
+    undo it; Admin / CEO undo it in the same step (20 Nov 2026, Admin report:
+    a partly paid invoice could not be unmapped from Admin)."""
     receipt = db.get(CustomerReceipt, receipt_id)
     if receipt is None:
         raise HTTPException(status_code=404, detail="Receipt not found")
@@ -874,9 +908,11 @@ def unmap_invoice(receipt_id: int, invoice_id: int, db: Session = Depends(get_cr
         raise HTTPException(status_code=404, detail="That invoice is not mapped to this receipt")
     inv = db.get(Invoice, invoice_id)
     tds_back = Decimal("0")
+    received_back = Decimal("0")
+    num = getattr(inv, "invoice_number", None) or f"#{invoice_id}"
     if tds is not None:
         tds_back = _d(tds.tds_amount)
-        tds_svc.unbook(db, tds)
+        received_back = tds_svc.unbook(db, tds, force=user.is_admin, user=user)
     cash = Decimal("0")
     for pay in pays:
         cash += _d(pay.amount)
@@ -885,13 +921,34 @@ def unmap_invoice(receipt_id: int, invoice_id: int, db: Session = Depends(get_cr
         db.delete(pay)
     receipt.unallocated_amount = (_d(receipt.unallocated_amount) + cash).quantize(TWO)
     receipt.tds_total = max(_d(getattr(receipt, "tds_total", 0)) - tds_back, Decimal("0"))
+    if received_back > 0:
+        _log_admin_override(db, inv, user,
+                            f"{num} unmapped from received amount #{receipt.id} by Admin — the TDS "
+                            f"received of {float(received_back):,.2f} (Form 16A) was undone with it")
     db.commit()
     db.refresh(receipt)
-    num = getattr(inv, "invoice_number", None) or f"#{invoice_id}"
     msg = f"{num} unmapped — {float(cash):,.2f} back on account"
     if tds_back > 0:
-        msg += f" (TDS {float(tds_back):,.2f} removed)"
+        msg += f" (TDS {float(tds_back):,.2f} removed"
+        msg += f", incl. {float(received_back):,.2f} marked received)" if received_back > 0 else ")"
     return envelope(_receipt_payload(db, receipt), message=msg)
+
+
+def _log_admin_override(db, invoice, user, text: str) -> None:
+    """Keep an Admin step that undid received TDS on the customer's log."""
+    if invoice is None:
+        return
+    try:
+        from services import customer_activity
+        from services.invoice_payments import invoice_customer_ids
+
+        cid, _ = invoice_customer_ids(db, invoice)
+        if cid is not None:
+            customer_activity.record(db, cid, "ADMIN_TDS_OVERRIDE", text, entity="invoice",
+                                     entity_id=invoice.id,
+                                     subject=invoice.invoice_number or f"#{invoice.id}", user=user)
+    except Exception:  # noqa: BLE001 — a log line never blocks the step
+        pass
 
 
 @router.delete("/{receipt_id}")
@@ -902,13 +959,16 @@ def delete_receipt(receipt_id: int, db: Session = Depends(get_crm_db),
     if receipt is None:
         raise HTTPException(status_code=404, detail="Receipt not found")
     booked = db.execute(select(TdsRecord).where(TdsRecord.receipt_id == receipt.id)).scalars().all()
-    received = [t.invoice.invoice_number if t.invoice else f"#{t.invoice_id}" for t in booked
-                if _d(t.tds_paid) > 0 or list(t.payments or [])]
-    if received:
-        raise HTTPException(status_code=409,
-                            detail=f"TDS on {', '.join(received)} was already marked received — undo that first")
+    received = [t for t in booked if tds_svc.is_received(t)]
+    if received and not user.is_admin:
+        raise HTTPException(status_code=409, detail=tds_svc.received_block(received[0]))
     for t in booked:
-        tds_svc.unbook(db, t)
+        inv = t.invoice
+        back = tds_svc.unbook(db, t, force=user.is_admin, user=user)
+        if back > 0:
+            _log_admin_override(db, inv, user,
+                                f"Received amount #{receipt.id} deleted by Admin — the TDS received of "
+                                f"{float(back):,.2f} on {getattr(inv, 'invoice_number', '')} was undone with it")
     for pay in list(receipt.payments or []):
         inv = db.get(Invoice, pay.invoice_id)
         if inv is not None:

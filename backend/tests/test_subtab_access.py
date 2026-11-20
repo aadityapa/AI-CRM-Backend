@@ -37,9 +37,10 @@ def test_a_picked_list_decides_alone():
 
 
 def test_registry_lists_every_reports_sub_tab_and_keeps_them_out_of_fields():
-    # invoice_summary added 23 Oct 2026 (Sales' customer + month invoice summary).
+    # invoice_summary added 23 Oct 2026 (Sales' customer + month invoice summary);
+    # customer_ledger 20 Nov 2026 (Finance's own Customer Ledger tab).
     assert set(SUB_TABS["reports"]) == {"opportunities", "profiles", "productivity", "financial", "revenue",
-                                        "invoice_summary"}
+                                        "invoice_summary", "customer_ledger"}
     assert "tab:revenue" in FIELDS_BY_TAB["reports"]
     reports = next(t for t in registry()["tabs"] if t["key"] == "reports")
     assert {s["key"] for s in reports["subtabs"]} >= {"tab:financial", "tab:revenue"}
@@ -89,5 +90,6 @@ def test_report_routes_are_wired_to_their_sub_tabs():
         or "OPP_REPORT_READ" in inspect.getsource(reports)
     assert "REVENUE_READ" in inspect.getsource(reports.revenue)
     src = inspect.getsource(finance_reports)
-    assert 'LEDGER_READ = subtab_gate("finance-reports", "ledger", _FIN_REPORTS)' in src
+    assert 'LEDGER_READ = subtab_gate("finance-reports", "ledger",' in src
+    assert 'subtab_gate("reports", ("customer_ledger", "financial"), INV_READ)' in src
     assert "Depends(LEDGER_READ)" in inspect.getsource(finance_reports.customer_ledger)

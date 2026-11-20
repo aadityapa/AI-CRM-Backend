@@ -205,6 +205,12 @@ class Invoice(Base):
     #: beside the cash — balance = grand_total − paid − tds_deducted — and is
     #: followed as "pending from client" on the TdsRecord until Form 16A is in.
     tds_deducted = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    #: Settled in full by Finance / Admin (0154): the small balance left on a
+    #: partly paid invoice, adjusted (not cash). balance = grand − paid − TDS − this.
+    settled_adjustment = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    settled_reason = sa.Column(sa.Text, nullable=True)
+    settled_by = sa.Column(sa.Integer, nullable=True)
+    settled_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
     #: Buyer / shipping details as they were when the invoice was issued (0143):
     #: a later change to the customer's address never moves an issued invoice.
     #: See services/invoice_parties.py. NULL = read the branch live.
@@ -291,6 +297,10 @@ class CustomerReceipt(Base):
     unallocated_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
     #: TDS the customer withheld on the invoices this receipt settles (0136).
     tds_total = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    #: Part of the credit that pays invoices from an earlier financial year, not
+    #: kept in Orbit (0154). Left out of on account: amount − applied − this.
+    prior_period_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    prior_period_note = sa.Column(sa.Text, nullable=True)
     #: Proof of the credit — bank screenshot / remittance advice (0140).
     proof_url = sa.Column(sa.String(512), nullable=True)
     proof_name = sa.Column(sa.String(255), nullable=True)

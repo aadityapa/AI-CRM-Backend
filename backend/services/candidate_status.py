@@ -184,10 +184,23 @@ STATUS_DEFS: list[StatusDef] = [
     _d("technical_interview", "Technical Interview", INFO, "internal",
        "RMG / GM shortlisted the CV. Next: schedule the AI L1 or ask TA to book a manual L1.",
        _PRE_REVIEW),
-    *_round_defs("ai_l1", "AI L1", "internal", set(_INTERNAL), {PS.RMG_REJECTED.value},
-                 "The AI interview"),
-    _d("ai_l1_review", "AI L1 – Under Review", WARN, "internal",
-       "The AI interview is done; a recruiter put the result on hold / review.", _INTERNAL),
+    # 18 Nov 2026 (user rule): the AI scores, a PERSON decides. A finished AI L1
+    # is "In Review" until RMG / GM select, reject or hold it; Selected /
+    # Rejected / On Hold are the recruiter's words, never the AI's.
+    *[(_d(d.key, {"ai_l1_passed": "AI L1 – Selected", "ai_l1_failed": "AI L1 – Rejected"}.get(d.key, d.label),
+          d.tone, d.group,
+          {"ai_l1_passed": "RMG / GM selected the candidate after reading the AI L1 report. Next: request the L2 "
+                           "or submit to Sales.",
+           "ai_l1_failed": "RMG / GM rejected the candidate after reading the AI L1 report.",
+           "ai_l1_scheduled": "The AI L1 is booked. When it finishes, RMG / GM read the report and decide."}
+          .get(d.key, d.hint), set(d.stages)))
+      for d in _round_defs("ai_l1", "AI L1", "internal", set(_INTERNAL), {PS.RMG_REJECTED.value},
+                           "The AI interview")],
+    _d("ai_l1_in_review", "AI L1 – In Review", WARN, "internal",
+       "The AI interview is done and scored. RMG / GM read the report and decide: Select, Reject or put On Hold "
+       "— the AI's score is advice, not the decision.", _INTERNAL | {PS.RMG_REJECTED.value}),
+    _d("ai_l1_review", "AI L1 – On Hold", WARN, "internal",
+       "RMG / GM put the AI L1 result on hold — the reason is in the history.", _INTERNAL),
     _d("ai_l1_not_attempted", "AI L1 – Not Attempted", WARN, "internal",
        "The candidate did not answer any question — the link was opened late, the session "
        "dropped, or it was never started. TA checks with them and sends a fresh link "
@@ -300,6 +313,8 @@ PENDING, SCHEDULED, HELD, PASSED, FAILED, REVIEW = (
 #: The AI L1 ran but no scored question was answered — "never happened", not
 #: "did badly" (`ai_interview_links.not_attempted`, 7 Oct 2026). TA reschedules.
 NOT_ATTEMPTED = "not_attempted"
+#: The AI L1 finished and nobody has decided yet (18 Nov 2026).
+IN_REVIEW = "in_review"
 
 _PASS_RESULTS = {"hire", "strong hire", "leaning hire", "selected", "pass", "passed", "shortlisted"}
 _FAIL_RESULTS = {"no hire", "leaning no", "rejected", "reject", "fail", "failed", "not selected"}
@@ -328,14 +343,19 @@ def ai_state(effective_result: str | None, not_attempted: bool = False) -> str:
     """AiInterviewLink.effective_result (+ its not_attempted flag) → round state.
 
     A recruiter's override still wins: "Selected" over a not-attempted link is
-    a pass; the flag only refines a Failed / unreviewed verdict."""
+    a pass; the flag only refines an undecided verdict.
+
+    18 Nov 2026: only a PERSON passes or fails an AI L1. The AI's own Passed /
+    Failed (score vs threshold) reads "In Review" until RMG / GM decide."""
     value = (effective_result or "").strip().lower()
-    if value in {"passed", "selected"}:
+    if value == "selected":
         return PASSED
-    if value in {"failed", "rejected"}:
-        return NOT_ATTEMPTED if not_attempted else FAILED
-    if value in {"on hold", "pending review"}:
+    if value == "rejected":
+        return FAILED
+    if value == "on hold":
         return REVIEW
+    if value in {"in review", "pending review", "passed", "failed"}:
+        return NOT_ATTEMPTED if not_attempted else IN_REVIEW
     return SCHEDULED
 
 
@@ -401,7 +421,8 @@ def _round_status(prefix: str, state: str) -> CandidateStatus:
         return _status(f"{prefix}_scheduled",
                        hint="Interview held — waiting for the verdict to be recorded.")
     suffix = {PENDING: "scheduled", SCHEDULED: "scheduled", PASSED: "passed",
-              FAILED: "failed", REVIEW: "review", NOT_ATTEMPTED: "not_attempted"}[state]
+              FAILED: "failed", REVIEW: "review", NOT_ATTEMPTED: "not_attempted",
+              IN_REVIEW: "in_review"}[state]
     return _status(f"{prefix}_{suffix}")
 
 
@@ -613,8 +634,10 @@ _ROUNDS: dict[str, tuple[str, str]] = {
     "customer_l2": ("customer_l2", "Customer L2 Interview"),
 }
 _ROUND_STATES = {"pending": "Yet to Schedule", "scheduled": "Scheduled", "passed": "Passed",
-                 "failed": "Failed", "review": "Under Review", "shortlisted": "Yet to Schedule",
-                 "not_attempted": "Not Attempted"}
+                 "failed": "Failed", "review": "On Hold", "shortlisted": "Yet to Schedule",
+                 "not_attempted": "Not Attempted", "in_review": "In Review"}
+#: The AI L1 is passed / failed only by a person (18 Nov 2026) — say so.
+_AI_ROUND_STATES = {"passed": "Selected", "failed": "Rejected"}
 #: Non-round statuses → (round key, name, state) for the Status column.
 _STATUS_ROUND: dict[str, tuple[str | None, str, str | None]] = {
     "sourcing": (None, "New Applicant", None),
@@ -642,7 +665,10 @@ def round_for(status: CandidateStatus) -> tuple[str | None, str, str | None]:
         return _STATUS_ROUND[status.key]
     for prefix, (key, name) in _ROUNDS.items():
         if status.key.startswith(prefix + "_"):
-            return key, name, _ROUND_STATES.get(status.key[len(prefix) + 1:])
+            suffix = status.key[len(prefix) + 1:]
+            if prefix == "ai_l1" and suffix in _AI_ROUND_STATES:
+                return key, name, _AI_ROUND_STATES[suffix]
+            return key, name, _ROUND_STATES.get(suffix)
     return None, status.label, None
 
 

@@ -315,6 +315,7 @@ def enrich_resumes_with_ai(db: Session, rows: list[Resume]) -> list[dict]:
         d["ai_hr_decision"] = link.hr_decision
         d["ai_hr_decision_label"] = hr_decision_label(link.hr_decision)
         d["ai_effective_result"] = link.effective_result
+        d["ai_suggestion"] = link.ai_suggestion
         d["ai_is_overridden"] = bool(link.hr_decision) and link.effective_result != link.result
         d["ai_not_attempted"] = bool(link.not_attempted)
         d["ai_interview_record_id"] = link.interview_record_id

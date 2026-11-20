@@ -29,19 +29,10 @@ def _client(purpose: str = "default"):
 
 
 def _db_target() -> str:
-    """Resolve the active database target for prompt logging."""
-    direct = (os.getenv("AUTH_DB_URL") or "").strip()
-    if direct:
-        return direct
-    host = (os.getenv("DB_HOST") or "").strip()
-    port = (os.getenv("DB_PORT") or "5432").strip()
-    name = (os.getenv("DB_NAME") or "").strip()
-    user = (os.getenv("DB_USER") or "").strip()
-    pw = (os.getenv("DB_PASSWORD") or "").strip()
-    if host and name and user:
-        return f"postgresql://{user}:{pw}@{host}:{port}/{name}"
-    from paths import KARNEX_DB_FILE
-    return str(KARNEX_DB_FILE)
+    """The store prompt logs, AI costs and the response cache live in — the login store."""
+    from auth_db import default_db_target
+
+    return default_db_target()
 
 
 def _jd_cv_char_limits(num_questions: int) -> tuple[int, int]:

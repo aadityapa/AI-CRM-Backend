@@ -7,7 +7,32 @@
 > the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
 > short copy and points here. Keep both in step.
 
-**Last updated:** 12 Nov 2026 (one candidate name everywhere — Edit applicant / the Candidates page rename the
+**Last updated:** 20 Nov 2026, later (migration **0154**, run `alembic upgrade head`: Finance / Admin
+**Settle in full** a Partially paid invoice — the balance left is adjusted, not cash, invoice reads Paid, ledger line
+"Adjustment", undoable; a received amount can **set aside the part for an earlier financial year** (never mapped, never
+on account); **Reports ▸ Customer Ledger** tab for Finance + Admin / CEO with Financial year / Month / Custom dates /
+All time). Before: 20 Nov 2026 (TDS marked received no longer locks an invoice: **Undo "received"**
+`POST /api/invoices/{id}/tds-payments/undo {reason}` for Finance; Admin / CEO unmap, delete a receipt, delete a TDS
+record or delete an invoice in ONE step — received TDS undone, cash from a Received Amount back on account, logged on
+the customer's Activity Log; Finance's 409s now say where to undo; no migration, restart). Before: 18 Nov 2026, latest (two server changes, no migration, restart: (1) **an AI L1 is "In Review"
+until RMG / GM decide** — `AiInterviewLink.effective_result` reads In Review over the AI's Passed / Failed, a pass no
+longer auto-forwards to RMG Review, statuses "AI L1 – In Review / Selected / Rejected / On Hold"; (2) **the Integrity
+tab says the real reason an interview ended**, with each warning, its cause and what to tell the candidate — proctor
+copies of a warning are no longer counted twice, a completed interview is never labelled "Repeated policy violations",
+the proctor channel's termination is recorded, a page reload no longer submits the interview; F-V2 `app.js?v=58`).
+Before: 18 Nov 2026, very last (no server change — F-V2: a live interview no longer closes when a TA joins
+from the same browser (the interview tab keeps its own session in sessionStorage instead of sharing the dashboard's
+localStorage token), and the Rules page is redesigned; `app.js?v=57`; see F-V2 `CLAUDE.md`). Earlier the same evening:
+(no server change — F-V2 candidate screen: the two-column interview layout on every
+laptop / PC, sized to the window; Send Response / Skip Question always on screen; `app.js?v=56`; see F-V2 `CLAUDE.md`). Earlier 18 Nov: (AI Costs "password authentication failed for user karnex_app" in production: the AI-call
+log / AI Costs / ATS / question code built the database URL WITHOUT encoding the password, logins did — one resolver now,
+`auth_db.default_db_target()`; no migration; restart). Before: 13 Nov 2026 (anti-cheating checks per template — headphones, lighting, gesture check +
+random gesture prompts, eye calibration, reading detection, room scan — and the Integrity tab's lobby, real-time silent
+watch and recruiter Terminate; `services/interview/proctoring.py`, `interview_live.py` watch / terminate / lobby,
+`POST /candidate/invite/{token}/presence`; no migration; TURN guide `docs/TURN_SETUP.md`). Before: 12 Nov 2026, later (no server change: a CEO screenshot showing Revenue Inc Tax = Ex. Tax and
+every TDS / Due figure 0 was the dashboard drawing its fallback for a backend OLDER than 6 Nov — no `revenue_inc`,
+`invoices`, `predicted_projects` keys; the current `_finance` sends all of them (re-checked). F-V2 now says so instead
+of faking the figures. Deploying the backend fixes the numbers). Before: 12 Nov 2026 (one candidate name everywhere — Edit applicant / the Candidates page rename the
 master AND every position's resume row (`services/candidate_names.py`); an upload for a known candidate keeps the
 master's name; parsed names are tidied; no migration). Before: 8 Nov 2026, last (people cost & gross margin hidden until CTCs are tracked — Settings ▸ Organisation ▸
 Billing ▸ "Show people cost & gross margin" (`finance.track_people_cost`, default OFF); no migration). Before: 8 Nov 2026, later (people cost stops at TODAY in every running period — gross margin no longer charges the months still to come; PO cover = active PO balance ÷ what the team deployed today bills a month, the invoice average only a fallback; no migration). Before: 8 Nov 2026 (UI only: Customer, Sales, People and the Billing Tracker tabs — and the Finance tab's "Cash received month" view — use the interactive story chart, F-V2 `StoryChart`; no server change). Before: 7 Nov 2026 (the Billed drill page speaks the ten money words — every invoice carries the
@@ -25,8 +50,8 @@ Sourcing and show in TA's default list. Earlier 5 Nov: drill-page month bars lis
 project band; TA / Hiring Manager workload + a suggested pick in the Assign dialog; careers applications name their
 channel + a channel analysis; the Karnex JD drafted from the customer's JD, downloadable as PDF / Word). 4 Nov: received
 never above billed, Predicted every month, release / extension dates, internal candidates skip HR, Expenses, TDS, reopen
-& resume. **State:** migration head **0153** (6 Nov; 0152 before). The shell came back late on 5 Nov and the
-suites were run from /tmp copies (6 Nov, later: backend 2,379 pass / 3 skipped); earlier backend 2,356 pass / 3 skipped (only the known `test_public_invoice_qr` fails); F-V2
+& resume. **State:** migration head **0154** (20 Nov; 0153 before) (6 Nov; 0152 before). The shell came back late on 5 Nov and the
+suites were run from /tmp copies (18 Nov, latest: backend 2,423 pass / 3 skipped; 6 Nov: 2,379 pass / 3 skipped); earlier backend 2,356 pass / 3 skipped (only the known `test_public_invoice_qr` fails); F-V2
 `tsc` green, vitest 392 with only the two known failures (`brand.test` needs the runtime pages, `opportunitySchema`
 "Remote"). Nothing is committed since `dd61630`, so **commit the working tree.**
 
@@ -79,7 +104,8 @@ Roles:
 **Candidate flow**
 - An upload waits at **Sourcing** until TA presses Technical Screening.
 - RMG / GM choose the AI or manual L1; TA schedules it.
-- The AI verdict is advice: the screener decides, and a reject closes the candidacy.
+- The AI verdict is advice: the screener decides, and a reject closes the candidacy. **A finished AI L1 reads
+  "In Review" on every screen until RMG / GM Select / Reject / Hold it** (18 Nov 2026); nothing moves on the AI's score.
 - A candidate who applies through a public form (careers page, apply link) is already interested: no opening
   email, no Interested step; they wait at Sourcing for TA's Technical Screening (3 Nov 2026).
 - The opening "are you interested?" email is **manual only**. Archive is manual, except that a held deal parks its
@@ -99,6 +125,10 @@ Roles:
 - Laptop / PC only. Camera is mandatory. Entire screen is shared.
 - The 10th look-away warning ends the interview.
 - Conversation features are opt-in per template.
+- Anti-cheating checks are opt-in per template (`weights.proctoring`, 13 Nov 2026). Before the interview a "Required"
+  check blocks the start, "Recommended" records the miss; during the interview nothing ends it — misses are soft
+  flags. A recruiter may join, call, watch in real time or Terminate from the moment the link opens; the candidate is
+  always told when they are watched.
 
 **Billing**
 - PO drawn by the value **before GST**.
@@ -164,6 +194,7 @@ Roles:
 - Proctoring, recording and live join.
 - Per-question evidence scoring, re-score, L2 question suggestions.
 - AI Costs.
+- Anti-cheating checks per template + the Integrity lobby, real-time watch and recruiter Terminate (13 Nov 2026).
 
 **CRM**
 - Customers, branches and policies; rate cards and CTC slab.
@@ -4860,6 +4891,65 @@ name is a placeholder, which takes the uploaded one. The single-upload reply say
 applicant to change the name everywhere" (F-V2 shows it). Same for careers / apply-link applications and an applied held
 duplicate. Names already out of step stay as they are until someone edits them (no backfill). Deploy: restart.
 
+**13 Nov 2026 — anti-cheating checks per template; the Integrity lobby, silent watch and recruiter Terminate
+(`tests/test_proctoring_and_lobby.py` 13; no migration — everything rides on the existing `live_control` /
+`live_reply` / `device_check_log` columns):** user ask (all 7 decisions taken with the recommendations).
+(1) **`services/interview/proctoring.py`** (PURE) — `weights.proctoring` (camelCase): `headphones` / `lighting`
+off · warn · require, `gestureCheck`, `gesturePrompts` 0..5, `gazeCalibration`, `readingDetection`, `roomScan`;
+`clean_config` (lenient, never 400 — `/job/config` normalises it), `proctoring_settings` (snake_case + `enabled`),
+`public_config`, `stamp` / `settings_of` (session meta; both bootstraps stamp it), `report_summary(settings,
+device_log, events)` → `report.proctoring` (pre-checks with attempts / passed, gesture prompts asked / passed /
+missed, headphones unplugged, device changes, low light, reading flags + their questions, room-scan times, `flags`
+in words) — built in `hr/service.build_report_record`. At invite login the Device Check log is copied into
+`meta.device_check_log` so the report never re-reads the row. `_interview_format` adds `proctoring` (the rules page
+and the candidate page read it before sign-in). Failure rules (user decision): before the interview "require" blocks
+(gesture check always blocks), "warn" records the miss; during the interview nothing ends it.
+(2) **`services/device_check.py`**: `CHECKS` += headphones · lighting · gesture · gaze_calibration (+ a short
+`detail` the page measured, e.g. "tone heard 18 dB"); `CHECK_REASON_WORDS` (speaker_leak · wrong_count · too_dark ·
+backlit · no_hands · palms_not_shown · wrong_gesture · timeout · model_unavailable …), timeline types
+`<check>_ok/_failed` (gesture → `gesture_check_…`), `passed()`, `failure_count(log, check)`.
+(3) **`interview_integrity.EVENT_TYPES`** += the device-check types (system, 0) and the during-interview SOFT flags
+`gesture_prompt_missed` (gesture, 4) · `headphones_disconnected` (audio, 5) · `audio_device_changed` (audio, 2) ·
+`low_light` (light, 1) · `reading_pattern` (reading, 3) · `room_scan_skipped` (gesture, 3), informational
+`gesture_prompt_ok`, `headphones_reconnected`, `room_scan_started/done`, `candidate_in_lobby`, `recruiter_watch`,
+`recruiter_watch_ended`, `recruiter_terminated`. None is a strike. `FAMILIES` += gesture · audio · light · reading;
+CSV gains four columns at the end.
+(4) **`services/interview_live.py` phase 3** — control `watch` (viewer id → {id, offer, by, at}, at most
+`MAX_WATCHERS`=2, `start_watch` / `end_watch` / `prune_watchers` (a watcher whose panel stopped saying presence for
+`PRESENCE_WINDOW_SEC` is dropped)), `terminated` {reason ≥ `MIN_TERMINATE_REASON`=5, by, at} (`terminate` ends the
+pause, call and every watch; idempotent; `termination_reason` = "Ended by the recruiter (<by>): <reason>"); reply
+`watch_answers` (`set_watch_answer`) and `lobby` {stage, at, first_at, stages[]} (`set_lobby` → True the first time;
+`LOBBY_STAGES` opened · rules · device_check · gesture · calibration · verify · waiting · signed_in · room_scan ·
+interview · finished; `lobby_view` with `online`). `candidate_view` adds `watched`, `watchers` (first names),
+`watch_ids`, `watch` (unanswered offers) and `terminated` {by} (the reason stays internal); `staff_view(..., viewer_id)`
+adds this viewer's `watch` + answer, `watchers`, `max_watchers`, `terminated`, `lobby`, `turn_configured`.
+(5) **main.py**: staff actions `watch` · `unwatch` · `terminate` (`_terminate_from_staff`: closes the link at once —
+schedule `session_status=terminated` + a termination event on `violations_log`, stamps a session living in this
+process, tells the scheduling TA via `_notify_ta_of_integrity`); `_apply_recruiter_termination(s, ctrl)` stamps
+`meta.termination_reason / terminated_at / terminated_by_recruiter` once — called from `_live_sync_session` (every
+/next and /answer) and `/candidate/live/state`, so /submit and the recovery worker finalise as TERMINATED;
+`_live_pause_payload` returns `{terminated, code: "recruiter_terminated", message}` (409 on /answer);
+`/interview/violation` ignores everything after a recruiter ended it. **The lobby**: `POST
+/candidate/invite/{token}/presence {stage}` (150/min, token = credential like the lookup; returns the live view so the
+pre-sign-in page can take a call / watch; 404 unknown, `finished` for a closed link) — the first report notifies the
+scheduling TA (event **`interview.candidate_in_lobby`**, in `email_flows.EVENTS`, dedupe per token, link
+`/admin/?view=integrityLogs&live=<token>`); `POST /candidate/invite/{token}/live/answer {kind: call|watch}`;
+`/candidate/live/answer` takes `kind` too (`_live_store_answer`); `/candidate/live/state` moves the lobby to
+"interview". `_integrity_rows` adds `lobby` + `watchers` for unfinished rows (one cached live read each).
+(6) **TURN** (decision 7): `docs/TURN_SETUP.md` (coturn, ports, env `INTERVIEW_TURN_URLS / _USERNAME / _CREDENTIAL`,
+how to verify); the panel warns while `turn_configured` is false. Full suite 2,408 pass, 3 skipped. Deploy: restart;
+F-V2 `app.js?v=54` + `vendor/mediapipe/hand_landmarker.task`; set up TURN for real-time video off the office network.
+
+**18 Nov 2026 — ONE resolver for the interview-platform store (`tests/test_legacy_db_target.py`, 4; no migration):**
+screenshot — AI Costs (Admin) read "OperationalError … password authentication failed for user karnex_app" against the RDS
+host while every login worked. ⚠️ `ai._db_target()`, `ats._db_target()` and `question_service._db_target()` built
+`postgresql://{user}:{pw}@…` RAW from `DB_*`; `main._auth_db_target()` URL-encoded the user / password. A password with
+`@ # % / :` therefore reached Postgres wrong on the AI paths only — the prompt-log writer, the response cache, AI Costs,
+cost repair, the ATS / question logs. Those writes are best-effort, so AI calls made while it failed were NOT logged or
+priced (AI Costs starts again from the restart). **`auth_db.default_db_target()`** is now the one rule (AUTH_DB_URL
+normalised, else encoded `DB_*` with no sslmode added — exactly the URL logins used, else the SQLite file); all four call
+it. **Never build the legacy DSN by hand again.** Deploy: restart.
+
 **CLAUDE.md itself:** both repos' files are tracked in git (`git checkout -- CLAUDE.md` restores the committed
 edition); the September notes above exist only in the working tree — **commit them**.
 
@@ -5448,3 +5538,88 @@ Ordered roughly by severity. Everything here is evidenced at a file:line.
 | `PRODUCTION_RUNBOOK.md` | deploy steps + hardening list | migration numbers stale |
 | `NEXUS_VS_KARNEX_GAP_ANALYSIS.md` | the 8 prioritised product gaps vs the Zoho app | good |
 | `CLEANUP_REPORT.md` | known test failures | **stale** — `test_rmg_timesheet_reports` now passes; three new failures unlisted |
+
+**18 Nov 2026 (very last) — no server change; why a live interview closed when a TA joined:** the candidate page
+and the /admin dashboard shared one set of localStorage auth keys, so with both in one browser the candidate's
+sign-in replaced the recruiter's token, the dashboard's next call answered 401 and cleared the keys, and the candidate
+page reloaded on that `storage` event. The server's live-join code (`interview_live`, `/candidate/live/state`, pause
+clock, `_session_time_up`) was checked and is not involved. Fixed in F-V2 (`js/auth/session.js` — an interview tab
+keeps its own session in sessionStorage); the Rules page was redesigned in the same change (`app.js?v=57`).
+
+**18 Nov 2026 (latest) — Integrity: the real reason an interview ended; AI L1 "In Review" until RMG / GM decide
+(`tests/test_integrity_termination_reason.py` 6, `tests/test_ai_l1_in_review.py` 5; `test_ai_l1_reschedule`,
+`test_candidate_status`, `test_duplicate_notifications`, `test_filter_audit`, `test_rmg_tasks`, `test_screening_desk`
+re-pinned; full suite 2,423 pass / 3 skipped; no migration).** Two screenshot asks.
+(1) **Integrity** — a row read Completed, "6 of 3 strikes", Termination reason "Repeated interview policy violations"
+and "the candidate ended the interview early" at once. Causes: (a) ⚠️ the candidate page reports every warning on TWO
+channels (`/interview/violation` and `/proctor/violation` as `proctor_tabSwitch`), both landed in the log and both
+counted — `services/interview_integrity.proctor_echo_indexes` (a proctor event within `ECHO_WINDOW_S`=6 s of a direct
+strike is the same incident; each direct strike absorbs one), `counted_events`; `count_strikes` and `summarise` skip
+echoes (the timeline keeps them, `echo: true`, "Same incident · not counted"). (b) `_termination_reason_from_events`
+guessed a termination from the count — it now answers only for a TERMINATED interview. (c) The proctor channel's own
+limit ended interviews in the page only: `/proctor/start-session` stamps `pause_token` (the invite) so a recruiter's
+pause also stops it, and a proctor termination calls `_record_policy_termination` (session meta + schedule terminated +
+termination event); `/submit` runs `_adopt_schedule_termination` first and stores `meta.finalize_via`; `finalize_via ==
+"unload"` → reason `page_closed`. (d) F-V2 no longer submits on page close (see its notes). **Diagnosis**
+(`services/interview_diagnosis.py`): `diagnose(..., events=, recording_available=, max_warnings=, gaze_limit=)` →
+`warnings` (each counted strike: n · label · family · time · question), `causes` (`WARNING_HELP` per family: what the
+page saw + what to tell the candidate), `terminated` (status OR final_status OR termination reason / event — a schedule
+row overwritten "completed" still reads terminated), `terminated_by_recruiter`; headlines "Terminated — 4 warnings,
+3 allowed" (names the warning that crossed the limit), "Terminated — looked away N times", "Ended by the recruiter",
+"Ended early — the page was closed or reloaded / End Interview pressed / submitted before the last question"; a flag
+when a recruiter joined before an early end; the "no recording" flag only when storage has none. New progress-summary
+meta keys `finalize_via`, `boundary_saved_via`, `terminated_by_recruiter`. (2) **AI L1 = In Review** (user rule: the AI
+scores, a person decides). `AiInterviewLink.effective_result` = the decision label, else "In Review" for a finished link
+(`AI_SUGGESTIONS` Passed / Failed), else `result`; `ai_suggestion` property; `pending_review` labels "In Review".
+`candidate_status`: `IN_REVIEW` state, `ai_state` maps Passed / Failed / In Review → in_review (Selected → passed,
+Rejected → failed, On Hold → review); catalogue `ai_l1_in_review` "AI L1 – In Review", `ai_l1_passed` / `_failed`
+labelled "AI L1 – Selected / Rejected", `ai_l1_review` "AI L1 – On Hold"; round states Selected / Rejected / In Review.
+`ai_interview_bridge.sync_completed_interview` **no longer moves a pass to RMG Review**; one "AI L1 done — review and
+decide" notice to the screeners (dedupe `ai_review:<link>:<Passed|Failed>`), TA told "In Review", resume
+`ai_interview_status = "Completed"`. Self-heals (`get_profile`, `services/resumes`) forward only an RMG / GM
+**Selected**. Screening Desk: `ai_result_bucket` adds `in_review` (`AI_RESULTS`), `next_step` `ai_review` → category
+"AI L1 to decide"; results chips "AI L1: In Review · 78%" (warn). Reschedule refused over Selected or an undecided AI
+pass. HR / Reports: `_dash_status_from_report` → "In Review" (the AI recommendation is `recommendation`, advice),
+`_effective_interview_status` / `_merge_candidate_status_with_hr` never read Selected / Rejected without a recruiter.
+Payloads add `ai_suggestion` (AI links, `latest_ai_interviews`, resume rows, integrity rows' `ai_result` = the decision).
+Deploy: restart. Existing finished interviews nobody decided read In Review at once; candidates the old flow already
+auto-forwarded to RMG Review stay there.
+
+**20 Nov 2026 — received TDS no longer locks an invoice; Admin / CEO undo in one step
+(`tests/test_tds_admin_override.py` 4; no migration):** screenshot report — Admin could not unmap a partly paid
+invoice from its received amount ("TDS … was already marked received — undo that first") nor delete it ("has TDS
+payment(s)"), and there was NO way to undo "TDS received" anywhere. `services/tds.py`: `is_received(record)`,
+`received_block(record)` (the 409 now says "open <invoice> ▸ TDS ▸ Undo 'received' — or ask Admin / CEO"),
+`undo_received(db, record, reason=, user=, require_reason=True)` (reason ≥ `MIN_UNDO_REASON`=10; deletes every
+`TdsPayment` — taken off `record.payments` first so a later record delete never cascades them twice — the TDS reads
+Pending from client again, the deduction stays; logs `TDS_RECEIPT_UNDONE` on the customer Activity Log) and
+`unbook(db, record, force=, user=)` → returns the received amount taken back; `force` (= `user.is_admin`) undoes the
+received entries first instead of 409. New route **`POST /api/invoices/{id}/tds-payments/undo {reason}`**
+(`gated_write("tds", "Finance")`). Admin / CEO paths: `unmap_invoice` and `delete_receipt` pass `force`, log
+`ADMIN_TDS_OVERRIDE` (`customer_receipts._log_admin_override`); `DELETE /api/tds/{id}` passes `force` and now lowers
+the receipt's `tds_total`; **`DELETE /api/invoices/{id}`** for Admin / CEO runs `crm_delete.undo_invoice_admin`
+(payments + received TDS go with it; credit notes still block), which now puts each payment that came from a Received
+Amount back ON ACCOUNT and lowers the receipt's `tds_total` (it used to make that cash vanish — the timesheet undo
+path benefits too), logged `INVOICE_DELETED_BY_ADMIN`. Finance's delete blockers name where to reverse each thing.
+Deploy: restart.
+
+**20 Nov 2026 (later) — Settle in full, the earlier-year part of a receipt, Customer Ledger in Reports, migration
+0154, head is now 0154 (`tests/test_settle_and_prior_period.py` 4; `test_subtab_access` re-pinned):** three Finance asks.
+(1) **Settle in full** — `services/invoice_settlement.py`: `settle_block(inv)` (PURE: Proforma · already settled · nothing
+left · not partly paid → reason), `settle_in_full(db, inv, reason ≥ 10, user)` stores the open balance in
+`invoices.settled_adjustment` (+ `settled_reason / settled_by / settled_at`) and refreshes — ⚠️ `tax.refresh_invoice_balance`
+and `finance.apply_round_off` now take it off: balance = grand − paid − TDS − adjustment. It is NOT cash: `paid_amount` is
+untouched, so Collected / Received Bank never count it; status Paid makes Due 0 everywhere. `undo_settlement` (reason ≥ 10)
+opens it again. Both log on the customer Activity Log (`INVOICE_SETTLED_IN_FULL` / `INVOICE_SETTLEMENT_UNDONE`). Routes
+`POST /api/invoices/{id}/settle-in-full {reason}` and `…/settle-in-full/undo` behind `role_required("Finance")` (Finance +
+Admin / CEO by role, never template-widenable). `GET /api/invoices/{id}` adds `settlement {amount, reason, by_name, at}`,
+`can_settle`, `can_undo_settlement`; `serialize_invoice` adds `settled_adjustment`. The customer ledger prints an
+"Adjustment" credit line dated the settlement day. (2) **Earlier-year part** — `customer_receipts.prior_period_amount /
+prior_period_note`: part of a bank credit that pays invoices from before the current FY (not in Orbit). `ReceiptIn` /
+`ReceiptUpdate` take both; create allocates `amount − prior` (400 when prior ≥ amount); update keeps `unallocated =
+amount − applied − prior` and refuses a prior above what is not mapped. Everything that reads `unallocated_amount`
+(ledger On account, cash month, drill pages, work desk) therefore leaves it out. Payload adds `prior_period_amount`,
+`prior_period_note`, `counted_amount`. (3) **Customer Ledger** is its own Reports sub-tab (`SUB_TABS["reports"]
+["customer_ledger"]`); `LEDGER_READ = subtab_gate("finance-reports", "ledger", subtab_gate("reports", ("customer_ledger",
+"financial"), INV_READ))`. The ledger endpoint already took `date_from / date_to`; the periods are client-side. Deploy:
+`python -m alembic upgrade head` (0154), restart, rebuild F-V2.

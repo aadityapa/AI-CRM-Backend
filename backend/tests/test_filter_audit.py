@@ -35,7 +35,10 @@ def test_rmg_review_is_one_tab_whatever_the_screening_column_says():
 def test_ai_buckets_keep_on_hold_and_not_attempted_apart_from_results():
     assert ai_result_bucket({"ai_effective_result": "On Hold"}) == "on_hold"
     assert ai_result_bucket({"ai_effective_result": "Failed", "ai_not_attempted": True}) == "not_attempted"
-    assert ai_result_bucket({"ai_effective_result": "Failed"}) == "failed"
+    # 18 Nov 2026: the AI's own Failed / Passed is In Review; RMG / GM's words decide.
+    assert ai_result_bucket({"ai_effective_result": "Failed"}) == "in_review"
+    assert ai_result_bucket({"ai_effective_result": "In Review"}) == "in_review"
+    assert ai_result_bucket({"ai_effective_result": "Rejected"}) == "failed"
     assert ai_result_bucket({"ai_effective_result": "Selected"}) == "passed"
     hold = next_step(screening="Shortlisted", stage="Sourcing", ai={"ai_effective_result": "On Hold"},
                      rounds={"ai_l1_requested": True})

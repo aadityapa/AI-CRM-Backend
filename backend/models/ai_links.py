@@ -70,16 +70,35 @@ class AiInterviewLink(Base):
 
     @property
     def effective_result(self) -> str:
-        """What a human should act on: the override when present, else the AI verdict."""
-        return _DECISION_LABEL.get(self.hr_decision or "", None) or self.result
+        """The DECISION every screen shows (18 Nov 2026, user rule).
 
+        A person decides an AI L1 — RMG / GM select, reject or hold it. Until
+        they do, a finished interview reads "In Review" whatever the AI scored;
+        `result` (Passed / Failed vs the threshold) stays on the link as the
+        AI's suggestion. Pending = not finished yet."""
+        decided = _DECISION_LABEL.get(self.hr_decision or "", None)
+        if decided:
+            return decided
+        if (self.result or "") in AI_SUGGESTIONS:
+            return IN_REVIEW
+        return self.result
+
+    @property
+    def ai_suggestion(self) -> str | None:
+        """The AI's own read (score vs threshold) — advice, shown as such."""
+        return self.result if (self.result or "") in AI_SUGGESTIONS else None
+
+
+#: The AI's own verdicts on `result` — a suggestion, never the decision.
+AI_SUGGESTIONS = ("Passed", "Failed")
+IN_REVIEW = "In Review"
 
 #: Display labels for the override, so the UI and the API agree on wording.
 _DECISION_LABEL = {
     "selected": "Selected",
     "rejected": "Rejected",
     "on_hold": "On Hold",
-    "pending_review": "Pending Review",
+    "pending_review": IN_REVIEW,
 }
 
 

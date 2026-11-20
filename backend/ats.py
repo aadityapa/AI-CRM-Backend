@@ -21,18 +21,9 @@ def _client():
 
 
 def _db_target() -> str:
-    direct = (os.getenv("AUTH_DB_URL") or "").strip()
-    if direct:
-        return direct
-    host = (os.getenv("DB_HOST") or "").strip()
-    port = (os.getenv("DB_PORT") or "5432").strip()
-    name = (os.getenv("DB_NAME") or "").strip()
-    user = (os.getenv("DB_USER") or "").strip()
-    pw = (os.getenv("DB_PASSWORD") or "").strip()
-    if host and name and user:
-        return f"postgresql://{user}:{pw}@{host}:{port}/{name}"
-    from paths import KARNEX_DB_FILE
-    return str(KARNEX_DB_FILE)
+    from auth_db import default_db_target
+
+    return default_db_target()
 
 
 ATS_CACHE_FILE = DATA_DIR / "ats_cache.json"

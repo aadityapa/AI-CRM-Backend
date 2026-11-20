@@ -1841,6 +1841,7 @@ def _ai_state_by_profile(db: Session, profile_ids: list[int]) -> dict[int, dict]
                     "ai_hr_decision": link.hr_decision,
                     "ai_hr_decision_label": hr_decision_label(link.hr_decision),
                     "ai_effective_result": link.effective_result,
+                    "ai_suggestion": link.ai_suggestion,
                     "ai_is_overridden": bool(link.hr_decision) and link.effective_result != link.result,
                     "ai_not_attempted": bool(link.not_attempted),
                     "ai_interview_record_id": link.interview_record_id,

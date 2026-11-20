@@ -97,7 +97,10 @@ def test_every_candidate_has_a_stage_and_a_round():
     assert st(PS.RMG_REVIEW, rounds={"manual_l1": cs.SCHEDULED}) == \
         ("Technical Interview", "Technical L1 Interview", "Scheduled")
     assert st(PS.SOURCING, rmg_screening="Shortlisted", ai_l1=cs.PASSED) == \
-        ("Technical Interview", "Technical L1 Interview (AI)", "Passed")
+        ("Technical Interview", "Technical L1 Interview (AI)", "Selected")
+    # 18 Nov 2026: a finished AI L1 nobody decided yet.
+    assert st(PS.SOURCING, rmg_screening="Shortlisted", ai_l1=cs.IN_REVIEW) == \
+        ("Technical Interview", "Technical L1 Interview (AI)", "In Review")
     assert st(PS.RMG_REVIEW, rounds={"manual_l2": cs.FAILED}) == \
         ("Technical Interview", "Technical L2 Interview", "Failed")
     assert st(PS.SALES_SCREENING) == ("Sales Screening", "With Sales – Ready to Submit", None)
@@ -155,14 +158,15 @@ def test_manual_l1_then_l2_ladder():
 def test_rmg_rejection_names_the_round_that_failed():
     assert _label(PS.RMG_REJECTED, rounds={"manual_l2": cs.FAILED}) == "Manual L2 – Failed"
     assert _label(PS.RMG_REJECTED, rounds={"manual_l1": cs.FAILED}) == "Manual L1 – Failed"
-    assert _label(PS.RMG_REJECTED, ai_l1=cs.FAILED) == "AI L1 – Failed"
+    assert _label(PS.RMG_REJECTED, ai_l1=cs.FAILED) == "AI L1 – Rejected"
     assert _label(PS.RMG_REJECTED) == "RMG Rejected"
 
 
 def test_an_ai_interview_is_never_read_as_manual_l1_yet_to_schedule():
     assert _label(PS.TECHNICAL_SCREENING, ai_l1=cs.SCHEDULED) == "AI L1 – Scheduled"
-    assert _label(PS.RMG_REVIEW, ai_l1=cs.PASSED) == "AI L1 – Passed"
-    assert _label(PS.RMG_REVIEW, ai_l1=cs.REVIEW) == "AI L1 – Under Review"
+    assert _label(PS.RMG_REVIEW, ai_l1=cs.PASSED) == "AI L1 – Selected"
+    assert _label(PS.RMG_REVIEW, ai_l1=cs.REVIEW) == "AI L1 – On Hold"
+    assert _label(PS.TECHNICAL_SCREENING, ai_l1=cs.IN_REVIEW) == "AI L1 – In Review"
     # A manual round outranks the AI one (RMG chose the manual route after).
     assert _label(PS.RMG_REVIEW, ai_l1=cs.FAILED, rounds={"manual_l1": cs.SCHEDULED}) \
         == "Manual L1 – Scheduled"
@@ -335,7 +339,8 @@ def test_loader_reads_rounds_requests_and_ai_in_batch(db):
         l2_asked.id: "Manual L2 – Yet to Schedule",
         cancelled.id: "Manual L1 – Yet to Schedule",
         legacy_l2.id: "Customer L2 – Passed",
-        ai.id: "AI L1 – Passed",
+        # 18 Nov 2026: the AI's "Passed" is advice — In Review until RMG / GM decide.
+        ai.id: "AI L1 – In Review",
     }
 
 

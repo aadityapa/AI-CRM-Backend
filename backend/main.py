@@ -177,6 +177,7 @@ from services.interview.question_service import generate_mode_aware_questions
 from services.interview import conversation as interview_conversation
 from services.interview import skill_bank as interview_skill_bank
 from services.interview import skill_bank_fill as interview_skill_bank_fill
+from services.interview import proctoring as interview_proctoring
 from services import ai_models, template_archive
 from services.report_links import ai_report_link
 from utils.interview_limits import (
@@ -462,20 +463,9 @@ def _now_ist_parts() -> dict:
 
 
 def _auth_db_target() -> str:
-    direct = (os.getenv("AUTH_DB_URL") or "").strip()
-    if direct:
-        from auth_db import normalize_postgres_dsn
+    from auth_db import default_db_target
 
-        return normalize_postgres_dsn(direct)
-    host = (os.getenv("DB_HOST") or "").strip()
-    port = (os.getenv("DB_PORT") or "5432").strip()
-    name = (os.getenv("DB_NAME") or "").strip()
-    user = (os.getenv("DB_USER") or "").strip()
-    password = (os.getenv("DB_PASSWORD") or "").strip()
-    if host and name and user:
-        from urllib.parse import quote as _q
-        return f"postgresql://{_q(user, safe='')}:{_q(password, safe='')}@{host}:{port}/{name}"
-    return str(KARNEX_DB_FILE)
+    return default_db_target()
 
 
 def _auth_secret() -> str:
@@ -1843,6 +1833,14 @@ def _bootstrap_invite_interview_session(invite_token: str, schedule: dict, *, fa
         stamp_template_settings(sessions[skey]["meta"], weights)
         interview_conversation.stamp_conversation_settings(
             sessions[skey]["meta"], weights, customer_name=str((job or {}).get("customerName") or ""))
+        # Anti-cheating checks (13 Nov 2026): the template's switches, and what
+        # the Device Check measured before sign-in (headphones, light, gesture)
+        # so the report can say it without reading the schedule row again.
+        interview_proctoring.stamp(sessions[skey]["meta"], weights)
+        try:
+            sessions[skey]["meta"]["device_check_log"] = list(get_device_check_log(AUTH_DB_TARGET, invite_token) or [])
+        except Exception:
+            sessions[skey]["meta"]["device_check_log"] = []
         stamp_introduction_question_types(sessions[skey]["meta"], warmup_indices)
         if skill_cfg:
             _stamp_skill_bank(sessions[skey]["meta"], skill_pick, skill_specs, offset=len(warmup_indices or []))
@@ -3561,6 +3559,7 @@ async def setup(
     interview_conversation.stamp_conversation_settings(
         sessions[setup_session_key]["meta"], weights_for_suite,
         customer_name=str((job_cfg_row or {}).get("customerName") or ""))
+    interview_proctoring.stamp(sessions[setup_session_key]["meta"], weights_for_suite)
     stamp_introduction_question_types(sessions[setup_session_key]["meta"], warmup_indices)
     record_generated_questions_batch(
         sessions[setup_session_key],
@@ -5413,7 +5412,13 @@ def submit(
             auto_saved=auto_saved_flag,
             pending_appended=pending_appended,
         )
+        _adopt_schedule_termination(s)
         meta = s.get("meta", {})
+        # How the page got here (18 Nov 2026) — "unload" = the page was closed
+        # or reloaded, "manual" = End Interview, "timer" = the clock. Kept so
+        # the Integrity tab can say WHY an interview ended early.
+        if finalize_via_clean:
+            meta["finalize_via"] = finalize_via_clean[:16]
         bg_finalize = str(background_finalize or "").strip().lower() in ("1", "true", "yes", "on")
         final_status = "completed"
         reason = "candidate_submitted"
@@ -5425,7 +5430,7 @@ def submit(
             reason = "time_expired"
         elif int(s.get("current") or 0) < len(s.get("questions") or []):
             final_status = "partially_completed"
-            reason = "candidate_ended_early"
+            reason = "page_closed" if finalize_via_clean == "unload" else "candidate_ended_early"
 
         candidate_fast_finalize = bg_finalize or str((payload or {}).get("role") or "").lower() == "candidate"
         logger.info(
@@ -5674,14 +5679,13 @@ def _dash_status_from_report(report: dict | None, record: dict | None = None) ->
     r = report or {}
     if r.get("report_upgrade_pending"):
         return "Generating"
-    blob = f"{r.get('recommendation', '')} {r.get('overall_recommendation', '')} {r.get('fitment', '')}".lower()
-    if not blob.strip():
-        return "Pending Review"
-    if "reject" in blob or "no hire" in blob or "not hire" in blob:
-        return "Rejected"
-    if "hire" in blob or "select" in blob or "strong" in blob:
-        return "Selected"
-    return "Pending Review"
+    # 18 Nov 2026 (user rule): the AI never selects or rejects anyone. Its
+    # recommendation is shown as a suggestion (`recommendation`); the STATUS is
+    # "In Review" until RMG / GM press Selected / Rejected / On Hold.
+    return AI_IN_REVIEW
+
+
+AI_IN_REVIEW = "In Review"
 
 
 def _merge_candidate_status_with_hr(ai_status: str, hr_decision: str | None) -> str:
@@ -5694,7 +5698,9 @@ def _merge_candidate_status_with_hr(ai_status: str, hr_decision: str | None) -> 
     # pipeline but is visually distinct from the model's default badge.
     if hr_decision == "on_hold":
         return "On Hold"
-    return str(ai_status or "Pending Review")
+    if str(ai_status or "") in ("", "Pending Review", "Selected", "Rejected"):
+        return AI_IN_REVIEW  # without a recruiter's decision nothing is selected / rejected
+    return str(ai_status)
 
 
 def _effective_interview_status(record: dict, report: dict | None) -> str:
@@ -5703,8 +5709,10 @@ def _effective_interview_status(record: dict, report: dict | None) -> str:
     if report_status in {"generating", "pending", "ready_pending_ai"}:
         return "Generating"
     hr = str((record or {}).get("hr_interview_status") or "").strip()
-    if hr in ("Selected", "Rejected", "Pending Review", "On Hold"):
+    if hr in ("Selected", "Rejected", "On Hold"):
         return hr
+    if hr in ("Pending Review", AI_IN_REVIEW):
+        return AI_IN_REVIEW
     return _dash_status_from_report(report, record)
 
 
@@ -7258,6 +7266,10 @@ async def job_config(
                 weights_obj[interview_skill_bank.WEIGHTS_KEY])
         except interview_skill_bank.SkillBankError as exc:
             return JSONResponse({"error": str(exc), "code": "skill_bank_invalid"}, status_code=400)
+    # Anti-cheating switches (13 Nov 2026) — normalised, never refused.
+    if isinstance(weights_obj, dict) and interview_proctoring.WEIGHTS_KEY in weights_obj:
+        weights_obj[interview_proctoring.WEIGHTS_KEY] = interview_proctoring.clean_config(
+            weights_obj[interview_proctoring.WEIGHTS_KEY])
     mq_list: list = []
     mq_raw = (manualQuestions or "").strip()
     if mq_raw:
@@ -8077,6 +8089,8 @@ def _live_sync_session(s: dict) -> dict | None:
             except Exception:
                 logger.warning("interview.live.expire_write_failed", extra={"event": "interview.live.expire_write_failed"})
         live_ctl.mirror_clock(meta, ctrl, now)
+        if ctrl.get("terminated"):
+            _apply_recruiter_termination(s, ctrl)
         summary = live_ctl.report_summary(ctrl, now)
         if summary is not None:
             meta["live_summary"] = summary  # the report's "Recruiter joined" section
@@ -8084,6 +8098,41 @@ def _live_sync_session(s: dict) -> dict | None:
     except Exception:
         logger.warning("interview.live.sync_failed", extra={"event": "interview.live.sync_failed"}, exc_info=True)
         return None
+
+
+def _apply_recruiter_termination(s: dict, ctrl: dict) -> None:
+    """A recruiter ended this interview (13 Nov 2026): stamp the session the way
+    the three-strike rule does, so /submit and the recovery worker finalise it
+    as TERMINATED with the recruiter's reason. Idempotent."""
+    meta = s.setdefault("meta", {})
+    if meta.get("terminated_at"):
+        return
+    now_iso = _now_ist_parts()["ist_iso"]
+    reason = live_ctl.termination_reason(ctrl)
+    meta["termination_reason"] = reason
+    meta["terminated_at"] = now_iso
+    meta["terminated_by_recruiter"] = True
+    violations = list(meta.get("violations") or [])
+    violations.append({"type": "termination", "reason": reason, "details": reason, "timestamp": now_iso})
+    meta["violations"] = violations
+    token = str(meta.get("invite_token") or "").strip()
+    if token:
+        try:
+            update_schedule_field(AUTH_DB_TARGET, token, session_status="terminated",
+                                  interview_completed_at=now_iso,
+                                  violations_log=json.dumps(violations, ensure_ascii=False))
+        except Exception:
+            logger.warning("interview.live.terminate_sync_failed", exc_info=True)
+    invalidate_integrity_logs_cache()
+
+
+def _live_terminated_body(ctrl: dict) -> dict:
+    by = live_ctl.first_name((ctrl.get("terminated") or {}).get("by") or "")
+    return {
+        "terminated": True,
+        "code": "recruiter_terminated",
+        "message": f"{by} from Karnex has ended this interview. Thank you for your time.",
+    }
 
 
 def _live_paused_body(ctrl: dict) -> dict:
@@ -8125,6 +8174,8 @@ def _live_pause_payload(s: dict, *, apply_questions: bool = True) -> dict | None
     ctrl = _live_sync_session(s)
     if ctrl is None:
         return None
+    if ctrl.get("terminated"):
+        return _live_terminated_body(ctrl)
     if live_ctl.is_paused(ctrl, time.time()):
         return _live_paused_body(ctrl)
     if apply_questions:
@@ -8183,6 +8234,9 @@ _LIVE_TIMELINE_LABELS = {
     "message": ("recruiter_message", "sent a note"),
     "call_started": ("recruiter_call", "started a call"),
     "call_ended": ("recruiter_call_ended", "ended the call"),
+    "watch_started": ("recruiter_watch", "started watching (real time)"),
+    "watch_ended": ("recruiter_watch_ended", "stopped watching"),
+    "terminated": ("recruiter_terminated", "ended the interview"),
 }
 
 
@@ -8222,14 +8276,16 @@ async def _live_body(request: Request) -> dict:
 def interview_live_state(request: Request, invite_token: str):
     """The recruiter's live-control panel: pause state, queued and asked
     questions, the call and whether the candidate's page is checking in."""
-    token, rec, _name, _uid, err = _live_staff_target(request, invite_token)
+    token, rec, _name, uid, err = _live_staff_target(request, invite_token)
     if err:
         return err
     ctrl, reply = _live_read(token, fresh=True) or (live_ctl.empty_control(), live_ctl.empty_reply())
     now = time.time()
-    if live_ctl.expire_pause(ctrl, now):
+    changed = live_ctl.expire_pause(ctrl, now)
+    changed = live_ctl.prune_watchers(ctrl, now) or changed
+    if changed:
         _live_write_control(token, ctrl)
-    out = live_ctl.staff_view(ctrl, reply, now)
+    out = live_ctl.staff_view(ctrl, reply, now, viewer_id=uid)
     out["session_status"] = str(rec.get("session_status") or "pending")
     out["candidate_name"] = str(rec.get("candidate_name") or "")
     return out
@@ -8237,14 +8293,16 @@ def interview_live_state(request: Request, invite_token: str):
 
 @app.post("/interview/live/{invite_token}/{action}")
 async def interview_live_action(request: Request, invite_token: str, action: str):
-    """join · pause · resume · message · question · remove-question · call · hangup.
-    Every action is logged on the interview (shown in the report) and the
-    pause / resume / call ones on the Integrity timeline."""
+    """join · pause · resume · message · question · remove-question · call · hangup
+    · watch · unwatch · terminate (13 Nov 2026). Every action is logged on the
+    interview (shown in the report) and the pause / resume / call / watch /
+    terminate ones on the Integrity timeline. Works from the moment the link is
+    opened — the candidate's page polls before sign-in too (the lobby)."""
     token, rec, name, uid, err = _live_staff_target(request, invite_token)
     if err:
         return err
     finished = _live_refuse_finished(rec)
-    if finished and action not in ("hangup", "presence"):
+    if finished and action not in ("hangup", "presence", "unwatch"):
         return finished
     body = await _live_body(request)
     ctrl, reply = _live_read(token, fresh=True) or (live_ctl.empty_control(), live_ctl.empty_reply())
@@ -8274,18 +8332,59 @@ async def interview_live_action(request: Request, invite_token: str, action: str
             _live_record_event(token, "recruiter_call", f"{name} started a call with the candidate")
         elif action == "hangup":
             live_ctl.end_call(ctrl, name, now)
+        elif action == "watch":
+            live_ctl.start_watch(ctrl, uid, str(body.get("offer") or ""), name, now)
+            _live_record_event(token, "recruiter_watch", f"{name} started watching")
+        elif action == "unwatch":
+            live_ctl.end_watch(ctrl, uid, name, now)
+        elif action == "terminate":
+            live_ctl.terminate(ctrl, str(body.get("reason") or ""), name, now)
         else:
             return JSONResponse({"error": "Unknown action."}, status_code=404)
     except live_ctl.LiveError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     _live_write_control(token, ctrl)
+    if action == "terminate":
+        _terminate_from_staff(token, rec, ctrl)
     logger.info("interview.live.action",
                 extra={"event": "interview.live.action", "action": action, "by": name,
                        "invite_token": _invite_token_tag(token)})
-    out = live_ctl.staff_view(ctrl, reply, now)
-    out["session_status"] = str(rec.get("session_status") or "pending")
+    out = live_ctl.staff_view(ctrl, reply, now, viewer_id=uid)
+    out["session_status"] = "terminated" if ctrl.get("terminated") else str(rec.get("session_status") or "pending")
     out["candidate_name"] = str(rec.get("candidate_name") or "")
     return out
+
+
+def _terminate_from_staff(token: str, rec: dict, ctrl: dict) -> None:
+    """The recruiter pressed Terminate. The link closes at once (whether or not
+    the candidate ever signed in); a session living in THIS process is stamped
+    now, one in another process on its next live check (`_live_sync_session`).
+    The TA who scheduled it is told (bell + email)."""
+    sess = sessions.get(f"inv:{token}")
+    if isinstance(sess, dict):
+        _apply_recruiter_termination(sess, ctrl)
+        try:
+            _persist_interview_progress(sess, status="terminated")
+        except Exception:
+            logger.warning("interview.live.terminate_persist_failed", exc_info=True)
+    else:
+        now_iso = _now_ist_parts()["ist_iso"]
+        reason = live_ctl.termination_reason(ctrl)
+        events = _parse_violations_log(rec.get("violations_log"))
+        events.append({"type": "termination", "reason": reason, "details": reason, "timestamp": now_iso})
+        try:
+            update_schedule_field(AUTH_DB_TARGET, token, session_status="terminated",
+                                  interview_completed_at=now_iso,
+                                  violations_log=json.dumps(events, ensure_ascii=False))
+        except Exception:
+            logger.warning("interview.live.terminate_write_failed", exc_info=True)
+    invalidate_integrity_logs_cache()
+    t = ctrl.get("terminated") or {}
+    logger.warning("interview.live.terminated",
+                   extra={"event": "interview.live.terminated", "by": t.get("by"),
+                          "invite_token": _invite_token_tag(token)})
+    _notify_ta_of_integrity(token, candidate_name=str(rec.get("candidate_name") or ""),
+                            reason=live_ctl.termination_reason(ctrl), strikes=0)
 
 
 def _session_time_up(sess: dict | None) -> bool:
@@ -8342,6 +8441,10 @@ def candidate_live_state(request: Request):
         seen = float(reply.get("seen_at") or 0)
     except (TypeError, ValueError):
         seen = 0.0
+    # Signed in and polling → the lobby reads "In the interview" (13 Nov 2026).
+    if str((reply.get("lobby") or {}).get("stage") or "") not in ("interview", "room_scan", "finished"):
+        live_ctl.set_lobby(reply, "interview", now)
+        seen = 0.0
     if now - seen > live_ctl.CANDIDATE_POLL_SEC * 2:
         reply["seen_at"] = now
         try:
@@ -8350,10 +8453,12 @@ def candidate_live_state(request: Request):
             pass
     if isinstance(sess, dict):
         live_ctl.mirror_clock(sess.setdefault("meta", {}), ctrl, now)
+        if ctrl.get("terminated"):
+            _apply_recruiter_termination(sess, ctrl)
     view = live_ctl.candidate_view(ctrl, reply, now)
     view["enabled"] = True
     view["time_up"] = _session_time_up(sess)
-    if view.get("call"):
+    if view.get("call") or view.get("watch"):
         view["ice_servers"] = live_ctl.ice_servers()
     return view
 
@@ -8368,13 +8473,132 @@ async def candidate_live_answer(request: Request):
     cols = _live_read(token, fresh=True)
     if cols is None:
         return JSONResponse({"error": "Interview not found."}, status_code=404)
+    return _live_store_answer(token, cols, body)
+
+
+def _live_store_answer(token: str, cols: tuple[dict, dict], body: dict):
+    """The candidate's browser answered a call (``kind`` "call") or a silent
+    watch (``kind`` "watch", 13 Nov 2026)."""
     ctrl, reply = cols
+    kind = str(body.get("kind") or "call").strip().lower()
     try:
-        live_ctl.set_answer(reply, ctrl, str(body.get("call_id") or ""), str(body.get("answer") or ""), time.time())
+        if kind == "watch":
+            live_ctl.set_watch_answer(reply, ctrl, str(body.get("watch_id") or ""), str(body.get("answer") or ""), time.time())
+        else:
+            live_ctl.set_answer(reply, ctrl, str(body.get("call_id") or ""), str(body.get("answer") or ""), time.time())
     except live_ctl.LiveError as exc:
         return JSONResponse({"error": str(exc), "code": "call_gone"}, status_code=409)
     _live_write_reply(token, reply)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# The lobby (13 Nov 2026): from the moment the link opens, before sign-in.
+# The invite token is the only credential — the same one the public lookup and
+# the device-check report take. The page POSTs where it is; the reply is the
+# same live view the signed-in page polls (a call to guide the candidate, a
+# silent watch, a note, an ended interview).
+# ---------------------------------------------------------------------------
+
+def _lobby_target(token: str):
+    clean = _live_route_token(token)
+    rec = get_schedule_by_token(AUTH_DB_TARGET, clean) if clean else None
+    if not rec:
+        return "", None, JSONResponse({"error": "Invalid or expired interview link."}, status_code=404)
+    return clean, rec, None
+
+
+@app.post("/candidate/invite/{token}/presence")
+@_rl.limit("150/minute")
+async def candidate_invite_presence(token: str, request: Request):
+    clean, rec, err = _lobby_target(token)
+    if err:
+        return err
+    status = str(rec.get("session_status") or "pending").strip().lower()
+    if status in ("completed", "terminated"):
+        return {"enabled": live_ctl.enabled(), "finished": True, "session_status": status,
+                "terminated": {"by": ""} if status == "terminated" else None, "poll_ms": 10_000}
+    if not live_ctl.enabled():
+        return {"enabled": False, "poll_ms": 10_000}
+    body = await _live_body(request)
+    cols = _live_read(clean, fresh=True)
+    if cols is None:
+        return {"enabled": True, "poll_ms": live_ctl.CANDIDATE_POLL_SEC * 1000}
+    ctrl, reply = cols
+    now = time.time()
+    prev_stage = str((reply.get("lobby") or {}).get("stage") or "")
+    prev_seen = reply.get("seen_at")
+    first = live_ctl.set_lobby(reply, str(body.get("stage") or "opened"), now)
+    stage_changed = prev_stage != str(reply["lobby"]["stage"])
+    try:
+        stale = now - float(prev_seen or 0) > live_ctl.CANDIDATE_POLL_SEC * 2
+    except (TypeError, ValueError):
+        stale = True
+    if first or stage_changed or stale:
+        try:
+            _live_write_reply(clean, reply)
+        except Exception:
+            logger.warning("interview.lobby.write_failed", exc_info=True)
+    if first:
+        invalidate_integrity_logs_cache()
+        _notify_ta_candidate_in_lobby(clean, rec)
+    if live_ctl.expire_pause(ctrl, now):
+        _live_write_control(clean, ctrl)
+    view = live_ctl.candidate_view(ctrl, reply, now)
+    view["enabled"] = True
+    if view.get("call") or view.get("watch"):
+        view["ice_servers"] = live_ctl.ice_servers()
+    return view
+
+
+@app.post("/candidate/invite/{token}/live/answer")
+@_rl.limit("60/minute")
+async def candidate_invite_live_answer(token: str, request: Request):
+    """The lobby page accepted a recruiter's call or watch (before sign-in)."""
+    clean, rec, err = _lobby_target(token)
+    if err:
+        return err
+    if str(rec.get("session_status") or "").strip().lower() in ("completed", "terminated"):
+        return JSONResponse({"error": "This interview has finished.", "code": "finished"}, status_code=409)
+    cols = _live_read(clean, fresh=True)
+    if cols is None:
+        return JSONResponse({"error": "Interview not found."}, status_code=404)
+    return _live_store_answer(clean, cols, await _live_body(request))
+
+
+def _notify_ta_candidate_in_lobby(invite_token: str, rec: dict) -> None:
+    """Bell + email to the TA who scheduled the interview: the candidate has
+    opened the link — Join from the Integrity tab to guide them (13 Nov 2026).
+    Once per interview (dedupe key), best-effort."""
+    try:
+        from sqlalchemy import select as sa_select
+        from crm_db import get_session_factory
+        from models import AiInterviewLink
+        from services.notify import notify_role, notify_user
+        factory = get_session_factory()
+    except Exception:
+        return
+    name = str(rec.get("candidate_name") or "The candidate")
+    title = f"{name} opened the AI interview link"
+    body = ("They are on the device check now. Open Interview Integrity and press Join to guide them "
+            "(how to sit, the light, the headphones) or watch the interview live.")
+    try:
+        with factory() as db:
+            link = db.execute(
+                sa_select(AiInterviewLink).where(AiInterviewLink.invite_token == invite_token)
+            ).scalars().first()
+            path = f"/admin/?view=integrityLogs&live={invite_token}"
+            with db.begin_nested():
+                if link is not None and link.scheduled_by:
+                    notify_user(db, link.scheduled_by, title, body, path, event="interview.candidate_in_lobby",
+                                dedupe_key=f"lobby:{invite_token}", related_type="candidate",
+                                related_id=link.candidate_id)
+                else:
+                    notify_role(db, "TA", title, body, path, event="interview.candidate_in_lobby",
+                                dedupe_prefix=f"lobby:{invite_token}")
+            db.commit()
+    except Exception:
+        logger.warning("interview.lobby.notify_failed", exc_info=True)
 
 
 @app.get("/interview/live-config")
@@ -8473,6 +8697,62 @@ def _merge_proctor_events_into_schedule(invite_token: str, sess: dict) -> None:
     )
 
 
+def _record_policy_termination(invite_token: str, reason: str, detail: str) -> None:
+    """Record that an interview was ENDED for its warnings (18 Nov 2026).
+
+    The proctor channel's own limit ended interviews in the candidate's page
+    and nowhere else: /submit then filed the interview as "the candidate ended
+    the interview early" and the Integrity tab could not say why it stopped.
+    Stamps the live session (this process) and the schedule row, once."""
+    token = (invite_token or "").strip()
+    if not token:
+        return
+    now_iso = _now_ist_parts()["ist_iso"]
+    s = sessions.get(f"inv:{token}")
+    if s is not None:
+        meta = s.setdefault("meta", {})
+        if not meta.get("termination_reason"):
+            meta["termination_reason"] = reason
+            meta["terminated_at"] = now_iso
+            meta.setdefault("violations", []).append(
+                {"type": "termination", "reason": reason, "details": detail, "timestamp": now_iso})
+    try:
+        rec = get_schedule_by_token(AUTH_DB_TARGET, token)
+        if not rec or str(rec.get("session_status") or "").lower() == "terminated":
+            return
+        events = _parse_violations_log(rec.get("violations_log"))
+        if not any(isinstance(e, dict) and e.get("type") == "termination" for e in events):
+            events.append({"type": "termination", "reason": reason, "details": detail, "timestamp": now_iso})
+        update_schedule_field(AUTH_DB_TARGET, token, session_status="terminated",
+                              interview_completed_at=now_iso,
+                              violations_log=json.dumps(events, ensure_ascii=False))
+        invalidate_integrity_logs_cache()
+    except Exception:
+        logger.warning("integrity.termination_record_failed",
+                       extra={"event": "integrity.termination_record_failed"}, exc_info=True)
+
+
+def _adopt_schedule_termination(s: dict) -> None:
+    """Before /submit picks the ending: if the schedule already says the
+    interview was TERMINATED (another worker, the proctor channel, a recruiter),
+    the session must say so too (18 Nov 2026)."""
+    meta = s.setdefault("meta", {})
+    if meta.get("termination_reason") or s.get("terminated"):
+        return
+    token = str(meta.get("invite_token") or "").strip()
+    if not token:
+        return
+    try:
+        rec = get_schedule_by_token(AUTH_DB_TARGET, token)
+    except Exception:
+        return
+    if not rec or str(rec.get("session_status") or "").lower() != "terminated":
+        return
+    events = _parse_violations_log(rec.get("violations_log"))
+    meta["termination_reason"] = _termination_reason_from_events(rec, events) or "Interview terminated"
+    meta.setdefault("terminated_at", str(rec.get("interview_completed_at") or _now_ist_parts()["ist_iso"]))
+
+
 @app.post("/proctor/start-session")
 async def proctor_start_session(
     request: Request,
@@ -8489,6 +8769,10 @@ async def proctor_start_session(
         "sessionId": sid,
         "candidateId": cid,
         "interviewId": iid,
+        # 18 Nov 2026: the interview this proctor session belongs to, so a
+        # recruiter's pause also stops this channel counting and a termination
+        # here is recorded on the interview (it used to be client-side only).
+        "pause_token": str((user or {}).get("invite_token") or "").strip(),
         "started_at_ist": _now_ist_parts()["ist_iso"],
         "ended_at_ist": "",
         "violations": {"tabSwitch": 0, "extraFace": 0},
@@ -8517,7 +8801,7 @@ async def proctor_violation(
     sess = _proctor_sessions.get(sid)
     if not sess:
         return {"error": "Invalid proctor session."}
-    paused_tok = str(sess.get("invite_token") or sess.get("interviewId") or "").strip()
+    paused_tok = str(sess.get("invite_token") or sess.get("pause_token") or sess.get("interviewId") or "").strip()
     if paused_tok and live_ctl.enabled():
         cols = _live_read(paused_tok)
         if cols and live_ctl.is_paused(cols[0], time.time()):
@@ -8552,6 +8836,12 @@ async def proctor_violation(
     terminate = status == "FAIL"
     if terminate:
         sess["terminated"] = True
+        # The page ends the interview on this answer — record it on the
+        # interview too, or /submit files it as "ended early" (18 Nov 2026).
+        _record_policy_termination(
+            paused_tok, "Repeated interview policy violations",
+            f"Interview terminated after {sum(int(v or 0) for v in sess['violations'].values())} warnings "
+            f"(proctor channel; last: {vtype})")
     return {
         "violations": sess["violations"],
         "proctorScore": score,
@@ -9344,6 +9634,9 @@ def _interview_format(cfg: dict, job: dict | None) -> dict:
         "screen_recorded": _screen_recording_on(),
         # Look-away reminders that end the interview (0 = never) — the rules page.
         "gaze_limit": _integrity_gaze_limit(),
+        # The template's anti-cheating checks (13 Nov 2026) — the Device Check
+        # and the rules page read them before sign-in.
+        "proctoring": interview_proctoring.public_config(weights if job else {}),
     }
 
 
@@ -9868,6 +10161,9 @@ async def interview_violation(
         return {"status": "ignored"}
 
     meta = s.get("meta", {})
+    if meta.get("terminated_by_recruiter"):
+        return {"status": "ignored", "reason": "terminated", "auto_terminated": True,
+                "violation_count": int(meta.get("violation_count") or 0), "max_warnings": MAX_WARNINGS}
     # While a recruiter has the interview paused (11 Oct 2026) the candidate may
     # look away, leave fullscreen or talk to them on camera — nothing counts.
     if _live_pause_payload(s, apply_questions=False) is not None:
@@ -9979,18 +10275,21 @@ def invalidate_integrity_logs_cache(hr_username: str | None = None) -> None:
 
 
 def _termination_reason_from_events(row: dict, events: list[dict]) -> str:
+    """Why the interview was TERMINATED — empty for one that was not (18 Nov
+    2026: a completed interview with many warnings used to read "Repeated
+    interview policy violations" although nothing ended it, and the count it
+    went by included the proctor channel's duplicate of every warning)."""
     for event in reversed(events):
         if not isinstance(event, dict):
             continue
         reason = str(event.get("reason") or event.get("termination_reason") or "").strip()
         if reason:
             return reason
-    policy_count = _count_integrity_violations(events)
-    if policy_count >= 4 or int(row.get("violation_count") or 0) >= 4:
+    if str(row.get("session_status") or "").strip().lower() != "terminated":
+        return ""
+    if _count_integrity_violations(events) > MAX_WARNINGS:
         return "Repeated interview policy violations"
-    if str(row.get("session_status") or "").strip().lower() == "terminated":
-        return "Interview terminated"
-    return ""
+    return "Interview terminated"
 
 
 def _append_termination_event(row: dict, reason: str, now_iso: str) -> list[dict]:
@@ -10165,7 +10464,10 @@ def _crm_links_for_tokens(tokens: list[str]) -> dict[str, dict]:
                     "customer_name": cust or "",
                     "scheduled_by_name": names.get(lk.scheduled_by, "") if lk.scheduled_by else "",
                     "ai_score": float(lk.overall_score_percent) if lk.overall_score_percent is not None else None,
-                    "ai_result": lk.result,
+                    # 18 Nov 2026: the DECISION ("In Review" until RMG / GM decide);
+                    # the AI's own Passed / Failed is `ai_suggestion`.
+                    "ai_result": lk.effective_result,
+                    "ai_suggestion": lk.ai_suggestion,
                     # 5 Nov 2026: "Failed 0 %" on the row was really "never
                     # attempted" — the link knew, the row did not say.
                     "not_attempted": bool(getattr(lk, "not_attempted", False)),
@@ -10251,6 +10553,20 @@ def _integrity_rows() -> list[dict]:
         finished = it["session_status"] in {"completed", "terminated"}
         it["report_link"] = ai_report_link(it.get("candidate_email"), record_id) if finished else None
         it.pop("events", None)  # the list stays light; /integrity-logs/{token} has the timeline
+        # The lobby (13 Nov 2026): where an unfinished interview's page is right
+        # now — "On the device check", online — so a recruiter can Join before
+        # sign-in. Only live rows read the two live columns.
+        it["lobby"] = None
+        it["watchers"] = 0
+        if not finished and live_ctl.enabled():
+            try:
+                cols = _live_read(it["invite_token"])
+                if cols:
+                    now = time.time()
+                    it["lobby"] = live_ctl.lobby_view(cols[1], now)
+                    it["watchers"] = len(cols[0].get("watch") or {})
+            except Exception:
+                logger.warning("integrity.lobby_read_failed", exc_info=True)
     return items
 
 
@@ -10366,21 +10682,27 @@ def interview_integrity_detail(request: Request, invite_token: str):
     timeline = []
     for ev in summary_events:
         t = str(ev.get("type") or "")
+        echo = bool(ev.get("echo"))
+        details = ev.get("details") or ev.get("reason") or ""
+        if echo:
+            details = f"{details} — the same incident reported a second time; not counted".lstrip(" —")
         timeline.append({
             "type": t,
             "label": label_for(t),
-            "details": ev.get("details") or ev.get("reason") or "",
+            "details": details,
             "timestamp": ev.get("timestamp") or ev.get("at_ist") or "",
             "question": ev.get("question") or "",
             "ip": ev.get("ip") or "",
             "user_agent": ev.get("user_agent") or "",
-            "is_strike": t in _INTEGRITY_VIOLATION_TYPES,
+            "is_strike": t in _INTEGRITY_VIOLATION_TYPES and not echo,
+            "echo": echo,
         })
     row = next((i for i in _integrity_payload()["logs"] if i.get("invite_token") == token), None)
     # 5 Nov 2026: "What happened" — the journey and a plain-words verdict, read
     # from the schedule, the progress row (slim, no JSON), the device-check log,
     # the CRM link and this process's lookup memory. Never fails the page.
     diagnosis = None
+    recording = _recording_detail(token, status)
     try:
         device_log = get_device_check_log(AUTH_DB_TARGET, token)
         sched_for_diag = dict(rec)
@@ -10392,6 +10714,12 @@ def interview_integrity_detail(request: Request, invite_token: str):
             device_log=device_log if isinstance(device_log, list) else [],
             link={k: (row or {}).get(k) for k in ("ai_result", "ai_score", "not_attempted")},
             prewarm=_invite_prewarm_snapshot(token),
+            # 18 Nov 2026: the warnings (echoes marked), whether storage holds
+            # the recording, and the limits — for the real reason + advice.
+            events=summary_events,
+            recording_available=bool((recording or {}).get("available")),
+            max_warnings=MAX_WARNINGS,
+            gaze_limit=_integrity_gaze_limit(),
         )
     except Exception:
         logger.warning("integrity.diagnosis_failed", extra={"event": "integrity.diagnosis_failed",
@@ -10411,7 +10739,7 @@ def interview_integrity_detail(request: Request, invite_token: str):
         # 22 Sep 2026: the whole-session recording. `available: False` carries a
         # reason so the tab can say WHY rather than showing an empty player;
         # `live: True` (23 Sep 2026) tells it to stream the parts instead.
-        "recording": _recording_detail(token, status),
+        "recording": recording,
         "row": row,
     }
 

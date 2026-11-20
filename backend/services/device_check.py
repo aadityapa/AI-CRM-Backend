@@ -18,8 +18,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-#: Checks the page may report. Only the screen share today.
-CHECKS = frozenset({"screen_share"})
+#: Checks the page may report. The screen share (24 Oct 2026), and the
+#: anti-cheating checks a template can switch on (13 Nov 2026,
+#: services/interview/proctoring.py).
+CHECKS = frozenset({"screen_share", "headphones", "lighting", "gesture", "gaze_calibration"})
 
 #: Entries kept per interview — a candidate pressing the button 50 times must
 #: not grow the row without end. The newest are kept.
@@ -38,6 +40,37 @@ REASON_WORDS: dict[str, str] = {
     "TypeError": "the browser rejected the share settings (TypeError)",
     "OverconstrainedError": "the browser could not meet the share settings (OverconstrainedError)",
 }
+
+#: The anti-cheating checks' failure codes (13 Nov 2026).
+CHECK_REASON_WORDS: dict[str, dict[str, str]] = {
+    "headphones": {
+        "speaker_leak": "the microphone heard the test tones — sound is coming from speakers, not headphones",
+        "wrong_count": "the candidate could not tell how many beeps they heard",
+        "no_mic": "the microphone could not be opened for the test",
+        "no_audio": "the browser could not play the test tones",
+    },
+    "lighting": {
+        "too_dark": "the face is too dark on camera",
+        "backlit": "a bright light or window behind the candidate hides the face",
+        "no_face": "no face was found to measure the light on",
+        "no_camera": "the camera could not be read",
+    },
+    "gesture": {
+        "no_hands": "no hands were seen on camera",
+        "palms_not_shown": "both open palms were not shown",
+        "wrong_gesture": "the gesture asked for was not shown",
+        "timeout": "the gesture was not shown in time",
+        "model_unavailable": "the hand detector could not load in this browser",
+    },
+    "gaze_calibration": {
+        "no_face": "no face was seen while calibrating",
+        "skipped": "the calibration was skipped",
+        "model_unavailable": "the face monitor could not load in this browser",
+    },
+}
+
+CHECK_LABELS = {"headphones": "Headphones", "lighting": "Lighting", "gesture": "Gesture check",
+                "gaze_calibration": "Eye calibration"}
 
 SURFACE_WORDS = {"browser": "a browser tab", "window": "a window", "monitor": "the entire screen"}
 
@@ -64,6 +97,9 @@ def clean_event(body: dict, *, user_agent: str = "", ip: str = "", at: str = "")
         "ok": ok,
         "reason": "" if ok else (_clip(body.get("reason"), 40) or "error"),
         "surface": _clip(body.get("surface"), 16),
+        # A short measured fact ("tone heard 4 dB", "face brightness 112") — the
+        # page's numbers, never its sentences.
+        "detail": _clip(body.get("detail"), 80),
         "attempt": max(0, min(int(_num(body.get("attempt"))), 999)),
         "user_agent": str(user_agent or "")[:240],
         "ip": str(ip or "")[:64],
@@ -92,11 +128,37 @@ def reason_words(reason: str, surface: str = "") -> str:
     return f"the share failed ({reason or 'unknown error'})"
 
 
+def check_words(check: str, reason: str) -> str:
+    """A failed anti-cheating check's reason, in words."""
+    return CHECK_REASON_WORDS.get(check, {}).get(reason) or f"the check failed ({reason or 'unknown reason'})"
+
+
+def _check_event(e: dict) -> dict:
+    check = str(e.get("check") or "")
+    label = CHECK_LABELS.get(check, check)
+    attempt = int(_num(e.get("attempt")))
+    prefix = f"{label}, attempt {attempt}: " if attempt else f"{label}: "
+    detail = str(e.get("detail") or "").strip()
+    if e.get("ok"):
+        text = prefix + "passed" + (f" ({detail})" if detail else "") + "."
+        kind = f"{'gesture_check' if check == 'gesture' else check}_ok"
+    else:
+        text = prefix + check_words(check, str(e.get("reason") or "")) + (f" ({detail})" if detail else "") + "."
+        kind = f"{'gesture_check' if check == 'gesture' else check}_failed"
+    return {"type": kind, "details": text, "timestamp": str(e.get("timestamp") or ""),
+            "ip": str(e.get("ip") or ""), "user_agent": str(e.get("user_agent") or "")}
+
+
 def timeline_events(log: list | None) -> list[dict]:
     """The stored entries as Integrity timeline events (informational)."""
     out: list[dict] = []
     for e in log or []:
-        if not isinstance(e, dict) or e.get("check") != "screen_share":
+        if not isinstance(e, dict):
+            continue
+        if e.get("check") in CHECK_LABELS:
+            out.append(_check_event(e))
+            continue
+        if e.get("check") != "screen_share":
             continue
         attempt = int(_num(e.get("attempt")))
         prefix = f"Device check, attempt {attempt}: " if attempt else "Device check: "
@@ -117,5 +179,10 @@ def timeline_events(log: list | None) -> list[dict]:
     return out
 
 
-def failure_count(log: list | None) -> int:
-    return sum(1 for e in log or [] if isinstance(e, dict) and e.get("check") == "screen_share" and not e.get("ok"))
+def failure_count(log: list | None, check: str = "screen_share") -> int:
+    return sum(1 for e in log or [] if isinstance(e, dict) and e.get("check") == check and not e.get("ok"))
+
+
+def passed(log: list | None, check: str) -> bool:
+    """True when the check passed at least once (13 Nov 2026)."""
+    return any(isinstance(e, dict) and e.get("check") == check and e.get("ok") for e in log or [])

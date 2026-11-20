@@ -46,13 +46,14 @@ def invoice_hard_delete_blockers(invoice: Invoice) -> list[str]:
     blockers: list[str] = []
     num = invoice.invoice_number or f"#{invoice.id}"
     if invoice.payments:
-        blockers.append(f"{num} has recorded payments")
+        blockers.append(f"{num} has recorded payments (reverse them in Payment History, "
+                        "or unmap it in Received Amount)")
     tds = invoice.tds_record
     if tds is not None:
         paid = Decimal(str(tds.tds_paid or 0))
         pays = list(tds.payments or [])
         if paid > 0 or pays:
-            blockers.append(f"{num} has TDS payment(s)")
+            blockers.append(f"{num} has TDS marked received (open the invoice ▸ TDS ▸ Undo 'received')")
     return blockers
 
 
@@ -70,7 +71,8 @@ def assert_invoice_cascade_ok(db: Session, invoice: Invoice) -> None:
     if blockers:
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot delete: {'; '.join(blockers)}. Reverse them first.",
+            detail=f"Cannot delete: {'; '.join(blockers)}. Reverse them first — or ask Admin / CEO, "
+                   "who can delete it with everything recorded on it.",
         )
 
 
@@ -115,7 +117,25 @@ def undo_invoice_admin(db: Session, invoice: Invoice) -> dict:
         "payments_reversed": len(payments),
         "payments_amount": float(paid_total),
         "tds_paid_reversed": float(tds_paid),
+        "back_on_account": 0.0,
     }
+    # Money that came from a Received Amount goes back ON ACCOUNT there (20 Nov
+    # 2026): deleting the invoice must never make the customer's cash vanish.
+    from models import CustomerReceipt
+
+    two = Decimal("0.01")
+    for p in payments:
+        if getattr(p, "receipt_id", None):
+            r = db.get(CustomerReceipt, p.receipt_id)
+            if r is not None:
+                amt = Decimal(str(p.amount or 0))
+                r.unallocated_amount = (Decimal(str(r.unallocated_amount or 0)) + amt).quantize(two)
+                summary["back_on_account"] += float(amt)
+    if tds is not None and getattr(tds, "receipt_id", None):
+        r = db.get(CustomerReceipt, tds.receipt_id)
+        if r is not None:
+            r.tds_total = max(Decimal(str(r.tds_total or 0)) - Decimal(str(tds.tds_amount or 0)),
+                              Decimal("0"))
     from services.finance import release_invoice_from_po
     release_invoice_from_po(db, invoice)
     db.delete(invoice)  # lines, payments, TDS record + TDS payments cascade

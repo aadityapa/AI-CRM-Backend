@@ -43,7 +43,104 @@ REASON_WORDS: dict[str, str] = {
     "stale_active_recovery": "the clean-up closed it — signed in, but never submitted",
 }
 
+REASON_WORDS.update({
+    # 18 Nov 2026
+    "page_closed": "the candidate's interview page was closed or reloaded before the last question",
+})
+
 STARTED_STATUSES = {"active", "completed", "terminated"}
+
+#: 18 Nov 2026 — every warning family, in words a recruiter can repeat to the
+#: candidate: what the page saw (`cause`) and how to avoid it next time (`advice`).
+WARNING_HELP: dict[str, dict[str, str]] = {
+    "tab": {
+        "label": "Tab switch",
+        "cause": "The interview tab was hidden — the candidate opened another tab, minimised the browser or switched to another app.",
+        "advice": "Keep only the interview tab open and do not minimise the browser.",
+    },
+    "focus": {
+        "label": "Window lost focus",
+        "cause": ("The interview window lost focus — a click outside the browser, Alt+Tab / the Windows key, or another app "
+                  "taking the screen (a Teams / WhatsApp / Outlook pop-up, an update or antivirus window)."),
+        "advice": ("Close Teams, WhatsApp, Outlook and other apps, turn on Do Not Disturb (Windows: Focus assist), "
+                   "and do not click outside the browser window."),
+    },
+    "fullscreen": {
+        "label": "Left full screen",
+        "cause": "The page left full screen — Esc or F11 was pressed, or another window / a second monitor pulled focus.",
+        "advice": "Stay in full screen, do not press Esc / F11, and use ONE screen (disconnect a second monitor).",
+    },
+    "face": {
+        "label": "Another face on camera",
+        "cause": "The camera saw a second face.",
+        "advice": "Sit alone in a closed room with nobody behind or beside you.",
+    },
+    "clipboard": {
+        "label": "Copy / paste",
+        "cause": "Copy or paste was tried.",
+        "advice": "Do not copy or paste during the interview.",
+    },
+    "devtools": {
+        "label": "Developer tools",
+        "cause": "Browser developer tools were opened (F12 / Ctrl+Shift+I).",
+        "advice": "Do not open developer tools or browser extensions during the interview.",
+    },
+    "gaze": {
+        "label": "Looked away",
+        "cause": "The camera saw the candidate look away from the screen many times.",
+        "advice": "Keep your eyes on the screen; keep notes, phones and a second screen out of reach.",
+    },
+}
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def warning_list(events: list | None) -> list[dict]:
+    """The COUNTED strikes, oldest first (proctor echoes left out), PURE."""
+    from services.interview_integrity import EVENT_TYPES, STRIKE_TYPES, event_type, label_for
+
+    out: list[dict] = []
+    for ev in events or []:
+        t = event_type(ev)
+        if t not in STRIKE_TYPES or (isinstance(ev, dict) and ev.get("echo")):
+            continue
+        fam = EVENT_TYPES.get(t, ("", "other", 0, False))[1]
+        out.append({
+            "n": len(out) + 1,
+            "type": t,
+            "label": label_for(t).replace(" (proctor)", ""),
+            "family": fam,
+            "at": _iso(parse_when(ev.get("timestamp") or ev.get("at_ist"))),
+            "question": _txt(ev.get("question")),
+            "details": _txt(ev.get("details"))[:160],
+        })
+    out.sort(key=lambda w: w["at"] or "")
+    for i, w in enumerate(out, 1):
+        w["n"] = i
+    return out
+
+
+def warning_causes(warnings: list[dict], gaze: int = 0) -> list[dict]:
+    """One entry per warning family seen: count, cause, advice (PURE)."""
+    counts: dict[str, int] = {}
+    for w in warnings:
+        counts[w["family"]] = counts.get(w["family"], 0) + 1
+    if gaze:
+        counts["gaze"] = gaze
+    out = []
+    for fam, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        help_ = WARNING_HELP.get(fam) or {"label": fam.title(), "cause": "", "advice": ""}
+        out.append({"family": fam, "count": n, **help_})
+    return out
+
+
+def _warn_line(w: dict) -> str:
+    q = f" (question {w['question']})" if w.get("question") not in ("", None) else ""
+    return f"{_clock(parse_when(w.get('at')))} · {w['label']}{q}"
 
 
 def _txt(value: Any) -> str:
@@ -133,11 +230,16 @@ def diagnose(
     prewarm: dict | None = None,
     now: datetime | None = None,
     reason_words=None,
+    events: list | None = None,
+    recording_available: bool | None = None,
+    max_warnings: int = 3,
+    gaze_limit: int = 10,
 ) -> dict:
     """The verdict for one interview. `schedule` = the schedule row,
     `progress` = `auth_db.interview_progress_summary`, `link` = the CRM link
     facts (`ai_result`, `ai_score`, `not_attempted`), `prewarm` = the in-memory
-    lookup state (lost on restart)."""
+    lookup state (lost on restart), `events` = the integrity timeline (proctor
+    echoes marked), `recording_available` = what storage holds."""
     reason_words = reason_words or _device_reason_words
     now = (now or datetime.now(IST)).astimezone(IST)
     sched = schedule or {}
@@ -166,6 +268,23 @@ def diagnose(
     device = _device_step(device_log, reason_words)
     device_fails = sum(1 for e in device_log or [] if isinstance(e, dict) and e.get("check") == "screen_share" and not e.get("ok"))
 
+    # 18 Nov 2026 — the warnings and who / what ended the interview.
+    warnings = warning_list(events)
+    gaze = sum(1 for e in events or [] if isinstance(e, dict) and _txt(e.get("type")) == "gaze_away")
+    causes = warning_causes(warnings, gaze)
+    term_event = next((e for e in reversed(events or []) if isinstance(e, dict) and _txt(e.get("type")) == "termination"), None)
+    term_reason = (_txt(meta.get("termination_reason")) or _txt((term_event or {}).get("reason"))
+                   or (_txt(sched.get("reason")) if status == "terminated" else ""))
+    by_recruiter = bool(meta.get("terminated_by_recruiter")) or term_reason.lower().startswith("ended by the recruiter") or any(
+        isinstance(e, dict) and _txt(e.get("type")) == "recruiter_terminated" for e in events or [])
+    terminated = status == "terminated" or final_status == "terminated" or bool(term_reason) or by_recruiter
+    if terminated and status != "terminated":
+        status = "terminated"  # the schedule row lost it — the session / timeline say it ended so
+    via = _txt(meta.get("finalize_via") or meta.get("boundary_saved_via")).lower()
+    recruiter_joins = [parse_when(e.get("timestamp")) for e in events or []
+                       if isinstance(e, dict) and _txt(e.get("type")) in {"recruiter_joined", "recruiter_call", "recruiter_watch"}]
+    recruiter_joins = [t for t in recruiter_joins if t]
+
     steps: list[dict] = [
         {"key": "scheduled", "label": "Scheduled", "at": _iso(slot), "state": "done" if slot else "missing",
          "detail": "The link opens from this time." if slot else "No time on the schedule."},
@@ -187,22 +306,35 @@ def diagnose(
          "state": "done" if answers else ("missing" if status in {"completed", "terminated"} or started else "info"),
          "detail": f"{answers} answered of {questions} question(s) prepared." if questions or answers else "No answers."},
     ]
+    if warnings or gaze:
+        steps.append({"key": "warnings", "label": "Warnings", "at": warnings[-1]["at"] if warnings else None,
+                      "state": "bad" if len(warnings) > max_warnings else ("info" if warnings else "done"),
+                      "detail": (f"{len(warnings)} warning(s), {max_warnings} allowed"
+                                 + (f"; {gaze} look-away reminder(s)" if gaze else "") + ".")})
     if status in {"completed", "terminated"} or ended:
         how = REASON_WORDS.get(reason, reason.replace("_", " ") if reason else "")
+        if reason == "candidate_ended_early" and via == "manual":
+            how = "the candidate pressed End Interview before the last question"
+        elif reason == "candidate_ended_early" and via == "unload":
+            how = REASON_WORDS["page_closed"]
         if status == "terminated":
-            how = _txt(meta.get("termination_reason")) or _txt(sched.get("reason")) or how or "terminated by proctoring"
+            how = term_reason or how or "terminated by proctoring"
         steps.append({"key": "ended", "label": "Ended", "at": _iso(ended), "state": "bad" if status == "terminated" or not started else "done",
                       "detail": (how[0].upper() + how[1:] + ".") if how else "Ended."})
     if ai_result or not_attempted:
         verdict = "Not attempted (no scored answer)" if not_attempted else (
             f"{ai_result}" + (f" · {float(ai_score):.0f}%" if ai_score is not None else ""))
         steps.append({"key": "report", "label": "AI report", "at": None,
-                      "state": "bad" if not_attempted or ai_result.lower() == "failed" else "done", "detail": verdict})
+                      "state": "bad" if not_attempted or ai_result.lower() in {"failed", "rejected"} else "done",
+                      "detail": verdict + (" — RMG / GM decide (the AI score is advice)"
+                                           if ai_result.lower() == "in review" else "")})
     elif _txt(prog.get("report_status")):
         steps.append({"key": "report", "label": "AI report", "at": None, "state": "info",
                       "detail": f"Report status: {prog.get('report_status')}."})
     rec_words = {"ready": "Saved.", "recording": "Recording in progress.", "missing": "No recording was saved.",
                  "corrupt": "Saved but damaged (first slice lost)."}
+    if recording_available and recording not in {"corrupt", "recording"}:
+        recording = "ready"  # storage holds the file even when the schedule row was never stamped
     steps.append({"key": "recording", "label": "Recording", "at": None,
                   "state": {"ready": "done", "recording": "info", "missing": "missing", "corrupt": "bad"}.get(recording, "missing"),
                   "detail": rec_words.get(recording, "Nothing was recorded" + ("." if started else " — recording starts after sign-in."))})
@@ -216,13 +348,22 @@ def diagnose(
         flags.append(f"The recovery job touched this session {prog.get('recovery_attempts')} time(s).")
     if device_fails:
         flags.append(f"Screen share failed {device_fails} time(s) on the Device Check.")
-    if started and status == "completed" and recording in {"", "missing"}:
+    if started and status in {"completed", "terminated"} and recording in {"", "missing"} and recording_available is not True:
         flags.append("Signed in but no recording was saved — the camera / screen recorder never uploaded.")
+    early = reason in {"candidate_ended_early", "page_closed"} or (status == "terminated" and not by_recruiter)
+    if recruiter_joins and ended and early:
+        first_join = min(recruiter_joins)
+        if first_join <= ended:
+            flags.append(f"A recruiter joined this live interview at {_clock(first_join)}. Before 18 Nov 2026, a recruiter "
+                         "signed in to the dashboard in the SAME browser as the candidate made the candidate's page reload "
+                         "and end the interview (fixed). Test with two devices or two browser profiles.")
 
     headline, tone, expl, next_steps = _verdict(
         status=status, started=started, signed_in=signed_in, first_q=first_q, answers=answers, reason=reason,
         final_status=final_status, not_attempted=not_attempted, opened=opened, slot=slot, ended=ended,
-        last_act=last_act, verified=verified, device_fails=device_fails, progress=bool(prog), now=now, sched=sched, meta=meta)
+        last_act=last_act, verified=verified, device_fails=device_fails, progress=bool(prog), now=now, sched=sched, meta=meta,
+        warnings=warnings, causes=causes, gaze=gaze, term_reason=term_reason, by_recruiter=by_recruiter, via=via,
+        max_warnings=max_warnings, gaze_limit=gaze_limit, questions=questions)
 
     facts = {
         "session_status": status,
@@ -245,20 +386,59 @@ def diagnose(
         "fast_bootstrap": meta.get("fast_bootstrap"),
         "prewarm": {k: prewarm.get(k) for k in ("status", "reason", "started_at", "error") if prewarm.get(k)} or None,
     }
+    facts["termination_reason"] = term_reason or None
+    facts["terminated_by_recruiter"] = by_recruiter
+    facts["finalize_via"] = via or None
+    facts["warnings_counted"] = len(warnings)
     return {"headline": headline, "tone": tone, "explanation": expl, "next_steps": next_steps,
-            "steps": steps, "flags": flags, "facts": facts}
+            "steps": steps, "flags": flags, "facts": facts,
+            "warnings": warnings, "causes": causes, "max_warnings": max_warnings,
+            "terminated": status == "terminated", "terminated_by_recruiter": by_recruiter}
+
+
+def _candidate_advice(causes: list[dict]) -> list[str]:
+    """What to tell the candidate before the next attempt, one line per cause."""
+    return [f"Tell the candidate ({c['label'].lower()} ×{c['count']}): {c['advice']}" for c in causes if c.get("advice")]
 
 
 def _verdict(*, status, started, signed_in, first_q, answers, reason, final_status, not_attempted, opened, slot,
-             ended, last_act, verified, device_fails, progress, now, sched, meta):
+             ended, last_act, verified, device_fails, progress, now, sched, meta,
+             warnings=(), causes=(), gaze=0, term_reason="", by_recruiter=False, via="",
+             max_warnings=3, gaze_limit=10, questions=0):
     reschedule = "Ask the TA to send a fresh link: Applied Candidates ▸ Reschedule AI L1 (the old link is closed)."
+    warnings = list(warnings or [])
+    causes = list(causes or [])
     if status == "terminated":
-        why = _txt(meta.get("termination_reason")) or _txt(sched.get("reason")) or "the proctoring rules"
-        return ("Ended by proctoring", "bad",
-                [f"The interview was stopped: {why}.",
-                 f"{answers} answer(s) were saved before it ended."],
-                ["Open the timeline below to see each warning, then watch the recording at those times.",
-                 "If the warnings were unfair (e.g. a camera glitch), reschedule the AI L1 with a note."])
+        if by_recruiter:
+            why = term_reason or "Ended by the recruiter"
+            return ("Ended by the recruiter", "bad",
+                    [f"{why}.", f"{answers} answer(s) were saved before it ended."],
+                    ["The recruiter's reason is above; the timeline shows when the recruiter joined and ended it.",
+                     "If it was ended by mistake, reschedule the AI L1 with a note."])
+        lines: list[str] = []
+        looked_away = "looked away" in term_reason.lower() or (gaze_limit and gaze >= gaze_limit and len(warnings) <= max_warnings)
+        if looked_away:
+            headline = f"Terminated — looked away from the screen {gaze} times"
+            lines.append(f"The camera counted {gaze} look-away reminders; the {_ordinal(gaze_limit)} ends the interview.")
+        elif len(warnings) > max_warnings:
+            last = warnings[max_warnings]  # the warning that crossed the limit
+            headline = f"Terminated — {len(warnings)} warnings, {max_warnings} allowed"
+            lines.append(f"The {_ordinal(max_warnings + 1)} warning ended the interview at {_clock(parse_when(last['at']))}: "
+                         f"{last['label']}" + (f" during question {last['question']}." if last.get("question") else "."))
+        else:
+            headline = f"Terminated — {term_reason or 'proctoring rules'}"
+            lines.append(f"The interview was stopped: {term_reason or 'the proctoring rules'}.")
+        if warnings:
+            lines.append("Warnings, in order: " + "; ".join(f"{w['n']}. {_warn_line(w)}" for w in warnings) + ".")
+        for c in causes:
+            if c.get("cause"):
+                lines.append(f"{c['label']} ×{c['count']} — {c['cause']}")
+        lines.append(f"{answers} answer(s) of {questions or '?'} were saved before it ended; the report scores only those.")
+        return (headline, "bad", lines,
+                ["Watch the recording at each warning's time (the timeline below) to see what happened.",
+                 *_candidate_advice(causes),
+                 "If the warnings were not the candidate's fault (a pop-up, a camera glitch), reschedule the AI L1 "
+                 "with that note — otherwise decide on what was answered."])
     if status == "completed" and not started:
         lines = []
         if opened:
@@ -286,11 +466,38 @@ def _verdict(*, status, started, signed_in, first_q, answers, reason, final_stat
                 ["Check the timeline for a tab switch / browser close near the last activity.",
                  "Reschedule if the candidate had a technical problem."])
     if status == "completed":
+        warn_lines: list[str] = []
+        if warnings:
+            warn_lines.append(f"{len(warnings)} warning(s) during the interview ({max_warnings} allowed — it was NOT ended "
+                              "for them): " + "; ".join(_warn_line(w) for w in warnings) + ".")
+            warn_lines += [f"{c['label']} ×{c['count']} — {c['cause']}" for c in causes if c.get("cause")]
+        early = reason in {"candidate_ended_early", "page_closed"}
+        if early:
+            of = f"{answers} of {questions}" if questions else f"{answers}"
+            if reason == "page_closed" or via == "unload":
+                headline = "Ended early — the interview page was closed or reloaded"
+                lines = [f"{of} question(s) answered; at {_clock(ended)} the candidate's page closed or reloaded and an older "
+                         "version of the page submitted the interview, which closed the link.",
+                         "A reload no longer ends an interview (fixed 18 Nov 2026): reopening the same link resumes it."]
+            elif via == "manual":
+                headline = "Ended early — the candidate pressed End Interview"
+                lines = [f"{of} question(s) answered; at {_clock(ended)} the candidate pressed End Interview before the last question."]
+            else:
+                headline = "Ended early — submitted before the last question"
+                lines = [f"{of} question(s) answered; ended at {_clock(ended)} before the last question.",
+                         "The page did not say how: End Interview was pressed, or the page was closed / reloaded "
+                         "(before 18 Nov 2026 a reload submitted the interview)."]
+            steps_ = ["Call the candidate and ask what happened; watch the end of the recording.",
+                      *_candidate_advice(causes), reschedule + " Add the reason as the note."]
+            return (headline, "warn", lines + warn_lines, steps_)
         lines = [f"{answers} answer(s) saved; ended at {_clock(ended)}: {REASON_WORDS.get(reason, reason or 'submitted')}."]
         if not_attempted:
             lines.append("No scored answer — only the warm-up was answered, so the report reads \"Not attempted\".")
-            return ("Answered only the warm-up", "warn", lines, [reschedule])
-        return ("Completed", "ok", lines, ["Open the candidate report for the scores and the recording."])
+            return ("Answered only the warm-up", "warn", lines + warn_lines, [reschedule])
+        return ("Completed" + (" — with warnings" if warnings else ""), "warn" if len(warnings) >= max_warnings else "ok",
+                lines + warn_lines,
+                ["Open the candidate report for the scores and the recording.",
+                 *(["Watch the recording at each warning's time before deciding."] if warnings else [])])
     if status == "active":
         idle = (now - last_act).total_seconds() / 60 if last_act else None
         if idle is not None and idle >= 35:

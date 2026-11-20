@@ -1063,6 +1063,7 @@ def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
     ids = set(invoice_approval.user_ids(invoice))
     ids |= {i for i in [getattr(invoice, "issued_by", None),
                         getattr(tds, "created_by", None) if tds is not None else None,
+                        getattr(invoice, "settled_by", None),
                         *[getattr(p, "created_by", None) for p in payments]] if i}
     names = _user_names(db, ids) if ids else {}
     data.update(invoice_approval.payload(invoice, user, names))
@@ -1072,6 +1073,13 @@ def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
         "by_name": names.get(getattr(invoice, "issued_by", None) or 0),
         "at": issued_at.isoformat() if issued_at is not None else None,
     }
+    # Settled in full (0154) — who closed the small balance, why, and whether
+    # this login may do it now (Finance / Admin / CEO by role).
+    from services import invoice_settlement
+    data["settlement"] = invoice_settlement.payload(invoice, names)
+    may_settle = bool(user is not None and (getattr(user, "is_admin", False) or "Finance" in (user.roles or set())))
+    data["can_settle"] = may_settle and invoice_settlement.settle_block(invoice) is None
+    data["can_undo_settlement"] = may_settle and data["settlement"] is not None
     if isinstance(data.get("payments"), list):
         for row in data["payments"]:
             row["recorded_by_name"] = names.get(row.get("created_by") or 0)
@@ -1434,13 +1442,35 @@ def return_proforma(invoice_id: int, body: RejectIn,
 def delete_invoice(invoice_id: int, db: Session = Depends(get_crm_db),
                    user: CurrentUser = Depends(INV_WRITE)):
     from services.crm_common import commit_or_conflict
-    from services.crm_delete import cascade_delete_invoice
+    from services.crm_delete import cascade_delete_invoice, undo_invoice_admin
 
     invoice = get_invoice_or_404(db, invoice_id)
-    # Cascades owned unpaid TDS; still blocks on payments / TDS payments / credit notes.
-    cascade_delete_invoice(db, invoice)
+    if not user.is_admin:
+        # Cascades owned unpaid TDS; blocks on payments / received TDS / credit notes.
+        cascade_delete_invoice(db, invoice)
+        commit_or_conflict(db, "Cannot delete: invoice is still referenced by other records.")
+        return envelope(message="Invoice deleted")
+    # Admin / CEO (20 Nov 2026): payments and received TDS go with the invoice;
+    # money from a Received Amount goes back on account. Credit notes still block.
+    from services.invoice_payments import invoice_customer_ids
+
+    cid, _ = invoice_customer_ids(db, invoice)
+    summary = undo_invoice_admin(db, invoice)
+    if cid is not None and (summary["payments_reversed"] or summary["tds_paid_reversed"]):
+        from services import customer_activity
+
+        customer_activity.record(
+            db, cid, "INVOICE_DELETED_BY_ADMIN",
+            f"{summary['invoice_number']} deleted by Admin with {summary['payments_reversed']} payment(s) of "
+            f"{summary['payments_amount']:,.2f} and TDS received of {summary['tds_paid_reversed']:,.2f}"
+            + (f" — {summary['back_on_account']:,.2f} back on account" if summary["back_on_account"] else ""),
+            entity="invoice", entity_id=invoice_id, subject=summary["invoice_number"], user=user)
     commit_or_conflict(db, "Cannot delete: invoice is still referenced by other records.")
-    return envelope(message="Invoice deleted")
+    msg = "Invoice deleted"
+    if summary["payments_reversed"] or summary["tds_paid_reversed"]:
+        msg += (f" — {summary['payments_reversed']} payment(s) and the TDS recorded on it removed"
+                + (f"; {summary['back_on_account']:,.2f} back on account" if summary["back_on_account"] else ""))
+    return envelope(data=summary, message=msg)
 
 
 @router.post("/invoices/{invoice_id}/generate-pdf")
@@ -1636,6 +1666,62 @@ def list_tds_payments(invoice_id: int, db: Session = Depends(get_crm_db),
     return envelope([serialize_tds_payment(p) for p in record.payments])
 
 
+class TdsUndoReceivedIn(BaseModel):
+    reason: str = Field(default="", max_length=500)
+
+
+@router.post("/invoices/{invoice_id}/tds-payments/undo")
+def undo_tds_received(invoice_id: int, body: TdsUndoReceivedIn, db: Session = Depends(get_crm_db),
+                      user: CurrentUser = Depends(gated_write("tds", "Finance"))):
+    """Undo "TDS received (Form 16A)" on an invoice (20 Nov 2026). Until now a
+    received TDS could not be taken back at all, so the invoice could never be
+    unmapped or deleted. The TDS reads Pending from client again; a reason is
+    required and kept on the customer's Activity Log."""
+    from services import tds as tds_svc
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    record = invoice.tds_record
+    if record is None or not tds_svc.is_received(record):
+        raise HTTPException(status_code=409, detail="No TDS is marked received on this invoice")
+    back = tds_svc.undo_received(db, record, reason=body.reason, user=user)
+    db.commit()
+    db.refresh(record)
+    return envelope(serialize_tds(record, invoice_number=invoice.invoice_number),
+                    f"TDS received of {float(back):,.2f} undone — pending from client again")
+
+
+class SettleIn(BaseModel):
+    reason: str = Field(default="", max_length=1000)
+
+
+@router.post("/invoices/{invoice_id}/settle-in-full")
+def settle_invoice_in_full(invoice_id: int, body: SettleIn, db: Session = Depends(get_crm_db),
+                           user: CurrentUser = Depends(role_required("Finance"))):
+    """Close a Partially paid invoice as Paid (20 Nov 2026): the balance left is
+    adjusted, not received. Finance / Admin / CEO only (by role)."""
+    from services import invoice_settlement
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    adj = invoice_settlement.settle_in_full(db, invoice, reason=body.reason, user=user)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"{invoice.invoice_number} settled in full — {float(adj):,.2f} adjusted, invoice reads Paid")
+
+
+@router.post("/invoices/{invoice_id}/settle-in-full/undo")
+def undo_invoice_settlement(invoice_id: int, body: SettleIn, db: Session = Depends(get_crm_db),
+                            user: CurrentUser = Depends(role_required("Finance"))):
+    from services import invoice_settlement
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    adj = invoice_settlement.undo_settlement(db, invoice, reason=body.reason, user=user)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"Settlement undone — {float(adj):,.2f} is open on {invoice.invoice_number} again")
+
+
 @router.get("/tds")
 def list_tds(tds_status: str | None = None, customer_id: int | None = None,
              pp: PageParams = Depends(page_params),
@@ -1708,22 +1794,21 @@ def delete_tds(
     db: Session = Depends(get_crm_db),
     user: CurrentUser = Depends(gated_write("tds", "Finance")),
 ):
-    """Hard-delete a TDS record (cascades its payment rows). Blocks when any payment was recorded."""
+    """Hard-delete a TDS record. TDS already marked received blocks Finance
+    (with where to undo it); Admin / CEO undo it in the same step."""
+    from models import CustomerReceipt
+    from services import tds as tds_svc
     from services.crm_common import commit_or_conflict
 
     record = db.get(TdsRecord, tds_id)
     if record is None:
         raise HTTPException(status_code=404, detail="TDS record not found")
-    paid = Decimal(str(record.tds_paid or 0))
-    pay_count = len(record.payments or [])
-    if paid > 0 or pay_count > 0:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot delete: {pay_count or 1} TDS payment(s) exist. Reverse payments first.",
-        )
     invoice = record.invoice
-    from services import tds as tds_svc
-    tds_svc.unbook(db, record)  # the TDS goes back on the invoice balance
+    receipt = db.get(CustomerReceipt, record.receipt_id) if record.receipt_id else None
+    amount = Decimal(str(record.tds_amount or 0))
+    tds_svc.unbook(db, record, force=user.is_admin, user=user)  # back on the invoice balance
+    if receipt is not None:
+        receipt.tds_total = max(Decimal(str(receipt.tds_total or 0)) - amount, Decimal("0"))
     commit_or_conflict(db, "Cannot delete: TDS record is still referenced by other records.")
     return envelope(
         data={"id": tds_id, "invoice_id": invoice.id if invoice else None},

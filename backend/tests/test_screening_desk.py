@@ -481,7 +481,10 @@ def test_next_step_reads_like_a_to_do_list():
     assert ns(screening="Rejected")["key"] == "rejected"
     assert ns()["key"] == "route"                                           # shortlisted, nothing chosen
     assert ns(ai={"ai_effective_result": "Pending"})["key"] == "ai_wait"
-    assert ns(ai={"ai_effective_result": "Failed"})["key"] == "ai_failed"
+    # 18 Nov 2026: a finished AI L1 waits for RMG / GM — In Review.
+    assert ns(ai={"ai_effective_result": "In Review"})["key"] == "ai_review"
+    assert ns(ai={"ai_effective_result": "Failed"})["key"] == "ai_review"
+    assert ns(ai={"ai_effective_result": "Rejected"})["key"] == "ai_failed"
     assert ns(ai={"ai_effective_result": "Selected"})["key"] == "ai_done"
     assert ns(rounds=_rounds(l1_manual_requested=True))["key"] == "l1_book"
     assert ns(rounds=_rounds(l1_manual_requested=True, l1_manual_scheduled=True))["key"] == "l1_feedback"
@@ -653,8 +656,10 @@ def test_notice_ai_and_l1_buckets_read_what_is_recorded():
         == ["15", "15", "30", "60", "90", "unknown", "unknown"]
     assert desk.notice_days("3 weeks") == 21
     assert desk.ai_result_bucket(None) == "none"
-    assert desk.ai_result_bucket({"ai_effective_result": "Passed"}) == "passed"
-    assert desk.ai_result_bucket({"ai_effective_result": "Failed"}) == "failed"
+    # 18 Nov 2026: Passed / Failed are the AI's suggestion → In Review.
+    assert desk.ai_result_bucket({"ai_effective_result": "Passed"}) == "in_review"
+    assert desk.ai_result_bucket({"ai_effective_result": "Selected"}) == "passed"
+    assert desk.ai_result_bucket({"ai_effective_result": "Rejected"}) == "failed"
     assert desk.ai_result_bucket({"ai_effective_result": None}) == "pending"
     assert desk.l1_result_bucket({"l1_manual_result": "Hire"}) == "hire"
     assert desk.l1_result_bucket({"l1_manual_result": "No Hire"}) == "no_hire"

@@ -77,6 +77,33 @@ EVENT_TYPES: dict[str, tuple[str, str, int, bool]] = {
     # warning — never a strike; `gaze_limit()` of them end the interview.
     "gaze_away": ("Looked away from the screen", "gaze", 2, False),
     "camera_monitor_unavailable": ("Face / eye monitor unavailable", "system", 0, False),
+    # Anti-cheating checks a template can switch on (13 Nov 2026,
+    # services/interview/proctoring.py). Before sign-in (the Device Check) they
+    # are informational; during the interview a miss is a SOFT flag that lowers
+    # the integrity score — none of them is a strike or ends the interview.
+    "headphones_ok": ("Headphones check passed", "system", 0, False),
+    "headphones_failed": ("Headphones check failed", "system", 0, False),
+    "lighting_ok": ("Lighting check passed", "system", 0, False),
+    "lighting_failed": ("Lighting check failed", "system", 0, False),
+    "gesture_check_ok": ("Gesture check passed", "system", 0, False),
+    "gesture_check_failed": ("Gesture check failed", "system", 0, False),
+    "gaze_calibration_ok": ("Eye calibration done", "system", 0, False),
+    "gaze_calibration_failed": ("Eye calibration failed", "system", 0, False),
+    "gesture_prompt_ok": ("Gesture prompt passed", "system", 0, False),
+    "gesture_prompt_missed": ("Gesture prompt missed", "gesture", 4, False),
+    "headphones_disconnected": ("Headphones disconnected", "audio", 5, False),
+    "headphones_reconnected": ("Headphones reconnected", "system", 0, False),
+    "audio_device_changed": ("Audio device changed", "audio", 2, False),
+    "low_light": ("Poor lighting", "light", 1, False),
+    "reading_pattern": ("Eyes moved as if reading", "reading", 3, False),
+    "room_scan_started": ("Room scan started", "system", 0, False),
+    "room_scan_done": ("Room scan finished", "system", 0, False),
+    "room_scan_skipped": ("Room scan not completed", "gesture", 3, False),
+    # The recruiter on the Integrity tab (13 Nov 2026).
+    "candidate_in_lobby": ("Candidate opened the link", "system", 0, False),
+    "recruiter_watch": ("Recruiter started watching", "system", 0, False),
+    "recruiter_watch_ended": ("Recruiter stopped watching", "system", 0, False),
+    "recruiter_terminated": ("Ended by the recruiter", "system", 0, False),
     # bookkeeping
     "termination": ("Terminated", "system", 0, False),
 }
@@ -85,6 +112,9 @@ FAMILIES: dict[str, str] = {
     "tab": "Tab switches", "focus": "Focus loss", "fullscreen": "Fullscreen exits",
     "keys": "Key escapes", "face": "Camera", "clipboard": "Clipboard", "devtools": "Dev tools",
     "gaze": "Looking away",
+    # 13 Nov 2026 — the anti-cheating checks
+    "gesture": "Gesture checks missed", "audio": "Headphones / audio", "light": "Lighting",
+    "reading": "Reading pattern",
 }
 
 #: Types that count toward the three-warning termination rule.
@@ -131,8 +161,67 @@ def label_for(t: str) -> str:
     return EVENT_TYPES.get(t, (t.replace("_", " ").title(), "other", 0, False))[0]
 
 
+#: Proctor-channel copies (18 Nov 2026). The candidate page reports every
+#: warning TWICE — to /interview/violation (the authority) and to
+#: /proctor/violation as "proctor_tabSwitch" / "proctor_extraFace" — and the
+#: proctor copies are merged into the same log when the interview ends. Counted
+#: as well, one real incident read as two strikes ("6 of 3 allowed" for three
+#: real events). A proctor event with a direct strike within this many seconds
+#: is the SAME incident: shown, never counted.
+PROCTOR_TYPES: frozenset[str] = frozenset({"proctor_tabSwitch", "proctor_extraFace"})
+ECHO_WINDOW_S = 6
+
+
+def _event_epoch(ev) -> float | None:
+    from datetime import datetime, timedelta, timezone
+    raw = str((ev or {}).get("timestamp") or (ev or {}).get("at_ist") or "").strip() if isinstance(ev, dict) else ""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    return dt.timestamp()
+
+
+def proctor_echo_indexes(events: list) -> set[int]:
+    """Indexes of proctor-channel events that repeat a direct strike (PURE)."""
+    direct = [t for t in (_event_epoch(ev) for ev in events
+                          if event_type(ev) in STRIKE_TYPES and event_type(ev) not in PROCTOR_TYPES) if t is not None]
+    if not direct:
+        return set()
+    out: set[int] = set()
+    used: set[int] = set()
+    for i, ev in enumerate(events):
+        if event_type(ev) not in PROCTOR_TYPES:
+            continue
+        at = _event_epoch(ev)
+        if at is None:
+            continue
+        # Each direct strike may absorb ONE proctor copy.
+        best = None
+        for j, d in enumerate(direct):
+            if j in used or abs(d - at) > ECHO_WINDOW_S:
+                continue
+            if best is None or abs(d - at) < abs(direct[best] - at):
+                best = j
+        if best is not None:
+            used.add(best)
+            out.add(i)
+    return out
+
+
+def counted_events(events: Iterable) -> list[dict]:
+    """The events that count: duplicates collapsed, proctor echoes dropped."""
+    evs = dedupe_events(events)
+    echoes = proctor_echo_indexes(evs)
+    return [ev for i, ev in enumerate(evs) if i not in echoes]
+
+
 def count_strikes(events: Iterable) -> int:
-    return sum(1 for ev in events if event_type(ev) in STRIKE_TYPES)
+    return sum(1 for ev in counted_events(events) if event_type(ev) in STRIKE_TYPES)
 
 
 def dedupe_events(events: Iterable) -> list[dict]:
@@ -164,9 +253,13 @@ def integrity_score(events: Iterable, *, terminated: bool = False) -> int:
 def summarise(events: Iterable, *, session_status: str = "") -> dict:
     """Per-family counts + score + flags for one interview row."""
     evs = dedupe_events(events)
+    echoes = proctor_echo_indexes(evs)
+    # The timeline keeps every event; a proctor echo is marked, never counted.
+    evs = [({**ev, "echo": True} if i in echoes else ev) for i, ev in enumerate(evs)]
+    counted = [ev for ev in evs if not ev.get("echo")]
     by_family: dict[str, int] = defaultdict(int)
     by_type: dict[str, int] = defaultdict(int)
-    for ev in evs:
+    for ev in counted:
         t = event_type(ev)
         if t == "termination" or not t:
             continue
@@ -174,10 +267,10 @@ def summarise(events: Iterable, *, session_status: str = "") -> dict:
         by_family[fam] += 1
         by_type[t] += 1
     terminated = str(session_status or "").lower() == "terminated"
-    score = integrity_score(evs, terminated=terminated)
+    score = integrity_score(counted, terminated=terminated)
     return {
         "events": evs,
-        "strikes": count_strikes(evs),
+        "strikes": count_strikes(counted),
         "gaze_warnings": count_gaze(evs),
         "by_family": {k: by_family.get(k, 0) for k in FAMILIES},
         "by_type": dict(by_type),
@@ -223,7 +316,7 @@ CSV_COLUMNS = [
     "candidate_name", "candidate_email", "customer_name", "requirement_title", "scheduled_at",
     "session_status", "integrity_score", "strikes", "tab_switches", "focus_loss", "fullscreen_exits",
     "face_events", "clipboard", "devtools", "looked_away", "reason", "interview_started_at",
-    "interview_completed_at",
+    "interview_completed_at", "gesture_missed", "headphones_audio", "lighting", "reading",
 ]
 
 
@@ -244,5 +337,6 @@ def rows_to_csv(rows: list[dict]) -> str:
             r.get("integrity_score"), r.get("strikes"), fam.get("tab", 0), fam.get("focus", 0),
             fam.get("fullscreen", 0), fam.get("face", 0), fam.get("clipboard", 0), fam.get("devtools", 0),
             fam.get("gaze", 0), r.get("reason"), r.get("interview_started_at"), r.get("interview_completed_at"),
+            fam.get("gesture", 0), fam.get("audio", 0), fam.get("light", 0), fam.get("reading", 0),
         )])
     return buf.getvalue()

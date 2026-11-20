@@ -109,6 +109,34 @@ def normalize_postgres_dsn(dsn: str) -> str:
     return f"{raw}{sep}sslmode=require"
 
 
+def default_db_target() -> str:
+    """THE store the interview platform reads and writes, from the environment.
+
+    `AUTH_DB_URL` (normalised), else `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` /
+    `DB_PASSWORD`, else the local SQLite file. ⚠️ The user name and password are
+    URL-encoded: a password holding `@ # % / :` built raw into the URL reaches
+    Postgres wrong ("password authentication failed") — that broke AI Costs and the
+    AI-call log in production while logins (which quoted them) worked (18 Nov 2026).
+    Every module that needs the legacy store calls this; never build the URL again.
+    """
+    direct = (os.getenv("AUTH_DB_URL") or "").strip()
+    if direct:
+        return normalize_postgres_dsn(direct)
+    host = (os.getenv("DB_HOST") or "").strip()
+    port = (os.getenv("DB_PORT") or "5432").strip()
+    name = (os.getenv("DB_NAME") or "").strip()
+    user = (os.getenv("DB_USER") or "").strip()
+    password = (os.getenv("DB_PASSWORD") or "").strip()
+    if host and name and user:
+        from urllib.parse import quote
+
+        # No sslmode added here on purpose — the same URL logins have always used.
+        return f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{name}"
+    from paths import KARNEX_DB_FILE
+
+    return str(KARNEX_DB_FILE)
+
+
 def _connect_sqlite(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -2893,6 +2921,8 @@ def interview_ids_by_invite(db_target: DbTarget, invite_tokens) -> dict[str, str
 PROGRESS_SUMMARY_META_KEYS = (
     "finalization_reason", "final_status", "interview_started_epoch", "startup_login_accepted_at_utc",
     "fast_bootstrap", "termination_reason", "terminated_at", "created_at_ist", "unstarted_hold_at",
+    # 18 Nov 2026 — how the page got to /submit, and who ended it
+    "finalize_via", "boundary_saved_via", "terminated_by_recruiter",
 )
 
 

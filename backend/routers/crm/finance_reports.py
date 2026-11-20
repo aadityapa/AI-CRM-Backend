@@ -52,7 +52,9 @@ INV_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
 #: Sub-tabs (22 Oct 2026): the page's own tab first, then Reports ▸ Financial
 #: Reports (where the page is embedded), then the invoices grant as before.
 _FIN_REPORTS = subtab_gate("reports", "financial", INV_READ)
-LEDGER_READ = subtab_gate("finance-reports", "ledger", _FIN_REPORTS)
+#: 20 Nov 2026 — the ledger is also its own Reports tab ("Customer Ledger").
+LEDGER_READ = subtab_gate("finance-reports", "ledger",
+                          subtab_gate("reports", ("customer_ledger", "financial"), INV_READ))
 RECEIVABLES_READ = subtab_gate("finance-reports", "receivables", _FIN_REPORTS)
 NOT_PROFORMA = Invoice.kind != InvoiceKind.PROFORMA.value
 #: Payment terms assumed when an invoice has no due date (revenue_report's rule).
@@ -232,6 +234,20 @@ def customer_ledger(
             "invoice_id": cn.invoice_id, "invoice_number": inv.invoice_number if inv else None,
             "credit_note_id": cn.id,
         })
+    # Settled in full by Finance / Admin (0154): the balance adjusted — a credit
+    # on the statement (not cash), dated the day it was settled.
+    for inv, _prj in inv_rows:
+        adj = Decimal(getattr(inv, "settled_adjustment", 0) or 0)
+        if adj > 0:
+            at = getattr(inv, "settled_at", None)
+            entries.append({
+                "date": at.date() if at is not None else inv.invoice_date, "rank": 3, "type": "Adjustment",
+                "ref": inv.invoice_number,
+                "note": "Balance settled in full (not received)"
+                        + (f" · {inv.settled_reason}" if getattr(inv, "settled_reason", None) else ""),
+                "debit": ZERO, "credit": adj,
+                "invoice_id": inv.id, "invoice_number": inv.invoice_number,
+            })
     for e in entries:
         e["branch_id"] = (inv_branch.get(e.get("invoice_id")) or (None, None))[0]
     # Money received but not mapped to any invoice yet is still a credit the customer

@@ -63,9 +63,12 @@ def test_ai_sync_announces_once_per_verdict_to_the_right_people():
     assert "announce = link.completed_at is None or" in sync
     assert "if not announce:" in sync
     assert 'dedupe_prefix=f"ai_done:{link.id}:{new_result}"' in sync
-    assert 'dedupe_prefix=f"ai_review:{link.id}:Passed"' in sync
-    # Failed and Not attempted are two outcomes with two keys (7 Oct 2026).
-    assert 'dedupe_prefix=f"ai_review:{link.id}:{\'not_attempted\' if not_attempted else \'Failed\'}"' in sync
+    # 18 Nov 2026: one "review and decide" notice per AI suggestion; Not
+    # attempted has its own key (7 Oct 2026).
+    assert 'dedupe_prefix=f"ai_review:{link.id}:{new_result}"' in sync
+    assert 'dedupe_prefix=f"ai_review:{link.id}:not_attempted"' in sync
+    # A finished AI L1 never moves the candidate on its own.
+    assert "PipelineStatus.RMG_REVIEW" not in sync
     assert 'dedupe_prefix=f"ai_done:{link.id}:not_attempted"' in sync
     # The TA notice is addressed to the candidate's TAs, not the whole role.
     assert "_candidate_tas(db, link.profile_id)" in sync

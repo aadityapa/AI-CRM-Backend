@@ -159,12 +159,14 @@ def test_a_finished_ai_l1_waits_in_results_until_marked_reviewed(db):
     db.flush()
     items = _cats(db)["results"]["items"]
     assert [i["title"] for i in items] == ["Asha"]                   # outside the window: not a task
-    assert items[0]["chip"] == "AI L1: Passed · 78%" and items[0]["tone"] == "ok"
+    # 18 Nov 2026: the AI's pass is advice — the result is In Review until RMG / GM decide.
+    assert items[0]["chip"] == "AI L1: In Review · 78%" and items[0]["tone"] == "warn"
     assert items[0]["path"] == f"screening-desk?task=results&focus={p.id}"
     # the desk row carries the highlight
     rows, _ = desk.desk_queue(db, desk.DeskFilters(screening="all"))
     row = next(r for r in rows if r["profile_id"] == p.id)
-    assert [(r["label"], r["result"]) for r in row["new_results"]] == [("AI L1", "Passed")]
+    assert [(r["label"], r["result"]) for r in row["new_results"]] == [("AI L1", "In Review")]
+    assert row["new_results"][0]["ai_suggestion"] == "Passed"
     assert row["new_results"][0]["key"].startswith("ai:")
     # "Open report" opens THIS interview's report (Reports tab), not the profile.
     assert row["new_results"][0]["report_link"] == "/admin/?view=candidateReport&cid=asha%40mail.com&iid=9"

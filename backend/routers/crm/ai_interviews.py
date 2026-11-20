@@ -94,7 +94,9 @@ def previous_outcome_words(link: AiInterviewLink) -> str:
         return "Not attempted"
     score = f" ({link.overall_score_percent}%)" if link.overall_score_percent is not None else ""
     eff = link.effective_result or link.result
-    return f"{eff}{score}" + (" (recruiter override)" if eff != link.result else "")
+    if link.hr_decision:
+        return f"{eff}{score} (RMG / GM decision)"
+    return f"{eff}{score}" + (f", AI suggested {link.ai_suggestion}" if link.ai_suggestion else "")
 
 
 class AiInterviewUpdate(BaseModel):
@@ -152,6 +154,10 @@ def _link_out(db: Session, link: AiInterviewLink, candidate: Candidate | None, r
     # history. `effective_result` is what a human should act on.
     data["hr_decision_label"] = hr_decision_label(link.hr_decision)
     data["effective_result"] = link.effective_result
+    # 18 Nov 2026: the AI's Passed / Failed is a SUGGESTION; the decision is a
+    # person's (hr_decision) and reads "In Review" until made.
+    data["ai_suggestion"] = link.ai_suggestion
+    data["decided"] = bool(link.hr_decision) and link.hr_decision != "pending_review"
     data["is_overridden"] = bool(link.hr_decision) and link.effective_result != link.result
     # Legacy schedule details so the UI can show and edit what the candidate received.
     row = _schedule_row(link.invite_token)
@@ -304,6 +310,7 @@ def ai_interview_summary(profile_id: int, link_id: int, db: Session = Depends(ge
         data["overall_score_percent"] = float(link.overall_score_percent)
     data["result"] = link.result
     data["effective_result"] = link.effective_result
+    data["ai_suggestion"] = link.ai_suggestion
     data["hr_decision_label"] = hr_decision_label(link.hr_decision)
     data["level"] = link.level
     data["template_mismatch"] = wrong_template_for(db, profile, link, record)
@@ -450,11 +457,16 @@ def trigger_ai_interview(profile_id: int, request: Request, payload: AiInterview
                        "interview template (at least 10 characters)",
             )
     elif previous is not None:
-        if (previous.effective_result or previous.result) in ("Passed", "Selected"):
+        selected = previous.effective_result == "Selected"
+        undecided_pass = not previous.hr_decision and previous.result == "Passed"
+        if selected or undecided_pass:
             raise HTTPException(
                 status_code=409,
-                detail="The candidate already passed the AI L1 — there is nothing to reschedule. "
-                       "If it ran on the wrong template, send a fresh link and void the previous one.",
+                detail=("RMG / GM already selected the candidate on this AI L1 — there is nothing to reschedule. "
+                        if selected else
+                        "This AI L1 is finished and In Review with RMG / GM (the AI scored it above the pass mark) "
+                        "— let them decide before sending another link. ")
+                       + "If it ran on the wrong template, send a fresh link and void the previous one.",
             )
         if len(reschedule_note) < MIN_RESCHEDULE_NOTE:
             raise HTTPException(

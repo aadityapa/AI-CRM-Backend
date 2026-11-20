@@ -898,23 +898,25 @@ def get_profile(profile_id: int,
     # Pre-fill commercials from Candidate (TA) + opportunity CTC slab (Sales) when
     # still empty, so RMG sees them without re-keying. Only touches NULL fields.
     changed = backfill_profile_commercials(db, profile)
-    # Self-heal: profiles whose AI L1 passed BEFORE the RMG hand-off flow existed
-    # are still parked in Technical_Screening — advance them to RMG_Review on
-    # open so the RMG decision actions appear.
+    # Self-heal: profiles whose AI L1 RMG / GM SELECTED (18 Nov 2026 — the AI's
+    # own "Passed" is only a suggestion and moves nobody) but which are still
+    # parked in Technical_Screening — advance them to RMG_Review on open so the
+    # L2 / Submit-to-Sales actions appear.
     if _status_val(profile.pipeline_status) == PipelineStatus.TECHNICAL_SCREENING.value:
         from models import AiInterviewLink
         passed = db.execute(
             select(AiInterviewLink.id).where(
                 AiInterviewLink.profile_id == profile.id,
-                AiInterviewLink.result == "Passed",
+                AiInterviewLink.hr_decision == "selected",
+                AiInterviewLink.voided_at.is_(None),
             ).limit(1)
         ).first()
         if passed:
             profile.pipeline_status = PipelineStatus.RMG_REVIEW
             log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                          "STATUS_CHANGE",
-                         "Technical_Screening -> RMG_Review: AI L1 already passed — "
-                         "auto-forwarded for RMG review")
+                         "Technical_Screening -> RMG_Review: AI L1 selected by RMG / GM — "
+                         "forwarded for RMG review")
             changed = True
     if changed:
         db.commit()
@@ -1275,7 +1277,7 @@ def ai_l1_decision(
             link.hr_decision_at = datetime.now(timezone.utc)
             log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                          "AI_INTERVIEW_DECISION",
-                         f"Interview marked Selected by {who} — AI verdict was {ai_said}{score}"
+                         f"Interview marked Selected by {who} — AI suggested {ai_said}{score}"
                          + (f" — {note}" if note else ""))
         hand_off_to_rmg_review(db, profile, user,
                                f"AI L1 {ai_said.lower()} — RMG / GM decided to proceed"
@@ -1303,7 +1305,7 @@ def ai_l1_decision(
             link.hr_decision_at = datetime.now(timezone.utc)
             log_activity(db, CandidateProfileActivityLog, "profile_id", profile.id, user.id,
                          "AI_INTERVIEW_DECISION",
-                         f"Interview marked Rejected by {who} — AI verdict was {ai_said}{score} — {note}")
+                         f"Interview marked Rejected by {who} — AI suggested {ai_said}{score} — {note}")
         close_on_ai_rejection(db, profile, user, note)
         db.commit()
         db.refresh(profile)

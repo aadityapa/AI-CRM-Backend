@@ -58,6 +58,12 @@ EVENTS: list[dict] = [
                     "repeated policy violations (tab switches, extra faces, dev tools…) — with the "
                     "strike count and a link to the candidate's AI Interview tab.",
      "default_roles": ["TA"]},
+    {"event": "interview.candidate_in_lobby",
+     "label": "Candidate opened the AI interview link",
+     "description": "Sent to the TA who scheduled an AI interview the first time the candidate opens "
+                    "the link — so they can Join from Interview Integrity, guide the candidate on the "
+                    "device check (how to sit, the light, headphones) and watch the interview live.",
+     "default_roles": ["TA"]},
     {"event": "project.close_scheduled",
      "label": "Project close scheduled",
      "description": "Sent when someone sets a project's last working day: who rolls off, on which "

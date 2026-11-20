@@ -28,7 +28,7 @@ from config import APP_NAME
 from crm_db import CrmNotConfiguredError, crm_database_url, get_session_factory
 from models import (
     AiInterviewLink, Candidate, CandidateProfile, CandidateProfileActivityLog, Opportunity,
-    OpportunitySkill, PipelineStatus, Requirement, RequirementSkill, Resume, Skill,
+    OpportunitySkill, Requirement, RequirementSkill, Resume, Skill,
     TemplateRequest,
     TemplateRequestStatus,
 )
@@ -615,12 +615,12 @@ def sync_completed_interview(record: dict) -> bool:
             link.result = new_result
             link.not_attempted = not_attempted
             link.completed_at = datetime.now(timezone.utc)
-            outcome_word = "Not attempted" if not_attempted else new_result
 
             if link.resume_id:
                 resume = db.get(Resume, link.resume_id)
                 if resume is not None:
-                    resume.ai_interview_status = "Passed" if passed else "Failed"
+                    # 18 Nov 2026: finished, not passed / failed — RMG / GM decide.
+                    resume.ai_interview_status = "Completed"
 
             # skill_evaluations.reviewer_rated ← report.skill_scores[i].{skill,score}
             skill_scores = report.get("skill_scores") or []
@@ -656,7 +656,8 @@ def sync_completed_interview(record: dict) -> bool:
                     db, CandidateProfileActivityLog, "profile_id", link.profile_id, link.scheduled_by,
                     "AI_INTERVIEW_COMPLETED",
                     f"AI L1 interview completed — score {pct if pct is not None else 'n/a'}% "
-                    f"({outcome_word}, threshold {threshold}%)",
+                    + ("(not attempted) — TA reschedules" if not_attempted else
+                       f"— In Review with RMG / GM (AI suggests {new_result}, pass mark {threshold}%)"),
                 )
             if not announce:
                 db.commit()
@@ -689,7 +690,8 @@ def sync_completed_interview(record: dict) -> bool:
                 notify_roles(
                     db, [] if ta_ids else ["TA"],
                     f"AI interview completed: {cname}",
-                    f"Score {pct if pct is not None else 'n/a'}% — {new_result}",
+                    f"Score {pct if pct is not None else 'n/a'}% — In Review: RMG / GM read the report and decide "
+                    "(Select, Reject or Hold).",
                     # Deep-link straight to the AI Interview tab — the score and the
                     # report are there, and landing on Overview makes the reader hunt
                     # for the thing the notification is about.
@@ -699,58 +701,35 @@ def sync_completed_interview(record: dict) -> bool:
                     dedupe_prefix=f"ai_done:{link.id}:{new_result}",
                 )
 
-            # PASSED L1 → hand off to RMG: auto-advance the profile to RMG_Review
-            # (from Technical_Screening) and notify RMG to review the report and
-            # decide — request an L2 round or submit to the Sales team.
-            if passed and link.profile_id:
-                profile = db.get(CandidateProfile, link.profile_id)
-                cur = getattr(profile.pipeline_status, "value", profile.pipeline_status) if profile else None
-                # ANY pre-RMG stage hands off (fix, 28 Aug 2026). This used to
-                # require exactly Technical_Screening, so a candidate applied
-                # from the Candidates page — who sits at SOURCING, having never
-                # come through the resume/ATS path — passed their AI L1 and then
-                # stalled: RMG was never asked to review, so the L2 button never
-                # appeared for anyone.
-                if profile is not None and cur in (PipelineStatus.SOURCING.value,
-                                                   PipelineStatus.TECHNICAL_SCREENING.value):
-                    profile.pipeline_status = PipelineStatus.RMG_REVIEW
-                    log_activity(
-                        db, CandidateProfileActivityLog, "profile_id", profile.id,
-                        # No scheduling user -> system user, NOT the candidate id.
-                        link.scheduled_by or None,
-                        "STATUS_CHANGE",
-                        f"{cur} -> RMG_Review: AI L1 passed at {pct}% "
-                        f"(threshold {threshold}%) — auto-forwarded for RMG review",
-                    )
-                if profile is not None and getattr(profile.pipeline_status, "value", profile.pipeline_status) == PipelineStatus.RMG_REVIEW.value:
-                    notify_role(
-                        db, "RMG",
-                        f"AI L1 passed — review {cname}",
-                        f"Score {pct}%. Review the interview report and decide: "
-                        f"request an L2 round or submit to the Sales team.",
-                        _review_link(link.profile_id),
-                        event="ai_interview.passed_review",
-                        # Everyone who screens — a GM is a custom role (28 Sep 2026).
-                        user_ids=screeners,
-                        dedupe_prefix=f"ai_review:{link.id}:Passed",
-                    )
-            elif link.profile_id:
-                # FAILED L1 → the screeners still decide (28 Sep 2026): reject, or
-                # take a manual L1 when the AI read looks wrong.
+            # 18 Nov 2026 (user rule): the AI scores, a PERSON decides. A finished
+            # AI L1 no longer moves the candidate on its own (a pass used to
+            # auto-forward to RMG Review). It reads "In Review" everywhere until
+            # RMG / GM select (→ RMG Review), reject (→ closed) or hold it — on
+            # the report page, Applied Candidates or the Screening Desk.
+            if link.profile_id and not_attempted:
                 notify_role(
                     db, "RMG",
-                    (f"AI L1 not attempted — {cname}" if not_attempted
-                     else f"AI L1 not cleared — decide on {cname}"),
-                    ("The candidate did not answer any question, so there is no verdict to read. "
-                     "TA is checking with them and will send a fresh link; you can also take a "
-                     "manual L1 or proceed without it."
-                     if not_attempted else
-                     f"Score {pct if pct is not None else 'n/a'}% (threshold {threshold}%). Review the "
-                     "report, then reject the candidate or take a manual L1 instead."),
+                    f"AI L1 not attempted — {cname}",
+                    "The candidate did not answer any question, so there is nothing to review. "
+                    "TA is checking with them and will send a fresh link; you can also take a "
+                    "manual L1 or proceed without it.",
                     _review_link(link.profile_id),
                     event="ai_interview.failed_review",
                     user_ids=screeners,
-                    dedupe_prefix=f"ai_review:{link.id}:{'not_attempted' if not_attempted else 'Failed'}",
+                    dedupe_prefix=f"ai_review:{link.id}:not_attempted",
+                )
+            elif link.profile_id:
+                notify_role(
+                    db, "RMG",
+                    f"AI L1 done — review and decide on {cname}",
+                    f"Score {pct if pct is not None else 'n/a'}% (the AI suggests {new_result.lower()}; pass mark "
+                    f"{threshold}%). The candidate is In Review until you decide: open the report, then "
+                    "Select, Reject or put On Hold.",
+                    _review_link(link.profile_id),
+                    event="ai_interview.passed_review" if passed else "ai_interview.failed_review",
+                    # Everyone who screens — a GM is a custom role (28 Sep 2026).
+                    user_ids=screeners,
+                    dedupe_prefix=f"ai_review:{link.id}:{new_result}",
                 )
             db.commit()
             return True

@@ -118,6 +118,15 @@ def build_report_record(session: dict, report_result: dict, evaluated_ist: dict)
         live_summary = meta.get("live_summary")
         if isinstance(live_summary, dict):
             report_result["live_intervention"] = live_summary
+        # Anti-cheating checks (13 Nov 2026): what the Device Check measured
+        # before sign-in and what the monitors flagged during the interview.
+        from services.interview.proctoring import report_summary as proctoring_summary, settings_of
+
+        proctoring = proctoring_summary(
+            settings_of(meta), meta.get("device_check_log"), meta.get("violations")
+        )
+        if proctoring is not None:
+            report_result["proctoring"] = proctoring
     return {
         "id": meta.get("interview_id", str(uuid4())),
         "created_at": meta.get("created_at"),

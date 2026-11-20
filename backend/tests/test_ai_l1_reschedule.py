@@ -68,7 +68,9 @@ def test_not_attempted_is_carried_on_the_row_and_in_the_derived_status(db):
     assert row["ai_interview_result"] == "Failed" and row["ai_not_attempted"] is True
     assert cs.ai_state("Failed", True) == cs.NOT_ATTEMPTED
     assert cs.ai_state("Selected", True) == cs.PASSED          # a recruiter override still wins
-    assert cs.ai_state("Failed", False) == cs.FAILED
+    # 18 Nov 2026: the AI's own Failed is NOT a fail — In Review until RMG / GM decide.
+    assert cs.ai_state("Failed", False) == cs.IN_REVIEW
+    assert cs.ai_state("Rejected", False) == cs.FAILED
     label = cs.statuses_for(db, [p])[p.id]["label"]
     assert label == "AI L1 – Not Attempted"
     assert cs.round_for(cs.STATUS_BY_KEY["ai_l1_not_attempted"])[2] == "Not Attempted"
@@ -117,9 +119,9 @@ def test_a_pending_link_still_blocks_and_the_outcome_words_read_right(db, bridge
         _post(db, p, note="again")
     assert err.value.status_code == 409
     assert ai.previous_outcome_words(_link(db, p, "Failed", 0, not_attempted=True)) == "Not attempted"
-    assert ai.previous_outcome_words(_link(db, p, "Failed", 42.5)) == "Failed (42.5%)"
+    assert ai.previous_outcome_words(_link(db, p, "Failed", 42.5)) == "In Review (42.5%), AI suggested Failed"
     assert ai.previous_outcome_words(_link(db, p, "Failed", 42.5, hr_decision="on_hold")) \
-        == "On Hold (42.5%) (recruiter override)"
+        == "On Hold (42.5%) (RMG / GM decision)"
 
 
 def test_the_reschedule_event_is_routable_from_email_flows():

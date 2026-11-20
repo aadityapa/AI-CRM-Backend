@@ -127,7 +127,7 @@ EXP_FITS = ("in", "out", "unknown")
 BUDGET_FITS = ("over", "within", "unknown")
 PRIORITIES = ("High", "Medium", "Low")
 NOTICE_BUCKETS = ("serving", "15", "30", "60", "90", "unknown")
-AI_RESULTS = ("passed", "failed", "on_hold", "not_attempted", "pending", "none")
+AI_RESULTS = ("in_review", "passed", "failed", "on_hold", "not_attempted", "pending", "none")
 L1_RESULTS = ("hire", "no_hire", "awaiting", "none")
 #: Rows read when a derived filter is on (a to-do list, not a report).
 MAX_DERIVED_ROWS = 2000
@@ -275,14 +275,19 @@ def ai_result_bucket(ai: dict | None) -> str:
     if not ai:
         return "none"
     eff = (ai.get("ai_effective_result") or "").strip()
-    if eff in ("Passed", "Selected"):
+    # 18 Nov 2026: "passed" / "failed" are RMG / GM's Selected / Rejected — the
+    # AI's own Passed / Failed reads "in_review" until a person decides.
+    decision = (ai.get("ai_hr_decision") or "").strip()
+    if eff == "Selected" or decision == "selected":
         return "passed"
+    if eff == "Rejected" or decision == "rejected":
+        return "failed"
+    if eff in ("On Hold", "On_Hold", "Hold") or decision == "on_hold":
+        return "on_hold"
     if ai.get("ai_not_attempted"):
         return "not_attempted"
-    if eff in ("On Hold", "On_Hold", "Hold") or (ai.get("ai_hr_decision") or "") == "on_hold":
-        return "on_hold"
-    if eff in ("Failed", "Rejected"):
-        return "failed"
+    if eff in ("In Review", "Pending Review", "Passed", "Failed"):
+        return "in_review"
     return "pending"
 
 
@@ -866,11 +871,15 @@ def next_step(*, screening: str | None, stage: str | None, ai: dict | None,
             return step("ai_not_attempted", "AI L1 not attempted — TA is rescheduling it", "TA", "warn")
         if bucket == "on_hold":
             return step("ai_on_hold", "AI L1 on hold — decide: proceed, manual L1 or reject", "you", "warn")
-        if result in (None, "Pending", "Pending Review"):
+        if result in (None, "Pending"):
             return step("ai_wait", "AI L1 scheduled — waiting for the candidate to take it", "candidate", "none")
-        if result in ("Failed", "Rejected"):
-            return step("ai_failed", "AI L1 not cleared — reject, or override the verdict on the profile", "you", "bad")
-        return step("ai_done", "AI L1 cleared — moving to review", "AI", "ok")
+        if bucket == "in_review":
+            # 18 Nov 2026: the AI scores, a person decides.
+            return step("ai_review", "AI L1 done — In Review: read the report, then select, reject or hold",
+                        "you", "warn")
+        if bucket == "failed":
+            return step("ai_failed", "AI L1 rejected — the candidacy closes", "done", "bad")
+        return step("ai_done", "AI L1 selected — moving to review", "you", "ok")
     return step("wait", "Waiting", "done", "none")
 
 

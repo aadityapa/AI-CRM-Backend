@@ -81,7 +81,9 @@ def refresh_invoice_balance(invoice) -> None:
     client" until the Form 16A is in)."""
     paid = _d(invoice.paid_amount)
     tds = _d(getattr(invoice, "tds_deducted", 0))
-    invoice.balance_amount = (_d(invoice.grand_total) - paid - tds).quantize(TWO_PLACES)
+    # Settled in full by Finance / Admin (0154) — an adjustment, not cash.
+    adj = _d(getattr(invoice, "settled_adjustment", 0))
+    invoice.balance_amount = (_d(invoice.grand_total) - paid - tds - adj).quantize(TWO_PLACES)
     if invoice.balance_amount <= 0:
         invoice.payment_status = "Paid"
         invoice.balance_amount = max(invoice.balance_amount, Decimal("0"))

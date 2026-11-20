@@ -81,15 +81,77 @@ def book(db, invoice: Invoice, figures: dict, *, section: str | None = None,
     return record
 
 
-def unbook(db, record: TdsRecord) -> None:
+MIN_UNDO_REASON = 10
+
+
+def is_received(record: TdsRecord) -> bool:
+    """Any of the TDS marked received (Form 16A in)?"""
+    return _d(record.tds_paid) > 0 or bool(list(record.payments or []))
+
+
+def received_block(record: TdsRecord) -> str:
+    """The words for a 409 when received TDS stands in the way (20 Nov 2026 —
+    the old "undo that first" named no place to undo it, and there was none)."""
+    num = record.invoice.invoice_number if record.invoice else f"#{record.invoice_id}"
+    return (f"TDS on {num} is already marked received (Form 16A). Undo it first: open {num} ▸ "
+            f"TDS ▸ Undo 'received' — or ask Admin / CEO, who can do this in one step")
+
+
+def undo_received(db, record: TdsRecord, *, reason: str = "", user=None,
+                  require_reason: bool = True) -> Decimal:
+    """Take back every "TDS received" (Form 16A) entry on the record: the TDS
+    reads Pending from client again. Returns the amount taken back. No commit.
+
+    A reason (≥ MIN_UNDO_REASON) is asked for and kept on the customer's
+    Activity Log; the Admin one-step paths pass `require_reason=False` and say
+    why themselves."""
+    reason = (reason or "").strip()
+    if require_reason and len(reason) < MIN_UNDO_REASON:
+        raise HTTPException(status_code=400,
+                            detail=f"Say why the TDS receipt is undone (at least {MIN_UNDO_REASON} characters)")
+    paid = _d(record.tds_paid)
+    for pay in list(record.payments or []):
+        record.payments.remove(pay)  # off the collection, so a later record delete cannot cascade it twice
+        db.delete(pay)
+    if paid:
+        tax.apply_tds_payment(record, -paid)
+    record.tds_status = TdsStatus.PENDING
+    record.tds_paid = Decimal("0")
+    record.tds_balance = _d(record.tds_amount)
+    db.flush()
+    invoice = record.invoice
+    if invoice is not None and paid > 0 and require_reason:  # the Admin one-step paths log themselves
+        try:
+            from services import customer_activity
+            from services.invoice_payments import invoice_customer_ids
+
+            cid, _ = invoice_customer_ids(db, invoice)
+            if cid is not None:
+                num = invoice.invoice_number or f"#{invoice.id}"
+                customer_activity.record(
+                    db, cid, "TDS_RECEIPT_UNDONE",
+                    f"TDS received of {float(paid):,.2f} on {num} undone — pending from client again"
+                    + (f". Reason: {reason}" if reason else ""),
+                    entity="invoice", entity_id=invoice.id, subject=num, user=user)
+        except Exception:  # noqa: BLE001 — the log never blocks the undo
+            pass
+    return paid
+
+
+def unbook(db, record: TdsRecord, *, force: bool = False, user=None, reason: str = "") -> Decimal:
     """Remove a TDS record and put its amount back on the invoice balance.
-    409 once any of it was marked received. No commit."""
-    if _d(record.tds_paid) > 0 or list(record.payments or []):
-        num = record.invoice.invoice_number if record.invoice else f"#{record.invoice_id}"
-        raise HTTPException(status_code=409,
-                            detail=f"TDS on {num} was already marked received — undo that first")
+    Returns the "received" amount that was taken back with it (0 normally).
+
+    409 once any of it was marked received — unless `force` (Admin / CEO),
+    which undoes the received entries first. No commit."""
+    taken_back = Decimal("0")
+    if is_received(record):
+        if not force:
+            raise HTTPException(status_code=409, detail=received_block(record))
+        taken_back = undo_received(db, record, reason=reason, user=user, require_reason=False)
     invoice = record.invoice
     if invoice is not None:
         tax.apply_tds_deduction(invoice, -_d(record.tds_amount))
         invoice.tds_record = None
     db.delete(record)
+    return taken_back
