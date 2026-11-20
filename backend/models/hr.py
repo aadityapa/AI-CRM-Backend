@@ -58,7 +58,7 @@ class Employee(Base, TimestampMixin):
     role_title = sa.Column(sa.String(120), nullable=True)
     skills = sa.Column(JSONB, nullable=True)            # list of skill names
     experience_years = sa.Column(sa.Numeric(4, 1), nullable=True)
-    employment_type = sa.Column(sa.String(24), nullable=True)  # Full_Time/Part_Time/Contract
+    employment_type = sa.Column(sa.String(24), nullable=True)  # Full_Time/Part_Time/Contract/Intern
     # --- Filled by HR at Joined, synced from the candidate profile (0105) -----
     #: What HR captured in the Workflow section before flipping the profile to
     #: Joined. These used to live ONLY on the candidate profile, so they were

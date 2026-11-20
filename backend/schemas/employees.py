@@ -5,14 +5,24 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from models import ProfileType
 
 _EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 Title = Literal["Mr", "Ms", "Mrs", "Dr"]
-EmploymentType = Literal["Full_Time", "Part_Time", "Contract"]
+#: Full-Time · Part-Time · Contract · Intern (Intern added 20 Nov 2026). The
+#: values are the stored keys; the UI prints "Full-Time", "Part-Time".
+EmploymentType = Literal["Full_Time", "Part_Time", "Contract", "Intern"]
+
+
+def _employment_type_in(v):
+    """Accept the words people type ("Full-Time", "internship") as well as the keys."""
+    if v is None or isinstance(v, str) and not v.strip():
+        return None
+    from services.employees import normalize_employment_type
+    return normalize_employment_type(v)
 
 
 class EmployeeCreate(BaseModel):
@@ -51,6 +61,12 @@ class EmployeeCreate(BaseModel):
     skills: list[str] | None = None
     experience_years: Decimal | None = Field(default=None, ge=0)
     employment_type: EmploymentType | None = None
+
+    @field_validator("employment_type", mode="before")
+    @classmethod
+    def _norm_employment_type(cls, v):
+        return _employment_type_in(v)
+
     is_resigned: bool = False
     date_of_resignation: date | None = None
     notice_period_days: int | None = Field(default=None, ge=0)
@@ -98,6 +114,12 @@ class EmployeeUpdate(BaseModel):
     skills: list[str] | None = None
     experience_years: Decimal | None = Field(default=None, ge=0)
     employment_type: EmploymentType | None = None
+
+    @field_validator("employment_type", mode="before")
+    @classmethod
+    def _norm_employment_type(cls, v):
+        return _employment_type_in(v)
+
     is_resigned: bool | None = None
     date_of_resignation: date | None = None
     notice_period_days: int | None = Field(default=None, ge=0)

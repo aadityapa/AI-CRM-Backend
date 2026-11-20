@@ -7,7 +7,14 @@
 > the dated note further down for the detail. The frontend file (`F:\AI-Interview-Model-F-V2\CLAUDE.md` §0) carries a
 > short copy and points here. Keep both in step.
 
-**Last updated:** 20 Nov 2026, later (migration **0154**, run `alembic upgrade head`: Finance / Admin
+**Last updated:** 20 Nov 2026, latest (employment type: Full-Time · Part-Time · Contract / Consultant · Intern — "consultant" read as Contract; the Employees list shows and filters it; no migration, restart). Before: 20 Nov 2026, closing (map money FROM the Invoices list — `routers/crm/receipt_mapping.py`: `GET /api/receipt-mapping/options` + `POST /api/receipt-mapping` put cash from a received amount on account (or a new one) and TDS from Received TDS (existing / new) or booked pending on ticked invoices of one customer, in one transaction; the CEO money words gain **Received (Ex. Tax)** / **Due (Ex. Tax)** — they add up to Revenue (Ex. Tax), a paid invoice counts its whole value before GST; no migration, restart). Before: 20 Nov 2026, latest-final (Admin / CEO delete an employee in one step — `services/crm_delete.purge_employee` removes their assignments, timesheets, leave applications, leave ledger and balances; a tax invoice from their timesheets still blocks; HR keeps the plain-words 409; no migration, restart). Before: 20 Nov 2026, after final (Invoices opens on an **All** tab with a Stage filter + every other filter; **Invoices** in the sidebar right under Projects; `stage` takes a CSV; no migration, restart). Before: 20 Nov 2026, final (Map invoices finds EVERY invoice by number / PO / employee / project — `GET /api/customer-receipts/{id}/find-invoices` says why an invoice is not in the receipt's list (another branch / another customer / paid / Proforma); allocate takes `other_branches` (map across branches) and `move_receipt` (a receipt that pays nothing yet moves to the invoices' customer / branch, logged); no migration, restart). Before: 20 Nov 2026, very last (the CEO Finance tab's two views reconcile — the cash view splits mapped money into **paid this period's invoices / paid earlier invoices** (`cash_this_period` / `cash_earlier`), and `money` carries `cash_month.due_breakdown` (`due_tds_expected` / `due_tds_booked` / `on_account` / `total_due_net`); the dashboards re-read within a minute and at once after Finance maps money; no migration, restart). Before: 20 Nov 2026, last (migration **0156**, run `alembic upgrade head`: invoice step 4 is now
+**Admin / CEO approval** — once customer approval, IRN, payment and TDS are all in, Admin / CEO approve and close the
+invoice (`services/invoice_closure.py`, `POST /api/invoices/{id}/closure-approval[/undo]`, bulk, Dashboard tab
+`GET /api/dashboard/invoice-approvals`)). Before: 20 Nov 2026, latest (migration **0155**, run `alembic upgrade head`: **Received TDS** —
+`tds_receipts` + `routers/crm/tds_receipts.py`, Finance records a Form 16A / 26AS TDS credit once and maps it onto
+invoices (amount per invoice editable), linked with Received Amount both ways; Received Amount maps EVERY issued tax
+invoice (approval / IRN pending is a note, no longer a 409) and takes an amount per invoice on Add; bulk
+`POST /api/invoices/settle-in-full/bulk`). Before: 20 Nov 2026, later (migration **0154**, run `alembic upgrade head`: Finance / Admin
 **Settle in full** a Partially paid invoice — the balance left is adjusted, not cash, invoice reads Paid, ledger line
 "Adjustment", undoable; a received amount can **set aside the part for an earlier financial year** (never mapped, never
 on account); **Reports ▸ Customer Ledger** tab for Finance + Admin / CEO with Financial year / Month / Custom dates /
@@ -50,7 +57,7 @@ Sourcing and show in TA's default list. Earlier 5 Nov: drill-page month bars lis
 project band; TA / Hiring Manager workload + a suggested pick in the Assign dialog; careers applications name their
 channel + a channel analysis; the Karnex JD drafted from the customer's JD, downloadable as PDF / Word). 4 Nov: received
 never above billed, Predicted every month, release / extension dates, internal candidates skip HR, Expenses, TDS, reopen
-& resume. **State:** migration head **0154** (20 Nov; 0153 before) (6 Nov; 0152 before). The shell came back late on 5 Nov and the
+& resume. **State:** migration head **0156** (20 Nov; 0155 / 0154 earlier the same day) (6 Nov; 0152 before). The shell came back late on 5 Nov and the
 suites were run from /tmp copies (18 Nov, latest: backend 2,423 pass / 3 skipped; 6 Nov: 2,379 pass / 3 skipped); earlier backend 2,356 pass / 3 skipped (only the known `test_public_invoice_qr` fails); F-V2
 `tsc` green, vitest 392 with only the two known failures (`brand.test` needs the runtime pages, `opportunitySchema`
 "Remote"). Nothing is committed since `dd61630`, so **commit the working tree.**
@@ -5623,3 +5630,141 @@ amount − applied − prior` and refuses a prior above what is not mapped. Ever
 ["customer_ledger"]`); `LEDGER_READ = subtab_gate("finance-reports", "ledger", subtab_gate("reports", ("customer_ledger",
 "financial"), INV_READ))`. The ledger endpoint already took `date_from / date_to`; the periods are client-side. Deploy:
 `python -m alembic upgrade head` (0154), restart, rebuild F-V2.
+
+
+**20 Nov 2026 (latest) — Received TDS, every invoice mappable, bulk Settle in full, migration 0155, head is now 0155
+(`tests/test_tds_receipts.py` 5; `test_customer_receipts` re-pinned):** four Finance asks with screenshots.
+(1) **Received TDS** — `models.finance.TdsReceipt` (`tds_receipts`: customer · branch · date · amount · certificate ·
+quarter · section · reference · notes · proof · `unallocated_amount` · `receipt_id` = the received amount it goes with,
+optional); `tds_payments.tds_receipt_id` (each "TDS received" line it made); `tds_records.tds_receipt_id` (a deduction the
+mapping booked itself). `routers/crm/tds_receipts.py` (`_MODULES` += it; read / write = the Received Amount gates
+`RC_READ` / `RC_WRITE`): `GET /api/tds-receipts` (customer · branch · from / to · receipt_id · search incl. invoice
+numbers; meta `total_received`, `total_unmapped`), `GET …/invoice-options?customer_id=` (rows add `tds_open` = pending,
+else the default rate on the value before GST capped at the balance; `tds_cap`; `has_tds`), `GET …/receipt-options`,
+`GET / PUT / DELETE /{id}`, `POST /{id}/allocate {items:[{invoice_id, amount?}]}`, `DELETE /{id}/allocations/{inv}`,
+create `POST` with optional `items`. PURE `open_tds`, `cap_for`, `plan_tds` (typed first ≤ cap, the rest oldest first).
+Mapping an invoice WITH a TDS deduction marks it received (TdsPayment, `apply_tds_payment`); one WITHOUT gets the
+deduction booked by the mapping (`tds.book`, marked `tds_receipt_id`) and received at once — unmapping / deleting
+removes both. **Links both ways**: an entry serialises `linked_receipts` (named + every received amount that paid the
+same invoices — cash or TDS booked with it); `customer_receipts._serialize` adds `tds_receipts`
+(`tds_receipts_for_receipt`, savepointed). Table in `data_backup.DATASETS["customers"]`. (2) ⚠️ **Received Amount maps
+every issued tax invoice** (user rule): `create_receipt` / `allocate_receipt` no longer 409 on `payment_block` — the note
+stays on the picker rows as information. The invoice page's Record payment / Record TDS buttons are gone (F-V2); the
+`record-payment` / `record-tds` routes keep their rule. `ReceiptIn.items` (amount per invoice, `plan_mapping`) replaces
+`invoice_ids` when sent. (3) **`POST /api/invoices/settle-in-full/bulk {invoice_ids, reason}`** (`role_required("Finance")`,
+declared before the `{invoice_id}` routes; each invoice in a savepoint, `skipped` names the rest). Deploy:
+`python -m alembic upgrade head` (0155), restart.
+
+
+**20 Nov 2026 (last) — Admin / CEO approval closes a collected invoice, migration 0156, head is now 0156
+(`tests/test_invoice_closure.py` 2):** user ask — step 4 of the invoice journey ("Payment") is replaced by an Admin / CEO
+sign-off once everything about the invoice is done, plus a Dashboard tab for it. **0156** `invoices.closure_approved_at`
+(indexed) / `closure_approved_by` / `closure_note`. **`services/invoice_closure.py`**: PURE `closure_checks(inv)` — the ONE
+readiness rule, five checks {key, label, ok, detail}: `issued` (Tax, not Proforma) · `customer` (customer_approved_at) · `irn`
+· `money` (grand total > 0, balance ≤ 0 — cash + TDS deducted + settled adjustment; detail names each part) · `tds` (no
+TdsRecord, or `tds_balance` ≤ 0 = Form 16A in); `state_of` → ready · changed (approved, but no longer ready — money / TDS
+taken back; never silently dropped) · waiting · approved. `approve(db, inv, user, note)` — Admin / CEO only by role (403),
+409 listing every blocker, 409 when already approved and still ready; logs `INVOICE_CLOSURE_APPROVED` on the customer
+Activity Log; tells Finance (event **`invoice.closure_approved`**, in `email_flows.EVENTS`, default Finance). `undo` (reason
+≥ 10, `INVOICE_CLOSURE_UNDONE`), `approve_many` (savepoint each, ONE Finance notice). `payload(inv, user, names)` → the
+invoice detail's **`closure`** block (state, checks, approved by / at / note, `can_approve` / `can_reapprove` /
+`can_undo`), added by `finance._with_approval` for every Tax invoice. Routes (`routers/crm/finance.py`, all
+`role_required()` = Admin / CEO): `POST /api/invoices/closure-approval/bulk {invoice_ids, note?}` (declared before the
+parametric ones) · `POST /api/invoices/{id}/closure-approval {note?}` · `POST /api/invoices/{id}/closure-approval/undo
+{reason}`. **`approval_queue(db, state, customer_id, month, search, page, limit)`** → `GET /api/dashboard/invoice-approvals`
+(`role_required()`): every Tax invoice in the data window (`invoice_window_clause`) with customer (PO's, else project's),
+branch / employee / work month (`invoice_facets`), total · cash · TDS amount / received / pending · adjusted · balance ·
+last payment date · `waiting_days` (ready since the latest of last payment / settlement / IRN) · checks · `missing` (first
+open check) · state; filters customer / month (work month) / search; meta `counts` / `amounts` per state over the
+filtered set, `summary` (ready + amount, oldest ready days, changed, approved this month + amount, waiting + amount,
+`missing` counts by check) and `options` (customers, months). Approval does not lock the money — Received Amount /
+Received TDS still change it, and the invoice then reads "changed". Deploy: `python -m alembic upgrade head` (0156),
+restart, rebuild F-V2.
+
+**20 Nov 2026 (very last) — why "Mapped ₹3.80 Cr" ≠ "Received ₹2.98 Cr" and "Total Due ₹3.09 Cr" read high
+(`tests/test_cash_month.py` +2; no migration):** CEO screenshots. Not a wrong sum — the two views of "How the year
+unfolded" count different money and the screen never said so. Work month: Received = cash mapped to invoices whose WORK
+month is in the period; Cash received month: Mapped = every mapped payment that ARRIVED in the period, for any invoice —
+so it also held money paid this FY for March / earlier-FY invoices. (1) `cash_month.cash_payments` rows carry `work`
+(`revenue_report.work_date` via an outer-joined Timesheet); `cash_by_month(..., period_start)` adds
+`cash_this_period` + `cash_earlier` (= `cash_mapped`); `_finance` passes `period.start`. (2) PURE
+`cash_month.due_breakdown(money, on_account)` → `due_tds_expected` (TDS assumed at the Settings rate on open invoices
+with none booked), `due_tds_booked`, `on_account` (today's unmapped money in the scope; 0 when out of scope),
+`total_due_net` = max(0, Total Due − on account). `_finance.money` gains those + `cash_mapped / cash_earlier /
+cash_on_account` period totals. Total Due itself is unchanged; mapping the on-account money in Received Amount moves it
+into Received and out of Due on the next read. Deploy: restart.
+
+**20 Nov 2026 (final) — Map invoices finds every invoice and says why (`tests/test_receipt_find_invoices.py` 4; no
+migration):** screenshot report — KRNX26-27-01-CT (Devesh Sharma, IRN added, Unpaid) read "No invoice matches" in
+receipt #71's Map invoices. ⚠️ Cause: the dialog lists only the receipt's customer's open invoices of the receipt's
+BRANCH (`invoice-options` + the client branch filter), and searches inside that list only. The receipt (APTIV-ASUX ·
+Aptiv - Bangalore) and the invoice (billed to branch "Ascendion Digital Solutions Private Limited" — the NEFT came from
+Ascendion — under the PO's customer ASUX Safety Components) did not match, so it was filtered out with no reason given.
+Fix (`routers/crm/customer_receipts.py`): (1) PURE **`invoice_fit(...)`** → `fit` here · other_branch · other_customer ·
+paid · proforma, `can_map`, `move_receipt`, `reason` in words; (2) **`GET /api/customer-receipts/{id}/find-invoices?q=
+&branch_id=`** (`RC_READ`; `clean_search`; matches invoice / PI / PO number, project name, employee name / code;
+≤ `FIND_LIMIT`=15, ordered by fit) — every customer and branch, each row = the picker brief + customer + fit;
+`_customers_of` (two queries) gives each invoice its customer (PO's else project's) and every customer it may take money
+from; (3) `AllocateIn.other_branches` — a same-customer invoice of another branch is mapped, the receipt keeps its branch
+(each invoice keeps its own; without the flag the old 400 still applies and now says how); `AllocateIn.move_receipt` →
+`_move_receipt_to_invoices`: only a receipt that pays nothing yet (no payments, no TDS — 409 otherwise), ticked invoices
+of ONE customer (400), the receipt takes their customer and their single branch (several branches of its own customer →
+stays, mapped across branches), `RECEIPT_MOVED` on both customers' Activity Log; the reply message says what moved.
+Deploy: restart.
+
+**20 Nov 2026 (after) — Invoices ▸ All tab + an Invoices sidebar entry (`test_invoice_stages_and_receipts` +1; no
+migration):** user ask with a screenshot. `GET /api/invoices` `stage` is now a CSV (each key checked, `.in_()`), so the
+All tab's Stage filter picks several stages; `billing_rules.statuses_for_stages(stages)` (PURE: the union in
+`INVOICE_STATUS_KEYS` order, none = every status) gives the Status choices. No `stage` = every invoice (Proformas
+included), as before. `access_registry.SUB_TABS["invoices"]` gains `All` ("All invoices") so a role limiting invoice
+sub-tabs can tick it. Client half in F-V2 `CLAUDE.md`. Deploy: restart.
+
+
+**20 Nov 2026 (latest-final) — Admin / CEO delete an employee in one step (`tests/test_employee_delete.py` 3; no
+migration):** screenshot report — Admin could not delete test employee "Test Test": "Cannot delete: employee has 15 leave
+ledger event(s). Deactivate (is_active=false) instead". `DELETE /api/employees/{id}`: for **Admin / CEO** it runs
+`services/crm_delete.purge_employee(db, emp)` — deletes their timesheets (entries, attachments, activity log), project
+assignments (leave details, rates, release events), leave applications, leave ledger (`LeaveAccrualEvent`), and through the
+ORM cascade their leave balances, education, experience and project history; CLEARS pointers from other records (peers'
+reporting manager / HR, `interview_events.employee_id`, `purchase_orders.employee_id`); a returned / open **Proforma** from
+their timesheets goes with them (no money moved), a **Tax invoice** blocks (409 naming it — delete the invoice first, which
+unwinds payments / PO draw). Reply `data.removed` (counts) + "Employee X deleted with …"; logged
+`employee.deleted_by_admin`. **HR** (and any templated writer) still deletes only a history-free record; the 409 now reads
+"Cannot delete X: they have 15 leave ledger event(s). Deactivate them instead — or ask Admin / CEO…"
+(`employee_delete_footprint`, `footprint_words`). Deploy: restart.
+
+**20 Nov 2026 (closing) — map money from the Invoices list; Received / Due on the Ex. Tax basis
+(`tests/test_receipt_mapping.py` 5, `test_ceo_drilldown` re-pinned; no migration):** Finance ask with a screenshot
+of Invoices ▸ Unpaid 119 — "a shortcut to map these to the customer's Received Amount and Received TDS from here; and
+after paid / partially paid the CEO / Admin Dashboard should move the same as Revenue (Ex. Tax)". (1) **New
+`routers/crm/receipt_mapping.py`** (`_MODULES` += `receipt_mapping`; read / write = the Received Amount gates `RC_READ` /
+`RC_WRITE`; its own prefix `/api/receipt-mapping` so no `/{id}` sibling can shadow it). `GET /options?invoice_ids=1,2
+[&customer_id=]` → the ticked invoices (`_invoice_brief` + `tds_open` / `tds_cap` / `has_tds`), the customer (PURE
+`common_customer` over `customer_receipts._customers_of`: `wanted` → the invoices' own customer → any customer they
+all allow; none → 400 naming them), the customer's received amounts ON ACCOUNT (`likely_match` vs the total open),
+Received TDS entries not fully mapped (savepointed — a DB before 0155 still maps cash), payment modes, default TDS rate.
+`POST` `{customer_id?, items:[{invoice_id, cash?, tds?}], receipt_id | new_receipt{received_date, amount, payment_mode,
+reference_number, notes, proof}, tds_mode received|pending, tds_receipt_id | new_tds{received_date, amount,
+certificate_number, quarter, section, reference_number}}` — ONE transaction, the existing rules: Proformas refused,
+`customer_invoice_clause` re-checked, ≤ `MAX_INVOICES`=100; TDS FIRST — *received* goes through `tds_receipts._apply`
+(books the deduction when the invoice has none, marks it received, `plan_tds` caps), *pending* books it with
+`tds.book` (409 when TDS is already booked); then the cash through `plan_mapping` + `InvoicePayment` / 
+`tax.apply_invoice_payment` exactly like `allocate_receipt`. A new received amount / Received TDS takes the invoices'
+most common branch (`_usual_branch`); invoices of several branches may share one credit (like Map invoices' "map
+anyway"); a new receipt amount below the cash typed → 400, above it → the rest stays on account. A Received TDS mapped
+here names the received amount used (`receipt_id`). Any refusal rolls everything back. (2) **`services/money_split`**:
+KEYS += `received_ex` / `due_ex` — PURE `ex_tax_split(sub, grand, balance, paid_in_full)`: Due (Ex. Tax) = open balance ×
+sub ÷ grand (0 once Paid — cash, TDS deducted or a settlement), Received (Ex. Tax) = sub − due; they always add up to
+Revenue (Ex. Tax). `executive_dashboard._finance` takes `received_ex` from the money split (the separate
+`before_gst_split` loop is gone), so Finance `monthly[]`, `money`, the Customer tab's month rows and the Billed drill page
+(`with_money_split` sets `balance_ex = due_ex`; `overdue_ex` after the split; `MONEY_SERIES` / `BILLED_COLUMNS` / two new
+KPIs Received (Ex. Tax) · Due (Ex. Tax)) all carry them. Deploy: restart.
+
+
+**20 Nov 2026 (latest) — Employment Type: the four choices (`tests/test_employment_type.py` +2 asserts):** user ask —
+Employees list "Type" → "Employment Type", and HR picks one of Full-Time · Part-Time · Contract / Consultant · Intern when
+adding an employee. Stored keys unchanged (`EMPLOYMENT_TYPES` = Full_Time · Part_Time · Contract · Intern, Intern already
+accepted); `EMPLOYMENT_TYPE_LABELS["Contract"]` = "Contract / Consultant", `_EMPLOYMENT_ALIASES` add consultant /
+contractconsultant / consultancy → Contract, the refusal names the four. Excel template hint updated. `GET /api/employees`
+already filters by `employment_type` (+ `none`) and returns it on every row. The API keeps it optional (imports,
+Joined sync); the New Employee form makes it required. Deploy: restart.

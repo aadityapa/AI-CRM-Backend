@@ -122,6 +122,7 @@ DEFAULT_EMPLOYEE_SORT = "recently_updated"
 @router.get("")
 def list_employees(is_active: bool | None = None, department_id: int | None = None,
                    profile_type: str | None = None,
+                   employment_type: str | None = None,
                    sort_by: str | None = None,
                    deployment: str | None = None,
                    pp: PageParams = Depends(page_params),
@@ -156,6 +157,17 @@ def list_employees(is_active: bool | None = None, department_id: int | None = No
             allowed = ", ".join(m.value for m in ProfileType)
             raise HTTPException(status_code=400,
                                 detail=f"Invalid profile_type '{profile_type}'. Allowed: {allowed}")
+    if employment_type:
+        # One key, or "none" = not recorded yet (20 Nov 2026).
+        from services.employees import EMPLOYMENT_TYPES
+        if employment_type == "none":
+            stmt = stmt.where(or_(Employee.employment_type.is_(None), Employee.employment_type == ""))
+        elif employment_type in EMPLOYMENT_TYPES:
+            stmt = stmt.where(Employee.employment_type == employment_type)
+        else:
+            raise HTTPException(status_code=400, detail=(
+                f"Invalid employment_type '{employment_type}'. Allowed: "
+                f"{', '.join(EMPLOYMENT_TYPES)}, none"))
     if pp.search:
         needle = f"%{pp.search}%"
         stmt = stmt.where(or_(
@@ -337,41 +349,41 @@ def update_employee(employee_id: int, body: EmployeeUpdate, db: Session = Depend
 @router.delete("/{employee_id}")
 def delete_employee(employee_id: int, db: Session = Depends(get_crm_db),
                     user: CurrentUser = Depends(EMP_WRITE)):
-    from models import LeaveAccrualEvent, LeaveApplication
+    """Delete an employee.
+
+    HR: only a record with no history (no assignment, timesheet or leave) —
+    anything else answers 409 and says to deactivate instead.
+    Admin / CEO (20 Nov 2026, user rule): in ONE step, with everything that is
+    only theirs (``crm_delete.purge_employee``). A tax invoice raised from their
+    timesheets still blocks — money is deleted on the invoice, not here.
+    """
+    import logging
     from services.crm_common import commit_or_conflict
+    from services.crm_delete import employee_delete_footprint, footprint_words, purge_employee
 
     emp = get_employee_or_404(db, employee_id)
-    linked_project = db.execute(
-        select(ProjectEmployee.id).where(ProjectEmployee.employee_id == emp.id).limit(1)
-    ).first()
-    linked_timesheet = db.execute(
-        select(Timesheet.id).where(Timesheet.employee_id == emp.id).limit(1)
-    ).first()
-    leave_apps = db.execute(
-        select(func.count()).select_from(LeaveApplication).where(
-            LeaveApplication.employee_id == emp.id
-        )
-    ).scalar() or 0
-    leave_events = db.execute(
-        select(func.count()).select_from(LeaveAccrualEvent).where(
-            LeaveAccrualEvent.employee_id == emp.id
-        )
-    ).scalar() or 0
-    if linked_project or linked_timesheet or leave_apps or leave_events:
-        parts = []
-        if linked_project:
-            parts.append("project assignment(s)")
-        if linked_timesheet:
-            parts.append("timesheet(s)")
-        if leave_apps:
-            parts.append(f"{leave_apps} leave application(s)")
-        if leave_events:
-            parts.append(f"{leave_events} leave ledger event(s)")
+    name = " ".join(x for x in (emp.first_name, emp.last_name) if x) or f"#{emp.id}"
+    if user.is_admin:
+        removed = purge_employee(db, emp)
+        db.delete(emp)
+        commit_or_conflict(db, "Cannot delete: employee is still referenced by other records.")
+        logging.getLogger("karnex.crm.employees").info(
+            "employee.deleted_by_admin id=%s name=%s by=%s removed=%s",
+            employee_id, name, user.id, removed)
+        gone = footprint_words({k: v for k, v in removed.items() if k != "proformas"})
+        if removed.get("proformas"):
+            gone.append(f"{removed['proformas']} Proforma(s)")
+        msg = f"Employee {name} deleted" + (f" with {', '.join(gone)}" if gone else "")
+        return envelope(data={"id": employee_id, "removed": removed}, message=msg)
+
+    parts = footprint_words(employee_delete_footprint(db, emp.id))
+    if parts:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Cannot delete: employee has {', '.join(parts)}. "
-                "Deactivate (is_active=false) instead, or remove those records first."
+                f"Cannot delete {name}: they have {', '.join(parts)}. "
+                "Deactivate them instead — or ask Admin / CEO, who can delete the "
+                "employee with everything recorded on them."
             ),
         )
     # Clear self-FK manager pointers so peers don't block the delete.
@@ -389,7 +401,7 @@ def delete_employee(employee_id: int, db: Session = Depends(get_crm_db),
             other.reporting_hr_id = None
     db.delete(emp)
     commit_or_conflict(db, "Cannot delete: employee is still referenced by other records.")
-    return envelope(message="Employee deleted")
+    return envelope(message=f"Employee {name} deleted")
 
 
 # ===========================================================================

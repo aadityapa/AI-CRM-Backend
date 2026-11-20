@@ -323,6 +323,7 @@ BILLED_COLUMNS = [
     col("employee", "Employee", link="employee_link"), col("po_number", "PO", link="po_link", hidden=True),
     col("revenue_ex", "Revenue (Ex. Tax)", "money"), col("tax", "GST", "money", hidden=True),
     col("revenue_inc", "Revenue (Inc Tax)", "money"),
+    col("received_ex", "Received (Ex. Tax)", "money"), col("due_ex", "Due (Ex. Tax)", "money"),
     col("receivable_bank", "Receivable Bank", "money", hidden=True),
     col("receivable_tds", "Receivable TDS", "money", hidden=True),
     col("received_bank", "Received Bank", "money"), col("received_tds", "Received TDS", "money"),
@@ -334,6 +335,8 @@ BILLED_COLUMNS = [
 #: The ten money words, in the CEO's order: (key, label, tone).
 MONEY_SERIES = (
     ("revenue_ex", "Revenue (Ex. Tax)", "brand"), ("revenue_inc", "Revenue (Inc Tax)", "brand"),
+    # 20 Nov 2026 — on Revenue (Ex. Tax)'s own basis: received + due = revenue ex. tax.
+    ("received_ex", "Received (Ex. Tax)", "success"), ("due_ex", "Due (Ex. Tax)", "warning"),
     ("receivable_bank", "Receivable Bank", "info"), ("receivable_tds", "Receivable TDS", "violet"),
     ("received_bank", "Received Bank", "success"), ("received_tds", "Received TDS", "success"),
     ("due_bank", "Due Bank", "warning"), ("due_tds", "Due TDS", "warning"),
@@ -355,6 +358,8 @@ def with_money_split(db: Session, rows: list[dict]) -> dict:
         inv = {"sub_total": r["sub_total"], "grand_total": r["grand_total"], "balance": r["balance"],
                "status": "Paid" if r["stage"] == "paid" else ""}
         r.update({k: round(v, 2) for k, v in money_split.invoice_money(inv, r["paid"], tds.get(r["id"]), rate).items()})
+        # 20 Nov 2026 — the before-GST split follows the dashboard's own rule.
+        r["balance_ex"] = r["due_ex"]
     total = money_split.totals(rows)
     total["tds_rate_pct"] = round(rate * 100, 2)
     total["invoices"] = len(rows)
@@ -472,7 +477,6 @@ def m_billed(db, period: Period, today: date, customer_id=None, project_id=None,
     for r in rows:
         late = r["days_late"] > 0
         r["overdue_amount"] = r["balance"] if late else 0.0
-        r["overdue_ex"] = r["balance_ex"] if late else 0.0
     try:
         money = with_money_split(db, rows)
     except Exception:  # noqa: BLE001 — the split is extra; the invoices must still list
@@ -481,6 +485,8 @@ def m_billed(db, period: Period, today: date, customer_id=None, project_id=None,
         for r in rows:
             for k in MONEY_KEYS:
                 r.setdefault(k, 0.0)
+    for r in rows:
+        r["overdue_ex"] = r.get("balance_ex", 0.0) if r["days_late"] > 0 else 0.0
     s = lambda k: round(sum(float(r.get(k) or 0) for r in rows), 2)  # noqa: E731
     rev_ex, rev_inc, tax = s("revenue_ex"), s("revenue_inc"), s("tax")
     rec_bank, rec_tds = s("receivable_bank"), s("receivable_tds")
@@ -514,6 +520,12 @@ def m_billed(db, period: Period, today: date, customer_id=None, project_id=None,
                 go={"segments": [], "sort": "revenue_ex"}),
             kpi("revenue_inc", "Revenue (Inc Tax)", rev_inc, tone="brand", sub=f"GST {_compact(tax)}",
                 go={"segments": [], "sort": "revenue_inc"}),
+            kpi("received_ex", "Received (Ex. Tax)", s("received_ex"), tone="success",
+                sub=f"{pct_of(s('received_ex'), rev_ex)} of Revenue (Ex. Tax)",
+                go={"segments": [], "where": "received_ex", "sort": "received_ex"}),
+            kpi("due_ex", "Due (Ex. Tax)", s("due_ex"), tone="warning" if s("due_ex") else "success",
+                sub=f"{count('due_ex')} invoices · before GST",
+                go={"segments": [], "where": "due_ex", "sort": "due_ex"}),
             kpi("receivable_bank", "Receivable Bank", rec_bank, tone="info",
                 sub=f"Inc Tax − TDS · {pct_of(rec_bank, rev_inc)}", go={"segments": [], "where": "receivable_bank", "sort": "receivable_bank"}),
             kpi("receivable_tds", "Receivable TDS", rec_tds, tone="violet",

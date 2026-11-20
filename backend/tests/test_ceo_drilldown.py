@@ -57,8 +57,11 @@ def test_billed_adds_up_to_the_tile_and_says_where_each_invoice_stands(book):
     monthly = page["charts"][0]
     assert monthly["key"] == "money_monthly" and monthly["kind"] == "money"
     assert [s["key"] for s in monthly["series"]] == [
-        "revenue_ex", "revenue_inc", "receivable_bank", "receivable_tds", "received_bank",
-        "received_tds", "due_bank", "due_tds", "total_due", "predicted"]
+        "revenue_ex", "revenue_inc", "received_ex", "due_ex", "receivable_bank", "receivable_tds",
+        "received_bank", "received_tds", "due_bank", "due_tds", "total_due", "predicted"]
+    # 20 Nov 2026 — Received + Due (Ex. Tax) add up to Revenue (Ex. Tax), month by month.
+    for m in monthly["rows"]:
+        assert m["received_ex"] + m["due_ex"] == pytest.approx(m["revenue_ex"], abs=0.05)
     assert not any(s.get("stack") for s in monthly["series"])
     assert round(sum(m["revenue_ex"] for m in monthly["rows"]), 2) == tile
     # Every table row names its month, so a month bar narrows the table to exactly its invoices.
@@ -71,7 +74,7 @@ def test_billed_adds_up_to_the_tile_and_says_where_each_invoice_stands(book):
     assert all("predicted" in m and "predicted_projects" in m for m in monthly["rows"])
     # The page matches the dashboard's own split (services/money_split) to the rupee.
     dash = ed.executive_dashboard(book, "finance", "2026-09", "fy", today=TODAY)["data"]["money"]
-    for k in ("revenue_ex", "revenue_inc", "receivable_bank", "receivable_tds", "received_bank",
+    for k in ("revenue_ex", "revenue_inc", "received_ex", "due_ex", "receivable_bank", "receivable_tds", "received_bank",
               "received_tds", "due_bank", "due_tds", "total_due"):
         assert page["money"][k] == pytest.approx(dash[k], abs=0.05), k
     # Per invoice: receivable = bank + TDS; due = receivable − received, never negative.

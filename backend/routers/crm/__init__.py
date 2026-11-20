@@ -23,7 +23,7 @@ _MODULES: tuple[str, ...] = (
     "finance_reports", "credit_notes", "tax_invoice", "employees", "dashboards",
     "reports", "apply", "template_requests", "slots", "outreach", "holidays",
     "leave_policies", "leave_applications", "ai_assist", "email_outbox", "email_flows",
-    "payroll", "rate_cards", "activity_log", "public_invoice", "customer_receipts", "bank_accounts", "invoice_revisions", "backup", "support", "custom_roles",
+    "payroll", "rate_cards", "activity_log", "public_invoice", "customer_receipts", "tds_receipts", "receipt_mapping", "bank_accounts", "invoice_revisions", "backup", "support", "custom_roles",
     "screening_desk", "ai_costs", "my_interviews", "candidate_resumes", "talent_pool", "public_talent_pool", "public_careers", "expenses",
 )
 

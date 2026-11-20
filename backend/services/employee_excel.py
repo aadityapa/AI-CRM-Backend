@@ -42,7 +42,7 @@ COLUMNS: list[tuple[str, str, bool, str]] = [
     ("Reporting Manager", "reporting_manager", False, "Employee code or email of an existing employee"),
     ("Reporting HR", "reporting_hr", False, "Employee code or email of an existing employee"),
     ("Profile Type", "profile_type", False, "Internal / External (default Internal)"),
-    ("Employment Type", "employment_type", False, "Full_Time / Part_Time / Contract"),
+    ("Employment Type", "employment_type", False, "Full-Time / Part-Time / Contract (Consultant) / Intern"),
     ("Date of Joining", "date_of_joining", False, "DD/MM/YYYY or an Excel date"),
     ("Work Location", "work_location", False, ""),
     ("Role Title", "role_title", False, ""),
@@ -328,12 +328,8 @@ def import_workbook(db: Session, file_bytes: bytes) -> dict:
             except ValueError:
                 raise ValueError(f"Profile Type must be Internal or External, not '{ptype}'")
 
-            etype = _cell_str(vals.get("employment_type")) or None
-            if etype:
-                norm = etype.replace(" ", "_").replace("-", "_").title().replace("_Time", "_Time")
-                if norm not in ("Full_Time", "Part_Time", "Contract"):
-                    raise ValueError(f"Employment Type must be Full_Time / Part_Time / Contract, not '{etype}'")
-                etype = norm
+            from services.employees import normalize_employment_type
+            etype = normalize_employment_type(_cell_str(vals.get("employment_type")))
 
             title = _cell_str(vals.get("title")) or None
             if title:

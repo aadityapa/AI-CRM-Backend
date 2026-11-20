@@ -205,6 +205,16 @@ STATUSES_BY_STAGE = {
 }
 
 
+
+def statuses_for_stages(stages) -> tuple:
+    """The Status filter's choices for one or several stages (PURE, 20 Nov 2026):
+    the union in `INVOICE_STATUS_KEYS` order; none given (the All tab) = every status."""
+    keys = [k for k in (stages or []) if k in STATUSES_BY_STAGE]
+    if not keys:
+        return INVOICE_STATUS_KEYS
+    wanted = {st for k in keys for st in STATUSES_BY_STAGE[k]}
+    return tuple(k for k in INVOICE_STATUS_KEYS if k in wanted)
+
 def _due_state(due, invoice_date, today: date) -> str:
     from datetime import timedelta
     if due is None and invoice_date is not None:

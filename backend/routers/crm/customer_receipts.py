@@ -118,6 +118,10 @@ class ReceiptIn(BaseModel):
     invoice_ids: list[int] = Field(default_factory=list, max_length=100)
     #: TDS the customer withheld, per ticked invoice (16 Oct 2026).
     tds: list["ReceiptTdsIn"] = Field(default_factory=list, max_length=100)
+    #: Amount per invoice (20 Nov 2026) — Finance edits what goes on an invoice
+    #: when the bank credit is less than its balance. Blank amounts take what
+    #: is left, oldest first. When sent, it replaces `invoice_ids`.
+    items: list["AllocateItemIn"] = Field(default_factory=list, max_length=100)
     #: Proof of the credit (19 Oct 2026) — the url `POST /proof` returned.
     proof_url: str | None = Field(default=None, max_length=512)
     proof_name: str | None = Field(default=None, max_length=255)
@@ -159,7 +163,7 @@ class ReceiptTdsIn(BaseModel):
     section: str | None = Field(default=None, max_length=16)
 
 
-ReceiptIn.model_rebuild()
+
 
 
 class ReceiptUpdate(BaseModel):
@@ -182,12 +186,21 @@ class AllocateItemIn(BaseModel):
     amount: Decimal | None = Field(default=None, gt=0)
 
 
+ReceiptIn.model_rebuild()
+
+
 class AllocateIn(BaseModel):
     """Map a receipt's unallocated amount onto invoices (22 Oct 2026)."""
     items: list[AllocateItemIn] = Field(default_factory=list, max_length=100)
     tds: list[ReceiptTdsIn] = Field(default_factory=list, max_length=100)
     #: For a receipt with no branch yet: the branch these invoices belong to.
     branch_id: int | None = None
+    #: 20 Nov 2026 (Finance report): map an invoice billed to ANOTHER branch of
+    #: the customer — each invoice keeps its own branch; the receipt keeps its.
+    other_branches: bool = False
+    #: 20 Nov 2026: the receipt was recorded on the wrong customer / branch and
+    #: pays nothing yet — move it to the ticked invoices' customer (+ branch).
+    move_receipt: bool = False
 
 
 def _d(v) -> Decimal:
@@ -253,6 +266,15 @@ def _invoice_brief(db: Session, invoices: list[Invoice]) -> list[dict]:
     } for i in invoices]
 
 
+def _linked_tds(db: Session, r: CustomerReceipt, inv_ids) -> list[dict]:
+    try:
+        from routers.crm.tds_receipts import tds_receipts_for_receipt
+        with db.begin_nested():
+            return tds_receipts_for_receipt(db, r, inv_ids)
+    except Exception:  # noqa: BLE001 — a table not migrated yet must not break the list
+        return []
+
+
 def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None,
                branch_name: str | None = None) -> dict:
     payments = list(r.payments or [])
@@ -287,6 +309,8 @@ def _serialize(db: Session, r: CustomerReceipt, customer_name: str | None = None
         "tds_pending": float(sum((_d(t.tds_balance) for t in booked), Decimal("0"))),
         "proof_url": getattr(r, "proof_url", None),
         "proof_name": getattr(r, "proof_name", None),
+        # The Received TDS entries that go with this money (20 Nov 2026).
+        "tds_receipts": _linked_tds(db, r, inv_ids),
         "created_by": r.created_by,
         "created_at": r.created_at.isoformat() if r.created_at else None,
         # One line per invoice: the cash it got from this receipt + the TDS the
@@ -344,6 +368,139 @@ def invoice_options(customer_id: int, include_paid: bool = False, branch_id: int
                             {"section": "194C", "rate": 2, "label": "194C · contract work (company)"},
                             {"section": "194C", "rate": 1, "label": "194C · contract work (individual / HUF)"}]
     return envelope(data=rows, message="Invoices", meta=meta)
+
+
+#: Invoices the Map dialog's search returns (20 Nov 2026).
+FIND_LIMIT = 15
+
+
+def invoice_fit(*, receipt_customer_id: int, receipt_branch_id: int | None, receipt_mapped: bool,
+                receipt_customer_name: str | None, receipt_branch_name: str | None,
+                inv_customer_id: int | None, inv_customer_ids: set[int], inv_customer_name: str | None,
+                inv_branch_id: int | None, inv_branch_name: str | None,
+                is_proforma: bool, balance) -> dict:
+    """PURE. Can this receipt pay this invoice, and if not, why not?
+
+    20 Nov 2026 (Finance report, screenshot): an invoice searched for by its
+    number read "No invoice matches" in Map invoices — it was billed to another
+    branch (or another customer record) than the receipt, so the picker never
+    listed it and nothing said why. Every search result now carries the reason
+    and what mapping it would do:
+      here           — this customer, this branch (or either has none)
+      other_branch   — this customer, another branch: mappable; a receipt that
+                       pays nothing yet MOVES to that branch, else it stays
+      other_customer — mappable only by MOVING a receipt that pays nothing yet
+      paid / proforma — nothing to map
+    """
+    rc_name = receipt_customer_name or "this customer"
+    if is_proforma:
+        return {"fit": "proforma", "can_map": False, "move_receipt": False,
+                "reason": "Still a Proforma — Finance generates the tax invoice first, then it takes money"}
+    if _d(balance) <= 0:
+        return {"fit": "paid", "can_map": False, "move_receipt": False,
+                "reason": "Already fully paid — nothing left to map"}
+    if receipt_customer_id in inv_customer_ids:
+        if receipt_branch_id is None or inv_branch_id is None or inv_branch_id == receipt_branch_id:
+            return {"fit": "here", "can_map": True, "move_receipt": False, "reason": None}
+        b = inv_branch_name or "another branch"
+        here = receipt_branch_name or "its branch"
+        if not receipt_mapped:
+            return {"fit": "other_branch", "can_map": True, "move_receipt": True,
+                    "reason": f"Billed to {b} — this receipt is on {here}. Mapping moves the receipt to {b}."}
+        return {"fit": "other_branch", "can_map": True, "move_receipt": False,
+                "reason": f"Billed to {b} — this receipt is on {here} and already pays its invoices. "
+                          f"It can still be mapped; each invoice keeps its own branch."}
+    other = inv_customer_name or "another customer"
+    where = f"{other}{f' · {inv_branch_name}' if inv_branch_name else ''}"
+    if receipt_mapped:
+        return {"fit": "other_customer", "can_map": False, "move_receipt": False,
+                "reason": f"Billed to {other}, not {rc_name} — this receipt already pays {rc_name}'s invoices. "
+                          f"Unmap them first, or record the money on {other}."}
+    return {"fit": "other_customer", "can_map": True, "move_receipt": True,
+            "reason": f"Billed to {other}, not {rc_name}. Mapping moves this receipt to {where}."}
+
+
+def _receipt_mapped(db: Session, receipt: CustomerReceipt) -> bool:
+    if receipt.payments:
+        return True
+    return db.execute(select(TdsRecord.id).where(TdsRecord.receipt_id == receipt.id).limit(1)).first() is not None
+
+
+def _customers_of(db: Session, invoices: list[Invoice]) -> dict[int, tuple[int | None, set[int]]]:
+    """invoice id → (its customer — PO's else project's, every customer it may
+    take money from). Two queries for the batch."""
+    from models import PurchaseOrder
+    from services.billing_rules import invoice_customer_id
+
+    pids = {i.project_id for i in invoices if i.project_id}
+    poids = {i.po_id for i in invoices if i.po_id}
+    pc = dict(db.execute(select(Project.id, Project.customer_id).where(Project.id.in_(pids))).all()) if pids else {}
+    oc = dict(db.execute(select(PurchaseOrder.id, PurchaseOrder.customer_id)
+                         .where(PurchaseOrder.id.in_(poids))).all()) if poids else {}
+    out = {}
+    for i in invoices:
+        p, o = pc.get(i.project_id), oc.get(i.po_id)
+        out[i.id] = (invoice_customer_id(p, o), {c for c in (p, o) if c})
+    return out
+
+
+@router.get("/{receipt_id}/find-invoices")
+def find_invoices(receipt_id: int, q: str, branch_id: int | None = None,
+                  db: Session = Depends(get_crm_db), user: CurrentUser = Depends(RC_READ)):
+    """Search EVERY tax invoice (and Proforma, to say why not) by invoice / PI /
+    PO number, project or employee — whatever customer or branch it is billed
+    to — and say whether this receipt can pay it (`invoice_fit`). `branch_id` is
+    the branch picked in the dialog for a receipt with none yet."""
+    from models import PurchaseOrder
+    from services.search_terms import clean_search
+
+    receipt = db.get(CustomerReceipt, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    term = clean_search(q)
+    if not term or len(term) < 2:
+        return envelope(data=[], message="Type at least 2 characters", meta={"term": term})
+    like = f"%{term}%"
+    emp_ts = (select(Timesheet.id).join(Employee, Employee.id == Timesheet.employee_id)
+              .where(or_(Employee.first_name.ilike(like), Employee.last_name.ilike(like),
+                         (Employee.first_name + " " + Employee.last_name).ilike(like),
+                         Employee.employee_code.ilike(like))))
+    stmt = (select(Invoice)
+            .join(Project, Project.id == Invoice.project_id, isouter=True)
+            .join(PurchaseOrder, PurchaseOrder.id == Invoice.po_id, isouter=True)
+            .where(or_(Invoice.invoice_number.ilike(like), Invoice.proforma_number.ilike(like),
+                       PurchaseOrder.po_number.ilike(like), Project.name.ilike(like),
+                       Invoice.timesheet_id.in_(emp_ts)))
+            .order_by(Invoice.invoice_date.desc(), Invoice.id.desc())
+            .limit(FIND_LIMIT))
+    invoices = db.execute(stmt).scalars().unique().all()
+    briefs = _invoice_brief(db, invoices)
+    custs = _customers_of(db, invoices)
+    cids = {c for c, _ in custs.values() if c} | {receipt.customer_id}
+    cnames = dict(db.execute(select(Customer.id, Customer.name).where(Customer.id.in_(cids))).all())
+    rb_id = receipt.branch_id if receipt.branch_id is not None else branch_id
+    rb_name = db.execute(select(CustomerBranch.branch_name).where(CustomerBranch.id == rb_id)).scalar() \
+        if rb_id else None
+    mapped = _receipt_mapped(db, receipt)
+    by_id = {i.id: i for i in invoices}
+    rows = []
+    for b in briefs:
+        inv = by_id[b["id"]]
+        cid, cset = custs.get(inv.id, (None, set()))
+        fit = invoice_fit(
+            receipt_customer_id=receipt.customer_id, receipt_branch_id=rb_id, receipt_mapped=mapped,
+            receipt_customer_name=cnames.get(receipt.customer_id), receipt_branch_name=rb_name,
+            inv_customer_id=cid, inv_customer_ids=cset, inv_customer_name=cnames.get(cid),
+            inv_branch_id=b["branch_id"], inv_branch_name=b["branch_name"],
+            is_proforma=getattr(inv.kind, "value", inv.kind) == InvoiceKind.PROFORMA.value,
+            balance=inv.balance_amount)
+        rows.append({**b, "customer_id": cid, "customer_name": cnames.get(cid),
+                     "proforma_number": getattr(inv, "proforma_number", None),
+                     "likely_match": likely_match(b["balance_amount"], receipt.unallocated_amount), **fit})
+    order = {"here": 0, "other_branch": 1, "other_customer": 2, "paid": 3, "proforma": 4}
+    rows.sort(key=lambda r: order.get(r["fit"], 9))
+    return envelope(data=rows, message=f"{len(rows)} invoice(s) match",
+                    meta={"term": term, "limit": FIND_LIMIT, "receipt_mapped": mapped})
 
 
 @router.get("")
@@ -555,11 +712,14 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         if branch is None or branch.customer_id != body.customer_id:
             raise HTTPException(status_code=400, detail=f"That branch does not belong to {customer.name}")
     invoices: list[Invoice] = []
-    if body.invoice_ids:
+    wanted_ids = [it.invoice_id for it in body.items] if body.items else list(body.invoice_ids)
+    if body.items and len(set(wanted_ids)) != len(wanted_ids):
+        raise HTTPException(status_code=400, detail="An invoice is listed twice")
+    if wanted_ids:
         invoices = db.execute(
-            select(Invoice).where(Invoice.id.in_(set(body.invoice_ids)), customer_invoice_clause(body.customer_id))
+            select(Invoice).where(Invoice.id.in_(set(wanted_ids)), customer_invoice_clause(body.customer_id))
         ).scalars().all()
-        missing = set(body.invoice_ids) - {i.id for i in invoices}
+        missing = set(wanted_ids) - {i.id for i in invoices}
         if missing:
             raise HTTPException(status_code=400,
                                 detail=f"Invoice(s) {sorted(missing)} do not belong to {customer.name}")
@@ -572,13 +732,9 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
             if other:
                 raise HTTPException(status_code=400,
                                     detail=f"Not invoices of {branch.branch_name}: {', '.join(other)}")
-        # Money is recorded against the e-invoice (8 Oct 2026): customer approval
-        # + IRN first — the same rule as Record Payment on the invoice.
-        waiting = [i.invoice_number or f"#{i.id}" for i in invoices if payment_block(i)]
-        if waiting:
-            raise HTTPException(status_code=409,
-                                detail=f"Not open for payment yet (customer approval / IRN pending): "
-                                       f"{', '.join(waiting)}")
+        # 20 Nov 2026 (Finance ask): every issued tax invoice takes money here —
+        # one still waiting for the customer's approval / IRN included. The
+        # approval note (`payment_block(i)`) stays on the picker as information.
     # 23 Oct 2026 (user ask): every receipt says which branch paid. Not chosen →
     # the one branch of the ticked invoices, else the customer's only branch,
     # else ask. A customer with no branches on record is the one exception.
@@ -632,7 +788,15 @@ def create_receipt(body: ReceiptIn, db: Session = Depends(get_crm_db),
         tds_svc.book(db, inv, figures, section=t.section, receipt_id=receipt.id, user_id=user.id)
         tds_total += _d(figures["amount"])
     receipt.tds_total = tds_total
-    plan, left = allocate(_d(body.amount) - prior, invoices)
+    if body.items:
+        try:
+            plan, left = plan_mapping(_d(body.amount) - prior,
+                                      [(by_id[it.invoice_id], it.amount) for it in body.items])
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        plan, left = allocate(_d(body.amount) - prior, invoices)
     receipt.unallocated_amount = left
     for inv, take in plan:
         db.add(InvoicePayment(
@@ -807,6 +971,11 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
     ids = [it.invoice_id for it in body.items]
     if len(set(ids)) != len(ids):
         raise HTTPException(status_code=400, detail="An invoice is listed twice")
+    moved_note = ""
+    other_branches = bool(body.other_branches)
+    if body.move_receipt:
+        moved_note, multi = _move_receipt_to_invoices(db, receipt, ids, user)
+        other_branches = other_branches or multi
     customer = db.get(Customer, receipt.customer_id)
     invoices = db.execute(
         select(Invoice).where(Invoice.id.in_(set(ids)), customer_invoice_clause(receipt.customer_id))
@@ -819,10 +988,6 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
                 if getattr(i.kind, "value", i.kind) == InvoiceKind.PROFORMA.value]
     if proforma:
         raise HTTPException(status_code=400, detail=f"A Proforma takes no money: {', '.join(proforma)}")
-    waiting = [i.invoice_number or f"#{i.id}" for i in invoices if payment_block(i)]
-    if waiting:
-        raise HTTPException(status_code=409,
-                            detail=f"Not open for payment yet (customer approval / IRN pending): {', '.join(waiting)}")
     # One receipt = one branch.
     from services.invoice_facets import invoice_facets
     facets = invoice_facets(db, invoices)
@@ -842,8 +1007,14 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
         # (24 Oct 2026 — the assign-branch rule); another branch's may not.
         other = [i.invoice_number or f"#{i.id}" for i in invoices
                  if (facets.get(i.id) or {}).get("branch_id") not in (None, branch_id)]
+        if other and not other_branches:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not invoices of {bname}: {', '.join(other)} — tick “map anyway” to put this "
+                       f"receipt's money on another branch's invoice")
         if other:
-            raise HTTPException(status_code=400, detail=f"Not invoices of {bname}: {', '.join(other)}")
+            moved_note = (moved_note + " " if moved_note else "") + \
+                f"Mapped across branches ({', '.join(other)}) — the receipt stays on {bname}."
     receipt.branch_id = branch_id
     by_id = {i.id: i for i in invoices}
     seen: set[int] = set()
@@ -886,7 +1057,58 @@ def allocate_receipt(receipt_id: int, body: AllocateIn, db: Session = Depends(ge
     if tds_added > 0:
         msg += f", TDS {float(tds_added):,.2f} pending from client"
     msg += f" — {float(left):,.2f} still on account" if left > 0 else " — nothing left on account"
+    if moved_note:
+        msg = f"{moved_note} {msg}"
     return envelope(_receipt_payload(db, receipt), message=msg)
+
+
+def _move_receipt_to_invoices(db: Session, receipt: CustomerReceipt, ids: list[int], user) -> tuple[str, bool]:
+    """20 Nov 2026: a receipt recorded on the wrong customer / branch, paying
+    nothing yet, moves to the ticked invoices' customer (one customer only) and
+    their branch (the single branch; several branches of the receipt's own
+    customer keep the receipt's branch and are mapped across branches).
+    Returns (note for the reply, invoices span several branches)."""
+    from services import customer_activity
+    from services.invoice_facets import invoice_facets
+
+    if _receipt_mapped(db, receipt):
+        raise HTTPException(status_code=409,
+                            detail="This receipt already pays invoices — it cannot move to another customer "
+                                   "or branch. Unmap them first, or map across branches.")
+    invs = db.execute(select(Invoice).where(Invoice.id.in_(set(ids)))).scalars().all()
+    custs = _customers_of(db, invs)
+    targets = {c for c, _ in custs.values()}
+    if len(targets) != 1 or None in targets:
+        raise HTTPException(status_code=400,
+                            detail="Tick invoices of ONE customer — a received amount pays one customer")
+    target = next(iter(targets))
+    facets = invoice_facets(db, invs)
+    bids = {(facets.get(i.id) or {}).get("branch_id") for i in invs} - {None}
+    multi = len(bids) > 1
+    if len(bids) == 1:
+        new_branch = next(iter(bids))
+    elif target == receipt.customer_id:
+        new_branch = receipt.branch_id
+    else:
+        new_branch = next(iter(sorted(bids))) if bids else None
+    old_cid, old_bid = receipt.customer_id, receipt.branch_id
+    if (target, new_branch) == (old_cid, old_bid):
+        return "", multi
+    names = dict(db.execute(select(Customer.id, Customer.name).where(Customer.id.in_({old_cid, target}))).all())
+    bnames = dict(db.execute(select(CustomerBranch.id, CustomerBranch.branch_name).where(
+        CustomerBranch.id.in_({b for b in (old_bid, new_branch) if b}))).all()) if (old_bid or new_branch) else {}
+
+    def where(cid, bid):
+        return f"{names.get(cid, f'#{cid}')}{f' · {bnames[bid]}' if bid in bnames else ''}"
+
+    receipt.customer_id, receipt.branch_id = target, new_branch
+    text = f"Received amount #{receipt.id} moved from {where(old_cid, old_bid)} to {where(target, new_branch)} " \
+           f"to map {len(invs)} invoice(s) billed there"
+    for cid in {old_cid, target}:
+        customer_activity.record(db, cid, "RECEIPT_MOVED", text, entity="receipt", entity_id=receipt.id,
+                                 branch_id=new_branch if cid == target else old_bid,
+                                 subject=f"Received amount #{receipt.id}", user=user)
+    return f"Receipt moved to {where(target, new_branch)}.", multi
 
 
 @router.delete("/{receipt_id}/allocations/{invoice_id}")

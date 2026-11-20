@@ -73,7 +73,7 @@ DATASETS: tuple[Dataset, ...] = (
             "Customers, branches, contacts, documents, billing / leave policies, rate cards, bank accounts, receipts",
             ("customers", "customer_branches", "contact_persons", "contact_roles", "customer_documents",
              "customer_billing_policies", "customer_leave_policies", "customer_rate_cards",
-             "customer_receipts", "expenses", "company_bank_accounts", "branch_holiday_years", "holidays",
+             "customer_receipts", "tds_receipts", "expenses", "company_bank_accounts", "branch_holiday_years", "holidays",
              "holiday_names", "calendar_years", "customer_activity_log")),
     Dataset("opportunities", "Opportunities & Requirements",
             "Opportunities, CTC slabs, skills, attachments, activity; requirements, job postings, slots, bookings",

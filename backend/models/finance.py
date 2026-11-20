@@ -211,6 +211,11 @@ class Invoice(Base):
     settled_reason = sa.Column(sa.Text, nullable=True)
     settled_by = sa.Column(sa.Integer, nullable=True)
     settled_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
+    #: Admin / CEO final approval once everything about the invoice is done (0156,
+    #: services/invoice_closure.py) — customer approved, IRN, money and TDS in.
+    closure_approved_at = sa.Column(sa.DateTime(timezone=True), nullable=True, index=True)
+    closure_approved_by = sa.Column(sa.Integer, nullable=True)
+    closure_note = sa.Column(sa.Text, nullable=True)
     #: Buyer / shipping details as they were when the invoice was issued (0143):
     #: a later change to the customer's address never moves an issued invoice.
     #: See services/invoice_parties.py. NULL = read the branch live.
@@ -354,6 +359,9 @@ class TdsRecord(Base):
     #: The customer receipt it was booked with; NULL = recorded on the invoice.
     receipt_id = sa.Column(sa.Integer, sa.ForeignKey("customer_receipts.id", ondelete="SET NULL"),
                            nullable=True, index=True)
+    #: Booked by mapping a Received TDS entry (0155) — unmapping removes it again.
+    tds_receipt_id = sa.Column(sa.Integer, sa.ForeignKey("tds_receipts.id", ondelete="SET NULL"),
+                               nullable=True, index=True)
     created_by = sa.Column(sa.Integer, nullable=True)
     created_at = sa.Column(sa.DateTime(timezone=True), nullable=True, server_default=sa.func.now())
 
@@ -376,9 +384,40 @@ class TdsPayment(Base):
     transaction_id = sa.Column(sa.String(64), nullable=True)
     attachment_url = sa.Column(sa.String(512), nullable=True)
     notes = sa.Column(sa.String(255), nullable=True)
+    #: The Received TDS entry this line came from (0155); NULL = marked on the invoice.
+    tds_receipt_id = sa.Column(sa.Integer, sa.ForeignKey("tds_receipts.id", ondelete="SET NULL"),
+                               nullable=True, index=True)
     created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 
     tds_record = relationship("TdsRecord", back_populates="payments")
+
+
+class TdsReceipt(Base):
+    """TDS the customer deposited for us (Form 16A / 26AS credit), recorded once
+    by Finance and mapped onto the invoices it covers (0155, 20 Nov 2026) —
+    the TDS twin of CustomerReceipt. Each mapping is a TdsPayment with
+    `tds_receipt_id`; what is not mapped yet stays as `unallocated_amount`."""
+    __tablename__ = "tds_receipts"
+    id = sa.Column(sa.Integer, primary_key=True)
+    customer_id = sa.Column(sa.Integer, sa.ForeignKey("customers.id"), nullable=False, index=True)
+    branch_id = sa.Column(sa.Integer, sa.ForeignKey("customer_branches.id"), nullable=True, index=True)
+    received_date = sa.Column(sa.Date, nullable=False, index=True)
+    amount = sa.Column(sa.Numeric(14, 2), nullable=False)
+    #: Form 16A certificate number (optional).
+    certificate_number = sa.Column(sa.String(64), nullable=True)
+    #: e.g. "Q2 FY2026-27" (optional).
+    quarter = sa.Column(sa.String(16), nullable=True)
+    section = sa.Column(sa.String(16), nullable=True)
+    reference_number = sa.Column(sa.String(128), nullable=True)
+    notes = sa.Column(sa.Text, nullable=True)
+    unallocated_amount = sa.Column(sa.Numeric(14, 2), nullable=False, server_default="0")
+    #: The received amount (bank credit) this TDS goes with — optional.
+    receipt_id = sa.Column(sa.Integer, sa.ForeignKey("customer_receipts.id", ondelete="SET NULL"),
+                           nullable=True, index=True)
+    proof_url = sa.Column(sa.String(512), nullable=True)
+    proof_name = sa.Column(sa.String(255), nullable=True)
+    created_by = sa.Column(sa.Integer, nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
 
 
 class CreditNote(Base):

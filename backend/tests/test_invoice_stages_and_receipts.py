@@ -241,3 +241,20 @@ def test_status_column_sql_matches_the_pure_rule_and_fits_its_stage(db):
                                             due=inv.due_date, invoice_date=inv.invoice_date, today=today)
         assert pure == got[inv.invoice_number]
         assert pure in billing_rules.STATUSES_BY_STAGE[stage]
+
+
+def test_all_tab_stage_csv_and_its_status_choices(db):
+    """20 Nov 2026: the Invoices ▸ All tab — every invoice, a Stage filter over
+    several stages, and the Status choices of the stages picked."""
+    from models import Invoice
+    _invoices(db)
+    open_stages = ["awaiting_customer", "pending_einvoice", "unpaid", "partially_paid"]
+    got = set(db.execute(select(Invoice.invoice_number)
+                         .where(billing_rules.invoice_stage_case().in_(open_stages))).scalars())
+    every = set(db.execute(select(Invoice.invoice_number)).scalars())
+    assert got and got < every
+    assert "PI-1" not in got and "E" not in got        # the Proforma and the paid one stay out
+    assert billing_rules.statuses_for_stages([]) == billing_rules.INVOICE_STATUS_KEYS
+    assert billing_rules.statuses_for_stages(["paid", "proforma"]) == (
+        "proforma_with_finance", "proforma_returned", "paid_tds_pending", "paid")
+    assert billing_rules.statuses_for_stages(["unpaid", "awaiting_customer"]) == ("overdue", "due_soon", "not_due")

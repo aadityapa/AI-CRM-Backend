@@ -203,6 +203,11 @@ EVENTS: list[dict] = [
      "description": "Sent when the Sales Manager / Sales Head confirms the customer accepted the original "
                     "invoice unchanged — Finance records the e-invoice IRN and Acknowledgement No.",
      "default_roles": ["Finance"]},
+    {"event": "invoice.closure_approved",
+     "label": "Admin / CEO approved a collected invoice",
+     "description": "Sent when Admin / CEO sign off an invoice that is collected in full and whose TDS "
+                    "is received — the invoice is closed.",
+     "default_roles": ["Finance"]},
     {"event": "opportunity.submitted",
      "label": "Opportunity awaiting approval",
      "description": "Sent when an opportunity is created or resubmitted for Sales Head approval.",

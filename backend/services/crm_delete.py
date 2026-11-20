@@ -405,3 +405,128 @@ def hard_delete_opportunities(db: Session, opportunity_ids: list[int]) -> None:
     for sql in _OPP_DELETE_SQL:
         db.execute(text(sql.format(**sub)).bindparams(bindparam("ids", expanding=True)), {"ids": ids})
     db.expire_all()
+
+
+# --------------------------------------------------------------------------
+# Employee delete (20 Nov 2026, user report: Admin could not remove a test
+# employee — "employee has 15 leave ledger event(s)").
+# --------------------------------------------------------------------------
+
+def employee_delete_footprint(db: Session, employee_id: int) -> dict:
+    """What an employee row drags with it — counts for the refusal / the reply."""
+    from models import (
+        LeaveAccrualEvent, ProjectEmployee as _PE,
+    )
+    def _count(model, col) -> int:
+        return db.execute(
+            select(func.count()).select_from(model).where(col == employee_id)
+        ).scalar() or 0
+    return {
+        "project_assignments": _count(_PE, _PE.employee_id),
+        "timesheets": _count(Timesheet, Timesheet.employee_id),
+        "leave_applications": _count(LeaveApplication, LeaveApplication.employee_id),
+        "leave_events": _count(LeaveAccrualEvent, LeaveAccrualEvent.employee_id),
+    }
+
+
+def footprint_words(fp: dict) -> list[str]:
+    words = {
+        "project_assignments": "project assignment(s)",
+        "timesheets": "timesheet(s)",
+        "leave_applications": "leave application(s)",
+        "leave_events": "leave ledger event(s)",
+    }
+    return [f"{n} {words[k]}" for k, n in fp.items() if n]
+
+
+def purge_employee(db: Session, emp: Employee) -> dict:
+    """Admin / CEO hard delete of an employee and everything that is ONLY theirs:
+    timesheets (entries, attachments, activity), project assignments (leave
+    details, rates, release plan), leave applications, the leave ledger and
+    balances, education / experience / project history. Pointers FROM other
+    records (reporting manager / HR, a panel interview round, a PO raised for
+    the person) are cleared, never deleted.
+
+    Money is never deleted here: a TAX invoice raised from one of their
+    timesheets blocks the delete (409 naming it — Admin deletes the invoice
+    first, which unwinds its payments / PO draw). A Proforma moved no money
+    and goes with its timesheet. No commit.
+    """
+    from models import (
+        LeaveAccrualEvent, ProjectEmployee as _PE, ProjectEmployeeReleaseEvent,
+        PurchaseOrder,
+    )
+    from models.finance import InvoiceKind
+
+    ts_rows = list(db.execute(
+        select(Timesheet).where(Timesheet.employee_id == emp.id)
+    ).scalars().all())
+    pe_rows = list(db.execute(select(_PE).where(_PE.employee_id == emp.id)).scalars().all())
+    pe_ids = [p.id for p in pe_rows]
+    if pe_ids:
+        # A sheet linked to one of their assignments but filed under another
+        # employee id would still hold the FK — take it too.
+        extra = db.execute(
+            select(Timesheet).where(Timesheet.project_employee_id.in_(pe_ids),
+                                    Timesheet.employee_id != emp.id)
+        ).scalars().all()
+        ts_rows.extend(extra)
+    ts_ids = [t.id for t in ts_rows]
+
+    invoices = invoices_for_timesheet_ids(db, ts_ids)
+    tax = [i for i in invoices if _ev(i.kind) != InvoiceKind.PROFORMA.value]
+    if tax:
+        names = ", ".join(i.invoice_number or f"#{i.id}" for i in tax[:5])
+        more = f" and {len(tax) - 5} more" if len(tax) > 5 else ""
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Cannot delete {emp.first_name or 'this employee'}: tax invoice(s) {names}{more} "
+                    "were raised from their timesheets. Delete those invoices first "
+                    "(Invoices ▸ the invoice ▸ Delete), then delete the employee."),
+        )
+
+    removed = employee_delete_footprint(db, emp.id)
+    for inv in invoices:                       # Proformas only — nothing was drawn
+        db.delete(inv)
+    db.flush()
+    for ts in ts_rows:
+        purge_timesheet(db, ts)                # entries + attachments cascade (ORM)
+    db.flush()
+
+    for app in db.execute(select(LeaveApplication).where(
+        or_(LeaveApplication.employee_id == emp.id,
+            LeaveApplication.project_employee_id.in_(pe_ids or [-1]))
+    )).scalars().all():
+        db.delete(app)
+    for ev in db.execute(select(LeaveAccrualEvent).where(
+        LeaveAccrualEvent.employee_id == emp.id
+    )).scalars().all():
+        db.delete(ev)
+    if pe_ids:
+        for ev in db.execute(select(ProjectEmployeeReleaseEvent).where(
+            ProjectEmployeeReleaseEvent.project_employee_id.in_(pe_ids)
+        )).scalars().all():
+            db.delete(ev)
+    db.flush()
+    for pe in pe_rows:
+        db.delete(pe)                          # leave details + rates cascade (ORM)
+    db.flush()
+
+    # Pointers from other records: clear, never delete.
+    for other in db.execute(select(Employee).where(
+        or_(Employee.reporting_manager_id == emp.id, Employee.reporting_hr_id == emp.id)
+    )).scalars().all():
+        if other.reporting_manager_id == emp.id:
+            other.reporting_manager_id = None
+        if other.reporting_hr_id == emp.id:
+            other.reporting_hr_id = None
+    for ev in db.execute(select(InterviewEvent).where(
+        InterviewEvent.employee_id == emp.id
+    )).scalars().all():
+        ev.employee_id = None
+    for po in db.execute(select(PurchaseOrder).where(
+        PurchaseOrder.employee_id == emp.id
+    )).scalars().all():
+        po.employee_id = None
+    removed["proformas"] = len(invoices)
+    return removed

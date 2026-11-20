@@ -24,7 +24,7 @@ from datetime import date, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Customer, CustomerReceipt, Invoice, InvoicePayment, Project, PurchaseOrder
+from models import Customer, CustomerReceipt, Invoice, InvoicePayment, Project, PurchaseOrder, Timesheet
 
 TOP_CUSTOMERS = 5
 
@@ -97,16 +97,25 @@ def on_account_summary(db: Session, today: date, customer_id=None, branch_id=Non
 
 
 def cash_payments(db: Session, start: date, end: date, invoice_filters: list) -> list[dict]:
-    """Mapped payments by the day the money arrived (`payment_date`)."""
+    """Mapped payments by the day the money arrived (`payment_date`).
+
+    Each row also carries `work` — the invoice's WORK month (1st of the month;
+    a manual invoice its invoice date) — so the cash view can say how much of
+    the money that arrived paid invoices of THIS period and how much paid
+    EARLIER invoices (20 Nov 2026: "Mapped ₹3.80 Cr vs Received ₹2.98 Cr")."""
+    from services.revenue_report import work_date
+
     rows = db.execute(
-        select(InvoicePayment.payment_date, InvoicePayment.amount)
+        select(InvoicePayment.payment_date, InvoicePayment.amount,
+               Timesheet.year, Timesheet.month, Invoice.invoice_date)
         .join(Invoice, Invoice.id == InvoicePayment.invoice_id)
         .join(Project, Project.id == Invoice.project_id)
         .outerjoin(PurchaseOrder, PurchaseOrder.id == Invoice.po_id)
+        .outerjoin(Timesheet, Timesheet.id == Invoice.timesheet_id)
         .where(InvoicePayment.payment_date >= start, InvoicePayment.payment_date <= end,
                *invoice_filters)
     ).all()
-    return [{"date": r[0], "amount": _num(r[1])} for r in rows]
+    return [{"date": r[0], "amount": _num(r[1]), "work": work_date(r[2], r[3], r[4])} for r in rows]
 
 
 def cash_on_account(db: Session, start: date, end: date, customer_id=None, branch_id=None,
@@ -121,15 +130,50 @@ def cash_on_account(db: Session, start: date, end: date, customer_id=None, branc
     return [{"date": r[0], "amount": _num(r[1])} for r in db.execute(q).all()]
 
 
-def cash_by_month(months, payments: list[dict], on_account: list[dict]) -> dict[str, dict]:
-    """PURE — `{month key: {cash_in, cash_mapped, cash_on_account}}`."""
+def cash_by_month(months, payments: list[dict], on_account: list[dict],
+                  period_start: date | None = None) -> dict[str, dict]:
+    """PURE — `{month key: {cash_in, cash_mapped, cash_on_account,
+    cash_this_period, cash_earlier}}`.
+
+    `cash_mapped` = `cash_this_period` + `cash_earlier`: of the mapped money
+    that arrived in the month, the part that paid invoices whose work month is
+    inside the period (it also shows as Received on the work-month view) and
+    the part that paid invoices from BEFORE the period starts (it never does)."""
     out = {}
     for m in months:
-        mapped = sum(p["amount"] for p in payments if p["date"] and m.start <= p["date"] <= m.end)
+        rows = [p for p in payments if p["date"] and m.start <= p["date"] <= m.end]
+        mapped = sum(p["amount"] for p in rows)
+        earlier = sum(p["amount"] for p in rows
+                      if period_start and _day(p.get("work")) and _day(p["work"]) < period_start)
         held = sum(r["amount"] for r in on_account if r["date"] and m.start <= r["date"] <= m.end)
         out[m.key] = {"cash_in": round(mapped + held, 2), "cash_mapped": round(mapped, 2),
-                      "cash_on_account": round(held, 2)}
+                      "cash_on_account": round(held, 2),
+                      "cash_this_period": round(mapped - earlier, 2),
+                      "cash_earlier": round(earlier, 2)}
     return out
+
+
+def due_breakdown(money: dict, on_account: dict | None) -> dict:
+    """PURE — what Total Due is made of (20 Nov 2026, user ask).
+
+    * `due_tds_expected` — TDS assumed at the Settings rate on open invoices
+      where no TDS is booked yet (an estimate, not a figure from the customer);
+      `due_tds_booked` — TDS the customer did deduct, Form 16A still to come.
+    * `on_account` — money already in Received Amount but not mapped to any
+      invoice. Those invoices still read due until Finance maps it, so
+      `total_due_net` = Total Due − that money is what is really still owed
+      (never below 0). `on_account` is a today figure for the whole book in the
+      chosen scope, not only this period's invoices — the note says so."""
+    due_tds = float(money.get("due_tds") or 0)
+    expected = min(due_tds, float(money.get("expected_tds") or 0))
+    held = 0.0 if not on_account or on_account.get("out_of_scope") else float(on_account.get("amount") or 0)
+    total = float(money.get("total_due") or 0)
+    return {
+        "due_tds_expected": round(expected, 2),
+        "due_tds_booked": round(max(0.0, due_tds - expected), 2),
+        "on_account": round(held, 2),
+        "total_due_net": round(max(0.0, total - held), 2),
+    }
 
 
 def mapping_changes(months, payments: list[dict]) -> dict[str, dict]:

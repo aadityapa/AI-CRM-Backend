@@ -281,13 +281,9 @@ def _finance(db: Session, period: Period, today: date,
 
     exp_rows = _safe(lambda: expenses_in(db, period.start, period.end), [], "expenses")
     exp_month = by_month(exp_rows)
-    from services.billing_rules import before_gst_split
-    for i in invoices:
-        # 4 Nov 2026 (user rule): received against an invoice on the SAME basis as billed —
-        # its before-GST share — so the "Received" bar can never stand above "Billed".
-        paid_in_full = str(i.get("status") or "").lower() == "paid"
-        got = i["grand_total"] if paid_in_full else max(0.0, i["grand_total"] - i["balance"])
-        i["received_ex"] = before_gst_split(i["sub_total"], i["grand_total"], got, 0.0)["received_ex"]
+    # 4 Nov 2026 (user rule): received against an invoice on the SAME basis as billed.
+    # 20 Nov 2026: `received_ex` / `due_ex` come from money_split (one rule) and always
+    # add up to Revenue (Ex. Tax) — a fully paid invoice counts its whole value before GST.
     # 6 Nov 2026: the bank / TDS split the CEO reads (services/money_split).
     from services import money_split
     tds_rate = money_split.expected_tds_rate()
@@ -296,8 +292,6 @@ def _finance(db: Session, period: Period, today: date,
     monthly = []
     for m in _months_in(period):
         billed = sum(i["sub_total"] for i in invoices if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end)
-        received_ex = sum(i["received_ex"] for i in invoices
-                          if i["invoice_date"] and m.start <= i["invoice_date"] <= m.end)
         collected = sum(p["amount"] for p in payments if p["date"] and m.start <= p["date"] <= m.end)
         cost = sum(_cost_in(r, m, today) for r in deployed if _overlaps(r, m))
         future = m.start > today
@@ -311,7 +305,7 @@ def _finance(db: Session, period: Period, today: date,
             "predicted_heads": len(pred["people"]),
             "predicted_customers": len(pred["customers"]),
             "key": m.key, "label": m.start.strftime("%b %y"), "billed": round(billed, 2),
-            "collected": round(collected, 2), "received_ex": round(received_ex, 2), "cost": round(cost, 2),
+            "collected": round(collected, 2), "cost": round(cost, 2),
             "margin": round(billed - cost, 2), "future": future,
             "predicted": predicted,
             "expenses": round(spent, 2),
@@ -329,7 +323,8 @@ def _finance(db: Session, period: Period, today: date,
         months,
         cash_month.cash_payments(db, period.start, period.end, _invoice_filters(customer_id, scoped)),
         cash_month.cash_on_account(db, period.start, period.end, customer_id, branch_id,
-                                   explicit_project)), {}, "cash month")
+                                   explicit_project),
+        period.start), {}, "cash month")
     changes = _safe(lambda: cash_month.mapping_changes(months, payments), {}, "mapping changes")
     for row in monthly:
         row.update(cash.get(row["key"], {}))
@@ -349,6 +344,12 @@ def _finance(db: Session, period: Period, today: date,
     money_total = money_split.totals(monthly)
     money_total["predicted"] = round(sum(r["predicted"] for r in monthly), 2)
     money_total["tds_rate_pct"] = round(tds_rate * 100, 2)
+    # 20 Nov 2026 — what Total Due is made of, and the cash that arrived this
+    # period for invoices of EARLIER periods (the gap between the two views).
+    money_total.update(cash_month.due_breakdown(money_total, on_account))
+    money_total["cash_mapped"] = round(sum(float(r.get("cash_mapped") or 0) for r in monthly), 2)
+    money_total["cash_earlier"] = round(sum(float(r.get("cash_earlier") or 0) for r in monthly), 2)
+    money_total["cash_on_account"] = round(sum(float(r.get("cash_on_account") or 0) for r in monthly), 2)
     return {
         "track_people_cost": rep.get("track_people_cost", True),
         "headline": rep["headline"],

@@ -152,6 +152,29 @@ def billing_reader(user: CurrentUser = Depends(any_crm_role)) -> CurrentUser:
     raise HTTPException(status_code=403, detail="The billing tracker is for Finance and the Sales Manager / Sales Head")
 
 
+@router.get("/invoice-approvals")
+def invoice_approvals(
+    state: str = Query("ready", description="ready · changed · waiting · approved · all"),
+    customer_id: int | None = None,
+    month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$"),
+    search: str | None = Query(None, max_length=120),
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=200),
+    db: Session = Depends(get_crm_db),
+    user: CurrentUser = Depends(role_required()),
+):
+    """Admin / CEO Dashboard tab "Invoice approvals" (20 Nov 2026): every issued
+    tax invoice by closure state — ready for approval (collected in full, TDS
+    received), changed after approval, not ready yet (with what is missing), or
+    approved. `services/invoice_closure.approval_queue`."""
+    from services.invoice_closure import approval_queue
+    from services.search_terms import clean_search
+
+    rows, meta = approval_queue(db, state=state, customer_id=customer_id, month=month,
+                                search=clean_search(search) if search else None, page=page, limit=limit)
+    return envelope(rows, meta=meta)
+
+
 @router.get("/billing")
 def billing_tracker(
     customer_id: int | None = None,

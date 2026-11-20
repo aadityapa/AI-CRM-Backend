@@ -208,6 +208,7 @@ def serialize_employee(emp: Employee, db: Session | None = None, detail: bool = 
         "date_of_joining": _iso(emp.date_of_joining),
         "is_active": emp.is_active,
         "role_title": emp.role_title,
+        "employment_type": emp.employment_type,
     }
     if detail and db is not None:
         data["pan"] = emp.pan
@@ -791,3 +792,35 @@ def employee_history(db: Session, emp: Employee) -> dict:
         "experience": [serialize_experience(r) for r in experience_rows],
         "timeline": timeline,
     }
+
+
+# --------------------------------------------------------------------------
+# Employment type (20 Nov 2026): Full-Time · Part-Time · Contract · Intern.
+# --------------------------------------------------------------------------
+
+EMPLOYMENT_TYPES = ("Full_Time", "Part_Time", "Contract", "Intern")
+EMPLOYMENT_TYPE_LABELS = {
+    "Full_Time": "Full-Time", "Part_Time": "Part-Time", "Contract": "Contract / Consultant", "Intern": "Intern",
+}
+_EMPLOYMENT_ALIASES = {
+    "fulltime": "Full_Time", "ft": "Full_Time", "permanent": "Full_Time",
+    "parttime": "Part_Time", "pt": "Part_Time",
+    "contract": "Contract", "contractual": "Contract", "contingent": "Contract",
+    "consultant": "Contract", "contractconsultant": "Contract", "consultancy": "Contract",
+    "intern": "Intern", "internship": "Intern", "trainee": "Intern",
+}
+
+
+def normalize_employment_type(raw) -> str | None:
+    """"Full-Time", "full time", "FULL_TIME", "Internship" → the stored key.
+    Blank → None; anything else → ValueError naming the four choices. PURE."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    key = "".join(ch for ch in text.lower() if ch.isalnum())
+    hit = _EMPLOYMENT_ALIASES.get(key)
+    if hit is None:
+        raise ValueError(f"Employment Type must be Full-Time, Part-Time, Contract / Consultant or Intern, not '{text}'")
+    return hit

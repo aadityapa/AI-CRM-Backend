@@ -26,6 +26,16 @@ month rule — `revenue_report.work_date`):
 * Due TDS            = Receivable TDS − Received TDS ("pending from client").
 * Total Due          = Due Bank + Due TDS.
 
+20 Nov 2026 (CEO ask: "after paid / partially paid the dashboard should move the
+same as Revenue (Ex. Tax)") — two words on the before-GST basis, so they always add
+up to Revenue (Ex. Tax):
+
+* Due (Ex. Tax)      = the invoice's open balance × (sub_total ÷ grand_total);
+                       0 once the invoice reads Paid (cash, TDS deducted, a
+                       settlement — whatever closed it).
+* Received (Ex. Tax) = Revenue (Ex. Tax) − Due (Ex. Tax). A fully paid invoice
+                       counts its whole value before GST; a partly paid one its share.
+
 Everything except `tds_by_invoice` is PURE.
 """
 from __future__ import annotations
@@ -37,7 +47,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 KEYS = ("revenue_ex", "revenue_inc", "receivable_bank", "receivable_tds", "received_bank",
-        "received_tds", "due_bank", "due_tds", "total_due", "expected_tds")
+        "received_tds", "due_bank", "due_tds", "total_due", "expected_tds",
+        "received_ex", "due_ex")
+
+
+def ex_tax_split(sub_total: float, grand_total: float, balance: float, paid_in_full: bool) -> tuple[float, float]:
+    """(received_ex, due_ex) — the invoice's value before GST split into what is
+    settled and what is still open; the two always add up to sub_total. PURE."""
+    sub, grand = max(0.0, _f(sub_total)), max(0.0, _f(grand_total))
+    if paid_in_full or sub <= 0:
+        return round(sub, 2), 0.0
+    share = (sub / grand) if grand > 0 else 1.0
+    due = round(min(sub, max(0.0, _f(balance)) * share), 2)
+    return round(sub - due, 2), due
 
 
 def _f(v) -> float:
@@ -78,7 +100,9 @@ def invoice_money(inv: dict, cash: float, tds: dict | None, rate: float) -> dict
     if paid_in_full:
         due_bank = 0.0
     due_tds = max(0.0, rec_tds - tds_in)
+    received_ex, due_ex = ex_tax_split(ex, inc, balance, paid_in_full)
     return {
+        "received_ex": received_ex, "due_ex": due_ex,
         "revenue_ex": ex, "revenue_inc": inc,
         "receivable_bank": rec_bank, "receivable_tds": rec_tds,
         "received_bank": cash, "received_tds": min(tds_in, rec_tds),

@@ -804,13 +804,16 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
     if bad:
         raise HTTPException(status_code=400,
                             detail=f"status must be one of: {', '.join(billing_rules.INVOICE_STATUS_KEYS)}")
-    if stage:
-        # 24 Oct 2026: the Invoices tabs — ONE stage per invoice
-        # (`billing_rules.invoice_stage_case`).
-        if stage not in billing_rules.INVOICE_STAGE_KEYS:
-            raise HTTPException(status_code=400,
-                                detail=f"stage must be one of: {', '.join(billing_rules.INVOICE_STAGE_KEYS)}")
-        stmt = stmt.where(billing_rules.invoice_stage_case() == stage)
+    # 24 Oct 2026: the Invoices tabs — ONE stage per invoice
+    # (`billing_rules.invoice_stage_case`). 20 Nov 2026: a CSV of stages — the
+    # All tab's Stage filter picks several ("everything still open").
+    stage_keys = [x.strip() for x in (stage or "").split(",") if x.strip()]
+    bad_stages = [x for x in stage_keys if x not in billing_rules.INVOICE_STAGE_KEYS]
+    if bad_stages:
+        raise HTTPException(status_code=400,
+                            detail=f"stage must be one of: {', '.join(billing_rules.INVOICE_STAGE_KEYS)}")
+    if stage_keys:
+        stmt = stmt.where(billing_rules.invoice_stage_case().in_(stage_keys))
     tab_stmt = stmt                      # the tab before the Status filter — its status counts
     if status_keys:
         stmt = stmt.where(billing_rules.invoice_status_case().in_(status_keys))
@@ -909,7 +912,7 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
         sub = tab_stmt.with_only_columns(Invoice.id, status_col).subquery()
         found = {st: int(n) for st, n in db.execute(
             select(sub.c.status_key, sa.func.count()).group_by(sub.c.status_key)).all()}
-        keys = billing_rules.STATUSES_BY_STAGE.get(stage or "", billing_rules.INVOICE_STATUS_KEYS)
+        keys = billing_rules.statuses_for_stages(stage_keys)
         labels = dict(billing_rules.INVOICE_STATUSES)
         meta["status_counts"] = [{"key": k, "label": labels[k], "count": found.get(k, 0)} for k in keys]
         # 27 Oct 2026: the pickers come from the tab WITHOUT the employee / PO
@@ -922,8 +925,8 @@ def list_invoices(payment_status: str | None = None, project_id: int | None = No
                                            invoice_from=invoice_from, invoice_to=invoice_to,
                                            due_from=due_from, due_to=due_to,
                                            amount_min=amount_min, amount_max=amount_max)
-        if stage:
-            opt_stmt = opt_stmt.where(billing_rules.invoice_stage_case() == stage)
+        if stage_keys:
+            opt_stmt = opt_stmt.where(billing_rules.invoice_stage_case().in_(stage_keys))
         meta["filter_options"] = _invoice_filter_options(db, opt_stmt)
     return envelope(data=rows, meta=meta)
 
@@ -1064,6 +1067,7 @@ def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
     ids |= {i for i in [getattr(invoice, "issued_by", None),
                         getattr(tds, "created_by", None) if tds is not None else None,
                         getattr(invoice, "settled_by", None),
+                        getattr(invoice, "closure_approved_by", None),
                         *[getattr(p, "created_by", None) for p in payments]] if i}
     names = _user_names(db, ids) if ids else {}
     data.update(invoice_approval.payload(invoice, user, names))
@@ -1080,6 +1084,10 @@ def _with_approval(db: Session, invoice: Invoice, user, data: dict) -> dict:
     may_settle = bool(user is not None and (getattr(user, "is_admin", False) or "Finance" in (user.roles or set())))
     data["can_settle"] = may_settle and invoice_settlement.settle_block(invoice) is None
     data["can_undo_settlement"] = may_settle and data["settlement"] is not None
+    # Step 4 (20 Nov 2026): Admin / CEO final approval once everything is done.
+    from services import invoice_closure
+    if (getattr(invoice, "kind", None) or "Tax") != "Proforma":
+        data["closure"] = invoice_closure.payload(invoice, user, names)
     if isinstance(data.get("payments"), list):
         for row in data["payments"]:
             row["recorded_by_name"] = names.get(row.get("created_by") or 0)
@@ -1692,6 +1700,98 @@ def undo_tds_received(invoice_id: int, body: TdsUndoReceivedIn, db: Session = De
 
 class SettleIn(BaseModel):
     reason: str = Field(default="", max_length=1000)
+
+
+class BulkSettleIn(BaseModel):
+    invoice_ids: list[int] = Field(min_length=1, max_length=500)
+    reason: str = Field(default="", max_length=1000)
+
+
+class ClosureIn(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ClosureUndoIn(BaseModel):
+    reason: str = Field(default="", max_length=1000)
+
+
+class BulkClosureIn(BaseModel):
+    invoice_ids: list[int] = Field(min_length=1, max_length=500)
+    note: str | None = Field(default=None, max_length=1000)
+
+
+# Literal path — declared before /invoices/{invoice_id}/closure-approval.
+@router.post("/invoices/closure-approval/bulk")
+def approve_invoice_closure_bulk(body: BulkClosureIn, db: Session = Depends(get_crm_db),
+                                 user: CurrentUser = Depends(role_required())):
+    """Admin / CEO approve many fully collected invoices at once (20 Nov 2026)."""
+    from services import invoice_closure
+
+    invoices = db.execute(select(Invoice).where(Invoice.id.in_(set(body.invoice_ids)))
+                          .order_by(Invoice.invoice_date, Invoice.id)).scalars().all()
+    done, skipped = invoice_closure.approve_many(db, invoices, user, body.note)
+    db.commit()
+    return envelope({"approved": [i.id for i in done], "skipped": skipped},
+                    f"{len(done)} invoice(s) approved and closed — Finance notified"
+                    + (f", {len(skipped)} skipped" if skipped else ""))
+
+
+@router.post("/invoices/{invoice_id}/closure-approval")
+def approve_invoice_closure(invoice_id: int, body: ClosureIn | None = None, db: Session = Depends(get_crm_db),
+                            user: CurrentUser = Depends(role_required())):
+    """Admin / CEO sign off an invoice once it is collected in full and its TDS
+    received (step 4 of the journey, 20 Nov 2026)."""
+    from services import invoice_closure
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice_closure.approve(db, invoice, user, body.note if body else None)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"{invoice.invoice_number} approved and closed — Finance notified")
+
+
+@router.post("/invoices/{invoice_id}/closure-approval/undo")
+def undo_invoice_closure(invoice_id: int, body: ClosureUndoIn, db: Session = Depends(get_crm_db),
+                         user: CurrentUser = Depends(role_required())):
+    from services import invoice_closure
+
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice_closure.undo(db, invoice, user, body.reason)
+    db.commit()
+    db.refresh(invoice)
+    return envelope(_with_approval(db, invoice, user, serialize_invoice(invoice, detail=True, db=db)),
+                    f"Approval of {invoice.invoice_number} undone")
+
+
+@router.post("/invoices/settle-in-full/bulk")
+def settle_invoices_in_full_bulk(body: BulkSettleIn, db: Session = Depends(get_crm_db),
+                                 user: CurrentUser = Depends(role_required("Finance"))):
+    """Settle many Partially paid invoices in one step (20 Nov 2026, Finance ask —
+    small balances left by rounding / bank charges). Each invoice in its own
+    savepoint; one that cannot be settled is named in `skipped`."""
+    from fastapi import HTTPException as _Http
+    from services import invoice_settlement
+
+    if len((body.reason or "").strip()) < invoice_settlement.MIN_REASON:
+        raise HTTPException(status_code=400,
+                            detail=f"Say why (at least {invoice_settlement.MIN_REASON} characters)")
+    done, skipped, total = [], [], Decimal("0")
+    invoices = db.execute(select(Invoice).where(Invoice.id.in_(set(body.invoice_ids)))).scalars().all()
+    for inv in invoices:
+        num = inv.invoice_number or f"#{inv.id}"
+        try:
+            with db.begin_nested():
+                adj = invoice_settlement.settle_in_full(db, inv, reason=body.reason, user=user)
+            done.append(num)
+            total += Decimal(str(adj))
+        except _Http as exc:
+            skipped.append({"invoice_number": num, "reason": exc.detail})
+    db.commit()
+    msg = f"{len(done)} invoice(s) settled in full — {float(total):,.2f} adjusted"
+    if skipped:
+        msg += f"; {len(skipped)} skipped"
+    return envelope({"settled": done, "skipped": skipped, "adjusted": float(total)}, msg)
 
 
 @router.post("/invoices/{invoice_id}/settle-in-full")

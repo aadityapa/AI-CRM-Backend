@@ -42,7 +42,7 @@ from models.timesheets import (  # noqa: F401
 from models.finance import (  # noqa: F401
     CompanyBankAccount, CreditNote, CreditNoteLine, CustomerReceipt, Expense, Invoice, InvoiceLine, InvoicePayment, InvoiceRevision,
     InvoiceRevisionStatus, PaymentStatus, POActivityLog,
-    POProjectAllocation, POStatus, POType, PurchaseOrder, TdsPayment, TdsRecord, TdsStatus,
+    POProjectAllocation, POStatus, POType, PurchaseOrder, TdsPayment, TdsReceipt, TdsRecord, TdsStatus,
 )
 from models.hr import (  # noqa: F401
     Employee, EmployeeEducation, EmployeeExperienceDetail, EmployeeLeaveBalance,

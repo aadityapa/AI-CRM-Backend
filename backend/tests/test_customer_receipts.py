@@ -88,15 +88,8 @@ def test_receipt_settles_invoices_and_delete_restores(db):
                 sub_total=200, tax_amount=0, grand_total=200, paid_amount=0, balance_amount=200,
                 payment_status="Unpaid")
     db.add_all([a, b]); db.commit()
-    # Money is recorded against the e-invoice (8 Oct 2026): refused until the
-    # customer approval + IRN are in.
-    import pytest
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException) as err:
-        create_receipt(ReceiptIn(customer_id=cust.id, received_date=date(2026, 9, 7), amount=Decimal("250"),
-                                 invoice_ids=[a.id, b.id]), db=db, user=FIN)
-    assert err.value.status_code == 409 and "INV-1" in err.value.detail
-    db.rollback()
+    # 20 Nov 2026: Received Amount maps every issued tax invoice, approval / IRN
+    # pending or not (the note on the picker is information only).
     from datetime import datetime, timezone
     for inv in (a, b):
         inv.customer_approved_at = datetime.now(timezone.utc)

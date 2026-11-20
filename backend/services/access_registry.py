@@ -391,7 +391,7 @@ SUB_TABS: dict[str, dict[str, str]] = {
         "approvals": "Timesheet Approvals", "all": "All Timesheets",
     },
     "invoices": {
-        "Proforma": "Proforma", "Awaiting_Customer": "Awaiting customer",
+        "All": "All invoices", "Proforma": "Proforma", "Awaiting_Customer": "Awaiting customer",
         "Customer_Approved": "Customer approved", "EInvoice": "E-invoice",
         "Unpaid": "Unpaid", "Partially_Paid": "Partially Paid", "Paid": "Paid",
     },
