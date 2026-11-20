@@ -14,7 +14,8 @@ from fastapi import HTTPException
 
 from models import Customer, CustomerBranch, Invoice, Project
 from routers.crm.customer_receipts import (
-    AllocateIn, AllocateItemIn, ReceiptIn, allocate_receipt, create_receipt, find_invoices, invoice_fit,
+    AllocateIn, AllocateItemIn, AssignBranchIn, ReceiptIn, ReceiptUpdate, allocate_receipt, assign_branch,
+    create_receipt, find_invoices, invoice_fit, update_receipt,
 )
 from tests.test_customer_receipts import FIN, db  # noqa: F401 — fixture
 
@@ -104,6 +105,29 @@ def test_another_customers_invoice_moves_an_unmapped_receipt_only(db):  # noqa: 
         allocate_receipt(rc2["id"], AllocateIn(items=[AllocateItemIn(invoice_id=c3.id)], move_receipt=True),
                          db=db, user=FIN)
     assert err.value.status_code == 409
+
+
+def test_a_mapped_receipt_moves_to_the_branch_that_paid(db):  # noqa: F811
+    """20 Nov 2026, Finance report: "0 receipts set to Ascendion … skipped #73
+    (mapped to KRNX26-27-26-CT …)" — a receipt paying Bangalore invoices could
+    not move to the Ascendion branch that paid it. It moves; the invoices stay
+    mapped and keep their own branch."""
+    aptiv, asux, blr, asc, a, _b, _c = _setup(db)
+    rc = create_receipt(ReceiptIn(customer_id=aptiv.id, branch_id=blr.id, received_date=date(2026, 9, 25),
+                                  amount=Decimal("1000"), invoice_ids=[a.id]), db=db, user=FIN)["data"]
+    res = assign_branch(AssignBranchIn(receipt_ids=[rc["id"]], branch_id=asc.id), db=db, user=FIN)
+    assert res["data"]["updated"] == 1 and res["data"]["mapped_across"] == 1
+    assert "moved to Ascendion" in res["message"] and "keeps its own branch" in res["message"]
+    db.refresh(a)
+    assert float(a.balance_amount) == 0          # still paid by the moved receipt
+    # Edit receipt ▸ Branch follows the same rule.
+    res = update_receipt(rc["id"], ReceiptUpdate(branch_id=blr.id), db=db, user=FIN)
+    assert res["data"]["branch_id"] == blr.id
+    # Another customer's branch is still refused.
+    other = CustomerBranch(customer_id=asux.id, branch_name="ASUX Chennai")
+    db.add(other); db.commit()
+    res = assign_branch(AssignBranchIn(receipt_ids=[rc["id"]], branch_id=other.id), db=db, user=FIN)
+    assert res["data"]["updated"] == 0 and "another customer" in res["message"]
 
 
 def test_map_anyway_across_branches_keeps_the_receipt_branch(db):  # noqa: F811

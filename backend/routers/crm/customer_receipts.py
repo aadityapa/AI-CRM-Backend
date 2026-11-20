@@ -47,6 +47,7 @@ in); a receipt with no branch takes the branch of the invoices it is mapped to.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -69,6 +70,7 @@ from services.finance import serialize_tds
 from services.invoice_customer_approval import payment_block
 
 router = APIRouter(prefix="/api/customer-receipts", tags=["customer-receipts"])
+log = logging.getLogger("karnex.crm.receipts")
 
 RC_READ = gated_read("invoices", "Finance", "Sales_Head", "Sales")
 RC_WRITE = gated_write_action("invoice.manage", "invoices", "Finance")
@@ -864,35 +866,70 @@ class AssignBranchIn(BaseModel):
 def assign_branch(body: AssignBranchIn, db: Session = Depends(get_crm_db),
                   user: CurrentUser = Depends(RC_WRITE)):
     """23 Oct 2026 (user ask): name the branch on several receipts at once —
-    the "<customer> · No branch on record" groups. A receipt already mapped to
-    invoices of another branch is skipped and named, never changed."""
-    from services.invoice_facets import invoice_facets
+    the "<customer> · No branch on record" groups, or move a receipt to the
+    branch that really paid.
 
+    20 Nov 2026 (Finance report): a receipt already mapped to invoices of the
+    old branch is MOVED too — the money is mapped across branches (the 20 Nov
+    Map invoices rule): each invoice keeps its own branch, the receipt shows the
+    branch that paid. Only another customer's branch is refused."""
     branch = db.get(CustomerBranch, body.branch_id)
     if branch is None:
         raise HTTPException(status_code=404, detail="Branch not found")
     receipts = db.execute(select(CustomerReceipt).where(
         CustomerReceipt.id.in_(set(body.receipt_ids)))).scalars().all()
-    done, skipped = 0, []
+    done, skipped, across = 0, [], 0
     for rc in receipts:
         if rc.customer_id != branch.customer_id:
             skipped.append(f"#{rc.id} (another customer)")
             continue
-        invs = db.execute(select(Invoice).where(
-            Invoice.id.in_({p.invoice_id for p in rc.payments or []}))).scalars().all()
-        facets = invoice_facets(db, invs) if invs else {}
-        other = [i.invoice_number or f"#{i.id}" for i in invs
-                 if (facets.get(i.id) or {}).get("branch_id") not in (None, branch.id)]
-        if other:
-            skipped.append(f"#{rc.id} (mapped to {', '.join(other)})")
+        if rc.branch_id == branch.id:
             continue
-        rc.branch_id = branch.id
+        if _move_receipt_branch(db, rc, branch, user):
+            across += 1
         done += 1
     db.commit()
-    msg = f"{done} receipt{'s' if done != 1 else ''} set to {branch.branch_name}"
+    msg = f"{done} receipt{'s' if done != 1 else ''} moved to {branch.branch_name}"
+    if across:
+        msg += (f" · {across} stay{'s' if across == 1 else ''} mapped to invoices of another branch "
+                f"(each invoice keeps its own branch)")
     if skipped:
         msg += f" · skipped {len(skipped)}: {'; '.join(skipped[:5])}"
-    return envelope({"updated": done, "skipped": skipped}, message=msg)
+    return envelope({"updated": done, "skipped": skipped, "mapped_across": across}, message=msg)
+
+
+def _move_receipt_branch(db: Session, rc: CustomerReceipt, branch: CustomerBranch | None,
+                         user: CurrentUser | None) -> list[str]:
+    """Move a receipt to another branch of the SAME customer (20 Nov 2026).
+    Its mapped invoices stay mapped and keep their own branch. Logged on the
+    customer's Activity Log. Returns the invoices now mapped across branches."""
+    from services import customer_activity
+    from services.invoice_facets import invoice_facets
+
+    new_bid = getattr(branch, "id", None)
+    invs = db.execute(select(Invoice).where(
+        Invoice.id.in_({p.invoice_id for p in rc.payments or []}))).scalars().all() if rc.payments else []
+    facets = invoice_facets(db, invs) if invs else {}
+    across = [i.invoice_number or f"#{i.id}" for i in invs
+              if (facets.get(i.id) or {}).get("branch_id") not in (None, new_bid)]
+    old_bid = rc.branch_id
+    if old_bid == new_bid:
+        return across
+    old_name = db.execute(select(CustomerBranch.branch_name).where(
+        CustomerBranch.id == old_bid)).scalar() if old_bid else None
+    rc.branch_id = new_bid
+    text = (f"Received amount #{rc.id} moved from {old_name or 'no branch'} to "
+            f"{getattr(branch, 'branch_name', None) or 'no branch'}")
+    if across:
+        text += f" — still pays {len(across)} invoice(s) of another branch ({', '.join(across[:6])})"
+    try:
+        with db.begin_nested():
+            customer_activity.record(db, rc.customer_id, "RECEIPT_BRANCH_MOVED", text, entity="receipt",
+                                     entity_id=rc.id, branch_id=new_bid,
+                                     subject=f"Received amount #{rc.id}", user=user)
+    except Exception:  # noqa: BLE001 — the log never blocks the move
+        log.warning("receipt %s: branch move not logged", rc.id, exc_info=True)
+    return across
 
 
 @router.put("/{receipt_id}")
@@ -934,28 +971,24 @@ def update_receipt(receipt_id: int, body: ReceiptUpdate, db: Session = Depends(g
         receipt.reference_number = (body.reference_number or "").strip() or None
     if "notes" in sent:
         receipt.notes = (body.notes or "").strip() or None
+    branch_note = ""
     if "branch_id" in sent and body.branch_id != receipt.branch_id:
+        branch = None
         if body.branch_id is not None:
             branch = db.get(CustomerBranch, body.branch_id)
             if branch is None or branch.customer_id != receipt.customer_id:
                 raise HTTPException(status_code=400, detail="That branch does not belong to this customer")
-            if payments:
-                from services.invoice_facets import invoice_facets
-                invs = db.execute(select(Invoice).where(Invoice.id.in_({p.invoice_id for p in payments}))).scalars().all()
-                facets = invoice_facets(db, invs)
-                other = [i.invoice_number or f"#{i.id}" for i in invs
-                         if (facets.get(i.id) or {}).get("branch_id") not in (None, branch.id)]
-                if other:
-                    raise HTTPException(status_code=400,
-                                        detail=f"Mapped invoices of another branch: {', '.join(other)} — unmap them first")
-        receipt.branch_id = body.branch_id
+        # 20 Nov 2026: mapped invoices of the old branch stay mapped (across branches).
+        across = _move_receipt_branch(db, receipt, branch, user)
+        if across:
+            branch_note = f" — still pays {len(across)} invoice(s) of another branch; each keeps its own branch"
     for pay in payments:
         pay.payment_date = receipt.received_date
         pay.payment_mode = receipt.payment_mode
         pay.reference_number = receipt.reference_number
     db.commit()
     db.refresh(receipt)
-    return envelope(_receipt_payload(db, receipt), message="Receipt updated")
+    return envelope(_receipt_payload(db, receipt), message="Receipt updated" + branch_note)
 
 
 @router.post("/{receipt_id}/allocate")
